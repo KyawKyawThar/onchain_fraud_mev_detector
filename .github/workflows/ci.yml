@@ -1,0 +1,171 @@
+name: CI
+
+# Mirrors `just check` (fmt-check + lint + test + build) plus the §20 gates:
+# per-service build, clippy + fmt + test + bench-smoke, and the security track.
+# Keep this in sync with the justfile so local `just check` == CI.
+
+# Push to main / version tags runs the full gate. Pull requests are handled by
+# pr.yml (fast feedback + coverage) so PRs and merges don't double-run.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# One run per ref; cancel superseded runs to save minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0          # required for sccache (it can't cache incremental builds)
+  RUST_BACKTRACE: 1
+  SQLX_OFFLINE: "true"          # build against the committed .sqlx cache, no live DB
+  RUSTC_WRAPPER: sccache        # compilation cache (artifacts stored in the GHA cache)
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  # ── fmt + clippy (fast feedback, runs first) ─────────────────────
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  # ── unit tests (nextest + doctests) ──────────────────────────────
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: cargo nextest run
+        run: cargo nextest run --workspace --all-features --locked
+      - name: doctests (nextest skips these)
+        run: cargo test --workspace --all-features --locked --doc
+
+  # ── integration tests (#[ignore], testcontainers-backed) ─────────
+  # GitHub's ubuntu runners ship Docker, so testcontainers can spin up
+  # Postgres/Redis/Kafka/etc. on demand. No-op until such tests exist.
+  integration-test:
+    name: integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: cargo nextest run (incl. ignored)
+        run: cargo nextest run --workspace --all-features --locked --run-ignored all
+
+  # ── per-service release build (§20) ──────────────────────────────
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1        # faster linking on the slow release build
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace --all-features --locked
+
+  # ── bench-smoke: benches must at least compile (§20) ─────────────
+  # Once criterion benches exist, swap --no-run for a short sampled run.
+  bench-smoke:
+    name: bench-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench --no-run
+        run: cargo bench --workspace --all-features --locked --no-run
+
+  # ── security / supply chain (cargo-audit + cargo-deny) ───────────
+  security:
+    name: audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit, cargo-deny
+      - name: cargo audit (vuln advisories)
+        run: cargo audit
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny check
+
+  # ── build + push service image to GHCR (cargo-chef Dockerfile) ───
+  # Only after the gates pass, and only on push (not manual dry-runs).
+  docker:
+    name: docker (server → GHCR)
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, security]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      # Lowercased below — GHCR requires lowercase image names.
+      IMAGE: ${{ github.repository }}/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Lowercase image name
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./deploy/Dockerfile
+          build-args: BIN=server
+          # Add linux/arm64 here once you need it (slower — uses QEMU emulation).
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,27 @@
+# Bacon jobs. Run `bacon` for the default (clippy), or `bacon <job>` /
+# press the shortcut key inside the TUI to switch jobs.
+# Docs: https://dystroy.org/bacon/
+
+default_job = "clippy"
+
+[jobs.check]
+command = ["cargo", "check", "--workspace", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.test]
+command = ["cargo", "test", "--workspace", "--color", "always"]
+need_stdout = true
+
+# Run the server binary; restarts on change.
+[jobs.run]
+command = ["cargo", "run", "-p", "server", "--color", "always"]
+need_stdout = true
+allow_warnings = true
+background = false
+
+[keybindings]
+r = "job:run"

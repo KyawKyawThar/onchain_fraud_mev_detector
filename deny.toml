@@ -1,0 +1,37 @@
+# cargo-deny config — drives the `security` CI job and `just deny`.
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail on any RUSTSEC advisory affecting the dependency tree.
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses we accept for dependencies. Add to this list as deps
+# pull in new (compatible) licenses — CI fails loudly on anything unlisted.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+# Our own crates are `license = "proprietary"` + `publish = false`; ignore them.
+private = { ignore = true }
+
+[bans]
+# Warn (don't fail) on duplicate versions of the same crate — common early on.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io and explicitly-allowed git sources.
+unknown-registry = "deny"
+unknown-git = "deny"

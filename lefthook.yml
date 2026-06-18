@@ -1,0 +1,18 @@
+# Git hooks via lefthook. Install once with `just hooks` (needs the lefthook
+# binary: `brew install lefthook`). Keeps formatting/lint failures out of CI.
+#
+# Commit stays fast (fmt only); the heavier lint + tests run on push.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    test:
+      run: cargo nextest run --workspace --all-features --locked

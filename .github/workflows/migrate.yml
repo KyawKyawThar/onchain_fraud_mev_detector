@@ -1,0 +1,64 @@
+name: Database Migrations
+
+# Manual, per-environment sqlx migrations. Requires a GitHub Environment
+# (staging / production) each holding a DATABASE_URL secret pointing at a
+# reachable Postgres. sqlx-cli reads DATABASE_URL from the env.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      action:
+        description: Migration action
+        required: true
+        default: info
+        type: choice
+        options:
+          - info      # show applied / pending
+          - up        # apply all pending
+          - revert    # roll back the last migration
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: sqlx ${{ inputs.action }} @ ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # gates on environment protection rules
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      MIGRATIONS: crates/db/migrations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+
+      - name: Show status
+        if: inputs.action == 'info'
+        run: sqlx migrate info --source "$MIGRATIONS"
+
+      - name: Apply pending migrations
+        if: inputs.action == 'up'
+        run: |
+          sqlx migrate run --source "$MIGRATIONS"
+          echo "✅ Migrations applied to ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revert last migration
+        if: inputs.action == 'revert'
+        run: |
+          sqlx migrate revert --source "$MIGRATIONS"
+          echo "⚠️ Reverted last migration on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final status
+        if: always()
+        run: sqlx migrate info --source "$MIGRATIONS" || true

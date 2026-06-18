@@ -1,0 +1,10 @@
+# Keep the build context small so Docker builds are fast and don't bust the
+# cargo-chef cache on unrelated changes.
+target/
+.git/
+.github/
+deploy/db-data/
+**/*.rs.bk
+.env
+*.md
+.vscode/

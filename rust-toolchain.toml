@@ -1,0 +1,6 @@
+# Pins the toolchain for local dev and CI so builds are reproducible (§21).
+# Bump `channel` to an exact version (e.g. "1.85.0") once you want to lock it
+# down; "stable" tracks the latest stable across the team and CI.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

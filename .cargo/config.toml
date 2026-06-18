@@ -1,0 +1,22 @@
+# Workspace-wide cargo config: aliases + optional faster linking.
+#
+# Linker overrides are COMMENTED on purpose — a forced linker that isn't
+# installed breaks every build. Uncomment the block for your OS after
+# installing the linker. CI enables mold via the rui314/setup-mold action,
+# so it doesn't depend on this file.
+
+[alias]
+# `cargo t` → nextest; `cargo ta` includes #[ignore] integration tests.
+t  = "nextest run --workspace --all-features"
+ta = "nextest run --workspace --all-features --run-ignored all"
+# `cargo lint` → exactly what CI runs.
+lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
+
+# ── Faster linking (opt-in) ──────────────────────────────────────
+# Linux  — install:  sudo apt-get install mold   (or  dnf install mold)
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# macOS  — install:  brew install llvm           (provides lld)
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
