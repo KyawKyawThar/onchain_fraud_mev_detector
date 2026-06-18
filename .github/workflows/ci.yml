@@ -22,11 +22,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0          # required for sccache (it can't cache incremental builds)
+  CARGO_INCREMENTAL: 0          # disable incremental — smaller, faster CI caches
   RUST_BACKTRACE: 1
   SQLX_OFFLINE: "true"          # build against the committed .sqlx cache, no live DB
-  RUSTC_WRAPPER: sccache        # compilation cache (artifacts stored in the GHA cache)
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   # ── fmt + clippy (fast feedback, runs first) ─────────────────────
@@ -38,7 +36,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -53,7 +50,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: rui314/setup-mold@v1
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -73,7 +69,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: rui314/setup-mold@v1
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -89,7 +84,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: rui314/setup-mold@v1        # faster linking on the slow release build
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release --workspace
         run: cargo build --release --workspace --all-features --locked
@@ -103,7 +97,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: rui314/setup-mold@v1
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run
         run: cargo bench --workspace --all-features --locked --no-run
@@ -115,7 +108,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit, cargo-deny
