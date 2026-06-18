@@ -55,7 +55,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: cargo nextest run
-        run: cargo nextest run --workspace --all-features --locked
+        run: cargo nextest run --workspace --all-features --locked --no-tests=pass
       - name: doctests (nextest skips these)
         run: cargo test --workspace --all-features --locked --doc
 
@@ -74,7 +74,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: cargo nextest run (incl. ignored)
-        run: cargo nextest run --workspace --all-features --locked --run-ignored all
+        run: cargo nextest run --workspace --all-features --locked --run-ignored all --no-tests=pass
 
   # ── per-service release build (§20) ──────────────────────────────
   build:

@@ -29,7 +29,11 @@ private = { ignore = true }
 [bans]
 # Warn (don't fail) on duplicate versions of the same crate — common early on.
 multiple-versions = "warn"
+# Forbid wildcard ("*") version requirements on crates.io deps...
 wildcards = "deny"
+# ...but allow internal workspace path deps (e.g. `db = { path = "../db" }`),
+# which cargo-deny otherwise reports as wildcards.
+allow-wildcard-paths = true
 
 [sources]
 # Only crates.io and explicitly-allowed git sources.

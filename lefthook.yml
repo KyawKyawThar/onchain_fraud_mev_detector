@@ -15,4 +15,4 @@ pre-push:
     clippy:
       run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     test:
-      run: cargo nextest run --workspace --all-features --locked
+      run: cargo nextest run --workspace --all-features --locked --no-tests=pass

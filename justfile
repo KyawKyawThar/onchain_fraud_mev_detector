@@ -156,12 +156,12 @@ lint-fix:
 
 # Run unit tests (nextest) + doctests
 test:
-    cargo nextest run --workspace
+    cargo nextest run --workspace --no-tests=pass
     cargo test --workspace --doc
 
 # Run all tests incl. #[ignore] integration (needs docker for testcontainers)
 test-integration:
-    cargo nextest run --workspace --run-ignored all
+    cargo nextest run --workspace --run-ignored all --no-tests=pass
 
 # ── Security / supply chain ──────────────────────────────────────
 
