@@ -56,7 +56,23 @@ pub enum EventError {
 /// [`DomainEvent::event_type`], so the type name on the wire (the serde `type`
 /// tag) and the event-store key can never drift from the variant identifier —
 /// adding a variant updates all of them at once.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::IntoStaticStr)]
+///
+/// `strum::EnumCount` and `strum::VariantNames` expose [`DomainEvent::COUNT`]
+/// and [`DomainEvent::VARIANTS`] (every variant name == its wire `type` tag).
+/// The wire-format golden test (`tests/wire_format.rs`) uses them to prove the
+/// schema is fully *locked*: every variant is pinned to an exact byte-for-byte
+/// JSON shape, so adding or renaming a field breaks CI rather than silently
+/// changing the contract downstream services depend on (sprint-plan risk #1).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumCount,
+    strum::VariantNames,
+)]
 #[serde(tag = "type", content = "payload")]
 pub enum DomainEvent {
     // Chain (§5)
@@ -219,7 +235,8 @@ impl EventEnvelope {
     }
 
     /// Reject envelopes written under a schema version this build can't read.
-    /// Forward-compatible reads (older `schema_version`) are allowed.
+    /// Reading older (equal-or-lower `schema_version`) data is allowed — new code
+    /// stays backwards-compatible with what older producers wrote.
     pub fn ensure_supported(&self) -> Result<(), EventError> {
         if self.schema_version > SCHEMA_VERSION {
             return Err(EventError::UnsupportedSchemaVersion {
