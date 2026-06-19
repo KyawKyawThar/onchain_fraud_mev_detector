@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use events::primitives::Chain;
+use events::primitives::{AccountAddress, Chain};
 use events::{DomainEvent, EventEnvelope};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -95,9 +95,36 @@ impl EventStore {
     }
 }
 
-/// One stored row. The envelope metadata (§2) is lifted into typed columns; the
-/// `DomainEvent` itself is the exact schema-locked JSON in `payload`, so a read
-/// reconstructs the original envelope via [`EventRow::into_envelope`].
+/// Canonical stored form of an on-chain address: lowercase `0x`-hex. The write
+/// path (the `addresses` index column) and the by-address query both normalize
+/// through this one function, so a lookup can never silently miss because the
+/// two sides disagreed on casing.
+pub(crate) fn normalized_address(address: &AccountAddress) -> String {
+    format!("{address:#x}")
+}
+
+/// Shared reconstruction: decode the stored `payload` JSON and rewrap it with its
+/// original identity via [`EventEnvelope::with_metadata`], so replay reproduces
+/// the event's `event_id`/`occurred_at` exactly (§18). Used by every read path.
+fn envelope_from_stored(
+    event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    chain: u64,
+    payload: &str,
+) -> Result<EventEnvelope, serde_json::Error> {
+    let payload: DomainEvent = serde_json::from_str(payload)?;
+    Ok(EventEnvelope::with_metadata(
+        event_id,
+        occurred_at,
+        Chain(chain),
+        payload,
+    ))
+}
+
+/// One row to *insert*. The envelope metadata (§2) is lifted into typed columns;
+/// the `DomainEvent` itself is the exact schema-locked JSON in `payload`. Reads
+/// don't use this type — they select only the canonical columns into
+/// [`StoredEvent`] (the denormalized index columns never feed reconstruction).
 ///
 /// Field names are the ClickHouse column names. `appended_at` is intentionally
 /// absent: it has a `DEFAULT`, so omitting it lets ClickHouse fill the ingest
@@ -120,6 +147,17 @@ pub struct EventRow {
     pub occurred_at: DateTime<Utc>,
     /// The `DomainEvent` as adjacently-tagged JSON (the locked wire format).
     pub payload: String,
+    /// Denormalized business key for the §4 audit-by-incident query: the
+    /// incident this event references, or `NULL` if it names none. Derived from
+    /// `payload` via [`DomainEvent::incident_id`]; an index accelerator only,
+    /// never read back when reconstructing the envelope. Maps to the
+    /// `Nullable(UUID)` column.
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub incident_id: Option<Uuid>,
+    /// Denormalized business key for the §4 by-address query: every on-chain
+    /// address this event references, lowercase `0x…` hex. Derived from `payload`
+    /// via [`DomainEvent::addresses`]; maps to the `Array(String)` column.
+    pub addresses: Vec<String>,
 }
 
 impl TryFrom<&EventEnvelope> for EventRow {
@@ -135,25 +173,50 @@ impl TryFrom<&EventEnvelope> for EventRow {
             event_family: env.payload.family().as_str().to_owned(),
             occurred_at: env.occurred_at,
             payload: serde_json::to_string(&env.payload)?,
+            incident_id: env.payload.incident_id().map(|id| id.0),
+            addresses: {
+                // One event can name the same address twice (e.g. a
+                // PreliminaryAlertCreated listing it as both a victim and a
+                // beneficiary); dedupe so the indexed array stays tight.
+                let mut addrs: Vec<String> = env
+                    .payload
+                    .addresses()
+                    .iter()
+                    .map(normalized_address)
+                    .collect();
+                addrs.sort_unstable();
+                addrs.dedup();
+                addrs
+            },
         })
     }
 }
 
-impl TryFrom<EventRow> for EventEnvelope {
+/// The canonical columns a read needs to rebuild an [`EventEnvelope`]: identity,
+/// chain, occurrence time, and the payload that is the source of truth. The
+/// denormalized `incident_id`/`addresses` index columns are deliberately *not*
+/// selected — they only accelerate lookups, never feed reconstruction, so a
+/// query that returns rows doesn't pay to ship them.
+#[derive(Debug, clickhouse::Row, Deserialize)]
+pub struct StoredEvent {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub event_id: Uuid,
+    pub chain: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub occurred_at: DateTime<Utc>,
+    pub payload: String,
+}
+
+/// The `SELECT` projection for [`StoredEvent`], in field order (RowBinary maps by
+/// position). The single source of the read column list, shared by every query.
+pub const STORED_EVENT_COLUMNS: &str = "event_id, chain, occurred_at, payload";
+
+impl TryFrom<StoredEvent> for EventEnvelope {
     /// The only fallible step is decoding the stored payload JSON.
     type Error = serde_json::Error;
 
-    /// Reconstruct the original envelope from a stored row. Uses the
-    /// identity-preserving [`EventEnvelope::with_metadata`] so replay reproduces
-    /// the event's `event_id`/`occurred_at` exactly (§18).
-    fn try_from(row: EventRow) -> Result<Self, Self::Error> {
-        let payload: DomainEvent = serde_json::from_str(&row.payload)?;
-        Ok(EventEnvelope::with_metadata(
-            row.event_id,
-            row.occurred_at,
-            Chain(row.chain),
-            payload,
-        ))
+    fn try_from(row: StoredEvent) -> Result<Self, Self::Error> {
+        envelope_from_stored(row.event_id, row.occurred_at, row.chain, &row.payload)
     }
 }
 
@@ -188,10 +251,36 @@ mod tests {
         assert_eq!(row.occurred_at, env.occurred_at);
         // payload is exactly the DomainEvent wire form, nothing more.
         assert_eq!(row.payload, serde_json::to_string(&env.payload).unwrap());
+        // A chain event names no business key, so both accelerator columns are empty.
+        assert_eq!(row.incident_id, None);
+        assert!(row.addresses.is_empty());
     }
 
     #[test]
-    fn row_round_trips_back_to_the_original_envelope() {
+    fn row_denormalizes_business_keys_for_indexed_lookup() {
+        use events::intelligence::SanctionHit;
+        use events::primitives::AccountAddress;
+
+        let address = AccountAddress::repeat_byte(0x42);
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::SanctionHit(SanctionHit {
+                address,
+                list: "OFAC".into(),
+                entry: "SDN-1".into(),
+            }),
+        );
+        let row = EventRow::try_from(&env).expect("map");
+
+        // SanctionHit carries an address but no incident.
+        assert_eq!(row.incident_id, None);
+        // Stored lowercase so it matches the by-address query's normalized input.
+        assert_eq!(row.addresses, vec![format!("{address:#x}")]);
+        assert_eq!(row.addresses[0], row.addresses[0].to_lowercase());
+    }
+
+    #[test]
+    fn write_then_canonical_read_round_trips_to_the_original() {
         // Build with a millisecond-precise timestamp: the DateTime64(3) column
         // stores only milliseconds, so an arbitrary `now()` (sub-ms precision)
         // would not survive the round trip. Replay timestamps are millisecond
@@ -204,8 +293,16 @@ mod tests {
             sample_envelope().payload,
         );
 
+        // What the write path stores, then what a read selects back (the
+        // canonical columns only) — the pair must reconstruct the original.
         let row = EventRow::try_from(&env).expect("map");
-        let back = EventEnvelope::try_from(row).expect("reconstruct");
+        let stored = StoredEvent {
+            event_id: row.event_id,
+            chain: row.chain,
+            occurred_at: row.occurred_at,
+            payload: row.payload,
+        };
+        let back = EventEnvelope::try_from(stored).expect("reconstruct");
         assert_eq!(back, env);
     }
 }

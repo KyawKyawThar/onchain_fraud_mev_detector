@@ -27,7 +27,7 @@ pub mod simulation;
 pub mod system;
 
 use chrono::{DateTime, Utc};
-use primitives::Chain;
+use primitives::{AccountAddress, Chain, IncidentId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -195,6 +195,87 @@ impl DomainEvent {
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
             UsageRecorded(_) => EventFamily::System,
+        }
+    }
+
+    /// The incident this event directly carries, if any — the business key for
+    /// the §4 audit-by-incident query (`GET /v1/audit/incident/{id}`). The
+    /// event-store denormalizes this into an indexed column so that lookup
+    /// doesn't scan + JSON-parse every row.
+    ///
+    /// Only the simulation lifecycle and the attribution overlay name an
+    /// incident. Like [`DomainEvent::family`], this is an explicit exhaustive
+    /// match (no `_` arm) on purpose: a future incident-bearing event then fails
+    /// to compile until it is classified here, rather than silently dropping out
+    /// of the audit trail (sprint-plan risk #1 — schema drift).
+    pub fn incident_id(&self) -> Option<IncidentId> {
+        use DomainEvent::*;
+        match self {
+            IncidentCreated(e) => Some(e.incident_id),
+            IncidentRetracted(e) => Some(e.incident_id),
+            IncidentFinalized(e) => Some(e.incident_id),
+            AttributionUpdated(e) => Some(e.incident_id),
+            RawBlockReceived(_)
+            | BlockAssembled(_)
+            | BlockCanonicalized(_)
+            | BlockReverted(_)
+            | BlockFinalized(_)
+            | DetectorTriggered(_)
+            | PreliminaryAlertCreated(_)
+            | SimulationRequested(_)
+            | SimulationCompleted(_)
+            | LabelAdded(_)
+            | LabelUpdated(_)
+            | LabelRevoked(_)
+            | EntityCreated(_)
+            | EntityMerged(_)
+            | EntitySplit(_)
+            | RiskScoreUpdated(_)
+            | SanctionHit(_)
+            | RuleCreated(_)
+            | RuleTriggered(_)
+            | RuleAlertCreated(_)
+            | UsageRecorded(_) => None,
+        }
+    }
+
+    /// The on-chain account addresses this event references — the business key
+    /// for the §4 by-address query. Denormalized into an indexed `Array(String)`
+    /// column by the event-store so an address lookup prunes granules instead of
+    /// scanning the payloads.
+    ///
+    /// Exhaustive on purpose (see [`DomainEvent::incident_id`]): a new
+    /// address-bearing event must be classified here or it won't compile, so it
+    /// can never silently become unfindable by address. Transaction hashes
+    /// (`txs`) are deliberately *not* addresses and are excluded.
+    pub fn addresses(&self) -> Vec<AccountAddress> {
+        use DomainEvent::*;
+        match self {
+            PreliminaryAlertCreated(e) => e.addresses.clone(),
+            LabelAdded(e) => vec![e.address],
+            LabelUpdated(e) => vec![e.address],
+            LabelRevoked(e) => vec![e.address],
+            EntityCreated(e) => vec![e.seed_address],
+            RiskScoreUpdated(e) => vec![e.address],
+            SanctionHit(e) => vec![e.address],
+            RawBlockReceived(_)
+            | BlockAssembled(_)
+            | BlockCanonicalized(_)
+            | BlockReverted(_)
+            | BlockFinalized(_)
+            | DetectorTriggered(_)
+            | SimulationRequested(_)
+            | SimulationCompleted(_)
+            | IncidentCreated(_)
+            | IncidentRetracted(_)
+            | IncidentFinalized(_)
+            | AttributionUpdated(_)
+            | EntityMerged(_)
+            | EntitySplit(_)
+            | RuleCreated(_)
+            | RuleTriggered(_)
+            | RuleAlertCreated(_)
+            | UsageRecorded(_) => Vec::new(),
         }
     }
 }
@@ -399,6 +480,49 @@ mod tests {
         assert_eq!(env.topic(), "mev.events.BlockAssembled");
         // Topic and family stay in lockstep with the variant.
         assert_eq!(env.payload.family().as_str(), "chain");
+    }
+
+    #[test]
+    fn incident_id_extracts_only_from_incident_keyed_events() {
+        use crate::primitives::IncidentId;
+        use crate::simulation::IncidentFinalized;
+
+        let incident = IncidentId::new();
+        let event = DomainEvent::IncidentFinalized(IncidentFinalized {
+            incident_id: incident,
+            block_hash: B256::repeat_byte(0x11),
+        });
+        assert_eq!(event.incident_id(), Some(incident));
+
+        // A chain event carries no incident — it must not surface in an
+        // audit-by-incident query.
+        let chain_event = DomainEvent::BlockAssembled(BlockAssembled {
+            block: sample_block(),
+            tx_count: 1,
+            trace_available: false,
+        });
+        assert_eq!(chain_event.incident_id(), None);
+    }
+
+    #[test]
+    fn addresses_extracts_every_referenced_address() {
+        use crate::intelligence::SanctionHit;
+        use alloy_primitives::Address;
+
+        let addr = Address::repeat_byte(0x42);
+        let event = DomainEvent::SanctionHit(SanctionHit {
+            address: addr,
+            list: "OFAC".into(),
+            entry: "SDN-1".into(),
+        });
+        assert_eq!(event.addresses(), vec![addr]);
+
+        // Transaction hashes are not addresses: DetectorTriggered carries `txs`
+        // but no account address, so it returns nothing.
+        let chain_event = DomainEvent::BlockFinalized(crate::chain::BlockFinalized {
+            block: sample_block(),
+        });
+        assert!(chain_event.addresses().is_empty());
     }
 
     #[test]

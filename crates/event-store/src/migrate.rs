@@ -26,11 +26,18 @@ struct Migration {
 
 /// The ordered migration set. Versions sort lexically, so zero-pad the numeric
 /// prefix.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: "0001_create_events",
-    up: include_str!("../migrations/0001_create_events.up.sql"),
-    down: include_str!("../migrations/0001_create_events.down.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "0001_create_events",
+        up: include_str!("../migrations/0001_create_events.up.sql"),
+        down: include_str!("../migrations/0001_create_events.down.sql"),
+    },
+    Migration {
+        version: "0002_business_key_columns",
+        up: include_str!("../migrations/0002_business_key_columns.up.sql"),
+        down: include_str!("../migrations/0002_business_key_columns.down.sql"),
+    },
+];
 
 /// Whether a migration has been applied — the result of [`status`].
 pub struct MigrationStatus {
