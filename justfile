@@ -234,4 +234,4 @@ tools:
     cargo install cargo-nextest --locked
     cargo install cargo-watch bacon cargo-audit cargo-deny cargo-machete
     @echo "ℹ️  Also install lefthook for git hooks: brew install lefthook && just hooks"
-    @echo "ℹ️  The event-store crate builds librdkafka from source — needs cmake + a C toolchain: brew install cmake"
+    @echo "ℹ️  The event-store crate builds librdkafka from source — needs a C toolchain + make (Xcode CLT on macOS; build-essential on Linux)"

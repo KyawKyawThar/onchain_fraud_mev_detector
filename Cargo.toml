@@ -40,12 +40,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net",
 # clickhouse — official client; RowBinary inserts via `#[derive(Row)]`. The
 #   `uuid` feature pulls in the UUID column (de)serializer (ClickHouse byte order).
 # rdkafka — librdkafka bindings for the consumer (consumer groups + manual offset
-#   commit). `cmake-build` compiles the vendored librdkafka with cmake — needs a
-#   C/C++ toolchain + cmake locally (`brew install cmake`); CI's ubuntu runners
-#   ship both. `tokio` enables the async StreamConsumer.
+#   commit). The default (configure-based) vendored build is used deliberately:
+#   it auto-`--disable`s the optional curl/ssl/gssapi/zstd deps we don't enable,
+#   so it compiles on a bare runner (CI, the slim Docker image) needing only a C
+#   toolchain + make, and yields a near-self-contained binary (libz only) — right
+#   for our PLAINTEXT Kafka. `cmake-build` is intentionally NOT used: cmake hard-
+#   requires curl headers and broke CI. Production SASL_SSL: add the `ssl`/`sasl`
+#   features here + the matching system libs in CI/Dockerfile when that lands.
+#   `tokio` enables the async StreamConsumer.
 axum = "0.8"
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
-rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
+rdkafka = { version = "0.39", features = ["tokio"] }
 # Production hardening for the network service:
 # tower-http — TraceLayer (HTTP spans into the existing OTel stack) + TimeoutLayer.
 # tokio-util — CancellationToken for cooperative, drain-then-exit shutdown.
