@@ -12,21 +12,24 @@
 
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use events::primitives::{AccountAddress, IncidentId};
 use events::EventEnvelope;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::query::{Cursor, EventPage, Filters, QueryError};
 use crate::store::EventStore;
 
 /// Cap on a single append batch. A within-limit body of tiny events could still
@@ -42,10 +45,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// automatically from the `events` crate's `ToSchema` derives.
 #[derive(OpenApi)]
 #[openapi(
-    paths(append, healthz),
-    components(schemas(EventEnvelope, AppendResponse)),
+    paths(append, healthz, audit_incident, events_by_address, replay),
+    components(schemas(EventEnvelope, AppendResponse, EventPageResponse)),
     modifiers(&SecurityAddon),
-    tags((name = "event-store", description = "Immutable event store — append API (§4)")),
+    tags((name = "event-store", description = "Immutable event store — append + query API (§4, §18)")),
 )]
 pub struct ApiDoc;
 
@@ -84,10 +87,19 @@ pub fn router(state: AppState) -> Router {
         middleware::from_fn_with_state(state.clone(), require_write_token),
     );
 
-    let public = Router::new().route("/healthz", get(healthz));
+    // Internal read surface: the §4 query API and §18 replay source, plus the
+    // `/healthz` probe. Unauthenticated by design — these are reached only over
+    // the internal network and are fronted by the public §11 API service, which
+    // owns end-user auth. They are strictly read-only; every write goes through
+    // the bearer-gated append above.
+    let read = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/audit/incident/{incident_id}", get(audit_incident))
+        .route("/v1/address/{address}/events", get(events_by_address))
+        .route("/v1/replay", get(replay));
 
     protected
-        .merge(public)
+        .merge(read)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(
@@ -168,6 +180,154 @@ async fn healthz(State(state): State<AppState>) -> Result<&'static str, AppError
     Ok("ok")
 }
 
+/// Shared query string for all three read endpoints: an optional chain /
+/// event-type narrowing, a half-open `[from, to)` time window (RFC 3339, e.g.
+/// `2024-01-01T00:00:00Z`), and keyset pagination (`limit` + `cursor`). Every
+/// field is optional; an unset field is simply not constrained.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct FilterParams {
+    /// Restrict to one chain id (e.g. `1` for Ethereum).
+    chain: Option<u64>,
+    /// Restrict to one event type (e.g. `BlockAssembled`).
+    event_type: Option<String>,
+    /// Inclusive lower bound on `occurred_at` (RFC 3339).
+    from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `occurred_at` (RFC 3339).
+    to: Option<DateTime<Utc>>,
+    /// Max events per page (clamped server-side to a hard ceiling).
+    limit: Option<u64>,
+    /// Opaque cursor from a previous page's `next_cursor`; resumes after it.
+    cursor: Option<String>,
+}
+
+impl FilterParams {
+    /// Convert to domain [`Filters`], parsing the opaque cursor token. A
+    /// malformed cursor is the caller's fault — surfaced as a 400.
+    fn into_filters(self) -> Result<Filters, AppError> {
+        let cursor = self
+            .cursor
+            .map(|token| {
+                Cursor::parse(&token)
+                    .ok_or_else(|| AppError::bad_request(format!("invalid cursor `{token}`")))
+            })
+            .transpose()?;
+        Ok(Filters {
+            chain: self.chain,
+            event_type: self.event_type,
+            from: self.from,
+            to: self.to,
+            cursor,
+            limit: self.limit,
+        })
+    }
+}
+
+/// Response body for the read endpoints: a page of events plus the cursor to
+/// fetch the next page (`null` when the stream is exhausted, so a caller can
+/// always distinguish a complete result from a truncated one).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct EventPageResponse {
+    events: Vec<EventEnvelope>,
+    next_cursor: Option<String>,
+}
+
+impl From<EventPage> for EventPageResponse {
+    fn from(page: EventPage) -> Self {
+        Self {
+            events: page.events,
+            next_cursor: page.next_cursor.map(|cursor| cursor.token()),
+        }
+    }
+}
+
+/// `GET /v1/audit/incident/{incident_id}` — the event sequence for one incident,
+/// oldest first (§4 audit use case): the events whose payload directly carries
+/// this incident id, optionally narrowed and paginated.
+#[utoipa::path(
+    get,
+    path = "/v1/audit/incident/{incident_id}",
+    tag = "event-store",
+    params(("incident_id" = String, Path, format = Uuid, description = "Incident id"), FilterParams),
+    responses(
+        (status = 200, description = "A page of the incident's event sequence", body = EventPageResponse),
+        (status = 400, description = "Invalid cursor"),
+        (status = 500, description = "Storage failure"),
+    ),
+)]
+async fn audit_incident(
+    State(state): State<AppState>,
+    Path(incident_id): Path<uuid::Uuid>,
+    Query(params): Query<FilterParams>,
+) -> Result<Json<EventPageResponse>, AppError> {
+    let page = state
+        .store
+        .audit_incident(IncidentId(incident_id), &params.into_filters()?)
+        .await
+        .map_err(AppError::from_query)?;
+    Ok(Json(page.into()))
+}
+
+/// `GET /v1/address/{address}/events` — every event referencing an on-chain
+/// address, oldest first, within the optional filters (§4 by-address query).
+#[utoipa::path(
+    get,
+    path = "/v1/address/{address}/events",
+    tag = "event-store",
+    params(
+        ("address" = String, Path, description = "On-chain address, 0x-prefixed hex (any case)"),
+        FilterParams,
+    ),
+    responses(
+        (status = 200, description = "A page of events referencing the address", body = EventPageResponse),
+        (status = 400, description = "Address is not valid hex, or invalid cursor"),
+        (status = 500, description = "Storage failure"),
+    ),
+)]
+async fn events_by_address(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(params): Query<FilterParams>,
+) -> Result<Json<EventPageResponse>, AppError> {
+    let address: AccountAddress = address
+        .parse()
+        .map_err(|_| AppError::bad_request(format!("invalid address `{address}`")))?;
+    let page = state
+        .store
+        .events_by_address(address, &params.into_filters()?)
+        .await
+        .map_err(AppError::from_query)?;
+    Ok(Json(page.into()))
+}
+
+/// `GET /v1/replay` — a deterministic event stream over a time window, oldest
+/// first (§18 replay source). With `event_type` set this is the §4
+/// replay-by-event-type-and-window; without it, the general by-time-range query.
+/// Requires at least one of `chain`/`event_type`/`from`/`to` — an unbounded
+/// replay over the whole log is refused with 400.
+#[utoipa::path(
+    get,
+    path = "/v1/replay",
+    tag = "event-store",
+    params(FilterParams),
+    responses(
+        (status = 200, description = "A page of the deterministic stream for the window", body = EventPageResponse),
+        (status = 400, description = "No narrowing filter, or invalid cursor"),
+        (status = 500, description = "Storage failure"),
+    ),
+)]
+async fn replay(
+    State(state): State<AppState>,
+    Query(params): Query<FilterParams>,
+) -> Result<Json<EventPageResponse>, AppError> {
+    let page = state
+        .store
+        .replay(&params.into_filters()?)
+        .await
+        .map_err(AppError::from_query)?;
+    Ok(Json(page.into()))
+}
+
 /// Middleware: require a valid `Authorization: Bearer <token>` or reject 401.
 async fn require_write_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let presented = req
@@ -214,6 +374,15 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: err.to_string(),
+        }
+    }
+
+    /// Map a read-path failure to a status: an unbounded replay is the caller's
+    /// mistake (400); a storage failure is ours (500).
+    fn from_query(err: QueryError) -> Self {
+        match err {
+            QueryError::UnboundedReplay => Self::bad_request(QueryError::UnboundedReplay),
+            QueryError::Store(inner) => Self::internal(inner),
         }
     }
 
@@ -267,9 +436,12 @@ mod tests {
 
         // The bearer scheme backs Swagger's Authorize button.
         assert!(spec["components"]["securitySchemes"]["bearer_token"].is_object());
-        // Both endpoints are documented.
+        // The append, probe, and query/replay endpoints are all documented.
         assert!(spec["paths"]["/v1/events"]["post"].is_object());
         assert!(spec["paths"]["/healthz"]["get"].is_object());
+        assert!(spec["paths"]["/v1/audit/incident/{incident_id}"]["get"].is_object());
+        assert!(spec["paths"]["/v1/address/{address}/events"]["get"].is_object());
+        assert!(spec["paths"]["/v1/replay"]["get"].is_object());
     }
 
     #[test]
