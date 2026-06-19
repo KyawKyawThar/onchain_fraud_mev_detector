@@ -103,6 +103,12 @@ dev-server:
 bacon:
     bacon
 
+# Sprint 0 deliverable: one trace span propagates end-to-end across a
+# stub producer/consumer (in-process; no infra needed). Watch the two
+# trace_id=… lines match.
+trace-demo:
+    RUST_LOG=info cargo run -p telemetry --example trace_propagation
+
 # Run the server binary inside bacon (live reload)
 run:
     bacon run
@@ -173,13 +179,12 @@ audit:
 deny:
     cargo deny check
 
-# ── Install / Setup ──────────────────────────────────────────────
+# Full pre-push check (mirrors CI)
 
-# Install dev tools (sqlx-cli, cargo-watch, bacon, nextest, audit, deny, machete)
-tools:
-    cargo install sqlx-cli --no-default-features --features rustls,postgres
-    cargo install cargo-watch bacon cargo-nextest cargo-audit cargo-deny cargo-machete
-    @echo "ℹ️  Also install lefthook for git hooks: brew install lefthook && just hooks"
+check: fmt-check lint test build
+    @echo "════════════════════════════════════════"
+    @echo "  ✅ All checks passed — safe to push"
+    @echo "════════════════════════════════════════"
 
 # ── Git hooks (lefthook) ─────────────────────────────────────────
 
@@ -191,7 +196,14 @@ hooks:
 # ── Pre-push check (everything CI checks) ────────────────────────
 
 # Full pre-push check (mirrors CI)
-check: fmt-check lint test build
-    @echo "════════════════════════════════════════"
-    @echo "  ✅ All checks passed — safe to push"
-    @echo "════════════════════════════════════════"
+
+
+# ── Install / Setup ──────────────────────────────────────────────
+
+# Install dev tools (sqlx-cli, cargo-watch, bacon, nextest, audit, deny, machete)
+tools:
+    cargo install sqlx-cli --no-default-features --features rustls,postgres
+    # nextest refuses to install without --locked, so it's a separate line.
+    cargo install cargo-nextest --locked
+    cargo install cargo-watch bacon cargo-audit cargo-deny cargo-machete
+    @echo "ℹ️  Also install lefthook for git hooks: brew install lefthook && just hooks"

@@ -1,0 +1,19 @@
+[package]
+name = "events"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The domain event schema (§2) — the contract every service produces/consumes.
+# Pure data + (de)serialization, no I/O and no transport deps on purpose: this
+# crate must stay cheap to depend on from every service.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+alloy-primitives.workspace = true
+thiserror.workspace = true

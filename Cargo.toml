@@ -10,7 +10,32 @@ publish = false
 # Shared dependency versions. Pin and reference these from member crates with
 # `dep = { workspace = true }`. Add crates here as services start needing them.
 [workspace.dependencies]
+# Internal crates (path deps — resolved by the `crates/*` glob above).
+events    = { path = "crates/events" }
+telemetry = { path = "crates/telemetry" }
+db        = { path = "crates/db" }
+
+# Errors.
 anyhow = "1"
 thiserror = "2"
+
+# Serialization & domain primitives (event schema, §2).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Derive-driven enum metadata so variant→string mappings can't drift (§2).
+strum = { version = "0.27", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+# alloy is the project's chosen Ethereum stack (§21) — use its type-safe
+# Address/B256/U256 in the event schema rather than stringly-typed hashes.
+alloy-primitives = { version = "1", features = ["serde"] }
+
+# Async runtime (used by the trace-propagation demo; services adopt it as built).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+# Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = "0.27"

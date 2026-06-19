@@ -1,14 +1,25 @@
-name: PR Validation
+name: PR & Branch Validation
 
-# Fast feedback on every pull request. The full gate (security, bench-smoke,
-# integration) runs on merge via ci.yml.
+# Fast feedback on every pull request AND every push to a non-main branch, so
+# work-in-progress on a feature branch is checked even before a PR is opened.
+# The full gate (security, bench-smoke, integration) + image publish runs only
+# on main / version tags via ci.yml — never from a feature branch.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
+    # main (and v* tags) are handled by ci.yml's full gate; everything else
+    # gets these fast checks. branches-ignore doesn't match tags.
+    branches-ignore:
+      - main
 
+# Collapse the push + pull_request events that both fire once a branch has an
+# open PR into a single run: normalize the group to the source branch name
+# (`head.ref` on PR events, `ref_name` on push events) so the duplicate is
+# cancelled instead of running twice.
 concurrency:
-  group: pr-${{ github.ref }}
+  group: pr-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 permissions:

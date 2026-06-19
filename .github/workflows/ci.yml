@@ -4,8 +4,10 @@ name: CI
 # per-service build, clippy + fmt + test + bench-smoke, and the security track.
 # Keep this in sync with the justfile so local `just check` == CI.
 
-# Push to main / version tags runs the full gate. Pull requests are handled by
-# pr.yml (fast feedback + coverage) so PRs and merges don't double-run.
+# Push to main / version tags runs the full gate (incl. security, bench-smoke,
+# and the GHCR image publish). Pull requests and pushes to feature branches are
+# handled by pr.yml (fast feedback + coverage), which is why the docker publish
+# below is gated to push events on this workflow only — never a feature branch.
 on:
   push:
     branches: [main]
