@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// A billable usage event, emitted from the API service (§11, §13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct UsageRecorded {
     pub customer_id: CustomerId,
     pub event_type: String,

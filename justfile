@@ -66,6 +66,10 @@ db-shell:
 redis-shell:
     {{compose}} exec redis redis-cli -a "$REDIS_PASSWORD"
 
+# Open clickhouse-client in the clickhouse container (event store, §4)
+ch-shell:
+    {{compose}} exec clickhouse clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB"
+
 # ── Migrations (sqlx-cli) ────────────────────────────────────────
 
 # Create a new migration: just new-migration add_foo
@@ -84,6 +88,24 @@ migrate-down:
 migrate-info:
     sqlx migrate info --source {{migrations}}
 
+# ── ClickHouse migrations (event store, §4) ──────────────────────
+# The event-store binary owns its ClickHouse schema (migrations under
+# crates/event-store/migrations, applied automatically on boot). These recipes
+# drive them explicitly, mirroring the sqlx ones above. Needs ClickHouse up
+# (`just up`) and the CLICKHOUSE_* / EVENT_STORE_* env from .env.
+
+# Apply all pending ClickHouse migrations
+ch-migrate-up:
+    cargo run -p event-store -- migrate up
+
+# Revert the last ClickHouse migration (destructive — drops the events table)
+ch-migrate-down:
+    cargo run -p event-store -- migrate down
+
+# Show ClickHouse migration status
+ch-migrate-info:
+    cargo run -p event-store -- migrate info
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets
@@ -98,6 +120,11 @@ dev: dev-server
 # Run server only with live reload
 dev-server:
     cargo watch -x 'run -p server'
+
+# Run the event-store service (§4). ClickHouse migrations apply on boot; needs
+# ClickHouse + Kafka up (`just up`).
+run-event-store:
+    cargo run -p event-store
 
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
@@ -207,3 +234,4 @@ tools:
     cargo install cargo-nextest --locked
     cargo install cargo-watch bacon cargo-audit cargo-deny cargo-machete
     @echo "ℹ️  Also install lefthook for git hooks: brew install lefthook && just hooks"
+    @echo "ℹ️  The event-store crate builds librdkafka from source — needs a C toolchain + make (Xcode CLT on macOS; build-essential on Linux)"

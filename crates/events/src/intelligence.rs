@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 /// A label was attached to an address (§8.1). Carries provenance (`source`) and
 /// `confidence`; conflicting labels coexist rather than overwrite.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LabelAdded {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub kind: String,
     pub value: String,
@@ -19,7 +21,9 @@ pub struct LabelAdded {
 
 /// A label's value changed (e.g. re-scored from a refreshed source) (§8.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LabelUpdated {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub label_id: LabelId,
     pub old_value: String,
@@ -29,7 +33,9 @@ pub struct LabelUpdated {
 
 /// A label was withdrawn (§8.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LabelRevoked {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub label_id: LabelId,
     pub reason: String,
@@ -37,14 +43,17 @@ pub struct LabelRevoked {
 
 /// A new entity (wallet cluster) was seeded (§8.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EntityCreated {
     pub entity_id: EntityId,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub seed_address: AccountAddress,
 }
 
 /// Two entities were merged into one. `evidence_ref` points at the clustering
 /// signal that justified the merge — auditable, reversible on reorg (§8.2, §15).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EntityMerged {
     pub surviving_id: EntityId,
     pub absorbed_id: EntityId,
@@ -53,6 +62,7 @@ pub struct EntityMerged {
 
 /// An entity was split back apart (§8.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EntitySplit {
     pub original_id: EntityId,
     pub new_ids: Vec<EntityId>,
@@ -62,6 +72,7 @@ pub struct EntitySplit {
 /// An incident was attributed to one or more entities (§8). Runs on
 /// `IncidentCreated`; this is the overlay, decoupled from the incident fact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AttributionUpdated {
     pub incident_id: IncidentId,
     pub entity_ids: Vec<EntityId>,
@@ -71,6 +82,7 @@ pub struct AttributionUpdated {
 /// A single factor contributing to a risk score, with the evidence that backs
 /// it. The aggregate score is only as auditable as its factors (§8.3, §23).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RiskFactor {
     pub name: String,
     /// Signed contribution to the score for this factor.
@@ -82,7 +94,9 @@ pub struct RiskFactor {
 /// A recomputed risk score (§8.3). Score (0–100, "how risky") and `confidence`
 /// (0–1, "how sure") are independent axes computed in the same pass (§23).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RiskScoreUpdated {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub entity_id: Option<EntityId>,
     /// 0–100.
@@ -95,7 +109,9 @@ pub struct RiskScoreUpdated {
 /// An address matched a sanctions list — a hard alert that bypasses the slow
 /// path (§8.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SanctionHit {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub list: String,
     pub entry: String,

@@ -9,6 +9,9 @@ publish.workspace = true
 # `tracing` and W3C trace-context propagation, so distributed traces stitch
 # across service boundaries. No service-specific logic lives here.
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true

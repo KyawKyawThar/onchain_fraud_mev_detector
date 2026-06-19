@@ -16,12 +16,15 @@ crates — scaffold them with `just new-lib <name>` / `just new-bin <name>`.
 
 ## Service crates (added per sprint)
 
-The roadmap (§3, §22) maps these onto sprints; each lands as its own
-`crates/<service>` binary when its sprint begins, consuming/producing `events`
-over the backbone:
+| Crate | Role |
+|---|---|
+| [`event-store`](event-store/) | **Sprint 1.** The immutable system of record (§4): an internal write-authenticated HTTP append API plus a Kafka consumer, persisting every domain event to an append-only ClickHouse `MergeTree` partitioned by `(chain, event_type, date)`. ClickHouse schema lives in [`event-store/migrations`](event-store/migrations/) (applied on boot). |
+
+Still ahead — each lands as its own `crates/<service>` binary when its sprint
+begins, consuming/producing `events` over the backbone (§3, §22):
 
 `ingestion` · `detection` · `simulation` · `intelligence` · `rule-engine` ·
-`event-store` · `api` · `notification` · `billing`
+`api` · `notification` · `billing`
 
 No cross-service database joins — services share data via events or read APIs
 (§3). Keep that boundary at code review.

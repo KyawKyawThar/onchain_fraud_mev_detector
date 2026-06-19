@@ -9,6 +9,15 @@ publish.workspace = true
 # Pure data + (de)serialization, no I/O and no transport deps on purpose: this
 # crate must stay cheap to depend on from every service.
 
+[lints]
+workspace = true
+
+[features]
+# Opt-in OpenAPI: derive `utoipa::ToSchema` on the event types so a service can
+# document them in Swagger. Off by default — the schema crate stays
+# dependency-free for the services that just produce/consume events.
+openapi = ["dep:utoipa"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -17,3 +26,4 @@ chrono.workspace = true
 uuid.workspace = true
 alloy-primitives.workspace = true
 thiserror.workspace = true
+utoipa = { workspace = true, optional = true }
