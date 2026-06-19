@@ -1,0 +1,347 @@
+//! Domain event schema (§2) — the contract every service produces and
+//! consumes, and the system of record once appended to the event store (§4).
+//!
+//! ## Shape
+//!
+//! - [`DomainEvent`] is the closed set of facts the system can record, one
+//!   variant per event in §2. It (de)serializes adjacently tagged, e.g.
+//!   `{"type":"BlockAssembled","payload":{…}}`, so a consumer can route on
+//!   `type` without parsing the payload.
+//! - [`EventEnvelope`] wraps a payload with the metadata every event carries
+//!   regardless of family: a unique id, the chain it pertains to, when it
+//!   occurred, and the schema version it was written under.
+//!
+//! ## Deliberate non-goals
+//!
+//! Transport concerns live elsewhere. The W3C trace context that ties an event
+//! to a distributed trace travels in Kafka *headers*, not in the event body —
+//! see the `telemetry` crate. Keeping the envelope free of transport fields is
+//! what lets the same struct be the wire format *and* the stored record.
+
+pub mod chain;
+pub mod detection;
+pub mod intelligence;
+pub mod primitives;
+pub mod rule_engine;
+pub mod simulation;
+pub mod system;
+
+use chrono::{DateTime, Utc};
+use primitives::Chain;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Schema version stamped onto every envelope. Bump on any
+/// backwards-incompatible change to a payload; consumers branch on it (§2 — the
+/// schema is versioned explicitly so downstream services can migrate, key risk
+/// #1 in the sprint plan).
+pub const SCHEMA_VERSION: u16 = 1;
+
+/// Errors from working with events (serialization, version mismatches).
+#[derive(Debug, thiserror::Error)]
+pub enum EventError {
+    /// JSON (de)serialization failed. Wraps the underlying `serde_json` error
+    /// so the source chain is preserved (no stringly-typed loss).
+    #[error("event (de)serialization failed")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("unsupported schema version {found} (this build understands up to {supported})")]
+    UnsupportedSchemaVersion { found: u16, supported: u16 },
+}
+
+/// Every domain event in the system (§2). New facts are added here; nothing is
+/// ever removed — old variants stay readable for replay (§18).
+///
+/// `strum::IntoStaticStr` derives the variant→name mapping used by
+/// [`DomainEvent::event_type`], so the type name on the wire (the serde `type`
+/// tag) and the event-store key can never drift from the variant identifier —
+/// adding a variant updates all of them at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::IntoStaticStr)]
+#[serde(tag = "type", content = "payload")]
+pub enum DomainEvent {
+    // Chain (§5)
+    RawBlockReceived(chain::RawBlockReceived),
+    BlockAssembled(chain::BlockAssembled),
+    BlockCanonicalized(chain::BlockCanonicalized),
+    BlockReverted(chain::BlockReverted),
+    BlockFinalized(chain::BlockFinalized),
+
+    // Detection (§6)
+    DetectorTriggered(detection::DetectorTriggered),
+    PreliminaryAlertCreated(detection::PreliminaryAlertCreated),
+
+    // Simulation (§7)
+    SimulationRequested(simulation::SimulationRequested),
+    SimulationCompleted(simulation::SimulationCompleted),
+    IncidentCreated(simulation::IncidentCreated),
+    IncidentRetracted(simulation::IncidentRetracted),
+    IncidentFinalized(simulation::IncidentFinalized),
+
+    // Intelligence (§8)
+    LabelAdded(intelligence::LabelAdded),
+    LabelUpdated(intelligence::LabelUpdated),
+    LabelRevoked(intelligence::LabelRevoked),
+    EntityCreated(intelligence::EntityCreated),
+    EntityMerged(intelligence::EntityMerged),
+    EntitySplit(intelligence::EntitySplit),
+    AttributionUpdated(intelligence::AttributionUpdated),
+    RiskScoreUpdated(intelligence::RiskScoreUpdated),
+    SanctionHit(intelligence::SanctionHit),
+
+    // Rule engine (§9)
+    RuleCreated(rule_engine::RuleCreated),
+    RuleTriggered(rule_engine::RuleTriggered),
+    RuleAlertCreated(rule_engine::RuleAlertCreated),
+
+    // System (§13)
+    UsageRecorded(system::UsageRecorded),
+}
+
+/// Which service domain an event belongs to. Used for coarse routing/metrics;
+/// the fine-grained key is [`DomainEvent::event_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventFamily {
+    Chain,
+    Detection,
+    Simulation,
+    Intelligence,
+    RuleEngine,
+    System,
+}
+
+impl DomainEvent {
+    /// The stable type name, matching the `type` tag on the wire and the §2
+    /// event names. This is the Kafka topic discriminator and the event store's
+    /// `event_type` partition key (§4, §20). Derived from the variant name by
+    /// `strum`, so it is guaranteed to stay in sync.
+    pub fn event_type(&self) -> &'static str {
+        self.into()
+    }
+
+    /// The domain family this event belongs to. Kept as an explicit match on
+    /// purpose: the family is a *semantic* classification (a human decides which
+    /// family a new event joins), and the compiler enforces exhaustiveness, so a
+    /// new variant fails to compile until it is classified — unlike a string
+    /// table, this can't silently drift.
+    pub fn family(&self) -> EventFamily {
+        use DomainEvent::*;
+        match self {
+            RawBlockReceived(_)
+            | BlockAssembled(_)
+            | BlockCanonicalized(_)
+            | BlockReverted(_)
+            | BlockFinalized(_) => EventFamily::Chain,
+            DetectorTriggered(_) | PreliminaryAlertCreated(_) => EventFamily::Detection,
+            SimulationRequested(_)
+            | SimulationCompleted(_)
+            | IncidentCreated(_)
+            | IncidentRetracted(_)
+            | IncidentFinalized(_) => EventFamily::Simulation,
+            LabelAdded(_)
+            | LabelUpdated(_)
+            | LabelRevoked(_)
+            | EntityCreated(_)
+            | EntityMerged(_)
+            | EntitySplit(_)
+            | AttributionUpdated(_)
+            | RiskScoreUpdated(_)
+            | SanctionHit(_) => EventFamily::Intelligence,
+            RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
+            UsageRecorded(_) => EventFamily::System,
+        }
+    }
+}
+
+/// Transport/storage wrapper around a [`DomainEvent`]. Carries the metadata
+/// every event needs regardless of family.
+///
+/// `chain` is the partition key: Kafka partitions by chain (§20) and the event
+/// store partitions by `(chain, event_type, date)` (§4). `event_id` makes
+/// consumers idempotent — a replayed envelope is recognised and deduped (§7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub event_id: Uuid,
+    pub schema_version: u16,
+    pub chain: Chain,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: DomainEvent,
+}
+
+impl EventEnvelope {
+    /// Wrap a payload with explicit identity and time.
+    ///
+    /// This is the constructor replay and tests use: re-appending an archived
+    /// event must reproduce its *original* `event_id` and `occurred_at`, not
+    /// mint new ones (§18 — deterministic replay). Live producers usually want
+    /// the [`EventEnvelope::new`] convenience instead.
+    pub fn with_metadata(
+        event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Self {
+        Self {
+            event_id,
+            schema_version: SCHEMA_VERSION,
+            chain,
+            occurred_at,
+            payload,
+        }
+    }
+
+    /// Wrap a payload for a *new* (live) event: fresh random id, current schema
+    /// version, `occurred_at = now`. Convenience over [`Self::with_metadata`];
+    /// do not use on the replay path, where identity must be preserved.
+    pub fn new(chain: Chain, payload: DomainEvent) -> Self {
+        Self::with_metadata(Uuid::new_v4(), Utc::now(), chain, payload)
+    }
+
+    /// The event's stable type name (delegates to the payload). Convenience for
+    /// the Kafka/event-store key.
+    pub fn event_type(&self) -> &'static str {
+        self.payload.event_type()
+    }
+
+    /// Serialize to JSON bytes for transport (Kafka record value / event-store
+    /// row). The inverse of [`Self::from_json_slice`].
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, EventError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Deserialize from JSON bytes, then reject any envelope written under a
+    /// schema version this build cannot read. The inverse of
+    /// [`Self::to_json_vec`].
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, EventError> {
+        let envelope: Self = serde_json::from_slice(bytes)?;
+        envelope.ensure_supported()?;
+        Ok(envelope)
+    }
+
+    /// Reject envelopes written under a schema version this build can't read.
+    /// Forward-compatible reads (older `schema_version`) are allowed.
+    pub fn ensure_supported(&self) -> Result<(), EventError> {
+        if self.schema_version > SCHEMA_VERSION {
+            return Err(EventError::UnsupportedSchemaVersion {
+                found: self.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::BlockAssembled;
+    use crate::primitives::BlockRef;
+    use alloy_primitives::B256;
+
+    fn sample_block() -> BlockRef {
+        BlockRef::new(19_800_000, B256::repeat_byte(0xab))
+    }
+
+    #[test]
+    fn envelope_round_trips_through_json() {
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockAssembled(BlockAssembled {
+                block: sample_block(),
+                tx_count: 142,
+                trace_available: true,
+            }),
+        );
+
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(env, back);
+        assert_eq!(back.event_type(), "BlockAssembled");
+        assert_eq!(back.payload.family(), EventFamily::Chain);
+    }
+
+    #[test]
+    fn payload_is_adjacently_tagged_on_the_wire() {
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockAssembled(BlockAssembled {
+                block: sample_block(),
+                tx_count: 1,
+                trace_available: false,
+            }),
+        );
+        let value: serde_json::Value = serde_json::to_value(&env.payload).unwrap();
+        assert_eq!(value["type"], "BlockAssembled");
+        assert!(value["payload"].is_object());
+    }
+
+    #[test]
+    fn rejects_future_schema_versions() {
+        let mut env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockFinalized(crate::chain::BlockFinalized {
+                block: sample_block(),
+            }),
+        );
+        env.schema_version = SCHEMA_VERSION + 1;
+        assert!(matches!(
+            env.ensure_supported(),
+            Err(EventError::UnsupportedSchemaVersion { .. })
+        ));
+
+        // from_json_slice must reject it too, not just ensure_supported.
+        let bytes = serde_json::to_vec(&env).unwrap();
+        assert!(matches!(
+            EventEnvelope::from_json_slice(&bytes),
+            Err(EventError::UnsupportedSchemaVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn with_metadata_preserves_identity_for_replay() {
+        // The whole point: re-wrapping an archived event reproduces its id and
+        // timestamp exactly, so replay is deterministic (§18).
+        let id = uuid::Uuid::nil();
+        let when = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let payload = DomainEvent::BlockFinalized(crate::chain::BlockFinalized {
+            block: sample_block(),
+        });
+
+        let a = EventEnvelope::with_metadata(id, when, Chain::ETHEREUM, payload.clone());
+        let b = EventEnvelope::with_metadata(id, when, Chain::ETHEREUM, payload);
+
+        assert_eq!(a, b, "same inputs must yield identical envelopes");
+        assert_eq!(a.event_id, id);
+        assert_eq!(a.occurred_at, when);
+    }
+
+    #[test]
+    fn json_byte_helpers_round_trip() {
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockCanonicalized(crate::chain::BlockCanonicalized {
+                block: sample_block(),
+            }),
+        );
+        let bytes = env.to_json_vec().expect("serialize");
+        let back = EventEnvelope::from_json_slice(&bytes).expect("deserialize");
+        assert_eq!(env, back);
+    }
+
+    #[test]
+    fn event_type_matches_serde_tag_for_every_variant() {
+        // strum-derived event_type() and the serde `type` tag must agree, since
+        // both are the variant name. Guard one representative.
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::SanctionHit(crate::intelligence::SanctionHit {
+                address: Default::default(),
+                list: "OFAC".into(),
+                entry: "SDN-123".into(),
+            }),
+        );
+        let value = serde_json::to_value(&env.payload).unwrap();
+        assert_eq!(env.event_type(), value["type"].as_str().unwrap());
+    }
+}

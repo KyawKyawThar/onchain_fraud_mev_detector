@@ -2,8 +2,13 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Fail on any RUSTSEC advisory affecting the dependency tree.
 version = 2
+# Vulnerabilities (CVEs) and yanked crates always hard-fail. *Unmaintained*
+# advisories are informational, not security holes — `cargo audit` only warns on
+# them too. We can't fix an unmaintained crate buried in a transitive dep (e.g.
+# `paste`/`derivative` under alloy-primitives, §21), so we only fail when a crate
+# we depend on *directly* is unmaintained — something we can actually act on.
+unmaintained = "workspace"
 ignore = []
 
 [licenses]
@@ -21,6 +26,9 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  # Public-domain dedication. Covers the optional secp256k1/bitcoin_hashes
+  # crates alloy-primitives can pull in (§21 stack); fully permissive.
+  "CC0-1.0",
 ]
 confidence-threshold = 0.8
 # Our own crates are `license = "proprietary"` + `publish = false`; ignore them.
