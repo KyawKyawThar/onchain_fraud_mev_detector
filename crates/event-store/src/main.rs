@@ -1,0 +1,166 @@
+//! Event-store service binary (§4) — the immutable system of record.
+//!
+//! A thin shell over the [`event_store`] library: two ingress paths feed one
+//! append-only ClickHouse store —
+//!   1. the internal HTTP append API ([`event_store::http`]), and
+//!   2. the Kafka consumer ([`event_store::kafka`]) that drains every
+//!      domain-event topic.
+//!
+//! Boot order: stand up observability, resolve config, connect ClickHouse and
+//! apply migrations, then run the Kafka consumer and the HTTP server together
+//! until a shutdown signal arrives. One [`CancellationToken`] coordinates the
+//! stop: a SIGTERM/Ctrl+C — or a fatal consumer error — cancels it, the HTTP
+//! server drains, and the consumer finishes its in-flight message and commits.
+//!
+//! Run modes (first CLI arg):
+//!   - *(none)* — run the service (the default).
+//!   - `migrate up` / `migrate down` / `migrate info` — drive ClickHouse
+//!     migrations explicitly and exit (the boot path always runs `up` too).
+
+use anyhow::{bail, Context, Result};
+use clickhouse::Client;
+use event_store::{config, http, kafka, migrate, store};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Hold the guard for the lifetime of `main` so spans flush on exit (§19).
+    let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("event-store"))?;
+    let cfg = config::Config::from_env()?;
+
+    // The binary owns the ClickHouse client; the migration runner and the store
+    // share it, but neither owns the connection lifecycle.
+    let client = store::build_client(&cfg.clickhouse);
+
+    // First positional arg selects the run mode; no arg runs the service.
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => serve(cfg, client).await,
+        Some("migrate") => migrate_cli(&client, args.next().as_deref()).await,
+        Some(other) => bail!(
+            "unknown argument {other:?}; expected `migrate up|down|info`, or no args to run the service"
+        ),
+    }
+}
+
+/// Run the service: apply pending migrations, then the Kafka consumer and HTTP
+/// server together until shutdown.
+async fn serve(cfg: config::Config, client: Client) -> Result<()> {
+    // Bring the schema up to date before accepting any writes.
+    migrate::run(&client)
+        .await
+        .context("running ClickHouse migrations")?;
+    tracing::info!(
+        schema_version = events::SCHEMA_VERSION,
+        "event-store schema ready"
+    );
+
+    let store = store::EventStore::new(client);
+    let shutdown = CancellationToken::new();
+
+    // Translate OS signals into a cancel.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    // ── Kafka ingest (background task) ────────────────────────────────
+    // A fatal consumer error cancels the token too, so the whole service stops
+    // and the orchestrator restarts it (fail fast) rather than silently running
+    // HTTP-only with no ingest.
+    let consumer = kafka::build_consumer(&cfg.kafka)?;
+    let consumer_task = tokio::spawn({
+        let store = store.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let result = kafka::run(consumer, store, shutdown.clone()).await;
+            if let Err(ref err) = result {
+                tracing::error!(error = %err, "Kafka consumer failed; initiating shutdown");
+                shutdown.cancel();
+            }
+            result
+        }
+    });
+
+    // ── HTTP append API ───────────────────────────────────────────────
+    let state = http::AppState {
+        store,
+        write_token: cfg.write_token.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind(cfg.http_addr)
+        .await
+        .with_context(|| format!("binding HTTP listener on {}", cfg.http_addr))?;
+    tracing::info!(addr = %cfg.http_addr, "event-store HTTP API listening");
+
+    axum::serve(listener, http::router(state))
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        })
+        .await
+        .context("HTTP server error")?;
+
+    // The server has drained — wait for the consumer to finish and surface a
+    // fatal error as a non-zero exit.
+    let consumer_result = consumer_task.await.context("consumer task panicked")?;
+    tracing::info!("event-store shut down");
+    consumer_result.context("Kafka consumer exited with error")
+}
+
+/// Drive ClickHouse migrations explicitly (`event-store migrate up|down|info`),
+/// then exit. Mirrors the sqlx/Postgres `just migrate-*` recipes.
+async fn migrate_cli(client: &Client, action: Option<&str>) -> Result<()> {
+    match action {
+        Some("up") => {
+            let applied = migrate::run(client).await.context("migrate up")?;
+            if applied.is_empty() {
+                println!("✅ migrate up: already up to date");
+            } else {
+                println!("✅ migrate up: applied {}", applied.join(", "));
+            }
+        }
+        Some("down") => match migrate::revert_last(client).await.context("migrate down")? {
+            Some(version) => println!("⚠️  migrate down: reverted {version}"),
+            None => println!("migrate down: nothing to revert"),
+        },
+        Some("info") => {
+            let statuses = migrate::status(client).await.context("migrate info")?;
+            println!("ClickHouse migrations:");
+            for status in statuses {
+                let mark = if status.applied { "applied" } else { "pending" };
+                println!("  [{mark}] {}", status.version);
+            }
+        }
+        other => bail!("unknown migrate action {other:?}; expected up, down, or info"),
+    }
+    Ok(())
+}
+
+/// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM — the signals a
+/// container runtime sends to ask for a graceful stop.
+async fn wait_for_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}

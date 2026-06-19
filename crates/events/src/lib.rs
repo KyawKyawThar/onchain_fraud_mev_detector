@@ -37,6 +37,22 @@ use uuid::Uuid;
 /// #1 in the sprint plan).
 pub const SCHEMA_VERSION: u16 = 1;
 
+/// Namespace prefix for the Kafka topic of every domain event. §20 routes one
+/// topic per event type (partitioned by chain); the full topic name is
+/// `mev.events.<EventType>` (e.g. `mev.events.BlockAssembled`).
+///
+/// This lives here, on the schema crate, so producers (Sprint 2) and the
+/// event-store consumer (§4) derive the topic from a single source of truth and
+/// can't drift. See [`topic_for`] and [`EventEnvelope::topic`].
+pub const TOPIC_PREFIX: &str = "mev.events";
+
+/// The Kafka topic an event of `event_type` is published on:
+/// `mev.events.<event_type>`. Pair with [`DomainEvent::event_type`] /
+/// [`EventEnvelope::event_type`] so the name never drifts from the variant.
+pub fn topic_for(event_type: &str) -> String {
+    format!("{TOPIC_PREFIX}.{event_type}")
+}
+
 /// Errors from working with events (serialization, version mismatches).
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
@@ -73,6 +89,7 @@ pub enum EventError {
     strum::EnumCount,
     strum::VariantNames,
 )]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "type", content = "payload")]
 pub enum DomainEvent {
     // Chain (§5)
@@ -115,8 +132,13 @@ pub enum DomainEvent {
 
 /// Which service domain an event belongs to. Used for coarse routing/metrics;
 /// the fine-grained key is [`DomainEvent::event_type`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `strum::IntoStaticStr` with `serialize_all = "snake_case"` mirrors the serde
+/// rename, so [`EventFamily::as_str`] (`"chain"`, `"rule_engine"`, …) and the
+/// wire form agree — the event store writes this as the `event_family` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EventFamily {
     Chain,
     Detection,
@@ -124,6 +146,14 @@ pub enum EventFamily {
     Intelligence,
     RuleEngine,
     System,
+}
+
+impl EventFamily {
+    /// The stable snake_case name (`"chain"`, `"rule_engine"`, …), matching the
+    /// serde wire form. Used as the event store's `event_family` column.
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
 }
 
 impl DomainEvent {
@@ -176,7 +206,9 @@ impl DomainEvent {
 /// store partitions by `(chain, event_type, date)` (§4). `event_id` makes
 /// consumers idempotent — a replayed envelope is recognised and deduped (§7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EventEnvelope {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
     pub event_id: Uuid,
     pub schema_version: u16,
     pub chain: Chain,
@@ -217,6 +249,13 @@ impl EventEnvelope {
     /// the Kafka/event-store key.
     pub fn event_type(&self) -> &'static str {
         self.payload.event_type()
+    }
+
+    /// The Kafka topic this envelope is published on (`mev.events.<EventType>`,
+    /// §20). Delegates to [`topic_for`] so producers and the event-store
+    /// consumer share one definition.
+    pub fn topic(&self) -> String {
+        topic_for(self.event_type())
     }
 
     /// Serialize to JSON bytes for transport (Kafka record value / event-store
@@ -344,6 +383,22 @@ mod tests {
         let bytes = env.to_json_vec().expect("serialize");
         let back = EventEnvelope::from_json_slice(&bytes).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn topic_is_namespaced_and_derived_from_event_type() {
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockAssembled(BlockAssembled {
+                block: sample_block(),
+                tx_count: 1,
+                trace_available: false,
+            }),
+        );
+        assert_eq!(topic_for("BlockAssembled"), "mev.events.BlockAssembled");
+        assert_eq!(env.topic(), "mev.events.BlockAssembled");
+        // Topic and family stay in lockstep with the variant.
+        assert_eq!(env.payload.family().as_str(), "chain");
     }
 
     #[test]

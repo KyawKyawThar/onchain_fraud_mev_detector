@@ -31,7 +31,43 @@ uuid = { version = "1", features = ["v4", "serde"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 
 # Async runtime (used by the trace-propagation demo; services adopt it as built).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# `net`/`signal`/`time` are for network services (axum listener, SIGTERM-driven
+# graceful shutdown) — added when the event-store service landed (§4).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+
+# Event-store service (§4): HTTP append API + ClickHouse storage + Kafka ingest.
+# axum    — internal append API (write-authenticated).
+# clickhouse — official client; RowBinary inserts via `#[derive(Row)]`. The
+#   `uuid` feature pulls in the UUID column (de)serializer (ClickHouse byte order).
+# rdkafka — librdkafka bindings for the consumer (consumer groups + manual offset
+#   commit). `cmake-build` compiles the vendored librdkafka with cmake — needs a
+#   C/C++ toolchain + cmake locally (`brew install cmake`); CI's ubuntu runners
+#   ship both. `tokio` enables the async StreamConsumer.
+axum = "0.8"
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
+# Production hardening for the network service:
+# tower-http — TraceLayer (HTTP spans into the existing OTel stack) + TimeoutLayer.
+# tokio-util — CancellationToken for cooperative, drain-then-exit shutdown.
+# secrecy    — keep passwords/tokens out of `Debug`/logs; explicit `expose_secret()`.
+# subtle     — audited constant-time comparison for the bearer token.
+tower-http = { version = "0.7", features = ["trace", "timeout"] }
+tokio-util = "0.7"
+secrecy = "0.10"
+subtle = "2"
+
+# Integration testing against real ClickHouse/Kafka via throwaway containers
+# (the `#[ignore]` tests CI's integration-test job runs).
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["clickhouse", "kafka"] }
+
+# OpenAPI/Swagger. `utoipa` derives the spec from the types & handlers; the
+# `chrono`/`uuid` features teach it those field types. `utoipa-swagger-ui` serves
+# the interactive UI (its `axum` feature provides the router integration). The
+# `events` crate gates its `ToSchema` derives behind an `openapi` feature so the
+# schema crate stays dependency-free unless a service opts in.
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"
@@ -39,3 +75,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = "0.27"
+
+# Lints defined once, inherited by every crate via `[lints] workspace = true`.
+# This is what makes `cargo build`/`clippy` enforce the same bar locally that CI
+# does with `-D warnings`, instead of devs first learning about a lint in CI.
+[workspace.lints.rust]
+# No first-party `unsafe` in this codebase — a fraud/security system's own code
+# stays safe. `forbid` (stronger than `deny`) can't be silently overridden with
+# `#[allow]`; if a hot path ever genuinely needs unsafe, downgrade this to
+# "deny" here, as a deliberate, reviewed workspace-level decision.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Deny the default clippy lints (mirrors CI). `priority = -1` so individual
+# lints below could override it; we keep none for now.
+all = { level = "deny", priority = -1 }

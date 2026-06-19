@@ -12,6 +12,8 @@ use uuid::Uuid;
 ///
 /// Modelled as a chain id so adding an L2 (Phase 10) needs no new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(value_type = u64))]
 #[serde(transparent)]
 pub struct Chain(pub u64);
 
@@ -33,8 +35,11 @@ impl std::fmt::Display for Chain {
 /// chain, hash disambiguates competing blocks at the same height during a reorg
 /// (§5, §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BlockRef {
     pub number: u64,
+    /// 32-byte block hash, hex-encoded (`0x…`) on the wire.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub hash: B256,
 }
 
@@ -47,6 +52,7 @@ impl BlockRef {
 /// What a detector/incident is about. Attribution-blind on the fast path (§6) —
 /// this names the *behaviour*, never the actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     Sandwich,
@@ -60,6 +66,7 @@ pub enum AlertKind {
 
 /// Coarse incident severity, set when simulation confirms an incident (§7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Low,
@@ -77,6 +84,8 @@ macro_rules! id_newtype {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
 
@@ -130,6 +139,7 @@ id_newtype!(
 /// [`crate::detection::DetectorTriggered`] must carry the exact triple so an
 /// alert is reproducible against a specific model build (§6, §22).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DetectorRef {
     pub id: String,
     pub version: String,
@@ -154,6 +164,8 @@ pub struct ConfidenceOutOfRange {
 /// (deserialized input, model output) where an out-of-range value is a bug you
 /// want surfaced, not silently masked.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(value_type = f64))]
 #[serde(transparent)]
 pub struct Confidence(f64);
 

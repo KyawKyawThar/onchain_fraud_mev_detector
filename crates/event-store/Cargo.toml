@@ -1,0 +1,52 @@
+[package]
+name = "event-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Domain schema (the contract this service persists) + observability.
+# `openapi` turns on the event types' `ToSchema` derives so they document in
+# Swagger (§4 append API).
+events = { workspace = true, features = ["openapi"] }
+telemetry.workspace = true
+
+# Errors.
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Async runtime + HTTP + storage + transport.
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+clickhouse.workspace = true
+rdkafka.workspace = true
+
+# Secret handling + constant-time token comparison.
+secrecy.workspace = true
+subtle.workspace = true
+
+# Serialization / primitives shared with the event schema.
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# OpenAPI spec generation + Swagger UI for the append API.
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
+
+# Observability.
+tracing.workspace = true
+
+[dev-dependencies]
+# Real ClickHouse/Kafka in throwaway containers for the `#[ignore]` tests.
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+# Build sample events (B256 block hashes) in unit/integration tests.
+alloy-primitives.workspace = true
