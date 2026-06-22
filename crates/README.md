@@ -19,11 +19,12 @@ crates — scaffold them with `just new-lib <name>` / `just new-bin <name>`.
 | Crate | Role |
 |---|---|
 | [`event-store`](event-store/) | **Sprint 1.** The immutable system of record (§4): an internal write-authenticated HTTP append API plus a Kafka consumer, persisting every domain event to an append-only ClickHouse `MergeTree` partitioned by `(chain, event_type, date)`. ClickHouse schema lives in [`event-store/migrations`](event-store/migrations/) (applied on boot). |
+| [`ingestion`](ingestion/) | **Sprint 2.** Chain data into the backbone (§5). Task 1 (done): the **source adapter** layer — a health-checked, circuit-broken RPC failover pool ([`source::rpc`](ingestion/src/source/rpc.rs)) behind the `ChainSource` seam (so the reth-ExEx / node-IPC adapters slot in later, Phase 8), feeding an ordered head stream. The reorg-aware block tree + `RawBlockReceived`/`BlockAssembled`/… emission are tasks 2–4. |
 
 Still ahead — each lands as its own `crates/<service>` binary when its sprint
 begins, consuming/producing `events` over the backbone (§3, §22):
 
-`ingestion` · `detection` · `simulation` · `intelligence` · `rule-engine` ·
+`detection` · `simulation` · `intelligence` · `rule-engine` ·
 `api` · `notification` · `billing`
 
 No cross-service database joins — services share data via events or read APIs

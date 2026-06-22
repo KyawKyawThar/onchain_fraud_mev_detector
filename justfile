@@ -126,6 +126,13 @@ dev-server:
 run-event-store:
     cargo run -p event-store
 
+# Run the ingestion service (§5). Needs ETH_RPC_URLS set (comma-separated RPC
+# endpoints); the source adapter is the health-checked, circuit-broken RPC
+# failover pool. Logs each new head (block-tree + event emission are Sprint 2
+# tasks 2–4).
+run-ingestion:
+    cargo run -p ingestion
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon
