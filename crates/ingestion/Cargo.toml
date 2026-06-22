@@ -1,0 +1,39 @@
+[package]
+name = "ingestion"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Service binary (§5): chain data source adapters + (Sprint 2 tasks 2–4) the
+# reorg-aware block tree and chain-event emission. This task delivers the source
+# adapter layer — the RPC failover pool (adapter #3).
+[[bin]]
+name = "ingestion"
+path = "src/main.rs"
+
+[dependencies]
+events = { workspace = true }
+telemetry = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-transport = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# A hermetic in-process JSON-RPC server (no network, no external node) to prove
+# failover + circuit breaking deterministically in tests/failover.rs.
+axum = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

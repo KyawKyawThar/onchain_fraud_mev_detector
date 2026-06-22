@@ -29,6 +29,10 @@ allow = [
   # Public-domain dedication. Covers the optional secp256k1/bitcoin_hashes
   # crates alloy-primitives can pull in (§21 stack); fully permissive.
   "CC0-1.0",
+  # Permissive *data* license covering the bundled CA root certificates
+  # (webpki-root-certs) reqwest's rustls TLS pulls in for the ingestion RPC
+  # pool (§5). Permissive, no copyleft on our code.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 # Our own crates are `license = "proprietary"` + `publish = false`; ignore them.

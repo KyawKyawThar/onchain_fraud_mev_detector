@@ -30,6 +30,29 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Address/B256/U256 in the event schema rather than stringly-typed hashes.
 alloy-primitives = { version = "1", features = ["serde"] }
 
+# Ingestion source adapter (§5, Sprint 2): the RPC failover pool talks JSON-RPC
+# to the chain over alloy's provider — adapter #3 of §5 (reth ExEx / node-IPC
+# adapters #1/#2 slot in behind the same trait in Phase 8). The pool, health
+# checks and circuit breaker are hand-rolled on top; alloy just carries each
+# request to one endpoint.
+#   alloy-provider     — the `Provider` trait + `RootProvider::new_http`. The
+#     `reqwest-rustls-tls` feature picks reqwest's *rustls* TLS so the binary
+#     needs no system OpenSSL (same self-contained-image goal as the rdkafka
+#     vendored build below) while still reaching https mainnet endpoints.
+#   alloy-rpc-types-eth — the `Block`/`Header`/`BlockNumberOrTag` RPC types the
+#     provider returns; we read header fields (hash, parent_hash, timestamp).
+#   alloy-transport    — `TransportError`, the typed RPC/transport failure the
+#     circuit breaker counts against an endpoint.
+alloy-provider = { version = "1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+alloy-rpc-types-eth = "1"
+alloy-transport = "1"
+# Object-safe async trait for the `ChainSource` adapter seam (§5) so the service
+# can hold a `dyn ChainSource` and swap adapters by config without generics
+# rippling through it.
+async-trait = "0.1"
+# Parse + validate the configured RPC endpoint URLs once at boot.
+url = "2"
+
 # Async runtime (used by the trace-propagation demo; services adopt it as built).
 # `net`/`signal`/`time` are for network services (axum listener, SIGTERM-driven
 # graceful shutdown) — added when the event-store service landed (§4).
