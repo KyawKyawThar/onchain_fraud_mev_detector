@@ -16,6 +16,8 @@
 //!   - *(none)* — run the service (the default).
 //!   - `migrate up` / `migrate down` / `migrate info` — drive ClickHouse
 //!     migrations explicitly and exit (the boot path always runs `up` too).
+//!   - `provision-topics` — declare the per-event-type Kafka topics (§20) and
+//!     exit (the boot path always provisions too; this is for ops/CI).
 
 use anyhow::{bail, Context, Result};
 use clickhouse::Client;
@@ -37,8 +39,13 @@ async fn main() -> Result<()> {
     match args.next().as_deref() {
         None => serve(cfg, client).await,
         Some("migrate") => migrate_cli(&client, args.next().as_deref()).await,
+        Some("provision-topics") => {
+            kafka::ensure_topics(&cfg.kafka).await?;
+            println!("✅ provision-topics: Kafka topics ensured");
+            Ok(())
+        }
         Some(other) => bail!(
-            "unknown argument {other:?}; expected `migrate up|down|info`, or no args to run the service"
+            "unknown argument {other:?}; expected `migrate up|down|info`, `provision-topics`, or no args to run the service"
         ),
     }
 }
@@ -67,6 +74,13 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
             shutdown.cancel();
         }
     });
+
+    // Declare the per-event-type topics (§20) before subscribing, so the
+    // topology exists explicitly rather than relying on broker auto-create.
+    // Idempotent — a no-op once the topics are there.
+    kafka::ensure_topics(&cfg.kafka)
+        .await
+        .context("provisioning Kafka topics")?;
 
     // ── Kafka ingest (background task) ────────────────────────────────
     // A fatal consumer error cancels the token too, so the whole service stops

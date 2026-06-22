@@ -23,6 +23,8 @@ use events::primitives::{
 };
 use events::simulation::IncidentCreated;
 use events::{DomainEvent, EventEnvelope};
+use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
+use rdkafka::consumer::Consumer;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
@@ -80,6 +82,18 @@ fn store_for(http_port: u16) -> EventStore {
         password: SecretString::from(String::new()),
         database: "default".to_owned(),
     }))
+}
+
+/// A [`KafkaConfig`] pointing at a testcontainer broker, with a small topology
+/// (3 partitions, replication 1 — one broker, 1h retention) matching the defaults.
+fn kafka_config(brokers: &str, group_id: &str) -> KafkaConfig {
+    KafkaConfig {
+        brokers: brokers.to_owned(),
+        group_id: group_id.to_owned(),
+        topic_partitions: 3,
+        topic_replication: 1,
+        retention_ms: 60 * 60 * 1_000,
+    }
 }
 
 async fn fetch_all_envelopes(store: &EventStore) -> Vec<EventEnvelope> {
@@ -285,6 +299,84 @@ async fn query_api_finds_events_by_incident_address_and_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers Kafka)"]
+async fn ensure_topics_provisions_one_topic_per_event_type() {
+    let kafka_node = Kafka::default().start().await.expect("start kafka");
+    let brokers = format!(
+        "127.0.0.1:{}",
+        kafka_node
+            .get_host_port_ipv4(KAFKA_PORT)
+            .await
+            .expect("kafka port")
+    );
+    let cfg = kafka_config(&brokers, "event-store-provision-test");
+
+    // Idempotent: provisioning twice succeeds — the second run is a no-op over
+    // already-existing topics (TopicAlreadyExists is swallowed, not an error).
+    kafka::ensure_topics(&cfg).await.expect("provision topics");
+    kafka::ensure_topics(&cfg)
+        .await
+        .expect("re-provisioning is idempotent");
+
+    // Every event type now has its `mev.events.<EventType>` topic, each with the
+    // configured partition count (§20 — topic-per-event-type, partitioned by chain).
+    let consumer = kafka::build_consumer(&cfg).expect("build consumer");
+    let metadata = consumer
+        .fetch_metadata(None, Duration::from_secs(10))
+        .expect("fetch metadata");
+    let partitions_by_topic: std::collections::HashMap<&str, usize> = metadata
+        .topics()
+        .iter()
+        .map(|t| (t.name(), t.partitions().len()))
+        .collect();
+
+    for expected in events::all_topics() {
+        let partitions = partitions_by_topic
+            .get(expected.as_str())
+            .unwrap_or_else(|| panic!("topic {expected} was not provisioned"));
+        assert_eq!(
+            *partitions, cfg.topic_partitions as usize,
+            "{expected} should have {} partitions",
+            cfg.topic_partitions
+        );
+    }
+
+    // Retention/cleanup policy must actually land on the broker — Kafka is the
+    // *bounded wire* (§2/§4); an unbounded topic would be a silent second record.
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .expect("admin client");
+    let described = admin
+        .describe_configs(
+            &[ResourceSpecifier::Topic("mev.events.BlockAssembled")],
+            &AdminOptions::new().request_timeout(Some(Duration::from_secs(10))),
+        )
+        .await
+        .expect("describe configs");
+    let resource = described
+        .into_iter()
+        .next()
+        .expect("one resource described")
+        .expect("describe ok");
+    let want_retention = cfg.retention_ms.to_string();
+    assert_eq!(
+        resource
+            .get("retention.ms")
+            .and_then(|e| e.value.as_deref()),
+        Some(want_retention.as_str()),
+        "topic retention must match config (bounded wire)"
+    );
+    assert_eq!(
+        resource
+            .get("cleanup.policy")
+            .and_then(|e| e.value.as_deref()),
+        Some("delete"),
+        "event topics delete on retention, never compact"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers ClickHouse + Kafka)"]
 async fn event_published_to_kafka_lands_in_store() {
     let ch = ClickHouse::default()
@@ -307,8 +399,12 @@ async fn event_published_to_kafka_lands_in_store() {
     let store = store_for(ch_port);
     migrate::run(store.client()).await.expect("migrate");
 
-    // Produce the event first so the topic exists before the consumer's regex
-    // subscription resolves (avoids waiting on a metadata refresh).
+    // Mirror production boot order: provision the topology first, so the topics
+    // exist before either the producer sends or the consumer's explicit
+    // subscription resolves.
+    let cfg = kafka_config(&brokers, "event-store-test");
+    kafka::ensure_topics(&cfg).await.expect("provision topics");
+
     let envelope = sample_events().remove(0);
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &brokers)
@@ -336,11 +432,7 @@ async fn event_published_to_kafka_lands_in_store() {
         .expect("produce");
 
     // Run the real consumer.
-    let consumer = kafka::build_consumer(&KafkaConfig {
-        brokers: brokers.clone(),
-        group_id: "event-store-test".to_owned(),
-    })
-    .expect("build consumer");
+    let consumer = kafka::build_consumer(&cfg).expect("build consumer");
     let consumer_store = store.clone();
     let shutdown = CancellationToken::new();
     let consumer_task = tokio::spawn({
