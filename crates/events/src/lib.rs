@@ -53,6 +53,18 @@ pub fn topic_for(event_type: &str) -> String {
     format!("{TOPIC_PREFIX}.{event_type}")
 }
 
+/// Every Kafka topic the schema can publish to — one per event type
+/// (`mev.events.<EventType>`, §20), derived from the locked variant set
+/// ([`DomainEvent::VARIANTS`]) so the *provisioned* topology can never drift
+/// from the schema: adding an event variant adds its topic here automatically.
+///
+/// The event-store provisions exactly these up front (see its `kafka::ensure_topics`),
+/// rather than leaning on broker auto-create, which is off in production.
+pub fn all_topics() -> impl Iterator<Item = String> {
+    use strum::VariantNames;
+    DomainEvent::VARIANTS.iter().map(|name| topic_for(name))
+}
+
 /// Errors from working with events (serialization, version mismatches).
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
@@ -464,6 +476,20 @@ mod tests {
         let bytes = env.to_json_vec().expect("serialize");
         let back = EventEnvelope::from_json_slice(&bytes).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn all_topics_covers_every_event_type_and_is_namespaced() {
+        use strum::EnumCount;
+
+        let topics: Vec<String> = all_topics().collect();
+        // One topic per variant, no duplicates (§20 — topic-per-event-type).
+        assert_eq!(topics.len(), DomainEvent::COUNT);
+        let unique: std::collections::BTreeSet<&str> = topics.iter().map(String::as_str).collect();
+        assert_eq!(unique.len(), DomainEvent::COUNT);
+        // Every topic is under the namespace and round-trips through topic_for.
+        assert!(topics.iter().all(|t| t.starts_with("mev.events.")));
+        assert!(topics.contains(&topic_for("BlockAssembled")));
     }
 
     #[test]
