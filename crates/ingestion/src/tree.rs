@@ -383,6 +383,7 @@ mod tests {
             hash: B256::repeat_byte(hash),
             parent_hash: B256::repeat_byte(parent),
             timestamp: 1_700_000_000 + number,
+            tx_count: 0,
         }
     }
 

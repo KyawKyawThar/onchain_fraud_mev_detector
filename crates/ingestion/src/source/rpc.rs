@@ -170,6 +170,10 @@ fn map_head(block: Option<Block>, label: impl std::fmt::Display) -> Result<Chain
             hash: block.header.hash,
             parent_hash: block.header.parent_hash,
             timestamp: block.header.timestamp,
+            // The header fetch returns transactions as a hash array (hashes-only
+            // by default); count them without a second round-trip. `hashes()`
+            // works whether the node returned hashes or full bodies.
+            tx_count: block.transactions.hashes().count() as u32,
         }),
         None => Err(SourceError::BlockNotFound(label.to_string())),
     }

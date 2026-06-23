@@ -29,6 +29,10 @@ alloy-rpc-types-eth = { workspace = true }
 alloy-transport = { workspace = true }
 url = { workspace = true }
 
+# Kafka producer (§20): the ingestion service is the system's first event
+# *producer*. Same librdkafka build the event-store consumer uses.
+rdkafka = { workspace = true }
+
 [dev-dependencies]
 # A hermetic in-process JSON-RPC server (no network, no external node) to prove
 # failover + circuit breaking deterministically in tests/failover.rs.

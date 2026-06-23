@@ -26,7 +26,10 @@ use events::primitives::BlockRef;
 /// common ancestor), and `timestamp` carries onto [`events::chain::RawBlockReceived`].
 ///
 /// Deliberately *not* the full block — the source layer streams cheap heads;
-/// transactions/traces are fetched on demand during assembly (task 2).
+/// execution traces are fetched on demand during assembly. `tx_count` is the one
+/// body fact carried along, because the header fetch (`eth_getBlockByNumber`)
+/// already returns the transaction-hash array, so counting it is free and saves
+/// a second round-trip just to fill [`events::chain::BlockAssembled::tx_count`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainHead {
     pub number: u64,
@@ -34,6 +37,9 @@ pub struct ChainHead {
     pub parent_hash: B256,
     /// Block timestamp as reported by the chain (unix seconds).
     pub timestamp: u64,
+    /// Number of transactions in the block, from the header fetch's tx-hash
+    /// array. Feeds [`events::chain::BlockAssembled::tx_count`].
+    pub tx_count: u32,
 }
 
 impl ChainHead {
@@ -88,4 +94,13 @@ pub trait ChainSource: Send + Sync {
     /// The latest *finalized* head (`finalized` tag, post-merge). Drives
     /// `BlockFinalized` and bounds the in-memory block tree (§5, §15).
     async fn finalized_head(&self) -> Result<ChainHead, SourceError>;
+
+    /// Whether this source can supply execution traces for an assembled block,
+    /// carried onto [`events::chain::BlockAssembled::trace_available`] so
+    /// trace-dependent detectors gate on it rather than assuming. The RPC
+    /// failover pool (adapter #3) is header-only and returns `false`; the
+    /// in-node adapters (#1/#2, Phase 8) override this once traces are wired.
+    fn traces_available(&self) -> bool {
+        false
+    }
 }

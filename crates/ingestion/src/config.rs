@@ -21,7 +21,22 @@ pub struct Config {
     /// can no longer be reorged (§15). Used by tasks 2–4; carried here so the
     /// whole service reads env in one place.
     pub finalization_depth: u64,
+    /// How often the pipeline polls the source's `finalized` tag to advance
+    /// finality and emit `BlockFinalized` (§5, §15). Coarser than the head poll —
+    /// finality moves at most once per epoch (~6.4 min on Ethereum).
+    pub finalize_interval: Duration,
     pub rpc: RpcPoolConfig,
+    pub kafka: KafkaConfig,
+}
+
+/// How to reach Kafka for *producing* chain events (§20). The ingestion service
+/// is the first producer in the system; the event-store owns topic provisioning,
+/// so this is just the broker list — the topic name is derived per event from
+/// the schema ([`events::EventEnvelope::topic`]).
+#[derive(Debug, Clone)]
+pub struct KafkaConfig {
+    /// Comma-separated bootstrap brokers (`localhost:9092`).
+    pub brokers: String,
 }
 
 /// The RPC failover pool's configuration (§5, adapter #3).
@@ -45,7 +60,11 @@ impl Config {
         Ok(Self {
             chain: Chain(env_parse("CHAIN_ID", 1u64)?),
             finalization_depth: env_parse("FINALIZATION_DEPTH", 64u64)?,
+            finalize_interval: Duration::from_millis(env_parse("FINALIZE_INTERVAL_MS", 12_000u64)?),
             rpc: rpc_from_env()?,
+            kafka: KafkaConfig {
+                brokers: env("KAFKA_BROKERS")?,
+            },
         })
     }
 }
