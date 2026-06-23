@@ -2497,6 +2497,7 @@ dependencies = [
  "async-trait",
  "axum",
  "events",
+ "rdkafka",
  "serde_json",
  "telemetry",
  "thiserror 2.0.18",

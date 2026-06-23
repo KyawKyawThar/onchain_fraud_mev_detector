@@ -1,20 +1,24 @@
 //! Ingestion service binary (§5).
 //!
-//! This task (Sprint 2 #1) delivers the **source adapter layer**: it stands up
-//! the RPC failover pool, verifies the configured endpoints are on the right
-//! chain, then runs three cooperating tasks until a shutdown signal —
+//! The service stands up the RPC failover pool, verifies the configured
+//! endpoints are on the right chain, then runs four cooperating tasks until a
+//! shutdown signal —
 //!   1. an active health probe sweeping every endpoint on an interval,
-//!   2. the head poller streaming new [`ChainHead`]s off the pool, and
-//!   3. a consumer that, for now, logs each head.
+//!   2. the head poller streaming new [`ChainHead`]s off the pool,
+//!   3. the [`Pipeline`] that feeds those heads through the reorg-aware block
+//!      tree and emits `RawBlockReceived`/`BlockAssembled`/`BlockCanonicalized`/
+//!      `BlockReverted` onto Kafka (Sprint 2 tasks 3–4), and
+//!   4. a finality ticker that polls the `finalized` tag and emits
+//!      `BlockFinalized` for blocks that cross the line.
 //!
-//! That consumer is the seam for tasks 2–4: the reorg-aware block tree replaces
-//! the logging loop and turns heads into `RawBlockReceived`/`BlockAssembled`/…
-//! events on Kafka. One [`CancellationToken`] coordinates a graceful stop.
+//! One [`CancellationToken`] coordinates a graceful stop.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use ingestion::config::{Config, RpcPoolConfig};
+use ingestion::pipeline::Pipeline;
+use ingestion::publisher::KafkaEventSink;
 use ingestion::source::head_stream::run_head_poller;
 use ingestion::source::rpc::RpcFailoverPool;
 use ingestion::source::{ChainHead, ChainSource};
@@ -90,24 +94,33 @@ async fn run(cfg: Config) -> Result<()> {
     });
 
     // ── Head poller ───────────────────────────────────────────────────
-    let (tx, mut rx) = mpsc::channel::<ChainHead>(1024);
+    let (tx, rx) = mpsc::channel::<ChainHead>(1024);
     let source: Arc<dyn ChainSource> = pool;
-    let poller_task = tokio::spawn(run_head_poller(source, poll_interval, tx, shutdown.clone()));
+    let poller_task = tokio::spawn(run_head_poller(
+        source.clone(),
+        poll_interval,
+        tx,
+        shutdown.clone(),
+    ));
 
-    // ── Head consumer (task 2+ replaces this with the block tree) ─────
-    while let Some(head) = rx.recv().await {
-        tracing::info!(
-            number = head.number,
-            hash = %head.hash,
-            parent_hash = %head.parent_hash,
-            timestamp = head.timestamp,
-            "new head (→ task 3 will emit RawBlockReceived)"
-        );
-    }
+    // ── Pipeline: heads → block tree → chain events on Kafka ──────────
+    // Owns the block tree in one task (single writer): ingests each head and, on
+    // a coarser tick, advances finality, until shutdown or the head stream closes.
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
+    let pipeline = Pipeline::new(
+        cfg.chain,
+        source,
+        sink,
+        cfg.finalization_depth,
+        shutdown.clone(),
+    );
+    let pipeline_task = tokio::spawn(pipeline.run(rx, cfg.finalize_interval));
 
-    // The channel closed: the poller stopped (shutdown). Join the tasks.
+    // Join the tasks. The poller drops `tx` on shutdown, which ends the pipeline.
     health_task.await.context("health task panicked")?;
     poller_task.await.context("head poller task panicked")?;
+    pipeline_task.await.context("pipeline task panicked")?;
     tracing::info!("ingestion shut down");
     Ok(())
 }
