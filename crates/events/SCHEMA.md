@@ -98,3 +98,52 @@ When you need to change the schema:
 
 Nothing is ever deleted from `DomainEvent`: retired variants stay readable so
 historical events replay (§18).
+
+### Reading old events: the upcasting seam
+
+The versioning above is only half a story. Today readers do two things with
+`schema_version`: **reject newer** (`ensure_supported`) and **accept
+equal-or-lower**. At `1` that is complete — `1` is the only shape that exists, so
+"accept equal-or-lower" means "accept `1`", and `from_json_slice` deserializes
+straight into the current `DomainEvent`.
+
+It stops being complete at the **first backwards-incompatible bump** (`1 → 2`).
+The event store is immutable and retained forever (§4, §18): every event ever
+written under `1` stays on disk as `1`, byte-for-byte, permanently. A `v2` reader
+replaying history (backtests, projections rebuilds, the `/v1/replay` stream) will
+therefore be handed `1`-shaped bytes that no longer match its `DomainEvent`. The
+current code path has no answer for that — `serde_json::from_slice` would just
+fail on the renamed/retyped field.
+
+The intended answer is an **upcasting chain on read**: deserialize old bytes into
+a version-tagged raw form, then run a pure `v1 → v2 → … → vN` transform sequence
+to bring the value up to the current shape *before* the rest of the system sees
+it. So the contract is "all code works against the latest `DomainEvent`; old
+on-disk versions are migrated forward at the deserialize boundary," not "every
+consumer branches on `schema_version` everywhere."
+
+The natural seam is **[`EventEnvelope::from_json_slice`]** — it is already the one
+place that inspects `schema_version` (via `ensure_supported`). The upcast path
+slots in there: on a below-current version, route through the transform chain
+instead of a direct deserialize; the rest of the codebase is untouched.
+
+**This is documented, not built — YAGNI at `1`.** There is exactly one version,
+so there is nothing to upcast and no chain to write. Capturing the design here is
+the point: when the first incompatible bump lands, adding a `1 → 2` upcaster plus
+a version branch at that single seam is a *localized change*, not a refactor of
+every reader. Two rules keep it that way:
+
+- **Keep upcasters pure and total.** A `vN → vN+1` step is a plain data transform
+  with no I/O — unit-testable against archived `vN` goldens (the same
+  `tests/wire_format.rs` goldens already pin those bytes).
+- **Never mutate an upcaster once shipped.** Old data on disk is forever; a step
+  that produced wrong output for some historical event can't be "fixed" in place
+  without re-reading all of history. Add a new step instead.
+
+Related tradeoff: if an incompatible change is a pure *field rename* that should
+stay internal (not alter the wire every downstream consumer reads), that is the
+signal to split `DomainEvent` into a **wire DTO + a domain type** — the rename
+lives in the domain type, the DTO (and its goldens) stay stable, and the mapping
+between them is just another upcaster. Until that need is concrete, the fused
+"one struct is both the wire format and the stored record" shape is simpler and
+is what the crate ships.
