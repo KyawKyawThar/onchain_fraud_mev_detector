@@ -20,11 +20,12 @@ crates — scaffold them with `just new-lib <name>` / `just new-bin <name>`.
 |---|---|
 | [`event-store`](event-store/) | **Sprint 1.** The immutable system of record (§4): an internal write-authenticated HTTP append API plus a Kafka consumer, persisting every domain event to an append-only ClickHouse `MergeTree` partitioned by `(chain, event_type, date)`. ClickHouse schema lives in [`event-store/migrations`](event-store/migrations/) (applied on boot). |
 | [`ingestion`](ingestion/) | **Sprint 2.** Chain data into the backbone (§5). Task 1 (done): the **source adapter** layer — a health-checked, circuit-broken RPC failover pool ([`source::rpc`](ingestion/src/source/rpc.rs)) behind the `ChainSource` seam (so the reth-ExEx / node-IPC adapters slot in later, Phase 8), feeding an ordered head stream. The reorg-aware block tree + `RawBlockReceived`/`BlockAssembled`/… emission are tasks 2–4. |
+| [`detection`](detection/) | **Sprint 3.** The fast path (§6): `BlockAssembled` → provisional alert in < 1s, attribution-blind. Task 1 (done): the **plugin seam** — the [`DetectorPlugin`](detection/src/plugin.rs) trait every detector crate implements, and **compile-time** detector registration ([`registry`](detection/src/registry.rs): explicit, feature-gated `register_builtins`, no dynamic loading — §6). Model-registry metadata (task 2), `DetectionCtx` enrichment (task 3), the sandwich/arb detector crates (task 4) and event emission (task 5) layer on top. Library-only until the service loop lands in task 5. |
 
 Still ahead — each lands as its own `crates/<service>` binary when its sprint
 begins, consuming/producing `events` over the backbone (§3, §22):
 
-`detection` · `simulation` · `intelligence` · `rule-engine` ·
+`simulation` · `intelligence` · `rule-engine` ·
 `api` · `notification` · `billing`
 
 No cross-service database joins — services share data via events or read APIs

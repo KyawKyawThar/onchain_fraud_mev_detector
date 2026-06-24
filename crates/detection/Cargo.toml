@@ -1,0 +1,41 @@
+[package]
+name = "detection"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Detection service (§6) — the fast path. Sprint 3 builds it in five slices;
+# **this task (1) delivers the plugin seam**: the `DetectorPlugin` trait every
+# detector implements and the compile-time registry that collects them. The
+# model-registry metadata (task 2), `DetectionCtx` enrichment (task 3), the
+# sandwich/arb detector crates (task 4) and event emission (task 5) layer on top
+# of the types defined here. Library-only for now; the service binary + Kafka
+# consumer loop land with task 5.
+
+[dependencies]
+events = { workspace = true }
+
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+
+# Compile-time detector registration (§6: "No dynamic loading — Rust has no
+# stable ABI. Each detector is an independent crate … registered at compile
+# time."). Each detector is an *optional* dependency behind a feature of the same
+# name; `register_builtins` wires it in under `#[cfg(feature = "…")]`, so the set
+# of linked detectors — and therefore the binary's plugin roster — is fixed at
+# compile time and selectable per build (premium detectors stay in closed
+# builds, §6). The detector crates + their features land in task 4; the seam in
+# `registry::register_builtins` is already shaped for them.
+[features]
+default = []
+# Exposes `detection::test_util` (shared detector test doubles) to downstream
+# crates — the task-4 detector crates pull `detection` as a dev-dependency with
+# `features = ["test-util"]` to test against the seam without re-rolling a mock.
+# Carries no extra deps; it just un-gates a module compiled out of normal builds.
+test-util = []
+
+[lints]
+workspace = true
