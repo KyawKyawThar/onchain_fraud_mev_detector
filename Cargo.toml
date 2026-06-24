@@ -24,6 +24,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Derive-driven enum metadata so variant→string mappings can't drift (§2).
 strum = { version = "0.27", features = ["derive"] }
+# Stable content hashing for the detection model registry (§6): a detector's
+# active config is hashed into the `config_hash` stamped onto every
+# `DetectorTriggered`, so an alert is reproducible against an exact build (§18).
+# A real cryptographic digest, not a hand-rolled hasher — config_hash is an
+# audit identifier where collision-resistance matters. Pure-Rust, no system
+# deps (keeps the self-contained-image goal). Hex-encoded via alloy's `hex`.
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # alloy is the project's chosen Ethereum stack (§21) — use its type-safe
