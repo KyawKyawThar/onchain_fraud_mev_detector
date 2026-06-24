@@ -10,8 +10,9 @@ publish.workspace = true
 # `detector-api` crate so detectors decouple from the service; this crate is the
 # service side: the model registry (task 2), feature flags (task 2), and the
 # compile-time `Registry` that collects detectors (task 1), re-exporting
-# `detector-api` so `detection::DetectorPlugin` etc. keep resolving. The service
-# binary + Kafka consumer loop land with task 5.
+# `detector-api` so `detection::DetectorPlugin` etc. keep resolving. Task 5 adds
+# the synchronous emission core (`emit`, `state`); the async/Kafka consumer loop
+# and rayon fan-out land in Sprint 4.
 
 [dependencies]
 # The detector seam — re-exported so downstream keeps using `detection::*`.
