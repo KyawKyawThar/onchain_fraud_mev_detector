@@ -5,15 +5,17 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Detection service (§6) — the fast path. Sprint 3 builds it in five slices;
-# **this task (1) delivers the plugin seam**: the `DetectorPlugin` trait every
-# detector implements and the compile-time registry that collects them. The
-# model-registry metadata (task 2), `DetectionCtx` enrichment (task 3), the
-# sandwich/arb detector crates (task 4) and event emission (task 5) layer on top
-# of the types defined here. Library-only for now; the service binary + Kafka
-# consumer loop land with task 5.
+# Detection service (§6) — the fast path. The detector *seam* (the
+# `DetectorPlugin` trait + `DetectionCtx`/enrichment) lives in the separate
+# `detector-api` crate so detectors decouple from the service; this crate is the
+# service side: the model registry (task 2), feature flags (task 2), and the
+# compile-time `Registry` that collects detectors (task 1), re-exporting
+# `detector-api` so `detection::DetectorPlugin` etc. keep resolving. The service
+# binary + Kafka consumer loop land with task 5.
 
 [dependencies]
+# The detector seam — re-exported so downstream keeps using `detection::*`.
+detector-api = { workspace = true }
 events = { workspace = true }
 
 thiserror = { workspace = true }
@@ -27,21 +29,28 @@ alloy-primitives = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 
-# Compile-time detector registration (§6: "No dynamic loading — Rust has no
-# stable ABI. Each detector is an independent crate … registered at compile
-# time."). Each detector is an *optional* dependency behind a feature of the same
-# name; `register_builtins` wires it in under `#[cfg(feature = "…")]`, so the set
-# of linked detectors — and therefore the binary's plugin roster — is fixed at
-# compile time and selectable per build (premium detectors stay in closed
-# builds, §6). The detector crates + their features land in task 4; the seam in
-# `registry::register_builtins` is already shaped for them.
+# Built-in detectors (§6, task 4). Each is an *optional* dependency behind a
+# feature of the same name; `register_builtins` wires it in under
+# `#[cfg(feature = "…")]`, so the set of linked detectors — and therefore the
+# binary's plugin roster — is fixed at compile time and selectable per build
+# (premium detectors stay in closed builds, §6). Because the detectors depend on
+# `detector-api` (not this crate), there's no dependency cycle.
+sandwich-detector = { workspace = true, optional = true }
+arb-detector = { workspace = true, optional = true }
+
 [features]
 default = []
-# Exposes `detection::test_util` (shared detector test doubles) to downstream
-# crates — the task-4 detector crates pull `detection` as a dev-dependency with
-# `features = ["test-util"]` to test against the seam without re-rolling a mock.
-# Carries no extra deps; it just un-gates a module compiled out of normal builds.
-test-util = []
+# Link the open-source Phase-2 detectors (§22). A binary turns these on (or a
+# superset including closed detectors) at build time; the library default links
+# none, leaving the choice to the composing binary.
+sandwich = ["dep:sandwich-detector"]
+arb = ["dep:arb-detector"]
+detectors = ["sandwich", "arb"]
+
+[dev-dependencies]
+# `MockDetector`/`dummy_evidence` for the registry/model tests — the seam's test
+# doubles now live in `detector-api` behind its `test-util` feature.
+detector-api = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

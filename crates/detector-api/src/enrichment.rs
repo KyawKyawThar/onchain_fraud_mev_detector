@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256, U256};
+use serde::{Deserialize, Serialize};
 
 /// A reference price in US dollars per *whole* token (decimal-adjusted, not per
 /// raw base unit), used to express on-chain quantities in a common numéraire —
@@ -89,6 +90,24 @@ impl TryFrom<f64> for UsdPrice {
 impl std::fmt::Display for UsdPrice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "${}", self.0)
+    }
+}
+
+// Serde routes through `try_new` on the way *in*, so a `UsdPrice` deserialized
+// from config/a feed (e.g. a detector's `min_profit_usd` threshold) is validated
+// at the edge — a NaN or negative can't slip in and silently poison a `<`
+// comparison later. Mirrors the validated-newtype discipline of `ConfigHash`.
+impl Serialize for UsdPrice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsdPrice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = f64::deserialize(deserializer)?;
+        Self::try_new(value).map_err(D::Error::custom)
     }
 }
 
@@ -409,6 +428,17 @@ mod tests {
         );
         assert!(UsdPrice::try_new(f64::NAN).is_err());
         assert!(UsdPrice::try_new(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn usd_price_validates_on_deserialize() {
+        // A good value round-trips through serde …
+        let p = UsdPrice::try_new(12.5).unwrap();
+        assert_eq!(serde_json::to_string(&p).unwrap(), "12.5");
+        assert_eq!(serde_json::from_str::<UsdPrice>("12.5").unwrap(), p);
+        // … and a nonsense one is rejected at the edge, not silently admitted.
+        assert!(serde_json::from_str::<UsdPrice>("-1.0").is_err());
+        assert!(serde_json::from_str::<UsdPrice>("null").is_err());
     }
 
     #[test]

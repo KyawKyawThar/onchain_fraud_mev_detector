@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::flags::FeatureFlags;
-use crate::plugin::{DetectorId, DetectorPlugin, SemVer};
+use detector_api::{DetectorId, DetectorPlugin, SemVer};
 
 /// The unique key a detector occupies in a [`Registry`]: its id and version.
 /// Two builds of the same detector (`sandwich` v1.2 and v1.3) coexist for safe
@@ -154,32 +154,32 @@ impl RegistryBuilder {
 /// the **compile-time** `#[cfg(feature = "…")]` decides whether a detector is in
 /// the binary at all (premium detectors aren't linked into an open build); the
 /// **runtime** `flags.is_enabled(...)` then decides whether a linked detector is
-/// turned on, without a recompile. The detector crates and their features land
-/// in task 4 — the wiring template is shown inline:
-///
-/// ```ignore
-/// #[cfg(feature = "sandwich")]
-/// b.register_if(flags.is_enabled(SANDWICH_ID), sandwich_detector::plugin()); // sandwich-v1.2
-/// #[cfg(feature = "arb")]
-/// b.register_if(flags.is_enabled(ARB_ID), arb_detector::plugin());           // arb-v1.0
-/// ```
+/// turned on, without a recompile. The detectors are optional dependencies of
+/// this crate (depending on the small `detector-api` seam, not on `detection`, so
+/// there's no cycle); a build that doesn't enable a feature never links it.
 ///
 /// Panics on a duplicate `(id, version)`: the built-in roster is statically
 /// known, so a duplicate is a build-time wiring bug to surface at boot, not a
 /// recoverable runtime condition (fail fast, mirroring the service's config
 /// loading).
 pub fn register_builtins(flags: &FeatureFlags) -> Registry {
-    // `flags` is unused only until the first detector lands (task 4); the gating
-    // is wired through `register_if` in the template above.
+    // `flags` goes unread only in a build that links *no* detector feature; each
+    // `#[cfg]` arm below consumes it via `register_if`.
     let _ = flags;
-    #[allow(unused_mut)] // empty until the first detector feature lands (task 4).
+    #[allow(unused_mut)] // stays `mut`-free only when no detector feature is on.
     let mut b = Registry::builder();
 
     // ── built-in detectors plug in here (task 4) ──
-    // #[cfg(feature = "sandwich")]
-    // b.register_if(flags.is_enabled(SANDWICH_ID), sandwich_detector::plugin());
-    // #[cfg(feature = "arb")]
-    // b.register_if(flags.is_enabled(ARB_ID), arb_detector::plugin());
+    #[cfg(feature = "sandwich")]
+    b.register_if(
+        flags.is_enabled(sandwich_detector::SandwichDetector::ID),
+        sandwich_detector::plugin(), // sandwich-v1.2
+    );
+    #[cfg(feature = "arb")]
+    b.register_if(
+        flags.is_enabled(arb_detector::ArbDetector::ID),
+        arb_detector::plugin(), // arb-v1.0
+    );
 
     b.build()
         .expect("built-in detector roster has a duplicate (id, version) — fix register_builtins")
@@ -188,8 +188,8 @@ pub fn register_builtins(flags: &FeatureFlags) -> Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctx::{BlockBundle, DetectionCtx};
-    use crate::test_util::{dummy_evidence, MockDetector};
+    use detector_api::test_util::{dummy_evidence, MockDetector};
+    use detector_api::{BlockBundle, DetectionCtx};
     use events::primitives::{BlockRef, Chain};
 
     #[test]
@@ -282,11 +282,30 @@ mod tests {
     }
 
     #[test]
-    fn register_builtins_is_consistent() {
-        // Task 1 ships an empty roster (detectors land in task 4); the contract
-        // under test is that the seam assembles without panicking on duplicates,
-        // for any feature-flag policy.
-        assert!(register_builtins(&FeatureFlags::all_enabled()).is_empty());
+    fn register_builtins_assembles_without_duplicates_and_honours_disable() {
+        // The load-bearing contract for any feature build: assembling the roster
+        // never panics on a duplicate `(id, version)` …
+        let _ = register_builtins(&FeatureFlags::all_enabled());
+        // … and a flags-all-off policy yields an empty roster no matter which
+        // detector features are compiled in (the runtime gate beats the link).
         assert!(register_builtins(&FeatureFlags::all_disabled()).is_empty());
+    }
+
+    #[cfg(feature = "sandwich")]
+    #[test]
+    fn sandwich_is_registered_when_feature_and_flag_are_on() {
+        let reg = register_builtins(&FeatureFlags::all_enabled());
+        assert!(reg
+            .get(DetectorId::new("sandwich"), SemVer::new(1, 2, 0))
+            .is_some());
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn arb_is_registered_when_feature_and_flag_are_on() {
+        let reg = register_builtins(&FeatureFlags::all_enabled());
+        assert!(reg
+            .get(DetectorId::new("arb"), SemVer::new(1, 0, 0))
+            .is_some());
     }
 }

@@ -3,16 +3,15 @@
 //! simulation, no label lookups on the hot path; confidence is attribution-blind
 //! (§6).
 //!
-//! Sprint 3 builds the service in five slices. **This crate currently delivers
-//! tasks 1–2 — the plugin seam and the model registry:**
+//! The detector **seam** — the [`DetectorPlugin`] trait, the [`DetectionCtx`] a
+//! detector reads, and the [`Evidence`] it returns — lives in the separate
+//! [`detector_api`] crate so detectors decouple from this service crate (they
+//! depend only on the small, stable seam, not on the registry/scheduler/state
+//! that churn here). This crate re-exports it, so `detection::DetectorPlugin`
+//! and friends keep resolving.
 //!
-//! - [`plugin::DetectorPlugin`] — the one trait every detector crate implements,
-//!   plus its value types ([`plugin::DetectorId`], [`plugin::SemVer`],
-//!   [`plugin::ModelKind`], [`plugin::Scope`], [`plugin::Evidence`]).
-//! - [`ctx::DetectionCtx`] — what a detector sees about one block: a
-//!   [`ctx::BlockBundle`] of raw facts plus the [`enrichment::Enrichment`]
-//!   (token/pool/price + decoded per-tx swaps/transfers, **no labels**) added in
-//!   task 3.
+//! This crate is the **service side**:
+//!
 //! - [`registry`] — **compile-time** detector registration: [`registry::Registry`]
 //!   is the live roster, [`registry::register_builtins`] the single greppable
 //!   place the linked detectors are named, each behind a Cargo feature (§6: no
@@ -26,34 +25,29 @@
 //!   that gates [`registry::register_builtins`], complementing the compile-time
 //!   feature gate.
 //!
-//! Still ahead this sprint, layering on these types: the `sandwich-v1.2` /
-//! `arb-v1.0` detector crates (task 4) and `DetectorTriggered`/
-//! `PreliminaryAlertCreated` emission with reorg-versioned cross-block state
-//! (task 5).
+//! Built-in detectors (`sandwich-v1.2`, `arb-v1.0`; task 4) are optional
+//! dependencies linked through [`registry::register_builtins`] behind their Cargo
+//! features. Still ahead this sprint: `DetectorTriggered`/`PreliminaryAlertCreated`
+//! emission with reorg-versioned cross-block state (task 5).
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
-pub mod ctx;
-pub mod enrichment;
 pub mod flags;
 pub mod model;
-pub mod plugin;
 pub mod registry;
 
-/// Shared detector test doubles. Compiled only for this crate's tests or when a
-/// downstream crate enables the `test-util` feature (task 4 detector crates).
-#[cfg(any(test, feature = "test-util"))]
-pub mod test_util;
-
-pub use ctx::{BlockBundle, DetectionCtx};
-pub use enrichment::{
-    Enrichment, EnrichmentBuilder, InvalidPrice, PoolState, Swap, TokenMeta, TokenTransfer,
-    TxActions, UsdPrice,
+// Re-export the detector seam so downstream code keeps using `detection::*`
+// (e.g. `detection::DetectorPlugin`, `detection::DetectionCtx`) without caring
+// that the seam now lives in its own crate.
+pub use detector_api::{
+    ctx, enrichment, plugin, BlockBundle, DetectionCtx, DetectorId, DetectorPlugin, Enrichment,
+    EnrichmentBuilder, Evidence, InvalidPrice, ModelKind, PoolState, Scope, SemVer,
+    SemVerParseError, Swap, TokenMeta, TokenTransfer, TxActions, UsdPrice,
 };
+
 pub use flags::FeatureFlags;
 pub use model::{
     ConfigHash, LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder,
     ModelRegistryError, Performance,
 };
-pub use plugin::{DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer};
 pub use registry::{register_builtins, Registry, RegistryBuilder, RegistryError};

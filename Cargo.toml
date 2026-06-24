@@ -14,6 +14,18 @@ publish = false
 events    = { path = "crates/events" }
 telemetry = { path = "crates/telemetry" }
 db        = { path = "crates/db" }
+# Detection seam (§6): `detector-api` is the thin, stable contract every detector
+# builds against — the `DetectorPlugin` trait + `DetectionCtx`/enrichment, and
+# nothing of the service's internals. The `detection` service crate re-exports it
+# and *optionally* depends on the detector crates to assemble the roster
+# (`register_builtins`); the detectors depend only on `detector-api`. So the graph
+# is `detection → {sandwich,arb} → detector-api ← detection` — acyclic — and a
+# closed/premium detector (§6) needs only the small `detector-api`, not the whole
+# service.
+detector-api     = { path = "crates/detector-api" }
+detection        = { path = "crates/detection" }
+sandwich-detector = { path = "crates/sandwich-detector" }
+arb-detector      = { path = "crates/arb-detector" }
 
 # Errors.
 anyhow = "1"
