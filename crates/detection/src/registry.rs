@@ -16,13 +16,16 @@
 //!
 //! The [`Registry`] this produces is the *live roster* of plugin instances. The
 //! richer model-registry metadata (`config_hash`, `deployed_at`, `performance`,
-//! deprecation — for safe rollouts and A/B comparison) layers on top in task 2;
-//! it is kept separate so registration (a detector exists and is linked) doesn't
-//! entangle with cataloguing (what we know about a detector's track record).
+//! deprecation — for safe rollouts and A/B comparison) lives separately in
+//! [`crate::model`] (task 2); registration (a detector exists and is linked) is
+//! kept apart from cataloguing (what we know about a detector's track record), so
+//! the two evolve independently. The runtime on/off switch — [`crate::flags`] —
+//! gates this roster through [`RegistryBuilder::register_if`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::flags::FeatureFlags;
 use crate::plugin::{DetectorId, DetectorPlugin, SemVer};
 
 /// The unique key a detector occupies in a [`Registry`]: its id and version.
@@ -143,34 +146,40 @@ impl RegistryBuilder {
     }
 }
 
-/// Assemble the registry of detectors this binary was compiled with (§6).
+/// Assemble the registry of detectors this binary was compiled with (§6),
+/// gated by the runtime [`FeatureFlags`].
 ///
 /// This is the single, greppable place the linked detector roster is declared.
-/// Each detector crate plugs in behind a Cargo feature of the same name; with
-/// the feature off the line is stripped at compile time and the detector isn't
-/// in the binary at all. The detector crates and their features land in task 4 —
-/// the wiring template is shown inline:
+/// Two gates compose here, answering different questions (see [`crate::flags`]):
+/// the **compile-time** `#[cfg(feature = "…")]` decides whether a detector is in
+/// the binary at all (premium detectors aren't linked into an open build); the
+/// **runtime** `flags.is_enabled(...)` then decides whether a linked detector is
+/// turned on, without a recompile. The detector crates and their features land
+/// in task 4 — the wiring template is shown inline:
 ///
 /// ```ignore
 /// #[cfg(feature = "sandwich")]
-/// b.register(sandwich_detector::plugin()); // sandwich-v1.2
+/// b.register_if(flags.is_enabled(SANDWICH_ID), sandwich_detector::plugin()); // sandwich-v1.2
 /// #[cfg(feature = "arb")]
-/// b.register(arb_detector::plugin());      // arb-v1.0
+/// b.register_if(flags.is_enabled(ARB_ID), arb_detector::plugin());           // arb-v1.0
 /// ```
 ///
 /// Panics on a duplicate `(id, version)`: the built-in roster is statically
 /// known, so a duplicate is a build-time wiring bug to surface at boot, not a
 /// recoverable runtime condition (fail fast, mirroring the service's config
 /// loading).
-pub fn register_builtins() -> Registry {
+pub fn register_builtins(flags: &FeatureFlags) -> Registry {
+    // `flags` is unused only until the first detector lands (task 4); the gating
+    // is wired through `register_if` in the template above.
+    let _ = flags;
     #[allow(unused_mut)] // empty until the first detector feature lands (task 4).
     let mut b = Registry::builder();
 
     // ── built-in detectors plug in here (task 4) ──
     // #[cfg(feature = "sandwich")]
-    // b.register(sandwich_detector::plugin());
+    // b.register_if(flags.is_enabled(SANDWICH_ID), sandwich_detector::plugin());
     // #[cfg(feature = "arb")]
-    // b.register(arb_detector::plugin());
+    // b.register_if(flags.is_enabled(ARB_ID), arb_detector::plugin());
 
     b.build()
         .expect("built-in detector roster has a duplicate (id, version) — fix register_builtins")
@@ -275,8 +284,9 @@ mod tests {
     #[test]
     fn register_builtins_is_consistent() {
         // Task 1 ships an empty roster (detectors land in task 4); the contract
-        // under test is that the seam assembles without panicking on duplicates.
-        let reg = register_builtins();
-        assert!(reg.is_empty());
+        // under test is that the seam assembles without panicking on duplicates,
+        // for any feature-flag policy.
+        assert!(register_builtins(&FeatureFlags::all_enabled()).is_empty());
+        assert!(register_builtins(&FeatureFlags::all_disabled()).is_empty());
     }
 }

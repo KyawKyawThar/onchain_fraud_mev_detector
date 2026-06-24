@@ -21,6 +21,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
 
+# Model registry (§6, task 2). `chrono` carries each model card's `deployed_at`
+# timestamp; `sha2` computes the `config_hash` that pins a detector's active
+# config onto every emitted `DetectorTriggered` for reproducible replay (§18).
+chrono = { workspace = true }
+sha2 = { workspace = true }
+
 # Compile-time detector registration (§6: "No dynamic loading — Rust has no
 # stable ABI. Each detector is an independent crate … registered at compile
 # time."). Each detector is an *optional* dependency behind a feature of the same
