@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::plugin::DetectorId;
+use detector_api::DetectorId;
 
 /// Which detectors are enabled at runtime (§6).
 ///

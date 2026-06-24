@@ -23,8 +23,8 @@ use events::primitives::{Confidence, DetectorRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::plugin::{DetectorId, DetectorPlugin, ModelKind, Scope, SemVer};
 use crate::registry::DetectorKey;
+use detector_api::{DetectorId, DetectorPlugin, ModelKind, Scope, SemVer};
 
 /// A stable content hash of a detector's active configuration — the third
 /// component of the [`DetectorRef`] triple (§6).
@@ -350,7 +350,7 @@ impl ModelRegistryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::MockDetector;
+    use detector_api::test_util::MockDetector;
     use serde::Serialize;
 
     /// A stand-in detector config to hash in the `ConfigHash` tests.

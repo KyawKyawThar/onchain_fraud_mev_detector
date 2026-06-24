@@ -1,0 +1,36 @@
+[package]
+name = "detector-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The detector seam (§6) — the thin, stable contract a detector crate implements,
+# extracted from the `detection` service so the two decouple: the `DetectorPlugin`
+# trait, the `DetectionCtx` a detector reads (raw `BlockBundle` facts +
+# token/pool/price `Enrichment`, **no labels**), and the behaviour-only `Evidence`
+# it returns. Detector crates (sandwich, arb, … — and closed/premium ones, §6)
+# depend on *this* small crate, not the heavy service crate, so they don't
+# recompile when service internals churn and a premium detector can live in a
+# separate repo behind a minimal dependency. The `detection` crate re-exports
+# everything here, so existing `detection::DetectorPlugin` paths keep working.
+
+[dependencies]
+events = { workspace = true }
+
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[features]
+default = []
+# Exposes `detector_api::test_util` (the shared `MockDetector` + `dummy_evidence`)
+# to downstream crates — `detection` and the detector crates pull `detector-api`
+# as a dev-dependency with `features = ["test-util"]` to test against the seam
+# without re-rolling a double. Carries no extra deps; it just un-gates a module
+# compiled out of normal builds.
+test-util = []
+
+[lints]
+workspace = true
