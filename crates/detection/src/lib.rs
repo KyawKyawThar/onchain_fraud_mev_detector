@@ -9,8 +9,10 @@
 //! - [`plugin::DetectorPlugin`] — the one trait every detector crate implements,
 //!   plus its value types ([`plugin::DetectorId`], [`plugin::SemVer`],
 //!   [`plugin::ModelKind`], [`plugin::Scope`], [`plugin::Evidence`]).
-//! - [`ctx::DetectionCtx`] — what a detector sees about one block. A skeleton
-//!   here; enrichment (token/pool/price, **no labels**) lands in task 3.
+//! - [`ctx::DetectionCtx`] — what a detector sees about one block: a
+//!   [`ctx::BlockBundle`] of raw facts plus the [`enrichment::Enrichment`]
+//!   (token/pool/price + decoded per-tx swaps/transfers, **no labels**) added in
+//!   task 3.
 //! - [`registry`] — **compile-time** detector registration: [`registry::Registry`]
 //!   is the live roster, [`registry::register_builtins`] the single greppable
 //!   place the linked detectors are named, each behind a Cargo feature (§6: no
@@ -24,14 +26,15 @@
 //!   that gates [`registry::register_builtins`], complementing the compile-time
 //!   feature gate.
 //!
-//! Still ahead this sprint, layering on these types: `DetectionCtx` enrichment
-//! (task 3), the `sandwich-v1.2` / `arb-v1.0` detector crates (task 4), and
-//! `DetectorTriggered`/`PreliminaryAlertCreated` emission with reorg-versioned
-//! cross-block state (task 5).
+//! Still ahead this sprint, layering on these types: the `sandwich-v1.2` /
+//! `arb-v1.0` detector crates (task 4) and `DetectorTriggered`/
+//! `PreliminaryAlertCreated` emission with reorg-versioned cross-block state
+//! (task 5).
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
 pub mod ctx;
+pub mod enrichment;
 pub mod flags;
 pub mod model;
 pub mod plugin;
@@ -43,6 +46,10 @@ pub mod registry;
 pub mod test_util;
 
 pub use ctx::{BlockBundle, DetectionCtx};
+pub use enrichment::{
+    Enrichment, EnrichmentBuilder, InvalidPrice, PoolState, Swap, TokenMeta, TokenTransfer,
+    TxActions, UsdPrice,
+};
 pub use flags::FeatureFlags;
 pub use model::{
     ConfigHash, LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder,
