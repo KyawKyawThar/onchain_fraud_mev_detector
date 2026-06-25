@@ -24,17 +24,29 @@
 //! - [`flags`] — **per-detector feature flags** (task 2): the runtime on/off
 //!   that gates [`registry::register_builtins`], complementing the compile-time
 //!   feature gate.
+//! - [`emit`] — **event emission** (task 5): the [`emit::DetectionPlan`] roster —
+//!   every live detector paired with its model card at link time — runs over one
+//!   block and turns each detector's `Evidence` into the
+//!   `DetectorTriggered`/`PreliminaryAlertCreated` wire events, stamped with the
+//!   exact [`DetectorRef`] triple. Pairing once and failing on an uncatalogued
+//!   detector keeps the per-block emit path total (no fabricated `config_hash`).
+//! - [`state`] — **reorg-versioned cross-block state** (task 5):
+//!   [`state::CrossBlockState`], the per-block snapshot store a `Scope::CrossBlock`
+//!   detector accumulates into so it can be rewound to a common ancestor on a reorg
+//!   (§15). The container and its rewind primitive land now; the event-driven
+//!   rewind and the async fan-out that feeds it are Sprint 4 (tasks 1–2).
 //!
 //! Built-in detectors (`sandwich-v1.2`, `arb-v1.0`; task 4) are optional
 //! dependencies linked through [`registry::register_builtins`] behind their Cargo
-//! features. Still ahead this sprint: `DetectorTriggered`/`PreliminaryAlertCreated`
-//! emission with reorg-versioned cross-block state (task 5).
+//! features.
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
+pub mod emit;
 pub mod flags;
 pub mod model;
 pub mod registry;
+pub mod state;
 
 // Re-export the detector seam so downstream code keeps using `detection::*`
 // (e.g. `detection::DetectorPlugin`, `detection::DetectionCtx`) without caring
@@ -45,9 +57,13 @@ pub use detector_api::{
     SemVerParseError, Swap, TokenMeta, TokenTransfer, TxActions, UsdPrice,
 };
 
+pub use emit::{
+    detector_triggered, implicated_addresses, preliminary_alert, DetectionPlan, UnlinkedDetector,
+};
 pub use flags::FeatureFlags;
 pub use model::{
     ConfigHash, LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder,
     ModelRegistryError, Performance,
 };
 pub use registry::{register_builtins, Registry, RegistryBuilder, RegistryError};
+pub use state::CrossBlockState;
