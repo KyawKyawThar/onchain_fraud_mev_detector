@@ -307,9 +307,19 @@ mod tests {
 
         let out = apply_reverts(&mut s, &[reverted(4), reverted(3), reverted(2)]);
 
-        assert_eq!(out, ReorgRewind { popped: 3, ignored: 0 });
+        assert_eq!(
+            out,
+            ReorgRewind {
+                popped: 3,
+                ignored: 0
+            }
+        );
         assert!(out.changed());
-        assert_eq!(s.current(), Some(&1), "left at the common ancestor's snapshot");
+        assert_eq!(
+            s.current(),
+            Some(&1),
+            "left at the common ancestor's snapshot"
+        );
         assert_eq!(s.tip(), Some(block(1)));
     }
 
@@ -320,7 +330,13 @@ mod tests {
 
         let out = apply_reverts(&mut s, &[reverted(3)]);
 
-        assert_eq!(out, ReorgRewind { popped: 1, ignored: 0 });
+        assert_eq!(
+            out,
+            ReorgRewind {
+                popped: 1,
+                ignored: 0
+            }
+        );
         assert_eq!(s.current(), Some(&2));
     }
 
@@ -340,11 +356,24 @@ mod tests {
         let mut s = state_up_to(4);
 
         let first = apply_reverts(&mut s, &[reverted(4), reverted(3)]);
-        assert_eq!(first, ReorgRewind { popped: 2, ignored: 0 });
+        assert_eq!(
+            first,
+            ReorgRewind {
+                popped: 2,
+                ignored: 0
+            }
+        );
         assert_eq!(s.tip(), Some(block(2)));
 
         let again = apply_reverts(&mut s, &[reverted(4), reverted(3)]);
-        assert_eq!(again, ReorgRewind { popped: 0, ignored: 2 }, "all stale");
+        assert_eq!(
+            again,
+            ReorgRewind {
+                popped: 0,
+                ignored: 2
+            },
+            "all stale"
+        );
         assert!(!again.changed());
         assert_eq!(s.tip(), Some(block(2)), "tip unchanged on redelivery");
     }
@@ -357,7 +386,13 @@ mod tests {
 
         let out = apply_reverts(&mut s, &[reverted(4), reverted(3), reverted(2)]);
 
-        assert_eq!(out, ReorgRewind { popped: 2, ignored: 1 });
+        assert_eq!(
+            out,
+            ReorgRewind {
+                popped: 2,
+                ignored: 1
+            }
+        );
         assert_eq!(s.current(), Some(&1), "rolled back to ancestor 1");
     }
 
@@ -379,8 +414,18 @@ mod tests {
 
         let out = apply_reverts(&mut s, &[reverted(2)]);
 
-        assert_eq!(out, ReorgRewind { popped: 0, ignored: 1 });
-        assert_eq!(s.tip(), Some(block(3)), "tip preserved — no wrong-version pop");
+        assert_eq!(
+            out,
+            ReorgRewind {
+                popped: 0,
+                ignored: 1
+            }
+        );
+        assert_eq!(
+            s.tip(),
+            Some(block(3)),
+            "tip preserved — no wrong-version pop"
+        );
     }
 
     // ── Rewindable / dyn dispatch ─────────────────────────────────────────
@@ -391,7 +436,13 @@ mod tests {
         // state rewinds identically to the concrete one.
         let mut boxed: Box<dyn Rewindable + Send> = Box::new(state_up_to(3));
         let out = apply_reverts(boxed.as_mut(), &[reverted(3), reverted(2)]);
-        assert_eq!(out, ReorgRewind { popped: 2, ignored: 0 });
+        assert_eq!(
+            out,
+            ReorgRewind {
+                popped: 2,
+                ignored: 0
+            }
+        );
     }
 
     // ── CrossBlockStates roster ───────────────────────────────────────────
@@ -424,7 +475,13 @@ mod tests {
         // One reorg orphans 4,3,2 for the whole roster → 3 popped per detector.
         let out = roster.apply_reverts(&[reverted(4), reverted(3), reverted(2)]);
 
-        assert_eq!(out, RosterRewind { rewound: 2, popped: 6 });
+        assert_eq!(
+            out,
+            RosterRewind {
+                rewound: 2,
+                popped: 6
+            }
+        );
         assert!(out.changed());
     }
 
@@ -438,7 +495,13 @@ mod tests {
         // Stream orphans 4,3,2: `a` pops 4,3,2 (3); `b`'s tip is 2 so it ignores
         // 4,3 and pops only 2 (1). Aggregate: both changed, 4 popped total.
         let out = roster.apply_reverts(&[reverted(4), reverted(3), reverted(2)]);
-        assert_eq!(out, RosterRewind { rewound: 2, popped: 4 });
+        assert_eq!(
+            out,
+            RosterRewind {
+                rewound: 2,
+                popped: 4
+            }
+        );
     }
 
     #[test]
