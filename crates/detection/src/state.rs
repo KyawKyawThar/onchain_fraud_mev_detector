@@ -35,9 +35,11 @@
 //! use, mirroring how [`Performance`](crate::model::Performance) existed before its
 //! metrics job. The wiring that drives it lands in Sprint 4:
 //!
-//! - **task 1** — consume `BlockReverted` and call [`revert_tip`](CrossBlockState::revert_tip)
-//!   (tip-first, matching the event stream) / [`rewind_to`](CrossBlockState::rewind_to)
-//!   the common ancestor.
+//! - **task 1** — consume `BlockReverted` and roll back to the common ancestor by
+//!   replaying [`revert_tip`](CrossBlockState::revert_tip) tip-first, matching the
+//!   event stream. This is the [`reorg`](crate::reorg) module, the thin consumer
+//!   over the [`revert_tip`](CrossBlockState::revert_tip) /
+//!   [`rewind_to`](CrossBlockState::rewind_to) primitives below.
 //! - **task 2** — the async scheduler threads each `CrossBlock` detector's state
 //!   through `detect`, calling [`apply`](CrossBlockState::apply) per canonical block.
 
