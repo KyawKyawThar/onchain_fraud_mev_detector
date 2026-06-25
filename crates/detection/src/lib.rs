@@ -33,8 +33,14 @@
 //! - [`state`] — **reorg-versioned cross-block state** (task 5):
 //!   [`state::CrossBlockState`], the per-block snapshot store a `Scope::CrossBlock`
 //!   detector accumulates into so it can be rewound to a common ancestor on a reorg
-//!   (§15). The container and its rewind primitive land now; the event-driven
-//!   rewind and the async fan-out that feeds it are Sprint 4 (tasks 1–2).
+//!   (§15). The container and its rewind primitive land in task 5; the async
+//!   fan-out that feeds it per canonical block is Sprint 4 (task 2).
+//! - [`reorg`] — **the event-driven rewind** (Sprint 4 task 1): the object-safe
+//!   [`reorg::Rewindable`] view of a cross-block state, [`reorg::apply_reverts`] to
+//!   replay one detector's tip-first `BlockReverted` stream onto it, and
+//!   [`reorg::CrossBlockStates`] — the roster that owns every cross-block detector's
+//!   (type-erased) state and rewinds all of them to the common ancestor on a reorg
+//!   (§15). The consumer layer over the `state` primitive that the scheduler calls.
 //!
 //! Built-in detectors (`sandwich-v1.2`, `arb-v1.0`; task 4) are optional
 //! dependencies linked through [`registry::register_builtins`] behind their Cargo
@@ -46,6 +52,7 @@ pub mod emit;
 pub mod flags;
 pub mod model;
 pub mod registry;
+pub mod reorg;
 pub mod state;
 
 // Re-export the detector seam so downstream code keeps using `detection::*`
@@ -66,4 +73,5 @@ pub use model::{
     ModelRegistryError, Performance,
 };
 pub use registry::{register_builtins, Registry, RegistryBuilder, RegistryError};
+pub use reorg::{apply_reverts, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind};
 pub use state::CrossBlockState;
