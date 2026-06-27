@@ -57,9 +57,12 @@
 
 use std::collections::BTreeMap;
 
+use detector_api::{CrossBlockDetector, DetectionCtx};
 use events::chain::BlockReverted;
-use events::primitives::BlockRef;
+use events::primitives::{BlockRef, DetectorRef};
+use events::DomainEvent;
 
+use crate::emit::evidence_events;
 use crate::registry::DetectorKey;
 use crate::state::CrossBlockState;
 
@@ -94,6 +97,70 @@ impl<S> Rewindable for CrossBlockState<S> {
 
     fn rewind_to(&mut self, ancestor_number: u64) {
         CrossBlockState::rewind_to(self, ancestor_number)
+    }
+}
+
+/// A cross-block detector reunited with its reorg-versioned state and resolved
+/// `(id, version, config_hash)` triple — the object-safe unit the scheduler stores
+/// per `Scope::CrossBlock` detector and drives serially (it threads `&mut` state,
+/// so unlike the parallel `Block` fan-out it can't be run concurrently with itself).
+///
+/// Extends [`Rewindable`] so a reorg rewinds it through the same tip-first replay as
+/// any other versioned state; adds [`observe_and_detect`](Self::observe_and_detect),
+/// the per-block apply path [`state`](crate::state) deferred to Sprint 4 task 2.
+pub trait CrossBlockSlot: Rewindable + Send {
+    /// Fold one canonical block into the running state (recording a new snapshot for
+    /// reorg rollback), then emit the detection events for whatever the detector
+    /// found, each stamped with the slot's [`DetectorRef`] — the same trigger→alert
+    /// mapping the `Block` paths use (`emit::evidence_events`).
+    ///
+    /// Called once per canonical block, in ascending order (the snapshot store's
+    /// `apply` asserts it). Returns the events in finding order; a detector that
+    /// finds nothing contributes none.
+    fn observe_and_detect(&mut self, ctx: &DetectionCtx) -> Vec<DomainEvent>;
+}
+
+/// One cross-block detector bundled with everything the scheduler needs to run and
+/// rewind it: the detector, its resolved triple, and its per-block snapshot store.
+struct Slot<D: CrossBlockDetector> {
+    detector: D,
+    detector_ref: DetectorRef,
+    state: CrossBlockState<D::State>,
+}
+
+impl<D: CrossBlockDetector> Rewindable for Slot<D> {
+    fn revert_tip(&mut self, block: BlockRef) -> bool {
+        self.state.revert_tip(block)
+    }
+    fn rewind_to(&mut self, ancestor_number: u64) {
+        self.state.rewind_to(ancestor_number)
+    }
+}
+
+impl<D: CrossBlockDetector> CrossBlockSlot for Slot<D> {
+    fn observe_and_detect(&mut self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
+        // Fork the tip snapshot (or seed a fresh state on the first block), fold this
+        // block in, and record it as the new tip — a full snapshot per block, so a
+        // reorg rollback is a cheap discard (see `crate::state`).
+        let mut next = self
+            .state
+            .current()
+            .cloned()
+            .unwrap_or_else(|| self.detector.init_state());
+        self.detector.observe(ctx, &mut next);
+        self.state.apply(ctx.block(), next);
+
+        let snapshot = self
+            .state
+            .current()
+            .expect("a snapshot was just applied for this block");
+        self.detector
+            .detect(ctx, snapshot)
+            .iter()
+            .flat_map(|evidence| {
+                evidence_events(&self.detector_ref, ctx.block(), ctx.enrichment(), evidence)
+            })
+            .collect()
     }
 }
 
@@ -173,22 +240,27 @@ fn replay<R: Rewindable + ?Sized>(state: &mut R, stream: &[BlockReverted]) -> Re
     out
 }
 
-/// The cross-block states of every `Scope::CrossBlock` detector, owned together so
-/// one reorg rewinds the whole roster — the plural analogue of the
-/// [`Registry`](crate::registry::Registry) (Sprint 4 task 1).
+/// The cross-block detectors of a binary, owned together so the scheduler can run
+/// them all over each canonical block and one reorg can rewind the whole roster —
+/// the plural analogue of the [`Registry`](crate::registry::Registry).
 ///
-/// Each detector's state has its own type `S`, so the states are stored type-erased
-/// behind [`Rewindable`] (a reorg never needs `S`; see [`Rewindable`]) and keyed by
-/// the detector's `(id, version)` [`DetectorKey`] — the same key the registry and
-/// model registry use, so a `BlockReverted` (or the per-block apply path) maps to a
-/// state with no extra bookkeeping. The reorg path is complete here; the typed
-/// per-block `apply` path — which *does* need `S` back — is Sprint 4 task 2, when
-/// the scheduler that threads detector state through `detect` lands.
+/// Each detector's state has its own type `S`, so the slots are stored type-erased
+/// behind [`CrossBlockSlot`] (which extends [`Rewindable`] — a reorg never needs
+/// `S`) and keyed by the detector's `(id, version)` [`DetectorKey`] — the same key
+/// the registry and model registry use, so a `BlockReverted` and the per-block apply
+/// path both map to a slot with no extra bookkeeping. Both halves of the path are
+/// complete here: [`observe_and_detect`](Self::observe_and_detect) advances and reads
+/// every slot per block (Sprint 4 task 2), and [`apply_reverts`](Self::apply_reverts)
+/// rewinds them all on a reorg (Sprint 4 task 1).
+///
+/// In a build with no `Scope::CrossBlock` detector (the case today — both built-ins
+/// are `Scope::Block`) the roster is simply empty, so the scheduler's cross-block
+/// path is a no-op until the first one (wash-trading) lands.
 #[derive(Default)]
 pub struct CrossBlockStates {
-    // `Send` so the async scheduler (task 2) can hold the roster across `.await`
-    // points; ordered for deterministic iteration in logs/tests.
-    by_key: BTreeMap<DetectorKey, Box<dyn Rewindable + Send>>,
+    // `Send` (via the `CrossBlockSlot: … + Send` bound) so the async scheduler can
+    // hold the roster across `.await`; ordered for deterministic iteration.
+    by_key: BTreeMap<DetectorKey, Box<dyn CrossBlockSlot>>,
 }
 
 impl CrossBlockStates {
@@ -197,17 +269,29 @@ impl CrossBlockStates {
         Self::default()
     }
 
-    /// Register a detector's freshly-built [`CrossBlockState`], erasing its state
-    /// type behind [`Rewindable`]. Generic at the call site (the caller knows `S`),
-    /// erased in storage. A second insert for the same key replaces the first.
-    pub fn insert<S>(&mut self, key: DetectorKey, state: CrossBlockState<S>)
+    /// Register a [`CrossBlockDetector`] with its resolved [`DetectorRef`], building
+    /// the snapshot store sized to its window and erasing its state type behind
+    /// [`CrossBlockSlot`]. A second insert for the same `(id, version)` replaces the
+    /// first. The `detector_ref` is resolved once at link time (model registry), the
+    /// same fail-fast pairing [`DetectionPlan`](crate::emit::DetectionPlan) does for
+    /// `Block` detectors, so the per-block emit path is total.
+    pub fn insert_detector<D>(&mut self, detector_ref: DetectorRef, detector: D)
     where
-        S: Send + 'static,
+        D: CrossBlockDetector + 'static,
     {
-        self.by_key.insert(key, Box::new(state));
+        let key = (detector.id(), detector.version());
+        let state = CrossBlockState::new(detector.window_blocks());
+        self.by_key.insert(
+            key,
+            Box::new(Slot {
+                detector,
+                detector_ref,
+                state,
+            }),
+        );
     }
 
-    /// How many detectors' states the roster holds.
+    /// How many cross-block detectors the roster holds.
     pub fn len(&self) -> usize {
         self.by_key.len()
     }
@@ -216,9 +300,22 @@ impl CrossBlockStates {
         self.by_key.is_empty()
     }
 
-    /// Whether a state is registered for `key`.
+    /// Whether a slot is registered for `key`.
     pub fn contains(&self, key: &DetectorKey) -> bool {
         self.by_key.contains_key(key)
+    }
+
+    /// Advance **every** cross-block detector over one canonical `ctx` (folding the
+    /// block into each running state and recording its snapshot), and collect the
+    /// detection events they emit — in `(id, version)` key order. The scheduler calls
+    /// this once per `BlockAssembled`, after the parallel `Block` fan-out.
+    ///
+    /// Empty (no events) when the roster is empty — the common case today.
+    pub fn observe_and_detect(&mut self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
+        self.by_key
+            .values_mut()
+            .flat_map(|slot| slot.observe_and_detect(ctx))
+            .collect()
     }
 
     /// Rewind **every** detector's state through one reorg's tip-first
@@ -232,8 +329,10 @@ impl CrossBlockStates {
     pub fn apply_reverts(&mut self, stream: &[BlockReverted]) -> RosterRewind {
         assert_tip_first(stream);
         let mut out = RosterRewind::default();
-        for state in self.by_key.values_mut() {
-            let rewind = replay(state.as_mut(), stream);
+        for slot in self.by_key.values_mut() {
+            // Upcast the slot to its `Rewindable` surface so the reorg replay is the
+            // same one the single-state `apply_reverts` uses.
+            let rewind = replay(slot.as_mut() as &mut dyn Rewindable, stream);
             if rewind.changed() {
                 out.rewound += 1;
             }
@@ -448,29 +547,52 @@ mod tests {
     // ── CrossBlockStates roster ───────────────────────────────────────────
 
     use crate::registry::DetectorKey;
-    use detector_api::{DetectorId, SemVer};
+    use detector_api::test_util::MockCrossBlockDetector;
+    use detector_api::{BlockBundle, DetectionCtx, DetectorId, Evidence, SemVer};
+    use events::primitives::{AlertKind, Chain, Confidence, DetectorRef};
 
     fn key(id: &'static str) -> DetectorKey {
         (DetectorId::new(id), SemVer::new(1, 0, 0))
     }
 
-    /// A `CrossBlockState<S>` advanced to `tip`, with each height as placeholder
-    /// state — generic so the roster can hold *different* `S` per detector.
-    fn ramp<S: From<u8>>(tip: u64) -> CrossBlockState<S> {
-        let mut s = CrossBlockState::new(16);
-        for n in 1..=tip {
-            s.apply(block(n), S::from(n as u8));
+    /// The resolved triple a slot stamps onto its events (the config_hash is opaque
+    /// to the rewind; a real one comes from the model registry at link time).
+    fn a_ref(id: &'static str) -> DetectorRef {
+        DetectorRef {
+            id: id.into(),
+            version: "1.0.0".into(),
+            config_hash: "deadbeef".into(),
         }
-        s
+    }
+
+    /// A header-only context for block `n` (no txs/enrichment) — enough to drive the
+    /// per-block apply path; the mock's `observe` folds the block in regardless.
+    fn ctx(n: u64) -> DetectionCtx {
+        DetectionCtx::new(BlockBundle::new(Chain::ETHEREUM, block(n), vec![]))
+    }
+
+    /// Drive `roster` over canonical blocks `1..=tip`, discarding emitted events —
+    /// the per-block apply path the scheduler runs, so each slot ends at tip `tip`.
+    fn advance(roster: &mut CrossBlockStates, tip: u64) {
+        for n in 1..=tip {
+            let _ = roster.observe_and_detect(&ctx(n));
+        }
     }
 
     #[test]
     fn roster_rewinds_every_detectors_state_through_one_reorg() {
-        // Two cross-block detectors with *different* state types, both at tip 4.
+        // Two cross-block detectors with *different* state types, advanced to tip 4.
         let mut roster = CrossBlockStates::new();
-        roster.insert(key("wash"), ramp::<u64>(4));
-        roster.insert(key("spoof"), ramp::<i32>(4));
+        roster.insert_detector(
+            a_ref("wash"),
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
+        );
+        roster.insert_detector(
+            a_ref("spoof"),
+            MockCrossBlockDetector::<i32>::new("spoof", SemVer::new(1, 0, 0)),
+        );
         assert_eq!(roster.len(), 2);
+        advance(&mut roster, 4);
 
         // One reorg orphans 4,3,2 for the whole roster → 3 popped per detector.
         let out = roster.apply_reverts(&[reverted(4), reverted(3), reverted(2)]);
@@ -487,26 +609,96 @@ mod tests {
 
     #[test]
     fn roster_aggregates_differing_per_detector_outcomes() {
-        // `a` is at tip 4, `b` only at tip 2 (registered later / shorter history).
+        // `a` keeps a full window; `b`'s short window (2) ages out the older blocks,
+        // so the same reorg pops fewer from it.
         let mut roster = CrossBlockStates::new();
-        roster.insert(key("a"), ramp::<u64>(4));
-        roster.insert(key("b"), ramp::<u64>(2));
+        roster.insert_detector(
+            a_ref("a"),
+            MockCrossBlockDetector::<u64>::new("a", SemVer::new(1, 0, 0)).with_window(16),
+        );
+        roster.insert_detector(
+            a_ref("b"),
+            MockCrossBlockDetector::<u64>::new("b", SemVer::new(1, 0, 0)).with_window(2),
+        );
+        advance(&mut roster, 4);
 
-        // Stream orphans 4,3,2: `a` pops 4,3,2 (3); `b`'s tip is 2 so it ignores
-        // 4,3 and pops only 2 (1). Aggregate: both changed, 4 popped total.
+        // Stream orphans 4,3,2: `a` (window 16) holds 1..4 and pops 4,3,2 (3); `b`
+        // (window 2) holds only 3,4 — pops 4,3, then ignores the stale 2 (2 popped).
         let out = roster.apply_reverts(&[reverted(4), reverted(3), reverted(2)]);
         assert_eq!(
             out,
             RosterRewind {
                 rewound: 2,
-                popped: 4
+                popped: 5
             }
         );
     }
 
     #[test]
-    fn an_empty_roster_rewinds_nothing() {
+    fn observe_and_detect_advances_each_slot_and_emits_in_key_order() {
+        // Two detectors that each fire one finding per block; one block observed.
+        let finding = vec![Evidence::new(
+            AlertKind::WashTrading,
+            vec![],
+            Confidence::new(0.5),
+        )];
         let mut roster = CrossBlockStates::new();
+        roster.insert_detector(
+            a_ref("wash"),
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0))
+                .returning(finding.clone()),
+        );
+        roster.insert_detector(
+            a_ref("spoof"),
+            MockCrossBlockDetector::<u64>::new("spoof", SemVer::new(1, 0, 0)).returning(finding),
+        );
+
+        let events = roster.observe_and_detect(&ctx(1));
+
+        // Each finding → a DetectorTriggered/PreliminaryAlertCreated pair, in
+        // `(id, version)` key order ("spoof" < "wash").
+        let types: Vec<&str> = events.iter().map(DomainEvent::event_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                "DetectorTriggered", // spoof
+                "PreliminaryAlertCreated",
+                "DetectorTriggered", // wash
+                "PreliminaryAlertCreated",
+            ]
+        );
+        let DomainEvent::DetectorTriggered(first) = &events[0] else {
+            panic!("expected DetectorTriggered");
+        };
+        assert_eq!(first.detector.id, "spoof");
+        assert_eq!(first.block, block(1));
+    }
+
+    #[test]
+    fn a_detector_that_finds_nothing_emits_nothing_but_still_advances() {
+        // No findings ⇒ no events, but the block is still folded in — so a later
+        // reorg has a snapshot to pop.
+        let mut roster = CrossBlockStates::new();
+        roster.insert_detector(
+            a_ref("wash"),
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
+        );
+        advance(&mut roster, 3);
+
+        let out = roster.apply_reverts(&[reverted(3), reverted(2)]);
+        assert_eq!(
+            out,
+            RosterRewind {
+                rewound: 1,
+                popped: 2
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_roster_observes_and_rewinds_nothing() {
+        let mut roster = CrossBlockStates::new();
+        assert!(roster.observe_and_detect(&ctx(1)).is_empty());
         let out = roster.apply_reverts(&[reverted(3)]);
         assert_eq!(out, RosterRewind::default());
         assert!(!out.changed());
@@ -518,12 +710,18 @@ mod tests {
         let mut roster = CrossBlockStates::new();
         assert!(!roster.contains(&key("wash")));
 
-        roster.insert(key("wash"), ramp::<u64>(3));
+        roster.insert_detector(
+            a_ref("wash"),
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
+        );
         assert!(roster.contains(&key("wash")));
         assert_eq!(roster.len(), 1);
 
         // Re-inserting the same key replaces rather than duplicates.
-        roster.insert(key("wash"), ramp::<u64>(1));
+        roster.insert_detector(
+            a_ref("wash"),
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
+        );
         assert_eq!(roster.len(), 1);
     }
 }

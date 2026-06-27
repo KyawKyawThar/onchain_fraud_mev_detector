@@ -8,8 +8,11 @@
 //! compiled into a normal build, so it can't bloat or leak into the shipped
 //! binary.
 
+use std::marker::PhantomData;
+
 use alloy_primitives::{Address, B256, U256};
 
+use crate::cross_block::CrossBlockDetector;
 use crate::ctx::{BlockBundle, DetectionCtx};
 use crate::enrichment::{EnrichmentBuilder, PoolState, Swap, TokenMeta, TxActions, UsdPrice};
 use crate::plugin::{DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer};
@@ -82,6 +85,84 @@ impl DetectorPlugin for MockDetector {
 /// returns, not their content.
 pub fn dummy_evidence() -> Evidence {
     Evidence::new(AlertKind::Sandwich, Vec::new(), Confidence::new(0.5))
+}
+
+/// A configurable stand-in for a real [`CrossBlockDetector`], for exercising the
+/// scheduler's per-block apply + reorg-rewind path without a production cross-block
+/// detector (there is none yet — both built-ins are `Scope::Block`).
+///
+/// Generic over the state type `S` so tests can prove the type-erased slot roster
+/// holds *heterogeneous* states. Its [`observe`](CrossBlockDetector::observe) folds
+/// the block in by setting the state to the block's number (`S: From<u8>`), so a
+/// rewind's effect on the accumulated value is observable; [`detect`] returns a
+/// fixed finding list regardless of state.
+pub struct MockCrossBlockDetector<S = u64> {
+    id: DetectorId,
+    version: SemVer,
+    kind: ModelKind,
+    window_blocks: u32,
+    findings: Vec<Evidence>,
+    _state: PhantomData<fn() -> S>,
+}
+
+impl<S> MockCrossBlockDetector<S> {
+    /// A `Rule` cross-block detector with the given identity, a window of 16, and
+    /// no findings. Layer on [`returning`](Self::returning) to vary output.
+    pub fn new(id: &'static str, version: SemVer) -> Self {
+        Self {
+            id: DetectorId::new(id),
+            version,
+            kind: ModelKind::Rule,
+            window_blocks: 16,
+            findings: Vec::new(),
+            _state: PhantomData,
+        }
+    }
+
+    /// Set the trailing window the snapshot store is sized to.
+    #[must_use]
+    pub fn with_window(mut self, window_blocks: u32) -> Self {
+        self.window_blocks = window_blocks;
+        self
+    }
+
+    /// Make `detect` return `findings` (cloned) for every block.
+    #[must_use]
+    pub fn returning(mut self, findings: Vec<Evidence>) -> Self {
+        self.findings = findings;
+        self
+    }
+}
+
+impl<S> CrossBlockDetector for MockCrossBlockDetector<S>
+where
+    S: Clone + Send + From<u8> + 'static,
+{
+    type State = S;
+
+    fn id(&self) -> DetectorId {
+        self.id
+    }
+    fn version(&self) -> SemVer {
+        self.version
+    }
+    fn kind(&self) -> ModelKind {
+        self.kind
+    }
+    fn window_blocks(&self) -> u32 {
+        self.window_blocks
+    }
+    fn init_state(&self) -> S {
+        S::from(0)
+    }
+    fn observe(&self, ctx: &DetectionCtx, state: &mut S) {
+        // Fold = "remember this block's height", so a rewind's effect on the
+        // accumulated value is directly observable in tests.
+        *state = S::from(ctx.block().number as u8);
+    }
+    fn detect(&self, _ctx: &DetectionCtx, _state: &S) -> Vec<Evidence> {
+        self.findings.clone()
+    }
 }
 
 // ── Fixtures: building a `DetectionCtx` for detector tests ───────────────────

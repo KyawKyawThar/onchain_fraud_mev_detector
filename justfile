@@ -133,6 +133,14 @@ run-event-store:
 run-ingestion:
     cargo run -p ingestion
 
+# Run the detection service (§6, §17). The fast path: consumes
+# BlockAssembled/BlockReverted off Kafka, fans detectors out on rayon, and
+# produces DetectorTriggered/PreliminaryAlertCreated. Needs Kafka up (`just up`)
+# and ingestion producing blocks. `--features detectors` links the built-in
+# sandwich + arb detectors (the lib default links none).
+run-detection:
+    cargo run -p detection --features detectors
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon
