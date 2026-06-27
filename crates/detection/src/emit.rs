@@ -109,6 +109,33 @@ pub fn implicated_addresses(enrichment: &Enrichment, txs: &[B256]) -> Vec<Accoun
     addresses
 }
 
+/// Map one detector's [`Evidence`] onto the causal pair it emits: the raw
+/// [`DetectorTriggered`] fact immediately followed by the provisional
+/// [`PreliminaryAlertCreated`] it raises (§6, task 5).
+///
+/// The single source of truth every emit path maps findings through — the
+/// sequential [`detection_events`](DetectionPlan::detection_events), the rayon
+/// [`detection_events_parallel`](DetectionPlan::detection_events_parallel), and the
+/// cross-block slot ([`crate::reorg`]) — so the trigger→alert pairing and the
+/// attribution-blind address lookup can't drift between them.
+pub(crate) fn evidence_events(
+    detector_ref: &DetectorRef,
+    block: BlockRef,
+    enrichment: &Enrichment,
+    evidence: &Evidence,
+) -> [DomainEvent; 2] {
+    let addresses = implicated_addresses(enrichment, &evidence.txs);
+    [
+        DomainEvent::DetectorTriggered(detector_triggered(detector_ref.clone(), block, evidence)),
+        DomainEvent::PreliminaryAlertCreated(preliminary_alert(
+            detector_ref.clone(),
+            evidence.kind,
+            addresses,
+            evidence.confidence,
+        )),
+    ]
+}
+
 /// A live detector is in the [`Registry`] but absent from the [`ModelRegistry`],
 /// so it has no `config_hash` to stamp onto its events.
 ///
@@ -208,28 +235,51 @@ impl DetectionPlan {
     ///
     /// Returns `Vec<DomainEvent>` payloads in emission order; the async shell wraps
     /// each in an [`EventEnvelope`](events::EventEnvelope) and publishes it (Sprint
-    /// 4). The fan-out here is sequential — parallelizing `Block`-scoped detectors
-    /// over a rayon pool is Sprint 4 task 2; the order and output are identical
-    /// either way because each `detect` is pure.
+    /// 4). This is the **sequential** path — deterministic and rayon-free, so it's
+    /// the reference for replay/backtests (§18) and unit tests. The live scheduler
+    /// runs [`detection_events_parallel`](Self::detection_events_parallel) instead;
+    /// the two produce the same events in the same order (each `detect` is pure).
     pub fn detection_events(&self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
         let mut events = Vec::new();
         for linked in &self.detectors {
             for evidence in linked.plugin.detect(ctx) {
-                events.push(DomainEvent::DetectorTriggered(detector_triggered(
-                    linked.detector_ref.clone(),
+                events.extend(evidence_events(
+                    &linked.detector_ref,
                     ctx.block(),
+                    ctx.enrichment(),
                     &evidence,
-                )));
-                let addresses = implicated_addresses(ctx.enrichment(), &evidence.txs);
-                events.push(DomainEvent::PreliminaryAlertCreated(preliminary_alert(
-                    linked.detector_ref.clone(),
-                    evidence.kind,
-                    addresses,
-                    evidence.confidence,
-                )));
+                ));
             }
         }
         events
+    }
+
+    /// Run the whole `Block`-scoped roster over one block **in parallel** on the
+    /// rayon pool (§17, Sprint 4 task 2) — the live scheduler's hot path, invoked
+    /// inside `spawn_blocking` so this CPU work never runs on the async reactor.
+    ///
+    /// Each detector's [`detect`](detector_api::DetectorPlugin::detect) is a pure
+    /// function sharing only the `&DetectionCtx`, so they fan out with no
+    /// coordination; rayon's `collect` preserves iteration order, so the emitted
+    /// events come out in the **same** `(id, version)` roster order — and are
+    /// byte-for-byte identical to [`detection_events`](Self::detection_events)
+    /// except for each alert's freshly-minted [`AlertId`]. Cross-block detectors are
+    /// *not* here: they thread `&mut` state and run serially (see [`crate::reorg`]).
+    pub fn detection_events_parallel(&self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
+        use rayon::prelude::*;
+        self.detectors
+            .par_iter()
+            .flat_map_iter(|linked| {
+                linked.plugin.detect(ctx).into_iter().flat_map(|evidence| {
+                    evidence_events(
+                        &linked.detector_ref,
+                        ctx.block(),
+                        ctx.enrichment(),
+                        &evidence,
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -438,6 +488,73 @@ mod tests {
         assert_eq!(arb_alert.confidence, Confidence::new(0.7));
         assert_eq!(arb_alert.addresses, vec![addr(1), addr(9)]);
         assert_eq!(arb_alert.detector, arb_dt.detector);
+    }
+
+    /// Project an event stream to everything *except* the random `AlertId`, so the
+    /// sequential and parallel paths can be compared for order + content (each alert
+    /// mints a fresh id by design, so full `DomainEvent` equality never holds).
+    fn projection(events: &[DomainEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                DomainEvent::DetectorTriggered(d) => {
+                    format!("T:{}:{}:{:?}", d.detector.id, d.detector.version, d.txs)
+                }
+                DomainEvent::PreliminaryAlertCreated(a) => format!(
+                    "A:{}:{:?}:{:?}:{:?}",
+                    a.detector.id, a.kind, a.addresses, a.confidence
+                ),
+                other => other.event_type().to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_fan_out_matches_the_sequential_path_in_order_and_content() {
+        // A multi-detector roster, each finding something — the parallel rayon
+        // fan-out must emit the same events in the same `(id, version)` order as the
+        // sequential reference (only the random AlertId differs, stripped here).
+        let registry = Registry::builder()
+            .register(
+                MockDetector::new("arb", SemVer::new(1, 0, 0)).returning(vec![evidence(
+                    AlertKind::Arbitrage,
+                    vec![hash(1)],
+                    0.7,
+                )]),
+            )
+            .register(
+                MockDetector::new("sandwich", SemVer::new(1, 2, 0)).returning(vec![
+                    evidence(AlertKind::Sandwich, vec![hash(2)], 0.8),
+                    evidence(AlertKind::Sandwich, vec![hash(3)], 0.9),
+                ]),
+            )
+            .build()
+            .unwrap();
+        let models = ModelRegistry::builder()
+            .record(card("arb", SemVer::new(1, 0, 0)))
+            .record(card("sandwich", SemVer::new(1, 2, 0)))
+            .build()
+            .unwrap();
+        let ctx = ctx_with(&[
+            (hash(1), addr(1), addr(9)),
+            (hash(2), addr(2), addr(8)),
+            (hash(3), addr(3), addr(7)),
+        ]);
+
+        let plan = DetectionPlan::link(&registry, &models).unwrap();
+        let sequential = plan.detection_events(&ctx);
+        let parallel = plan.detection_events_parallel(&ctx);
+
+        assert_eq!(
+            projection(&sequential),
+            projection(&parallel),
+            "rayon fan-out must not reorder or change events"
+        );
+        assert_eq!(
+            parallel.len(),
+            6,
+            "two findings + one finding ⇒ three pairs"
+        );
     }
 
     #[test]

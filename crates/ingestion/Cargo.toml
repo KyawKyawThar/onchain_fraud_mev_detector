@@ -15,6 +15,11 @@ path = "src/main.rs"
 [dependencies]
 events = { workspace = true }
 telemetry = { workspace = true }
+# The shared publish seam (§20): `EventSink`/`KafkaEventSink`/`publish_resilient`,
+# re-exported through `crate::publisher`. The Kafka producer config now lives in
+# `event-bus` (shared with detection), so ingestion no longer depends on rdkafka
+# directly.
+event-bus = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -28,10 +33,6 @@ alloy-provider = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 alloy-transport = { workspace = true }
 url = { workspace = true }
-
-# Kafka producer (§20): the ingestion service is the system's first event
-# *producer*. Same librdkafka build the event-store consumer uses.
-rdkafka = { workspace = true }
 
 [dev-dependencies]
 # A hermetic in-process JSON-RPC server (no network, no external node) to prove

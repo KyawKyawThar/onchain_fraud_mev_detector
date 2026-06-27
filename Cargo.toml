@@ -14,6 +14,10 @@ publish = false
 events    = { path = "crates/events" }
 telemetry = { path = "crates/telemetry" }
 db        = { path = "crates/db" }
+# Shared Kafka *producer* seam (§20): the `EventSink` trait + `KafkaEventSink` +
+# the at-least-once `publish_resilient` policy, depended on by every event
+# producer (ingestion, detection, …) so the producer config lives in one place.
+event-bus = { path = "crates/event-bus" }
 # Detection seam (§6): `detector-api` is the thin, stable contract every detector
 # builds against — the `DetectorPlugin` trait + `DetectionCtx`/enrichment, and
 # nothing of the service's internals. The `detection` service crate re-exports it
@@ -76,6 +80,12 @@ url = "2"
 # `net`/`signal`/`time` are for network services (axum listener, SIGTERM-driven
 # graceful shutdown) — added when the event-store service landed (§4).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+
+# CPU-bound work pool (§17): the detection service fans each block's Block-scoped
+# detectors out over rayon (off the async reactor) — and the simulation workers
+# (Sprint 5) run revm on it. A data-parallel pool, not async: the scheduler
+# bridges to it via `spawn_blocking` so the reactor is never blocked.
+rayon = "1"
 
 # Event-store service (§4): HTTP append API + ClickHouse storage + Kafka ingest.
 # axum    — internal append API (write-authenticated).

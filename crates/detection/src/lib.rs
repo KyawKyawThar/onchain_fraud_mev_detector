@@ -48,11 +48,13 @@
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
+pub mod config;
 pub mod emit;
 pub mod flags;
 pub mod model;
 pub mod registry;
 pub mod reorg;
+pub mod scheduler;
 pub mod state;
 
 // Re-export the detector seam so downstream code keeps using `detection::*`
@@ -73,5 +75,8 @@ pub use model::{
     ModelRegistryError, Performance,
 };
 pub use registry::{register_builtins, Registry, RegistryBuilder, RegistryError};
-pub use reorg::{apply_reverts, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind};
+pub use reorg::{
+    apply_reverts, CrossBlockSlot, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind,
+};
+pub use scheduler::{BlockEvent, Scheduler};
 pub use state::CrossBlockState;

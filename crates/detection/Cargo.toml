@@ -14,15 +14,37 @@ publish.workspace = true
 # the synchronous emission core (`emit`, `state`); the async/Kafka consumer loop
 # and rayon fan-out land in Sprint 4.
 
+[[bin]]
+name = "detection"
+path = "src/main.rs"
+
 [dependencies]
 # The detector seam — re-exported so downstream keeps using `detection::*`.
 detector-api = { workspace = true }
 events = { workspace = true }
+# Shared publish seam (§20) — the scheduler ships detector/alert events through
+# the same `EventSink`/`publish_resilient` ingestion uses.
+event-bus = { workspace = true }
+telemetry = { workspace = true }
 
+anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
+tracing = { workspace = true }
+
+# Concurrency model (§17, Sprint 4 task 2): the async scheduler runs on `tokio`
+# with bounded `mpsc` channels for inter-stage backpressure and a
+# `CancellationToken` for graceful drain; `rayon` is the CPU pool the per-block
+# Block-detector fan-out runs on (bridged off the reactor via `spawn_blocking`);
+# `rdkafka` is the `BlockAssembled`/`BlockReverted` consumer + the producer behind
+# `KafkaEventSink`; `async-trait` for the consumer/sink seams.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+rayon = { workspace = true }
+rdkafka = { workspace = true }
+async-trait = { workspace = true }
 
 # Model registry (§6, task 2). `chrono` carries each model card's `deployed_at`
 # timestamp; `sha2` computes the `config_hash` that pins a detector's active

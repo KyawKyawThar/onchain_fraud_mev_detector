@@ -58,13 +58,9 @@ use events::{DomainEvent, EventEnvelope};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::publisher::EventSink;
+use crate::publisher::{publish_resilient, EventSink, PUBLISH_BACKOFF};
 use crate::source::{ChainHead, ChainSource};
 use crate::tree::{AddOutcome, BlockTree, CanonicalUpdate};
-
-/// Back-off between retries of a transient publish failure, so a broker blip
-/// doesn't hot-loop the producer. Matches the event-store consumer's `RETRY_BACKOFF`.
-const PUBLISH_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Drives heads through the [`BlockTree`] and emits the resulting chain events.
 pub struct Pipeline {
@@ -225,46 +221,17 @@ impl Pipeline {
     /// retries so a redelivery is deduped downstream (§7).
     async fn publish_all(&self, payloads: Vec<DomainEvent>) {
         for payload in payloads {
-            self.publish_resilient(EventEnvelope::new(self.chain, payload))
-                .await;
-        }
-    }
-
-    /// Publish one envelope, retrying a *transient* failure (broker blip) until it
-    /// succeeds or shutdown — so a momentary outage can't leave a permanent hole
-    /// in the audit stream (the events can't be re-derived; see [module docs](self)).
-    /// A *permanent* failure (encode bug) is logged and skipped.
-    async fn publish_resilient(&self, envelope: EventEnvelope) {
-        loop {
-            match self.sink.publish(envelope.clone()).await {
-                Ok(()) => return,
-                Err(err) if err.is_transient() => {
-                    tracing::warn!(
-                        error = %err,
-                        event_type = envelope.event_type(),
-                        "transient publish failure; retrying after backoff"
-                    );
-                    tokio::select! {
-                        biased;
-                        _ = self.shutdown.cancelled() => {
-                            tracing::error!(
-                                event_type = envelope.event_type(),
-                                "shutdown during publish retry; event not delivered"
-                            );
-                            return;
-                        }
-                        _ = tokio::time::sleep(self.publish_backoff) => {}
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        error = %err,
-                        event_type = envelope.event_type(),
-                        "permanent publish failure; dropping event"
-                    );
-                    return;
-                }
-            }
+            // The shared at-least-once policy ([`event_bus::publish_resilient`]):
+            // retry a transient broker blip until it succeeds or shutdown, skip a
+            // permanent encode bug. The envelope (and its `event_id`) is fixed
+            // across retries so a redelivery is deduped downstream (§7).
+            publish_resilient(
+                self.sink.as_ref(),
+                EventEnvelope::new(self.chain, payload),
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await;
         }
     }
 }
