@@ -105,6 +105,16 @@ services:
       - zookeeper
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    # Probe the broker itself, not just the port — a lost ZooKeeper session can
+    # shut the broker JVM down while the container stays "Up" and Docker's proxy
+    # keeps accepting on 9092 (then clients see AllBrokersDown). A real metadata
+    # query marks that state `unhealthy` instead of silently dead.
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 45s
 
   # ── Redpanda Console (Kafka dev UI) ─────────────────────────────
   redpanda-console:
@@ -137,6 +147,56 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── Prometheus (metrics scrape, §19) ────────────────────────────
+  # Scrapes each service's /metrics — today the detection service's per-detector
+  # hit rate + latency. Targets live in ./prometheus.yml; services run on the
+  # host, so `host.docker.internal` (mapped below for Linux too) reaches them.
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    networks: [backend]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Grafana (metrics dashboards, §19) ───────────────────────────
+  # Datasource + per-detector dashboard are auto-provisioned from
+  # ./grafana/provisioning + ./grafana/dashboards, so they exist on first boot
+  # with no click-ops. Login: GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD (.env),
+  # defaulting to admin / admin.
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    networks: [backend]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
 # ─────────────────────────────────────────────
 # Networks
 # ─────────────────────────────────────────────
@@ -152,3 +212,5 @@ volumes:
   redis_data:
   clickhouse_data:
   rabbitmq_data:
+  prometheus_data:
+  grafana_data:

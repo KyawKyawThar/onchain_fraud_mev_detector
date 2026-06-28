@@ -3,6 +3,8 @@
 //! `telemetry`). Everything downstream takes an explicit [`Config`] so the rest of
 //! the service stays pure and testable.
 
+use std::net::SocketAddr;
+
 use anyhow::{bail, Result};
 use events::primitives::Chain;
 
@@ -20,6 +22,10 @@ pub struct Config {
     /// Capacity of the bounded scheduler→committer channel — published-but-not-yet-
     /// committed blocks. Defaults to 256.
     pub commit_buffer: usize,
+    /// Address the Prometheus `/metrics` endpoint binds to (§19 — per-detector
+    /// hit/latency, plus future service metrics). Defaults to `0.0.0.0:9100`, so a
+    /// scraper on the deploy network reaches it without extra config.
+    pub metrics_addr: SocketAddr,
 }
 
 /// How to reach Kafka: the broker list, and the consumer group whose committed
@@ -49,6 +55,10 @@ impl Config {
             },
             work_buffer,
             commit_buffer,
+            metrics_addr: env_parse(
+                "DETECTION_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9100)),
+            )?,
         })
     }
 }

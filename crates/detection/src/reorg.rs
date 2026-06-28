@@ -154,8 +154,16 @@ impl<D: CrossBlockDetector> CrossBlockSlot for Slot<D> {
             .state
             .current()
             .expect("a snapshot was just applied for this block");
-        self.detector
-            .detect(ctx, snapshot)
+
+        // Time + count the `detect` seam call, the same per-detector hit/latency
+        // the `Block` paths record (§19). `observe` is excluded: hit rate is about
+        // findings per block, and latency tracks the detect call the dashboards
+        // compare across detectors regardless of scope.
+        let start = std::time::Instant::now();
+        let evidence = self.detector.detect(ctx, snapshot);
+        crate::metrics::record_detector_run(&self.detector_ref, start.elapsed(), evidence.len());
+
+        evidence
             .iter()
             .flat_map(|evidence| {
                 evidence_events(&self.detector_ref, ctx.block(), ctx.enrichment(), evidence)

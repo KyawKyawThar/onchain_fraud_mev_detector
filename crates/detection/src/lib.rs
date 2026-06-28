@@ -30,6 +30,10 @@
 //!   `DetectorTriggered`/`PreliminaryAlertCreated` wire events, stamped with the
 //!   exact [`DetectorRef`] triple. Pairing once and failing on an uncatalogued
 //!   detector keeps the per-block emit path total (no fabricated `config_hash`).
+//! - [`metrics`] — **per-detector metrics** (Sprint 4 task 3): the single
+//!   [`metrics::record_detector_run`] every emit path calls per `detect`
+//!   invocation, recording hit rate (`hits / runs`) and latency through the
+//!   `metrics` facade (§19), exported by the binary via [`telemetry::metrics`].
 //! - [`state`] — **reorg-versioned cross-block state** (task 5):
 //!   [`state::CrossBlockState`], the per-block snapshot store a `Scope::CrossBlock`
 //!   detector accumulates into so it can be rewound to a common ancestor on a reorg
@@ -51,6 +55,7 @@
 pub mod config;
 pub mod emit;
 pub mod flags;
+pub mod metrics;
 pub mod model;
 pub mod registry;
 pub mod reorg;

@@ -1,0 +1,18 @@
+# Prometheus scrape config (§19). Scrapes each service's /metrics endpoint —
+# today the detection service's per-detector hit rate + latency
+# (detector_runs_total / detector_hits_total / detector_detect_duration_seconds).
+#
+# The services run on the **host** (they aren't containerized in this compose yet),
+# so targets reach them via `host.docker.internal`, mapped to the host gateway in
+# the Prometheus service's `extra_hosts`. When a service is containerized, switch
+# its target to the compose service name on the `backend` network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: detection
+    static_configs:
+      - targets: ["host.docker.internal:9100"] # DETECTION_METRICS_ADDR
+        labels:
+          service: detection
