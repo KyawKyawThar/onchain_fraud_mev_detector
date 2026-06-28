@@ -1,0 +1,14 @@
+# Auto-provisioned Prometheus datasource (§19). Grafana reads this on boot, so the
+# datasource exists without any click-ops. `prometheus` is the compose service
+# name, reachable on the `backend` network. The fixed `uid` is what the
+# per-detector dashboard panels reference.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

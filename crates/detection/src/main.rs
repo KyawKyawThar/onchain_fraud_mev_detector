@@ -38,6 +38,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    // Install the Prometheus exporter before any detection runs, so the
+    // per-detector hit/latency series (§19) are exported from the first block.
+    // Inside the Tokio runtime: the exporter spawns its `/metrics` listener here.
+    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+
     // Roster (compile-time + runtime flags) paired with its model cards once at
     // boot — `link` fails fast if any live detector is uncatalogued, so the hot
     // path never has to fabricate a config_hash (the link-or-fail discipline).

@@ -163,6 +163,19 @@ struct LinkedDetector {
     detector_ref: DetectorRef,
 }
 
+impl LinkedDetector {
+    /// Run this detector over `ctx`, recording its latency + hit/miss (§19) around
+    /// the seam call, and return the findings. The single instrumented call site
+    /// both `Block` emit paths route through, so the per-detector metrics can't
+    /// diverge between the sequential reference and the rayon fan-out.
+    fn detect(&self, ctx: &DetectionCtx) -> Vec<Evidence> {
+        let start = std::time::Instant::now();
+        let evidence = self.plugin.detect(ctx);
+        crate::metrics::record_detector_run(&self.detector_ref, start.elapsed(), evidence.len());
+        evidence
+    }
+}
+
 /// The emission roster: every live detector paired with its `(id, version,
 /// config_hash)` triple, validated once at [`link`](Self::link) time (§6, task 5).
 ///
@@ -242,7 +255,7 @@ impl DetectionPlan {
     pub fn detection_events(&self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
         let mut events = Vec::new();
         for linked in &self.detectors {
-            for evidence in linked.plugin.detect(ctx) {
+            for evidence in linked.detect(ctx) {
                 events.extend(evidence_events(
                     &linked.detector_ref,
                     ctx.block(),
@@ -270,7 +283,7 @@ impl DetectionPlan {
         self.detectors
             .par_iter()
             .flat_map_iter(|linked| {
-                linked.plugin.detect(ctx).into_iter().flat_map(|evidence| {
+                linked.detect(ctx).into_iter().flat_map(|evidence| {
                     evidence_events(
                         &linked.detector_ref,
                         ctx.block(),
@@ -623,5 +636,64 @@ mod tests {
                 version: SemVer::new(1, 2, 0),
             }
         );
+    }
+
+    // ── per-detector metrics wiring (§19, task 3) ─────────────────────
+
+    /// The `detect` seam is instrumented at the single [`LinkedDetector::detect`]
+    /// call site **both** `Block` paths route through, so running a plan records a
+    /// run per detector and a hit only for the one that found something. Asserted
+    /// here on the sequential path; the rayon fan-out calls the identical
+    /// `LinkedDetector::detect`, so it instruments by the same code (it can't be
+    /// asserted with a thread-*local* recorder, since the rayon workers don't see
+    /// it — in production the recorder is process-global, so they do).
+    fn runs_and_hits(events: impl FnOnce()) -> (u64, u64) {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, events);
+
+        let (mut runs, mut hits) = (0u64, 0u64);
+        for (ck, _, _, value) in snapshotter.snapshot().into_vec() {
+            if let DebugValue::Counter(n) = value {
+                match ck.key().name() {
+                    crate::metrics::RUNS_TOTAL => runs += n,
+                    crate::metrics::HITS_TOTAL => hits += n,
+                    _ => {}
+                }
+            }
+        }
+        (runs, hits)
+    }
+
+    /// A two-detector plan: "arb" fires once, "sandwich" finds nothing.
+    fn plan_one_hit_one_miss() -> DetectionPlan {
+        let registry = Registry::builder()
+            .register(
+                MockDetector::new("arb", SemVer::new(1, 0, 0)).returning(vec![evidence(
+                    AlertKind::Arbitrage,
+                    vec![hash(1)],
+                    0.7,
+                )]),
+            )
+            .register(MockDetector::new("sandwich", SemVer::new(1, 2, 0))) // returns []
+            .build()
+            .unwrap();
+        let models = ModelRegistry::builder()
+            .record(card("arb", SemVer::new(1, 0, 0)))
+            .record(card("sandwich", SemVer::new(1, 2, 0)))
+            .build()
+            .unwrap();
+        DetectionPlan::link(&registry, &models).unwrap()
+    }
+
+    #[test]
+    fn detection_records_a_run_per_detector_and_a_hit_only_for_a_finding() {
+        let plan = plan_one_hit_one_miss();
+        let ctx = ctx_with(&[(hash(1), addr(1), addr(9))]);
+
+        // Two detectors ran; only "arb" found something.
+        assert_eq!(runs_and_hits(|| drop(plan.detection_events(&ctx))), (2, 1));
     }
 }

@@ -1,0 +1,28 @@
+[package]
+name = "demo-detector"
+version = "0.1.0"        # mirrors the detector's `SemVer` build version (§6).
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Demo / test detector — `demo-v0.1`. NOT a real MEV heuristic: it fires a
+# synthetic finding on a deterministic schedule (even-numbered blocks) regardless
+# of transaction content, so the per-detector metrics (§19) — hit rate, findings,
+# latency — and the full DetectorTriggered/PreliminaryAlertCreated emit path can
+# be exercised end-to-end while the live source is still header-only (no decoded
+# txs for the real detectors to fire on). Linked only behind the detection crate's
+# `demo` Cargo feature; never compiled into a real build. Same seam as every
+# detector: depends on `detector-api`, not on `detection` (no cycle).
+
+[dependencies]
+detector-api = { workspace = true }
+events = { workspace = true }
+
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# `B256` for the synthetic-block test fixtures.
+alloy-primitives = { workspace = true }
+
+[lints]
+workspace = true

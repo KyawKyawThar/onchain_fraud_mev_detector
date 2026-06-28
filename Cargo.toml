@@ -30,6 +30,10 @@ detector-api     = { path = "crates/detector-api" }
 detection        = { path = "crates/detection" }
 sandwich-detector = { path = "crates/sandwich-detector" }
 arb-detector      = { path = "crates/arb-detector" }
+# Dev/test-only synthetic detector (§19): fires on a fixed schedule regardless of
+# tx content, so the per-detector metrics + emit path can be demoed while the live
+# source is header-only. Linked only behind detection's `demo` feature.
+demo-detector     = { path = "crates/demo-detector" }
 
 # Errors.
 anyhow = "1"
@@ -132,6 +136,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = "0.27"
+
+# Application metrics (§19): `metrics` is the lightweight facade a service records
+# through at the call site (e.g. per-detector hit/latency). The recording is a
+# near-free no-op until an exporter installs the global recorder, so the hot path
+# needn't know whether anything is scraping. `metrics-exporter-prometheus` is that
+# exporter — installed once per service (like `telemetry::init`), it owns the
+# global recorder and serves the `/metrics` Prometheus scrape endpoint on its own
+# HTTP listener (`http-listener`; the unused push-gateway path is trimmed).
+# `metrics-util` is the test-only in-memory recorder used to assert on recorded
+# series without standing up a scrape.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+metrics-util = "0.20"
 
 # Lints defined once, inherited by every crate via `[lints] workspace = true`.
 # This is what makes `cargo build`/`clippy` enforce the same bar locally that CI

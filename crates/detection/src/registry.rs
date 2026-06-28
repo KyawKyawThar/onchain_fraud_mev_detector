@@ -180,6 +180,13 @@ pub fn register_builtins(flags: &FeatureFlags) -> Registry {
         flags.is_enabled(arb_detector::ArbDetector::ID),
         arb_detector::plugin(), // arb-v1.0
     );
+    // Dev/demo only (§19): synthetic detector that fires on a fixed schedule so
+    // the per-detector metrics + emit path light up on a header-only source.
+    #[cfg(feature = "demo")]
+    b.register_if(
+        flags.is_enabled(demo_detector::DemoDetector::ID),
+        demo_detector::plugin(), // demo-v0.1
+    );
 
     b.build()
         .expect("built-in detector roster has a duplicate (id, version) — fix register_builtins")

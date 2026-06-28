@@ -33,6 +33,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
 tracing = { workspace = true }
+# Per-detector metrics (§19, task 3): every `detect` run records its latency + a
+# hit/miss through the `metrics` facade; the binary exports them via
+# `telemetry::metrics`. A no-op until an exporter installs the global recorder.
+metrics = { workspace = true }
 
 # Concurrency model (§17, Sprint 4 task 2): the async scheduler runs on `tokio`
 # with bounded `mpsc` channels for inter-stage backpressure and a
@@ -60,6 +64,8 @@ sha2 = { workspace = true }
 # `detector-api` (not this crate), there's no dependency cycle.
 sandwich-detector = { workspace = true, optional = true }
 arb-detector = { workspace = true, optional = true }
+# Dev/test-only synthetic detector behind the `demo` feature (§19) — see below.
+demo-detector = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -69,11 +75,19 @@ default = []
 sandwich = ["dep:sandwich-detector"]
 arb = ["dep:arb-detector"]
 detectors = ["sandwich", "arb"]
+# Link the synthetic `demo` detector (§19): fires on a deterministic schedule
+# regardless of tx content, so the per-detector metrics (hit rate/findings/
+# latency) and the emit path can be exercised end-to-end while the live source is
+# still header-only. Dev/demo only — never enable in a real build.
+demo = ["dep:demo-detector"]
 
 [dev-dependencies]
 # `MockDetector`/`dummy_evidence` for the registry/model tests — the seam's test
 # doubles now live in `detector-api` behind its `test-util` feature.
 detector-api = { workspace = true, features = ["test-util"] }
+# In-memory recorder so the metrics tests can assert on recorded series (runs,
+# hits, latency) under a scoped recorder — no global install, no scrape.
+metrics-util = { workspace = true }
 
 [lints]
 workspace = true

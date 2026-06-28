@@ -1,6 +1,6 @@
 //! Observability foundation (§19).
 //!
-//! Two responsibilities, and only these:
+//! Three responsibilities, and only these:
 //!
 //! 1. [`init`] — stand up `tracing` for a service: an `EnvFilter` (via
 //!    `RUST_LOG`), a fmt layer (`pretty` or `json`, chosen by `LOG_FORMAT`), and
@@ -10,6 +10,10 @@
 //!    headers and re-establish it on the consumer side, so a trace started in
 //!    one service continues in the next. The carrier is a plain string map,
 //!    which the Kafka producer/consumer (Sprint 1) adapts to record headers.
+//! 3. [`metrics::init`] — install the global Prometheus recorder and serve the
+//!    `/metrics` scrape endpoint, so a service's [`metrics`](https://docs.rs/metrics)
+//!    call sites (e.g. per-detector hit/latency) are exported the same way
+//!    everywhere.
 //!
 //! [W3C trace-context]: https://www.w3.org/TR/trace-context/
 
@@ -21,6 +25,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+pub mod metrics;
 pub mod propagation;
 
 /// Held for the lifetime of `main`. On drop it flushes and shuts the tracer

@@ -1,0 +1,115 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["detection", "mev", "§19"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Detection — per-detector metrics (§19)",
+  "uid": "detection-per-detector",
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "detector",
+        "label": "Detector",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(detector_runs_total, detector)", "refId": "detectors" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Hit rate (hits / runs)",
+      "description": "Fraction of invocations that produced at least one finding, per detector.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (detector) (rate(detector_hits_total{detector=~\"$detector\"}[$__rate_interval])) / sum by (detector) (rate(detector_runs_total{detector=~\"$detector\"}[$__rate_interval]))",
+          "legendFormat": "{{detector}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Detect latency p50 / p99 (s)",
+      "description": "Per-detector detect() call latency from the histogram.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (detector, le) (rate(detector_detect_duration_seconds_bucket{detector=~\"$detector\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{detector}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (detector, le) (rate(detector_detect_duration_seconds_bucket{detector=~\"$detector\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{detector}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Detector runs / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (detector) (rate(detector_runs_total{detector=~\"$detector\"}[$__rate_interval]))",
+          "legendFormat": "{{detector}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Findings / sec",
+      "description": "Total findings emitted per second (a detector can fire more than once per block).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (detector) (rate(detector_findings_total{detector=~\"$detector\"}[$__rate_interval]))",
+          "legendFormat": "{{detector}}"
+        }
+      ]
+    }
+  ]
+}

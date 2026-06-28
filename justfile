@@ -70,6 +70,23 @@ redis-shell:
 ch-shell:
     {{compose}} exec clickhouse clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB"
 
+# ── Observability (metrics, §19) ─────────────────────────────────
+# Prometheus scrapes each service's /metrics; Grafana visualizes it (datasource +
+# per-detector dashboard auto-provisioned). Services run on the host, so
+# Prometheus reaches them via host.docker.internal (deploy/prometheus.yml). Run a
+# service (e.g. `just run-detection`) so there's something to scrape.
+
+# Start Prometheus + Grafana
+metrics-up:
+    {{compose}} up -d prometheus grafana
+    @echo "📊 Prometheus → http://localhost:${PROMETHEUS_PORT:-9090}"
+    @echo "📈 Grafana    → http://localhost:${GRAFANA_PORT:-3000}  (login: ${GRAFANA_ADMIN_USER:-admin} / ${GRAFANA_ADMIN_PASSWORD:-admin})"
+    @echo "   Dashboard: 'Detection — per-detector metrics (§19)'"
+
+# Stop Prometheus + Grafana (keeps their volumes)
+metrics-down:
+    {{compose}} stop prometheus grafana
+
 # ── Migrations (sqlx-cli) ────────────────────────────────────────
 
 # Create a new migration: just new-migration add_foo
@@ -140,6 +157,13 @@ run-ingestion:
 # sandwich + arb detectors (the lib default links none).
 run-detection:
     cargo run -p detection --features detectors
+
+# Run detection with the synthetic `demo` detector linked (§19). It fires on a
+# fixed schedule regardless of tx content, so the per-detector metrics (hit rate,
+# findings, latency) and the emit path light up on a header-only source — for
+# demoing the Grafana dashboard. Dev only; never run this against real traffic.
+run-detection-demo:
+    cargo run -p detection --features detectors,demo
 
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:

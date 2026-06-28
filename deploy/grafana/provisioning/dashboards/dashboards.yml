@@ -1,0 +1,16 @@
+# Auto-provisioned dashboard provider (§19). Grafana loads every dashboard JSON
+# under the mounted path on boot, so the per-detector dashboard appears without
+# manual import.
+apiVersion: 1
+
+providers:
+  - name: detection
+    orgId: 1
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

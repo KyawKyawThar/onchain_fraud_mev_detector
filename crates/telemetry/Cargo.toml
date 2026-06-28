@@ -6,8 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 # Observability foundation (§19): one place every service calls to wire up
-# `tracing` and W3C trace-context propagation, so distributed traces stitch
-# across service boundaries. No service-specific logic lives here.
+# `tracing` + W3C trace-context propagation and the Prometheus metrics exporter,
+# so distributed traces stitch across service boundaries and every service
+# exposes `/metrics` the same way. No service-specific logic lives here.
 
 [lints]
 workspace = true
@@ -19,6 +20,9 @@ tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+# Prometheus exporter (§19): `telemetry::metrics::init` installs the global
+# recorder + `/metrics` HTTP listener — the metrics counterpart to `init`.
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
