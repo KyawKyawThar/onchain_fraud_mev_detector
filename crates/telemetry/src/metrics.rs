@@ -46,9 +46,11 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[
 /// recorder in the same process fails — there is only one global — so this is a
 /// boot-time, fail-fast call, mirroring [`crate::init`].
 pub fn init(addr: SocketAddr) -> anyhow::Result<()> {
+    // Any `_seconds` metric is a latency histogram; bucket it (see above).
+    let latency = Matcher::Suffix("_seconds".to_owned());
     PrometheusBuilder::new()
         .with_http_listener(addr)
-        .set_buckets_for_metric(Matcher::Suffix("_seconds".to_owned()), LATENCY_BUCKETS_SECONDS)
+        .set_buckets_for_metric(latency, LATENCY_BUCKETS_SECONDS)
         .context("configuring latency histogram buckets")?
         .install()
         .context("installing the Prometheus metrics exporter")?;

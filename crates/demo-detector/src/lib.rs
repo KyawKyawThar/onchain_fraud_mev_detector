@@ -62,8 +62,10 @@ impl DetectorPlugin for DemoDetector {
         let block = ctx.block();
         // Deterministic synthetic signal: fire on even blocks only, so the
         // hit-rate metric (`hits / runs`) lands near 0.5 over a stream rather than
-        // a flat 1.0. Odd blocks are a "run" with no finding (a miss).
-        if !block.number.is_multiple_of(2) {
+        // a flat 1.0. Odd blocks are a "run" with no finding (a miss). Bitwise
+        // even-test, not `% 2`/`is_multiple_of`, to dodge the rustc-version /
+        // clippy disagreement those trigger across toolchains.
+        if (block.number & 1) == 1 {
             return Vec::new();
         }
 
