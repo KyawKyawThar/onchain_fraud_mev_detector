@@ -27,3 +27,10 @@ uuid.workspace = true
 alloy-primitives.workspace = true
 thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Property-based round-trip for the event codec: prove `from_json_slice ∘
+# to_json_vec` is the identity over the whole `DomainEvent` value space, not just
+# the hand-picked goldens in `tests/wire_format.rs` (Sprint 4 task 4 / the schema
+# follow-up carried from Sprint 1).
+proptest.workspace = true

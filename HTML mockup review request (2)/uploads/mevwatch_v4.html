@@ -1,0 +1,2137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MEVWatch v2</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.8.0/tabler-icons.min.css">
+<style>
+:root{
+  --bg:#0d0f14;--bg2:#131720;--bg3:#1a1f2e;--bg4:#212840;
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.14);
+  --text:#e2e4ed;--muted:#7b8099;--faint:#3d4260;
+  --teal:#1fc8a4;--teal-dim:#0d6b58;--teal-bg:rgba(31,200,164,0.08);
+  --amber:#f0a840;--amber-dim:#7a5010;--amber-bg:rgba(240,168,64,0.08);
+  --red:#e84b4b;--red-dim:#7a1c1c;--red-bg:rgba(232,75,75,0.08);
+  --purple:#a27af0;--purple-bg:rgba(162,122,240,0.08);
+  --coral:#e8693c;--coral-bg:rgba(232,105,60,0.08);
+  --blue:#4a9ef0;--blue-bg:rgba(74,158,240,0.08);
+  --mono:'JetBrains Mono','Fira Code',monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --r:6px;--r2:10px;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;min-height:100vh;overflow-x:hidden;}
+
+/* NAV */
+.topnav{display:flex;align-items:center;height:52px;padding:0 18px;background:var(--bg2);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:200;}
+.logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px;color:var(--text);text-decoration:none;margin-right:16px;flex-shrink:0;}
+.logo-icon{width:26px;height:26px;background:linear-gradient(135deg,var(--teal),var(--purple));border-radius:6px;display:flex;align-items:center;justify-content:center;}
+.logo-icon i{font-size:14px;color:#fff;}
+.logo .sub{color:var(--muted);font-weight:400;font-size:12px;}
+.nav-tabs{display:flex;gap:1px;overflow-x:auto;}
+.nav-tab{padding:5px 11px;border-radius:var(--r);color:var(--muted);font-size:12px;cursor:pointer;border:none;background:transparent;font-family:var(--sans);display:flex;align-items:center;gap:5px;transition:background .15s,color .15s;white-space:nowrap;}
+.nav-tab:hover{background:var(--bg3);color:var(--text);}
+.nav-tab.active{background:var(--bg4);color:var(--text);}
+.nav-tab i{font-size:13px;}
+.nav-badge{background:var(--red-bg);color:var(--red);font-size:9px;padding:1px 4px;border-radius:8px;font-family:var(--mono);}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:7px;flex-shrink:0;}
+.chain-pill{display:flex;align-items:center;gap:5px;padding:4px 9px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;font-size:11px;color:var(--muted);white-space:nowrap;cursor:pointer;}
+.chain-pill:hover{border-color:var(--border2);color:var(--text);}
+.dot-live{width:6px;height:6px;border-radius:50%;background:var(--teal);box-shadow:0 0 6px var(--teal);animation:pulse 2s infinite;flex-shrink:0;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.icon-btn{width:30px;height:30px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted);transition:all .15s;}
+.icon-btn:hover{background:var(--bg4);color:var(--text);}
+.icon-btn i{font-size:14px;}
+.global-search{display:flex;align-items:center;gap:6px;padding:5px 11px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;min-width:240px;transition:border-color .15s;}
+.global-search:focus-within{border-color:var(--teal-dim);}
+.global-search i{font-size:13px;color:var(--muted);}
+.global-search input{background:none;border:none;outline:none;font-size:12px;color:var(--text);font-family:var(--sans);width:100%;}
+.global-search input::placeholder{color:var(--muted);}
+
+/* PIPELINE BAR - collapsible */
+.pipeline-wrap{background:var(--bg2);border-bottom:1px solid var(--border);overflow:hidden;transition:max-height .3s ease;}
+.pipeline-wrap.expanded{max-height:60px;}
+.pipeline-wrap.collapsed{max-height:0;border-bottom:none;}
+.pipeline-bar{padding:9px 18px;overflow-x:auto;}
+.pipeline-bar-inner{display:flex;align-items:center;min-width:max-content;}
+.pipe-stage{display:flex;align-items:center;gap:8px;padding:6px 11px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);position:relative;}
+.pipe-stage.ok{border-color:var(--teal-dim);background:var(--teal-bg);}
+.pipe-stage.warn{border-color:var(--amber-dim);background:var(--amber-bg);}
+.ps-icon{width:22px;height:22px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;}
+.ps-icon.t{background:var(--teal-bg);color:var(--teal);}
+.ps-icon.a{background:var(--amber-bg);color:var(--amber);}
+.ps-icon.p{background:var(--purple-bg);color:var(--purple);}
+.ps-icon.b{background:var(--blue-bg);color:var(--blue);}
+.ps-icon.c{background:var(--coral-bg);color:var(--coral);}
+.ps-name{font-size:11px;font-weight:500;}
+.ps-stat{font-size:10px;font-family:var(--mono);}
+.ps-stat.ok{color:var(--teal);}
+.ps-stat.warn{color:var(--amber);}
+.pipe-dot{position:absolute;top:-4px;right:-4px;width:7px;height:7px;border-radius:50%;border:1.5px solid var(--bg2);}
+.pipe-dot.ok{background:var(--teal);}
+.pipe-dot.warn{background:var(--amber);}
+.pipe-arrow{width:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center;position:relative;}
+.pipe-arrow-line{width:100%;height:1px;background:var(--faint);overflow:hidden;position:relative;}
+.pipe-arrow-flow{position:absolute;top:0;left:-40%;width:40%;height:100%;background:linear-gradient(90deg,transparent,var(--teal),transparent);animation:flow 1.8s linear infinite;}
+@keyframes flow{to{left:140%;}}
+.pipe-arrow i{position:absolute;right:-2px;font-size:10px;color:var(--faint);}
+.pipe-kpi{text-align:center;}
+.pipe-kpi .v{font-family:var(--mono);font-size:13px;font-weight:600;line-height:1.1;}
+.pipe-kpi .l{font-size:9.5px;color:var(--muted);}
+
+/* ANOMALY STRIP - shows when pipeline collapsed */
+.anomaly-strip{display:none;align-items:center;gap:8px;padding:5px 18px;background:rgba(240,168,64,.06);border-bottom:1px solid rgba(240,168,64,.15);font-size:11px;color:var(--amber);}
+.anomaly-strip.visible{display:flex;}
+.anomaly-strip i{font-size:13px;flex-shrink:0;}
+
+/* PAGES */
+.page{display:none;}
+.page.active{display:block;}
+
+/* SHARED */
+.page-inner{max-width:1200px;margin:0 auto;padding:22px 28px;}
+.page-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px;gap:14px;}
+.page-hdr-left h1{font-size:17px;font-weight:600;margin-bottom:3px;}
+.page-hdr-left p{font-size:11.5px;color:var(--muted);}
+.page-hdr-right{display:flex;gap:7px;flex-shrink:0;flex-wrap:wrap;align-items:center;}
+.btn{display:flex;align-items:center;gap:5px;padding:6px 13px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:12px;cursor:pointer;font-family:var(--sans);transition:all .15s;white-space:nowrap;}
+.btn:hover{background:var(--bg4);border-color:var(--border2);}
+.btn.primary{background:var(--teal-bg);border-color:var(--teal-dim);color:var(--teal);}
+.btn.primary:hover{background:rgba(31,200,164,.14);}
+.btn i{font-size:13px;}
+select.sel{padding:6px 9px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:12px;font-family:var(--sans);cursor:pointer;}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);}
+.card-hdr{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:7px;}
+.card-hdr-title{font-size:12px;font-weight:500;}
+.card-hdr-sub{font-size:11px;color:var(--muted);}
+.tbl{width:100%;border-collapse:collapse;font-size:11.5px;}
+.tbl th{padding:8px 14px;text-align:left;font-weight:500;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);}
+.tbl th.r{text-align:right;}
+.tbl td{padding:8px 14px;border-bottom:1px solid var(--border);}
+.tbl td.r{text-align:right;}
+.tbl tr:last-child td{border-bottom:none;}
+.tbl tr:hover td{background:rgba(255,255,255,.015);}
+.tag{padding:2px 6px;border-radius:4px;font-size:10px;font-weight:500;display:inline-block;}
+.tag-amber{background:var(--amber-bg);color:var(--amber);}
+.tag-red{background:var(--red-bg);color:var(--red);}
+.tag-teal{background:var(--teal-bg);color:var(--teal);}
+.tag-purple{background:var(--purple-bg);color:var(--purple);}
+.tag-blue{background:var(--blue-bg);color:var(--blue);}
+.tag-muted{background:var(--bg4);color:var(--muted);}
+.tag-coral{background:var(--coral-bg);color:var(--coral);}
+.srow{display:grid;gap:9px;margin-bottom:18px;}
+.sbox{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:14px;}
+.sbox .v{font-family:var(--mono);font-size:19px;font-weight:600;line-height:1.1;margin-bottom:3px;}
+.sbox .l{font-size:11px;color:var(--muted);}
+.sbox .delta{font-size:11px;margin-top:4px;}
+
+/* ══ LIVE MONITOR - REDUCED COGNITIVE LOAD ══ */
+.live-layout{display:grid;grid-template-columns:195px 1fr 255px;min-height:calc(100vh - 52px);}
+.sidebar-left{background:var(--bg2);border-right:1px solid var(--border);}
+.sidebar-right{background:var(--bg2);border-left:1px solid var(--border);overflow-y:auto;}
+.sidebar-right::-webkit-scrollbar{width:3px;}
+.sidebar-right::-webkit-scrollbar-thumb{background:var(--faint);}
+.s-label{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:11px 12px 5px;display:block;}
+.s-section{padding:0 8px 11px;border-bottom:1px solid var(--border);}
+.chain-row{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:var(--r);cursor:pointer;margin-bottom:1px;transition:background .15s;}
+.chain-row:hover{background:var(--bg3);}
+.chain-row.active{background:var(--bg4);}
+.chain-icon{width:22px;height:22px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;}
+.c-eth{background:#2f3a72;color:#8fa3f0;}
+.c-arb{background:#1a3050;color:#4a9ef0;}
+.c-base{background:#002a5c;color:#3b82f6;}
+.c-op{background:#4a1010;color:#e84b4b;}
+.chain-name{font-size:11px;font-weight:500;flex:1;}
+.chain-block{font-family:var(--mono);font-size:9.5px;color:var(--muted);}
+.c-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0;}
+.det-item{display:flex;align-items:center;gap:6px;padding:4px 7px;border-radius:var(--r);cursor:pointer;margin-bottom:1px;transition:background .15s;}
+.det-item:hover,.det-item.active{background:var(--bg3);}
+.det-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0;}
+.det-name{font-size:11px;flex:1;}
+.det-count{font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:8px;}
+
+/* MAIN PANEL */
+.main-panel{display:flex;flex-direction:column;overflow:hidden;}
+.main-toolbar{display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.filter-pill{display:flex;align-items:center;gap:4px;padding:3px 9px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;font-size:11px;color:var(--muted);cursor:pointer;transition:all .15s;white-space:nowrap;}
+.filter-pill:hover{border-color:var(--border2);color:var(--text);}
+.filter-pill.active{border-color:var(--teal-dim);color:var(--teal);background:var(--teal-bg);}
+.filter-pill i{font-size:11px;}
+.incident-list{flex:1;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:5px;}
+.incident-list::-webkit-scrollbar{width:3px;}
+.incident-list::-webkit-scrollbar-thumb{background:var(--faint);}
+
+/* ── REDUCED INCIDENT CARD (key change) ── */
+.inc-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);
+  padding:9px 11px 9px 14px;cursor:pointer;
+  transition:border-color .15s,background .15s;
+  position:relative;overflow:hidden;
+}
+.inc-card::before{content:'';position:absolute;top:0;left:0;width:3px;height:100%;}
+.inc-card.critical::before{background:var(--red);}
+.inc-card.high::before{background:var(--amber);}
+.inc-card.medium::before{background:var(--purple);}
+.inc-card.low::before{background:var(--teal);}
+.inc-card:hover{border-color:var(--border2);background:var(--bg3);}
+.inc-card.selected{border-color:var(--border2);background:var(--bg3);}
+.inc-card.provisional{opacity:.82;}
+.inc-card.retracted{opacity:.35;cursor:default;}
+
+/* Triage row - just 2 key facts */
+.inc-triage{display:flex;align-items:center;gap:8px;}
+.type-badge{display:flex;align-items:center;gap:4px;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:500;flex-shrink:0;}
+.type-badge i{font-size:11px;}
+.b-red{background:var(--red-bg);color:var(--red);border:1px solid rgba(232,75,75,.18);}
+.b-amber{background:var(--amber-bg);color:var(--amber);border:1px solid rgba(240,168,64,.18);}
+.b-purple{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(162,122,240,.18);}
+.b-teal{background:var(--teal-bg);color:var(--teal);border:1px solid rgba(31,200,164,.18);}
+.b-coral{background:var(--coral-bg);color:var(--coral);border:1px solid rgba(232,105,60,.18);}
+.b-blue{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(74,158,240,.18);}
+.inc-title{font-size:12px;font-weight:500;flex:1;line-height:1.3;}
+/* Only 2 stats visible by default */
+.inc-key-stats{display:flex;align-items:center;gap:12px;flex-shrink:0;}
+.inc-kstat{text-align:right;}
+.inc-kstat .kv{font-family:var(--mono);font-size:12px;font-weight:600;}
+.inc-kstat .kl{font-size:9.5px;color:var(--muted);}
+.inc-sub-row{display:flex;align-items:center;gap:6px;margin-top:5px;}
+.inc-chain-tag{font-size:10px;color:var(--muted);}
+.inc-status{display:flex;align-items:center;gap:3px;font-size:10px;padding:1px 5px;border-radius:3px;}
+.s-final{background:var(--teal-bg);color:var(--teal);}
+.s-prov{background:var(--amber-bg);color:var(--amber);}
+/* Expandable detail - hidden by default, shown on hover/select */
+.inc-expand{
+  max-height:0;overflow:hidden;
+  transition:max-height .2s ease,opacity .2s ease,margin .2s ease;
+  opacity:0;margin-top:0;
+}
+.inc-card.selected .inc-expand,
+.inc-card:hover .inc-expand{
+  max-height:80px;opacity:1;margin-top:7px;
+}
+.inc-expand-inner{
+  padding-top:7px;border-top:1px solid var(--border);
+  display:flex;flex-wrap:wrap;gap:3px;
+}
+.addr-chip{font-family:var(--mono);font-size:9.5px;padding:1px 5px;border-radius:3px;background:var(--bg4);color:var(--muted);border:1px solid var(--border);}
+.addr-chip.atk{background:var(--red-bg);color:var(--red);}
+.addr-chip.vic{background:var(--blue-bg);color:var(--blue);}
+.addr-chip.bot{background:var(--amber-bg);color:var(--amber);}
+.tx-link{font-family:var(--mono);font-size:9.5px;color:var(--blue);text-decoration:none;margin-left:auto;}
+.tx-link:hover{text-decoration:underline;}
+.reorg-banner{display:flex;align-items:center;gap:8px;padding:6px 10px;background:rgba(240,168,64,.07);border:1px solid rgba(240,168,64,.18);border-radius:var(--r);font-size:11px;color:var(--amber);margin-bottom:3px;}
+
+/* RIGHT SIDEBAR */
+.right-section{padding:11px 13px;border-bottom:1px solid var(--border);}
+.right-section:last-child{border-bottom:none;}
+.rs-title{font-size:10px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;}
+.rs-title button{font-size:11px;color:var(--blue);background:none;border:none;cursor:pointer;font-family:var(--sans);font-weight:400;text-transform:none;letter-spacing:0;}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;}
+.stat-box{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:8px;}
+.stat-box .v{font-family:var(--mono);font-size:15px;font-weight:600;line-height:1.1;}
+.stat-box .l{font-size:10px;color:var(--muted);margin-top:2px;}
+.sp-row{display:flex;align-items:center;gap:5px;margin-bottom:7px;}
+.sp-label{font-size:10px;color:var(--muted);width:62px;flex-shrink:0;}
+.sp-bars{flex:1;display:flex;align-items:flex-end;gap:2px;height:18px;}
+.sp-bar{flex:1;border-radius:1px;}
+.sp-val{font-family:var(--mono);font-size:10px;width:22px;text-align:right;}
+.prec-row{display:flex;align-items:center;gap:5px;margin-bottom:5px;}
+.prec-name{font-size:10px;width:74px;flex-shrink:0;}
+.prec-track{flex:1;height:3px;border-radius:2px;background:var(--bg4);overflow:hidden;}
+.prec-fill{height:100%;border-radius:2px;}
+.prec-val{font-family:var(--mono);font-size:10px;width:28px;text-align:right;color:var(--muted);}
+.block-row{display:flex;align-items:center;gap:5px;padding:4px 0;border-bottom:1px solid var(--border);font-size:10.5px;}
+.block-row:last-child{border-bottom:none;}
+.block-num{font-family:var(--mono);color:var(--blue);font-size:10px;width:68px;}
+.block-txs{color:var(--muted);flex:1;}
+.block-status{padding:1px 5px;border-radius:3px;font-size:9.5px;}
+.block-status.f{background:var(--teal-bg);color:var(--teal);}
+.block-status.p{background:var(--amber-bg);color:var(--amber);}
+.alert-item{display:flex;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:10.5px;}
+.alert-item:last-child{border-bottom:none;}
+.alert-dot{width:5px;height:5px;border-radius:50%;margin-top:3px;flex-shrink:0;}
+.alert-msg{color:var(--muted);line-height:1.5;flex:1;}
+.alert-msg strong{color:var(--text);}
+.alert-time{font-family:var(--mono);color:var(--faint);font-size:10px;white-space:nowrap;}
+.lat-row{display:flex;align-items:center;gap:5px;margin-bottom:4px;}
+.lat-stage{font-size:10px;color:var(--muted);width:50px;flex-shrink:0;}
+.lat-track{flex:1;height:7px;border-radius:2px;background:var(--bg4);overflow:hidden;}
+.lat-fill{height:100%;border-radius:2px;}
+.lat-val{font-family:var(--mono);font-size:10px;width:44px;text-align:right;color:var(--muted);}
+
+/* ══ INTELLIGENCE PAGE ══ */
+.intel-layout{display:grid;grid-template-columns:280px 1fr;min-height:calc(100vh - 52px);gap:0;}
+.intel-sidebar{background:var(--bg2);border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column;}
+.intel-sidebar::-webkit-scrollbar{width:3px;}
+.intel-sidebar::-webkit-scrollbar-thumb{background:var(--faint);}
+.intel-main{overflow-y:auto;background:var(--bg);}
+.intel-main::-webkit-scrollbar{width:3px;}
+.intel-main::-webkit-scrollbar-thumb{background:var(--faint);}
+
+/* Entity list */
+.entity-search{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid var(--border);}
+.entity-search input{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:5px 9px;font-size:11.5px;color:var(--text);font-family:var(--sans);width:100%;outline:none;padding-left:28px;}
+.entity-search input:focus{border-color:var(--teal-dim);}
+.entity-search-wrap{position:relative;flex:1;}
+.entity-search-wrap i{position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--muted);pointer-events:none;}
+.entity-card{padding:11px 13px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;}
+.entity-card:hover{background:var(--bg3);}
+.entity-card.active{background:var(--bg4);border-left:2px solid var(--teal);}
+.entity-top{display:flex;align-items:center;gap:9px;}
+.entity-avatar{width:36px;height:36px;border-radius:var(--r);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.entity-info{flex:1;min-width:0;}
+.entity-name{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.entity-addr{font-family:var(--mono);font-size:10px;color:var(--blue);margin-top:1px;}
+.entity-score{text-align:right;flex-shrink:0;}
+.entity-score .n{font-family:var(--mono);font-size:17px;font-weight:700;line-height:1;}
+.entity-score .l{font-size:9px;color:var(--muted);}
+.entity-tags{display:flex;gap:3px;margin-top:6px;flex-wrap:wrap;}
+.entity-last{font-size:10px;color:var(--faint);margin-top:4px;}
+
+/* Risk score ring */
+.risk-ring-wrap{position:relative;display:inline-block;}
+.risk-ring-wrap .ring-label{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;}
+.ring-label .n{font-family:var(--mono);font-weight:700;line-height:1;}
+.ring-label .d{font-size:9px;color:var(--muted);}
+
+/* Entity detail sections */
+.intel-pad{padding:20px 22px;}
+.intel-section{margin-bottom:22px;}
+.intel-section-title{font-size:10px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;}
+.intel-section-title button{font-size:11px;color:var(--blue);background:none;border:none;cursor:pointer;font-family:var(--sans);font-weight:400;text-transform:none;letter-spacing:0;}
+
+/* Timeline */
+.timeline-wrap{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:14px 16px;}
+.timeline-chart{display:flex;align-items:flex-end;gap:2px;height:52px;margin-bottom:6px;}
+.tl-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;position:relative;}
+.tl-bar{width:100%;border-radius:2px 2px 0 0;transition:opacity .15s;}
+.tl-col:hover .tl-bar{opacity:.7;}
+.tl-lbl{font-size:8.5px;color:var(--faint);}
+.tl-tooltip{position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border2);border-radius:var(--r);padding:4px 7px;font-size:10px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .15s;z-index:10;}
+.tl-col:hover .tl-tooltip{opacity:1;}
+
+/* Spike annotation */
+.tl-annotation{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--muted);margin-top:4px;}
+.tl-annotation i{color:var(--amber);font-size:12px;}
+
+/* Entity graph */
+.graph-wrap{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;position:relative;}
+.graph-canvas{width:100%;height:320px;position:relative;}
+.graph-node{position:absolute;transform:translate(-50%,-50%);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;}
+.graph-node-circle{border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;border:2px solid transparent;transition:transform .15s,border-color .15s;box-shadow:0 0 0 0 transparent;transition:box-shadow .2s;}
+.graph-node:hover .graph-node-circle{transform:scale(1.12);}
+.graph-node.focus .graph-node-circle{border-color:var(--text);box-shadow:0 0 12px rgba(255,255,255,.15);}
+.graph-node-label{font-size:9.5px;color:var(--muted);white-space:nowrap;background:rgba(13,15,20,.85);padding:1px 5px;border-radius:3px;}
+.graph-edge{position:absolute;pointer-events:none;top:0;left:0;}
+.graph-legend{display:flex;gap:12px;padding:10px 14px;border-top:1px solid var(--border);flex-wrap:wrap;}
+.graph-legend-item{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--muted);}
+.graph-legend-dot{width:8px;height:8px;border-radius:50%;}
+
+/* Related entities panel */
+.related-list{display:flex;flex-direction:column;gap:6px;}
+.related-item{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;cursor:pointer;transition:border-color .15s;}
+.related-item:hover{border-color:var(--border2);}
+.related-top{display:flex;align-items:center;gap:8px;}
+.related-avatar{width:28px;height:28px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
+.related-name{font-size:11.5px;font-weight:500;flex:1;}
+.related-addr{font-family:var(--mono);font-size:10px;color:var(--blue);}
+.related-score{font-family:var(--mono);font-size:14px;font-weight:700;}
+.related-signals{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;}
+.signal-chip{font-size:10px;padding:2px 6px;border-radius:3px;display:flex;align-items:center;gap:3px;}
+.signal-chip i{font-size:11px;}
+.signal-shared{background:rgba(162,122,240,.1);color:var(--purple);border:1px solid rgba(162,122,240,.2);}
+.signal-same-builder{background:rgba(31,200,164,.1);color:var(--teal);border:1px solid rgba(31,200,164,.2);}
+.signal-fund-flow{background:rgba(240,168,64,.1);color:var(--amber);border:1px solid rgba(240,168,64,.2);}
+.signal-same-pool{background:rgba(74,158,240,.1);color:var(--blue);border:1px solid rgba(74,158,240,.2);}
+
+/* Cross-entity correlation table */
+.corr-table{width:100%;border-collapse:collapse;font-size:11px;}
+.corr-table th{padding:7px 12px;text-align:left;font-weight:500;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);background:var(--bg3);}
+.corr-table td{padding:7px 12px;border-bottom:1px solid var(--border);}
+.corr-table tr:last-child td{border-bottom:none;}
+.corr-table tr:hover td{background:rgba(255,255,255,.015);}
+.corr-strength{display:flex;align-items:center;gap:5px;}
+.corr-bar{height:4px;border-radius:2px;background:var(--purple);}
+
+/* Investigation thread */
+.thread-box{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:14px 16px;}
+.thread-entry{display:flex;gap:9px;padding:8px 0;border-bottom:1px solid var(--border);}
+.thread-entry:last-child{border-bottom:none;}
+.thread-avatar{width:24px;height:24px;border-radius:50%;background:var(--bg4);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;flex-shrink:0;color:var(--muted);}
+.thread-body{flex:1;}
+.thread-meta{font-size:10.5px;color:var(--muted);margin-bottom:3px;}
+.thread-meta strong{color:var(--text);}
+.thread-text{font-size:11.5px;color:var(--text);line-height:1.5;}
+.thread-attach{display:flex;gap:4px;margin-top:5px;flex-wrap:wrap;}
+.thread-chip{font-family:var(--mono);font-size:10px;padding:2px 6px;border-radius:3px;background:var(--bg3);color:var(--blue);border:1px solid var(--border);}
+.thread-input{display:flex;gap:7px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);}
+.thread-input input{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:6px 10px;font-size:12px;color:var(--text);font-family:var(--sans);outline:none;}
+.thread-input input:focus{border-color:var(--teal-dim);}
+
+/* DRAWER */
+.drawer{position:fixed;top:52px;right:0;bottom:0;width:460px;background:var(--bg2);border-left:1px solid var(--border);z-index:150;transform:translateX(100%);transition:transform .25s ease;display:flex;flex-direction:column;}
+.drawer.open{transform:translateX(0);}
+.drawer-hdr{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.drawer-title{font-size:13px;font-weight:500;flex:1;}
+.drawer-close{width:26px;height:26px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted);}
+.drawer-close:hover{background:var(--bg4);color:var(--text);}
+.drawer-tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;}
+.drawer-tab{padding:8px 13px;font-size:11.5px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none;font-family:var(--sans);white-space:nowrap;}
+.drawer-tab:hover{color:var(--text);}
+.drawer-tab.active{color:var(--text);border-bottom-color:var(--teal);}
+.drawer-body{flex:1;overflow-y:auto;padding:14px 15px;}
+.drawer-body::-webkit-scrollbar{width:3px;}
+.drawer-body::-webkit-scrollbar-thumb{background:var(--faint);}
+.drawer-panel{display:none;}
+.drawer-panel.active{display:block;}
+.ds-title{font-size:10px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;margin-top:14px;}
+.ds-title:first-child{margin-top:0;}
+.kv-row{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;}
+.kv-row:last-child{border-bottom:none;}
+.kv-key{color:var(--muted);width:96px;flex-shrink:0;}
+.kv-val{font-family:var(--mono);color:var(--text);word-break:break-all;}
+.kv-val.pos{color:var(--red);}
+.kv-val.hash{color:var(--blue);font-size:10.5px;}
+.tx-flow{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:8px 10px;}
+.tf-step{display:flex;align-items:center;gap:7px;padding:5px 0;border-bottom:1px solid var(--border);font-size:10.5px;}
+.tf-step:last-child{border-bottom:none;}
+.tf-num{width:17px;height:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;flex-shrink:0;}
+.tf-num.a{background:var(--red-bg);color:var(--red);}
+.tf-num.v{background:var(--blue-bg);color:var(--blue);}
+.tf-desc{flex:1;}
+.tf-hash{font-family:var(--mono);font-size:9.5px;color:var(--muted);}
+.ev-block{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:9px 10px;font-family:var(--mono);font-size:10px;line-height:1.9;}
+.ev-k{color:var(--purple);}
+.ev-v{color:var(--text);}
+.ev-n{color:var(--teal);}
+.trace-tree{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:9px 10px;font-family:var(--mono);font-size:10px;line-height:1.85;}
+.trace-call{color:var(--blue);}
+.trace-fn{color:var(--purple);}
+.trace-val{color:var(--teal);}
+.trace-gas{color:var(--muted);font-size:9.5px;}
+.trace-indent{padding-left:14px;border-left:1px solid var(--faint);margin-left:6px;}
+.profit-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;}
+.profit-row:last-child{border-bottom:none;}
+.profit-total{display:flex;align-items:center;justify-content:space-between;padding:8px 0 0;font-size:12.5px;font-weight:600;}
+.feedback-row{display:flex;gap:5px;}
+.fb-btn{flex:1;padding:6px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);cursor:pointer;font-family:var(--sans);font-size:11px;color:var(--muted);transition:all .15s;display:flex;align-items:center;justify-content:center;gap:4px;}
+.fb-btn i{font-size:12px;}
+/* Risk factor breakdown */
+.factor-row{display:flex;align-items:center;gap:9px;padding:5px 0;}
+.factor-label{font-size:11.5px;color:var(--text);flex:1;}
+.factor-bar-track{width:120px;height:6px;border-radius:3px;background:var(--bg4);overflow:hidden;flex-shrink:0;}
+.factor-bar-fill{height:100%;border-radius:3px;background:var(--red);}
+.factor-pts{font-family:var(--mono);font-size:11.5px;font-weight:600;width:38px;text-align:right;flex-shrink:0;}
+.factor-total-row{display:flex;align-items:center;justify-content:space-between;padding-top:8px;margin-top:4px;border-top:1px solid var(--border);font-size:12px;font-weight:600;}
+.confidence-badge{display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid;}
+.confidence-badge.high{color:var(--teal);background:var(--teal-bg);border-color:var(--teal-dim);}
+.confidence-badge.med{color:var(--amber);background:var(--amber-bg);border-color:var(--amber-dim);}
+.confidence-badge.low{color:var(--muted);background:var(--bg3);border-color:var(--border2);}
+.ring-tooltip{position:relative;display:inline-block;}
+.ring-tooltip .rtip{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border2);border-radius:var(--r);padding:6px 10px;font-size:10.5px;color:var(--text);white-space:nowrap;z-index:50;pointer-events:none;width:200px;white-space:normal;line-height:1.5;}
+.ring-tooltip:hover .rtip{display:block;}
+
+/* Entity history timeline */
+.ehist-list{display:flex;flex-direction:column;}
+.ehist-item{display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);}
+.ehist-item:last-child{border-bottom:none;}
+.ehist-marker{display:flex;flex-direction:column;align-items:center;flex-shrink:0;width:18px;}
+.ehist-dot{width:9px;height:9px;border-radius:50%;border:2px solid var(--bg2);box-shadow:0 0 0 1px var(--border2);flex-shrink:0;margin-top:2px;}
+.ehist-line{flex:1;width:1px;background:var(--border);margin-top:3px;min-height:14px;}
+.ehist-body{flex:1;}
+.ehist-date{font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:2px;}
+.ehist-title{font-size:12px;font-weight:500;}
+.ehist-desc{font-size:11px;color:var(--muted);margin-top:2px;line-height:1.5;}
+
+/* Alert rule builder */
+.rule-builder{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:16px 18px;margin-bottom:18px;}
+.rule-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;}
+.rule-keyword{font-family:var(--mono);font-size:11px;font-weight:700;padding:4px 9px;border-radius:var(--r);flex-shrink:0;}
+.rule-keyword.if{color:var(--teal);background:var(--teal-bg);}
+.rule-keyword.and{color:var(--purple);background:var(--purple-bg);}
+.rule-keyword.then{color:var(--blue);background:var(--blue-bg);}
+.rule-select,.rule-input{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:6px 9px;font-size:12px;color:var(--text);font-family:var(--sans);outline:none;}
+.rule-select:focus,.rule-input:focus{border-color:var(--teal-dim);}
+.rule-input{width:90px;}
+.search-wrap{position:relative;}
+.search-dropdown{display:none;position:absolute;top:calc(100% + 6px);right:0;width:360px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);z-index:300;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.4);}
+.search-wrap:focus-within .search-dropdown{display:block;}
+.search-section{padding:7px 0;}
+.search-section-lbl{font-size:9.5px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;padding:3px 12px 4px;}
+.search-row{display:flex;align-items:center;gap:9px;padding:6px 12px;cursor:pointer;transition:background .12s;}
+.search-row:hover{background:var(--bg3);}
+.search-row-icon{width:26px;height:26px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;}
+.search-row-main{flex:1;min-width:0;}
+.search-row-name{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.search-row-sub{font-family:var(--mono);font-size:10px;color:var(--blue);margin-top:1px;}
+.search-row-right{text-align:right;flex-shrink:0;}
+.search-divider{height:1px;background:var(--border);}
+</style>
+</head>
+<body>
+
+<!-- TOP NAV -->
+<nav class="topnav">
+  <a class="logo" href="#"><div class="logo-icon"><i class="ti ti-eye-scan"></i></div>MEVWatch <span class="sub">v2</span></a>
+  <div class="nav-tabs">
+    <button class="nav-tab active" data-tab="intelligence"><i class="ti ti-fingerprint"></i> Intelligence</button>
+    <button class="nav-tab" data-tab="live"><i class="ti ti-radar-2"></i> Live Monitor</button>
+    <button class="nav-tab" data-tab="builders"><i class="ti ti-building-factory-2"></i> Builders</button>
+    <button class="nav-tab" data-tab="analytics"><i class="ti ti-chart-line"></i> Analytics</button>
+    <button class="nav-tab" data-tab="alerts"><i class="ti ti-bell-ringing"></i> Alerts</button>
+    <button class="nav-tab" data-tab="detectors"><i class="ti ti-adjustments-horizontal"></i> Detectors</button>
+    <button class="nav-tab" data-tab="billing"><i class="ti ti-credit-card"></i> Billing</button>
+  </div>
+  <div class="nav-right">
+    <div class="search-wrap">
+      <div class="global-search"><i class="ti ti-search"></i><input type="text" placeholder="Search address, entity, token, tx…" oninput="this.closest('.search-wrap').querySelector('.search-dropdown').style.display=this.value?'block':'none'"></div>
+      <div class="search-dropdown">
+        <div class="search-section">
+          <div class="search-section-lbl">Entity</div>
+          <div class="search-row">
+            <div class="search-row-icon" style="background:var(--amber-bg);color:var(--amber)">⚡</div>
+            <div class="search-row-main"><div class="search-row-name">jaredfromsubway.eth</div><div class="search-row-sub">0xd8dA…1c3f</div></div>
+            <div class="search-row-right"><div style="font-family:var(--mono);font-size:12px;color:var(--red);font-weight:600">91</div><div style="font-size:9px;color:var(--muted)">risk</div></div>
+          </div>
+        </div>
+        <div class="search-divider"></div>
+        <div class="search-section">
+          <div class="search-section-lbl">Address</div>
+          <div class="search-row">
+            <div class="search-row-icon" style="background:var(--blue-bg);color:var(--blue)"><i class="ti ti-wallet"></i></div>
+            <div class="search-row-main"><div class="search-row-name" style="font-family:var(--mono);font-size:11px">0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045</div><div class="search-row-sub">MEV Bot · jaredfromsubway.eth · ETH L1</div></div>
+            <div class="search-row-right"><span class="tag tag-red">risk 91</span></div>
+          </div>
+        </div>
+        <div class="search-divider"></div>
+        <div class="search-section">
+          <div class="search-section-lbl">Transaction</div>
+          <div class="search-row">
+            <div class="search-row-icon" style="background:var(--bg4);color:var(--muted)"><i class="ti ti-arrow-right-circle"></i></div>
+            <div class="search-row-main"><div class="search-row-name" style="font-family:var(--mono);font-size:11px">0x8fac…e221</div><div class="search-row-sub">Sandwich frontrun · ETH L1 #21,847,201 · 2m ago</div></div>
+            <div class="search-row-right"><span class="tag tag-red">Sandwich</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="chain-pill" id="pipelineToggle" title="Toggle pipeline bar"><span class="dot-live"></span>4 chains <i class="ti ti-chevron-down" style="font-size:10px;margin-left:2px" id="pipeChevron"></i></div>
+    <div class="chain-pill" style="font-family:var(--mono)"><i class="ti ti-clock" style="font-size:11px"></i>Δ 1.2s</div>
+    <div class="icon-btn"><i class="ti ti-bell"></i></div>
+    <div class="icon-btn"><i class="ti ti-settings"></i></div>
+  </div>
+</nav>
+
+<!-- ANOMALY STRIP (shown when pipeline collapsed + anomaly active) -->
+<div class="anomaly-strip visible" id="anomalyStrip" style="display:none">
+  <i class="ti ti-alert-triangle"></i>
+  <span><strong>Simulate queue high</strong> — depth 38, p95=82ms · clears ~3m · <a href="#" style="color:var(--amber)">expand pipeline</a></span>
+  <span style="margin-left:auto;font-family:var(--mono);font-size:10px">2m ago</span>
+</div>
+
+<!-- PIPELINE BAR (collapsible) -->
+<div class="pipeline-wrap collapsed" id="pipelineWrap" style="display:none">
+  <div class="pipeline-bar">
+    <div class="pipeline-bar-inner">
+      <div class="pipe-stage ok"><div class="ps-icon t"><i class="ti ti-antenna-bars-5"></i></div><div><div class="ps-name">Ingest</div><div class="ps-stat ok">reth ExEx · 4</div></div><div class="pipe-dot ok"></div></div>
+      <div class="pipe-arrow"><div class="pipe-arrow-line"><div class="pipe-arrow-flow"></div></div><i class="ti ti-chevron-right"></i></div>
+      <div class="pipe-stage ok"><div class="ps-icon b"><i class="ti ti-code-dots"></i></div><div><div class="ps-name">Decode</div><div class="ps-stat ok">312 tx/s</div></div><div class="pipe-dot ok"></div></div>
+      <div class="pipe-arrow"><div class="pipe-arrow-line"><div class="pipe-arrow-flow" style="animation-delay:-.4s"></div></div><i class="ti ti-chevron-right"></i></div>
+      <div class="pipe-stage ok"><div class="ps-icon p"><i class="ti ti-tag"></i></div><div><div class="ps-name">Enrich</div><div class="ps-stat ok">labels · prices</div></div><div class="pipe-dot ok"></div></div>
+      <div class="pipe-arrow"><div class="pipe-arrow-line"><div class="pipe-arrow-flow" style="animation-delay:-.8s"></div></div><i class="ti ti-chevron-right"></i></div>
+      <div class="pipe-stage warn"><div class="ps-icon a"><i class="ti ti-cpu"></i></div><div><div class="ps-name">Simulate</div><div class="ps-stat warn">q=38 · p95=82ms</div><div style="font-size:9px;color:var(--amber);margin-top:1px">clears ~3m · 12 jobs/s</div></div><div class="pipe-dot warn"></div></div>
+      <div class="pipe-arrow"><div class="pipe-arrow-line"><div class="pipe-arrow-flow" style="animation-delay:-1.2s"></div></div><i class="ti ti-chevron-right"></i></div>
+      <div class="pipe-stage ok"><div class="ps-icon c"><i class="ti ti-zoom-scan"></i></div><div><div class="ps-name">Detect</div><div class="ps-stat ok">7 detectors</div></div><div class="pipe-dot ok"></div></div>
+      <div class="pipe-arrow"><div class="pipe-arrow-line"><div class="pipe-arrow-flow" style="animation-delay:-1.6s"></div></div><i class="ti ti-chevron-right"></i></div>
+      <div class="pipe-stage ok"><div class="ps-icon t"><i class="ti ti-git-merge"></i></div><div><div class="ps-name">Correlate</div><div class="ps-stat ok">dedup · score</div></div><div class="pipe-dot ok"></div></div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:14px;padding-left:16px;border-left:1px solid var(--border)">
+        <div class="pipe-kpi"><div class="v" style="color:var(--teal)">21,847</div><div class="l">blocks today</div></div>
+        <div class="pipe-kpi"><div class="v" style="color:var(--amber)">1.84s</div><div class="l">e2e p50</div></div>
+        <div class="pipe-kpi"><div class="v" style="color:var(--red)">3</div><div class="l">reorgs/24h</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PAGE: LIVE MONITOR -->
+<div id="page-live" class="page">
+<div class="live-layout">
+  <aside class="sidebar-left">
+    <span class="s-label">Chains</span>
+    <div class="s-section">
+      <div class="chain-row active"><div class="chain-icon c-eth">Ξ</div><div><div class="chain-name">Ethereum L1</div><div class="chain-block">#21,847,203</div></div><div class="c-dot" style="background:var(--teal)"></div></div>
+      <div class="chain-row"><div class="chain-icon c-arb">A</div><div><div class="chain-name">Arbitrum</div><div class="chain-block">#284,102,441</div></div><div class="c-dot" style="background:var(--teal)"></div></div>
+      <div class="chain-row"><div class="chain-icon c-base">B</div><div><div class="chain-name">Base</div><div class="chain-block">#32,918,004</div></div><div class="c-dot" style="background:var(--teal)"></div></div>
+      <div class="chain-row"><div class="chain-icon c-op">O</div><div><div class="chain-name">Optimism</div><div class="chain-block">#128,441,009</div><div style="font-size:9.5px;color:var(--amber);margin-top:1px"><i class="ti ti-alert-triangle" style="font-size:10px;vertical-align:-1px"></i> Last block 18s ago · 3 RPC timeouts/min</div></div><div class="c-dot" style="background:var(--amber)"></div></div>
+    </div>
+    <span class="s-label">Detectors</span>
+    <div class="s-section">
+      <div class="det-item active"><div class="det-dot" style="background:var(--red)"></div><span class="det-name">Sandwich</span><span class="det-count" style="background:var(--red-bg);color:var(--red)">12</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--purple)"></div><span class="det-name">Atomic Arb</span><span class="det-count" style="background:var(--purple-bg);color:var(--purple)">48</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--amber)"></div><span class="det-name">Flash Loan</span><span class="det-count" style="background:var(--amber-bg);color:var(--amber)">3</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--coral)"></div><span class="det-name">Liquidation</span><span class="det-count" style="background:var(--bg4);color:var(--muted)">7</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--teal)"></div><span class="det-name">Rug Pull</span><span class="det-count" style="background:var(--teal-bg);color:var(--teal)">1</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--blue)"></div><span class="det-name">Wash Trading</span><span class="det-count" style="background:var(--bg4);color:var(--muted)">2</span></div>
+      <div class="det-item"><div class="det-dot" style="background:var(--muted)"></div><span class="det-name">Addr Poisoning</span><span class="det-count" style="background:var(--bg4);color:var(--muted)">0</span></div>
+    </div>
+    <span class="s-label">MEV (24h)</span>
+    <div style="padding:0 12px 12px">
+      <div style="font-family:var(--mono);font-size:20px;font-weight:600;color:var(--amber)">$2.41M</div>
+      <div style="font-size:10.5px;color:var(--muted);margin-top:2px">73 incidents · 4 chains</div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:4px">
+        <div class="prec-row"><div class="prec-name" style="font-size:9.5px">Sandwich</div><div class="prec-track"><div class="prec-fill" style="width:58%;background:var(--red)"></div></div><div class="prec-val">$1.4M</div></div>
+        <div class="prec-row"><div class="prec-name" style="font-size:9.5px">Atomic Arb</div><div class="prec-track"><div class="prec-fill" style="width:35%;background:var(--purple)"></div></div><div class="prec-val">$840K</div></div>
+        <div class="prec-row"><div class="prec-name" style="font-size:9.5px">Flash Loan</div><div class="prec-track"><div class="prec-fill" style="width:7%;background:var(--amber)"></div></div><div class="prec-val">$170K</div></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN: REDUCED COGNITIVE LOAD -->
+  <main class="main-panel">
+    <div class="main-toolbar">
+      <div class="filter-pill active"><i class="ti ti-filter"></i> All (73)</div>
+      <div class="filter-pill"><i class="ti ti-alert-octagon"></i> Critical</div>
+      <div class="filter-pill"><i class="ti ti-clock-pause"></i> Provisional</div>
+      <div class="filter-pill"><i class="ti ti-check"></i> Finalized</div>
+      <div style="margin-left:auto;display:flex;gap:5px">
+        <div class="icon-btn" title="Refresh"><i class="ti ti-refresh"></i></div>
+        <div class="icon-btn" title="Export"><i class="ti ti-download"></i></div>
+      </div>
+    </div>
+
+    <!-- Helper label explaining the reduced card design -->
+    <div style="padding:5px 11px 0;display:flex;align-items:center;gap:5px">
+      <span style="font-size:10px;color:var(--faint)"><i class="ti ti-info-circle" style="font-size:11px;vertical-align:-1px"></i> Hover or click a card to reveal address detail</span>
+    </div>
+
+    <div class="incident-list" id="incidentList">
+      <div id="incidentEmpty" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:48px 20px;color:var(--muted);text-align:center">
+        <i class="ti ti-radar-2" style="font-size:28px;opacity:.3"></i>
+        <div style="font-size:13px;font-weight:500;color:var(--text)">No incidents match this filter</div>
+        <div style="font-size:11.5px">Try widening to All or a different severity</div>
+        <button class="filter-pill active" style="margin-top:4px" onclick="resetFilter()"><i class="ti ti-filter"></i> Show all (73)</button>
+      </div>
+      <div class="reorg-banner"><i class="ti ti-git-branch-deleted" style="font-size:13px;flex-shrink:0"></i><div><strong>Reorg</strong> — L1 #21,847,198–200 orphaned. 2 incidents retracted.</div><span style="font-family:var(--mono);font-size:10px;margin-left:auto;white-space:nowrap">30s ago</span></div>
+
+      <!-- CARD 1: critical sandwich — 2 stats only, addresses hidden until hover -->
+      <div class="inc-card critical selected">
+        <div class="inc-triage">
+          <div class="type-badge b-red"><i class="ti ti-sandwich"></i> Sandwich</div>
+          <span class="inc-title">Multi-victim sandwich — Uniswap v3 WETH/USDC</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--amber)">+$14,820</div><div class="kl">profit</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--red)">94</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">ETH L1 · #21,847,201 · pos 0,4,9</span>
+          <div class="inc-status s-final"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+          <div style="display:flex;align-items:center;gap:4px;margin-left:auto">
+            <span style="font-size:9.5px;color:var(--muted)">sim</span>
+            <div style="width:36px;height:3px;border-radius:2px;background:var(--bg4);overflow:hidden"><div style="width:97%;height:100%;background:var(--teal)"></div></div>
+            <span style="font-family:var(--mono);font-size:9.5px;color:var(--teal)">0.97</span>
+            <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:4px">2m ago</span>
+          </div>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip bot">⚡ jaredfromsubway</span>
+            <span class="addr-chip vic">0x7a3b…e91a</span>
+            <span class="addr-chip vic">0x2f9c…04bc</span>
+            <span class="addr-chip">Uni v3 WETH/USDC</span>
+            <a class="tx-link" href="#">0x8fac…e221 ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD 2: flash loan provisional -->
+      <div class="inc-card critical provisional">
+        <div class="inc-triage">
+          <div class="type-badge b-red"><i class="ti ti-bolt"></i> Flash Loan</div>
+          <span class="inc-title">Oracle manipulation attack — Aave v3</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--red)">−$170K</div><div class="kl">victim loss</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--amber)">82</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">ETH L1 · #21,847,202 · pos 3</span>
+          <div class="inc-status s-prov"><i class="ti ti-clock" style="font-size:9px"></i> Provisional</div>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">1m ago</span>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip atk">0xf3a1₈88d0</span>
+            <span class="addr-chip">Aave v3 Pool</span>
+            <span class="addr-chip">Chainlink ETH/USD</span>
+            <a class="tx-link" href="#">0x3cf9…a41e ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD 3: rug pull -->
+      <div class="inc-card critical">
+        <div class="inc-triage">
+          <div class="type-badge b-coral"><i class="ti ti-crane"></i> Rug Pull</div>
+          <span class="inc-title">LP drain + honeypot confirmed — $ZKFARM</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--red)">$88.3K</div><div class="kl">drained</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--red)">98</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">Base · #32,917,991 · deployer exit</span>
+          <div class="inc-status s-final"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">9m ago</span>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip atk">0x1f3d…09ab (deployer)</span>
+            <span class="addr-chip">$ZKFARM</span>
+            <span class="addr-chip">Uni v2 LP</span>
+            <a class="tx-link" href="#">0x6ef2…7c3a ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD 4: atomic arb medium -->
+      <div class="inc-card medium">
+        <div class="inc-triage">
+          <div class="type-badge b-purple"><i class="ti ti-route-alt-right"></i> Atomic Arb</div>
+          <span class="inc-title">3-hop cycle — Uni v3 → Curve → Balancer</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--amber)">+$3,210</div><div class="kl">profit</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--purple)">61</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">Arbitrum · #284,102,438</span>
+          <div class="inc-status s-final"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">4m ago</span>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip atk">0x9ba2…c04f</span>
+            <span class="addr-chip">Uni v3</span><span class="addr-chip">Curve 3pool</span><span class="addr-chip">Balancer</span>
+            <a class="tx-link" href="#">0xa7d4…3b12 ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD 5: sandwich medium -->
+      <div class="inc-card medium">
+        <div class="inc-triage">
+          <div class="type-badge b-red"><i class="ti ti-sandwich"></i> Sandwich</div>
+          <span class="inc-title">Single-victim sandwich — Sushiswap WETH/WBTC</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--amber)">+$892</div><div class="kl">profit</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--purple)">58</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">ETH L1 · #21,847,200</span>
+          <div class="inc-status s-final"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">11m ago</span>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip bot">⚡ jaredfromsubway</span>
+            <span class="addr-chip vic">0x4c8a…f30d</span>
+            <span class="addr-chip">Sushi WETH/WBTC</span>
+            <a class="tx-link" href="#">0x2ba9…ff01 ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD 6: liquidation low -->
+      <div class="inc-card low">
+        <div class="inc-triage">
+          <div class="type-badge b-blue"><i class="ti ti-droplet-half-2-filled"></i> Liquidation</div>
+          <span class="inc-title">Aave v3 liquidation — undercollateralised WBTC</span>
+          <div class="inc-key-stats">
+            <div class="inc-kstat"><div class="kv" style="color:var(--text)">$41.2K</div><div class="kl">seized</div></div>
+            <div class="inc-kstat"><div class="kv" style="color:var(--teal)">22</div><div class="kl">risk</div></div>
+          </div>
+        </div>
+        <div class="inc-sub-row">
+          <span class="inc-chain-tag">ETH L1 · #21,847,198</span>
+          <div class="inc-status s-final"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">14m ago</span>
+        </div>
+        <div class="inc-expand">
+          <div class="inc-expand-inner">
+            <span class="addr-chip atk">0x8c3f…a12b</span>
+            <span class="addr-chip">Aave v3</span>
+            <a class="tx-link" href="#">0x91cd…2a44 ↗</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- RETRACTED -->
+      <div class="inc-card retracted">
+        <div style="display:flex;align-items:center;gap:7px"><i class="ti ti-git-branch-deleted" style="font-size:12px;color:var(--amber)"></i><span style="font-size:11px;color:var(--muted)"><strong style="color:var(--amber)">Retracted</strong> — Sandwich · Block #21,847,199 · orphaned by reorg</span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto">32s ago</span></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- RIGHT SIDEBAR -->
+  <aside class="sidebar-right">
+    <div class="right-section">
+      <div class="rs-title">24h Summary <button>CSV ↓</button></div>
+      <div class="stats-grid">
+        <div class="stat-box"><div class="v" style="color:var(--red)">73</div><div class="l">Incidents</div></div>
+        <div class="stat-box"><div class="v" style="color:var(--amber)">$2.41M</div><div class="l">MEV extracted</div></div>
+        <div class="stat-box"><div class="v" style="color:var(--teal)">96.2%</div><div class="l">Precision</div></div>
+        <div class="stat-box"><div class="v" style="color:var(--purple)">1.84s</div><div class="l">Detect latency</div></div>
+      </div>
+    </div>
+    <div class="right-section">
+      <div class="rs-title">Incidents / Hour</div>
+      <div class="sp-row"><span class="sp-label">Sandwich</span><div class="sp-bars"><div class="sp-bar" style="height:45%;background:var(--red);opacity:.5"></div><div class="sp-bar" style="height:55%;background:var(--red);opacity:.6"></div><div class="sp-bar" style="height:30%;background:var(--red);opacity:.45"></div><div class="sp-bar" style="height:70%;background:var(--red);opacity:.7"></div><div class="sp-bar" style="height:90%;background:var(--red);opacity:.85"></div><div class="sp-bar" style="height:60%;background:var(--red);opacity:.65"></div><div class="sp-bar" style="height:50%;background:var(--red);opacity:.6"></div><div class="sp-bar" style="height:80%;background:var(--red)"></div></div><span class="sp-val" style="color:var(--red)">12</span></div>
+      <div class="sp-row"><span class="sp-label">Atomic Arb</span><div class="sp-bars"><div class="sp-bar" style="height:60%;background:var(--purple);opacity:.5"></div><div class="sp-bar" style="height:75%;background:var(--purple);opacity:.6"></div><div class="sp-bar" style="height:90%;background:var(--purple);opacity:.8"></div><div class="sp-bar" style="height:55%;background:var(--purple);opacity:.55"></div><div class="sp-bar" style="height:65%;background:var(--purple);opacity:.65"></div><div class="sp-bar" style="height:80%;background:var(--purple);opacity:.75"></div><div class="sp-bar" style="height:70%;background:var(--purple);opacity:.7"></div><div class="sp-bar" style="height:85%;background:var(--purple)"></div></div><span class="sp-val" style="color:var(--purple)">48</span></div>
+      <div class="sp-row"><span class="sp-label">Flash Loan</span><div class="sp-bars"><div class="sp-bar" style="height:20%;background:var(--amber);opacity:.4"></div><div class="sp-bar"></div><div class="sp-bar" style="height:30%;background:var(--amber);opacity:.5"></div><div class="sp-bar"></div><div class="sp-bar" style="height:20%;background:var(--amber);opacity:.4"></div><div class="sp-bar"></div><div class="sp-bar" style="height:10%;background:var(--amber);opacity:.35"></div><div class="sp-bar" style="height:100%;background:var(--amber)"></div></div><span class="sp-val" style="color:var(--amber)">3</span></div>
+    </div>
+    <div class="right-section">
+      <div class="rs-title">Detector Precision</div>
+      <div class="prec-row"><div class="prec-name">Sandwich</div><div class="prec-track"><div class="prec-fill" style="width:97%;background:var(--teal)"></div></div><div class="prec-val">97%</div></div>
+      <div class="prec-row"><div class="prec-name">Atomic Arb</div><div class="prec-track"><div class="prec-fill" style="width:94%;background:var(--teal)"></div></div><div class="prec-val">94%</div></div>
+      <div class="prec-row"><div class="prec-name">Flash Loan</div><div class="prec-track"><div class="prec-fill" style="width:88%;background:var(--amber)"></div></div><div class="prec-val">88%</div></div>
+      <div class="prec-row"><div class="prec-name">Rug Pull</div><div class="prec-track"><div class="prec-fill" style="width:91%;background:var(--teal)"></div></div><div class="prec-val">91%</div></div>
+    </div>
+    <div class="right-section">
+      <div class="rs-title">Pipeline Latency (p50/p95)</div>
+      <div class="lat-row"><div class="lat-stage">Ingest</div><div class="lat-track"><div class="lat-fill" style="width:12%;background:var(--teal)"></div></div><div class="lat-val">8/14ms</div></div>
+      <div class="lat-row"><div class="lat-stage">Decode</div><div class="lat-track"><div class="lat-fill" style="width:8%;background:var(--teal)"></div></div><div class="lat-val">5/9ms</div></div>
+      <div class="lat-row"><div class="lat-stage">Enrich</div><div class="lat-track"><div class="lat-fill" style="width:22%;background:var(--teal)"></div></div><div class="lat-val">14/28ms</div></div>
+      <div class="lat-row"><div class="lat-stage">Simulate</div><div class="lat-track"><div class="lat-fill" style="width:68%;background:var(--amber)"></div></div><div class="lat-val">42/82ms</div></div>
+      <div class="lat-row"><div class="lat-stage">Detect</div><div class="lat-track"><div class="lat-fill" style="width:30%;background:var(--teal)"></div></div><div class="lat-val">18/31ms</div></div>
+    </div>
+    <div class="right-section">
+      <div class="rs-title">Recent Blocks (L1)</div>
+      <div class="block-row"><span class="block-num">#21,847,203</span><span class="block-txs">218 txs</span><span class="block-status p">Prov.</span></div>
+      <div class="block-row"><span class="block-num">#21,847,202</span><span class="block-txs">194 txs</span><span class="block-status p">Prov.</span></div>
+      <div class="block-row"><span class="block-num">#21,847,201</span><span class="block-txs">241 txs</span><span class="block-status f">Final</span></div>
+      <div class="block-row"><span class="block-num">#21,847,199</span><span class="block-txs" style="color:var(--amber)">⚠ orphaned</span><span class="block-status" style="background:var(--amber-bg);color:var(--amber)">Reorg</span></div>
+    </div>
+    <div class="right-section" style="border-bottom:none">
+      <div class="rs-title">System Alerts</div>
+      <div class="alert-item"><div class="alert-dot" style="background:var(--amber)"></div><div class="alert-msg"><strong>Sim queue high</strong> — depth 38, p95=82ms</div><div class="alert-time">2m</div></div>
+      <div class="alert-item"><div class="alert-dot" style="background:var(--red)"></div><div class="alert-msg"><strong>Reorg depth 3</strong> — 2 retracted</div><div class="alert-time">31s</div></div>
+      <div class="alert-item"><div class="alert-dot" style="background:var(--teal)"></div><div class="alert-msg"><strong>Optimism lag</strong> — 4.1s behind</div><div class="alert-time">8m</div></div>
+    </div>
+  </aside>
+</div>
+</div>
+
+<!-- PAGE: INTELLIGENCE -->
+<div id="page-intelligence" class="page active">
+<div class="intel-layout">
+
+  <!-- LEFT: Entity list -->
+  <aside class="intel-sidebar">
+    <div class="entity-search">
+      <div class="entity-search-wrap">
+        <i class="ti ti-search"></i>
+        <input type="text" placeholder="Address, ENS, label…" id="entitySearchInput">
+      </div>
+    </div>
+    <!-- filter row -->
+    <div style="display:flex;gap:4px;padding:8px 10px;border-bottom:1px solid var(--border);flex-wrap:wrap">
+      <button class="filter-pill active" style="padding:2px 7px;font-size:10px">All (312)</button>
+      <button class="filter-pill" style="padding:2px 7px;font-size:10px">MEV Bot</button>
+      <button class="filter-pill" style="padding:2px 7px;font-size:10px">Scammer</button>
+      <button class="filter-pill" style="padding:2px 7px;font-size:10px">Unknown</button>
+    </div>
+
+    <!-- entity cards -->
+    <div class="entity-card active" onclick="selectEntity(this,'jared')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--amber-bg);color:var(--amber)">⚡</div>
+        <div class="entity-info">
+          <div class="entity-name">jaredfromsubway.eth</div>
+          <div class="entity-addr">0xd8dA…1c3f</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--red)">91</div><div class="l">risk · 94% conf</div></div>
+      </div>
+      <div class="entity-tags">
+        <span class="tag tag-amber">MEV Bot</span>
+        <span class="tag tag-red">High Volume</span>
+        <span class="tag tag-muted">ETH · ARB</span>
+      </div>
+      <div class="entity-last">⚡ Last active 2m ago · 183 incidents</div>
+    </div>
+
+    <div class="entity-card" onclick="selectEntity(this,'arb')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--purple-bg);color:var(--purple)">◈</div>
+        <div class="entity-info">
+          <div class="entity-name">arb-bot-9ba2</div>
+          <div class="entity-addr">0x9ba2…c04f</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--amber)">67</div><div class="l">risk · 81% conf</div></div>
+      </div>
+      <div class="entity-tags"><span class="tag tag-purple">Arb Bot</span><span class="tag tag-muted">ARB · Base</span></div>
+      <div class="entity-last">Last active 4m ago · 48 incidents</div>
+    </div>
+
+    <div class="entity-card" onclick="selectEntity(this,'zkfarm')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--red-bg);color:var(--red)">☠</div>
+        <div class="entity-info">
+          <div class="entity-name">$ZKFARM deployer</div>
+          <div class="entity-addr">0x1f3d…09ab</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--red)">98</div><div class="l">risk · 99% conf</div></div>
+      </div>
+      <div class="entity-tags"><span class="tag tag-red">Rug Deployer</span><span class="tag tag-muted">Base</span></div>
+      <div class="entity-last">Last active 9m ago · 1 incident</div>
+    </div>
+
+    <div class="entity-card" onclick="selectEntity(this,'unknown')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--bg3);color:var(--muted)">?</div>
+        <div class="entity-info">
+          <div class="entity-name" style="color:var(--muted)">Unknown entity</div>
+          <div class="entity-addr">0xf3a1₈88d0</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--amber)">44</div><div class="l">risk · 38% conf</div></div>
+      </div>
+      <div class="entity-tags"><span class="tag tag-muted">Unclassified</span><span class="tag tag-muted">ETH</span></div>
+      <div class="entity-last">Last active 1h ago · 3 incidents</div>
+    </div>
+
+    <div class="entity-card" onclick="selectEntity(this,'bot2')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--amber-bg);color:var(--amber)">⚡</div>
+        <div class="entity-info">
+          <div class="entity-name">mev-bot-4c7e</div>
+          <div class="entity-addr">0x4c7e…221b</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--amber)">74</div><div class="l">risk · 87% conf</div></div>
+      </div>
+      <div class="entity-tags"><span class="tag tag-amber">MEV Bot</span><span class="tag tag-muted">ETH · Base</span></div>
+      <div class="entity-last">Last active 22m ago · 19 incidents</div>
+    </div>
+
+    <div class="entity-card" onclick="selectEntity(this,'bot3')">
+      <div class="entity-top">
+        <div class="entity-avatar" style="background:var(--purple-bg);color:var(--purple)">◈</div>
+        <div class="entity-info">
+          <div class="entity-name">cycle-arb-2f9c</div>
+          <div class="entity-addr">0x2f9c…77ab</div>
+        </div>
+        <div class="entity-score"><div class="n" style="color:var(--purple)">55</div><div class="l">risk · 64% conf</div></div>
+      </div>
+      <div class="entity-tags"><span class="tag tag-purple">Arb Bot</span><span class="tag tag-muted">ARB</span></div>
+      <div class="entity-last">Last active 1h ago · 31 incidents</div>
+    </div>
+  </aside>
+
+  <!-- RIGHT: Entity detail -->
+  <div class="intel-main">
+    <div class="intel-pad">
+
+      <!-- Entity header -->
+      <div class="card" style="margin-bottom:16px">
+        <div style="padding:16px 18px">
+          <div style="display:flex;align-items:flex-start;gap:14px">
+            <div style="width:48px;height:48px;border-radius:var(--r);background:var(--amber-bg);border:1px solid rgba(240,168,64,.2);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--amber);flex-shrink:0">⚡</div>
+            <div style="flex:1">
+              <div style="display:flex;align-items:center;gap:7px;margin-bottom:4px;flex-wrap:wrap">
+                <span style="font-size:15px;font-weight:600">jaredfromsubway.eth</span>
+                <span class="tag tag-amber">MEV Bot</span>
+                <span class="tag tag-red">High Risk</span>
+                <span class="tag tag-muted">Flashbots submitter</span>
+              </div>
+              <div style="font-family:var(--mono);font-size:11px;color:var(--blue);margin-bottom:5px">0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045</div>
+              <div style="font-size:11px;color:var(--muted)">Active on ETH · ARB · Base · First seen 2022-04-12 · Last active <strong style="color:var(--teal)">2m ago</strong></div>
+            </div>
+            <!-- Risk + Confidence -->
+            <div style="text-align:center;flex-shrink:0;display:flex;gap:14px;align-items:flex-start">
+            <div class="ring-tooltip">
+              <div style="position:relative;width:80px;height:80px">
+                <svg width="80" height="80" style="transform:rotate(-90deg)">
+                  <circle cx="40" cy="40" r="32" fill="none" stroke="var(--bg4)" stroke-width="7"/>
+                  <circle cx="40" cy="40" r="32" fill="none" stroke="var(--red)" stroke-width="7" stroke-dasharray="201" stroke-dashoffset="20" stroke-linecap="round"/>
+                </svg>
+                <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center">
+                  <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--red);line-height:1">91</div>
+                  <div style="font-size:9px;color:var(--muted)">/100</div>
+                </div>
+              </div>
+              <div style="font-size:10px;color:var(--muted);margin-top:3px">Risk Score</div>
+              <div class="rtip"><strong>Risk Score</strong> — how risky is this address? Aggregated from confirmed incidents, entity links, and behavioral history. Higher = more dangerous.</div>
+            </div>
+            <div class="ring-tooltip">
+              <div style="position:relative;width:80px;height:80px">
+                <svg width="80" height="80" style="transform:rotate(-90deg)">
+                  <circle cx="40" cy="40" r="32" fill="none" stroke="var(--bg4)" stroke-width="7"/>
+                  <circle cx="40" cy="40" r="32" fill="none" stroke="var(--teal)" stroke-width="7" stroke-dasharray="201" stroke-dashoffset="113" stroke-linecap="round"/>
+                </svg>
+                <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center">
+                  <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--teal);line-height:1">94%</div>
+                  <div style="font-size:9px;color:var(--muted)">conf.</div>
+                </div>
+              </div>
+              <div style="font-size:10px;color:var(--muted);margin-top:3px">Confidence</div>
+              <div class="rtip"><strong>Confidence</strong> — how sure are we? Based on evidentiary strength: sim-confirmed incidents score highest, heuristic labels score lowest. High risk + low confidence = act with caution.</div>
+            </div>
+            </div>
+          </div>
+        </div>
+        <!-- Risk factor breakdown -->
+        <div style="padding:12px 18px 14px;background:rgba(232,75,75,.04);border-top:1px solid rgba(232,75,75,.1)">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:6px">
+            <div>
+              <div style="font-size:10px;font-weight:600;color:var(--red);text-transform:uppercase;letter-spacing:.06em">Risk Factors — why 91?</div>
+              <div style="font-size:10.5px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:5px">
+                <span style="color:var(--red);font-family:var(--mono);font-weight:600">↑ +16</span> vs 3 days ago
+                <span style="color:var(--faint)">·</span>
+                <span>driven by <strong style="color:var(--amber)">4 new connected wallets</strong> + Base expansion</span>
+              </div>
+            </div>
+            <div class="confidence-badge high"><i class="ti ti-shield-check" style="font-size:12px"></i> 94% confidence</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">Confirmed sandwich attack history (183 incidents)</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:83%"></div></div>
+            <div class="factor-pts" style="color:var(--red)">+25</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">Same builder/wallet cluster as 2 known MEV bots</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:67%"></div></div>
+            <div class="factor-pts" style="color:var(--red)">+20</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">Prior exploit / flagged extraction event</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:50%"></div></div>
+            <div class="factor-pts" style="color:var(--red)">+15</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">Funded via Tornado Cash mixer (2 hops)</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:33%"></div></div>
+            <div class="factor-pts" style="color:var(--amber)">+10</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">$8.2M lifetime extraction, +40% profit/incident (30d)</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:40%"></div></div>
+            <div class="factor-pts" style="color:var(--amber)">+12</div>
+          </div>
+          <div class="factor-row">
+            <div class="factor-label">4 new connected wallets + expansion to Base (30d)</div>
+            <div class="factor-bar-track"><div class="factor-bar-fill" style="width:30%"></div></div>
+            <div class="factor-pts" style="color:var(--amber)">+9</div>
+          </div>
+          <div class="factor-total-row">
+            <span style="color:var(--muted);font-weight:400">Sum of factors</span>
+            <span style="color:var(--red)">91 / 100</span>
+          </div>
+          <div class="risk-conf-note"><i class="ti ti-info-circle" style="font-size:12px;vertical-align:-1px"></i> High confidence reflects sim-confirmed incidents and an on-chain-verified wallet cluster. Confidence would drop if factors relied on heuristic labels alone — high risk does not always mean high certainty.</div>
+        </div>
+      </div>
+
+      <!-- Stats row -->
+      <div class="srow" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
+        <div class="sbox"><div class="v" style="color:var(--amber)">$8.2M</div><div class="l">Lifetime profit</div><div class="delta" style="color:var(--teal)">↑ +$892K this month</div></div>
+        <div class="sbox"><div class="v" style="color:var(--red)">183</div><div class="l">Detected incidents</div><div class="delta" style="color:var(--muted)">31 this week</div></div>
+        <div class="sbox"><div class="v" style="color:var(--purple)">32</div><div class="l">Connected wallets</div><div class="delta" style="color:var(--red)">↑ 4 new (30d)</div></div>
+        <div class="sbox"><div class="v" style="color:var(--teal)">4</div><div class="l">Active chains</div><div class="delta" style="color:var(--amber)">↑ Base added (7d)</div></div>
+      </div>
+
+      <!-- TIMELINE (the key new feature) -->
+      <div class="intel-section">
+        <div class="intel-section-title">
+          Activity Timeline — last 90 days
+          <div style="display:flex;gap:6px;align-items:center">
+            <span style="font-size:10px;color:var(--muted)">Group by</span>
+            <select style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:2px 7px;font-size:11px;color:var(--text);font-family:var(--sans)"><option>Week</option><option>Day</option><option>Month</option></select>
+          </div>
+        </div>
+        <div class="timeline-wrap">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;display:flex;gap:12px">
+            <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--red);display:inline-block"></span>Sandwich</span>
+            <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--purple);display:inline-block"></span>Arb</span>
+            <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--amber);display:inline-block"></span>Profit ($K)</span>
+          </div>
+          <div class="timeline-chart">
+            <!-- 13 weeks of data -->
+            <div class="tl-col"><div class="tl-bar" style="height:30%;background:var(--red);opacity:.7"></div><div class="tl-lbl">W1</div><div class="tl-tooltip">W1: 3 incidents, $48K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:25%;background:var(--red);opacity:.65"></div><div class="tl-lbl">W2</div><div class="tl-tooltip">W2: 2 incidents, $31K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:40%;background:var(--red);opacity:.75"></div><div class="tl-lbl">W3</div><div class="tl-tooltip">W3: 5 incidents, $72K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:20%;background:var(--red);opacity:.6"></div><div class="tl-lbl">W4</div><div class="tl-tooltip">W4: 2 incidents, $28K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:15%;background:var(--red);opacity:.5"></div><div class="tl-lbl">W5</div><div class="tl-tooltip">W5: 1 incident, $14K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:10%;background:var(--red);opacity:.45"></div><div class="tl-lbl">W6</div><div class="tl-tooltip">W6: 1 incident, $9K — quiet period</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:5%;background:var(--red);opacity:.4"></div><div class="tl-lbl">W7</div><div class="tl-tooltip">W7: 0 incidents — quiet period</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:8%;background:var(--red);opacity:.42"></div><div class="tl-lbl">W8</div><div class="tl-tooltip">W8: 1 incident — quiet period</div></div>
+            <div class="tl-col" style="position:relative">
+              <!-- SPIKE: 3 new wallets appeared -->
+              <div class="tl-bar" style="height:60%;background:var(--red);opacity:.85"></div>
+              <div class="tl-lbl">W9</div>
+              <div class="tl-tooltip">W9: 7 incidents, $180K — ⚠ 3 new wallets detected</div>
+              <div style="position:absolute;top:-10px;left:50%;transform:translateX(-50%);color:var(--amber);font-size:11px">⚠</div>
+            </div>
+            <div class="tl-col"><div class="tl-bar" style="height:80%;background:var(--red);opacity:.9"></div><div class="tl-lbl">W10</div><div class="tl-tooltip">W10: 9 incidents, $240K — expanded to Base</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:90%;background:var(--red)"></div><div class="tl-lbl">W11</div><div class="tl-tooltip">W11: 11 incidents, $310K — peak activity</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:75%;background:var(--red);opacity:.88"></div><div class="tl-lbl">W12</div><div class="tl-tooltip">W12: 8 incidents, $270K</div></div>
+            <div class="tl-col"><div class="tl-bar" style="height:100%;background:var(--red)"></div><div class="tl-lbl">W13</div><div class="tl-tooltip">W13 (now): 12 incidents, $892K — highest ever</div></div>
+          </div>
+          <div class="tl-annotation">
+            <i class="ti ti-alert-triangle"></i>
+            <span>W9: Quiet for 6 weeks, then spiked — 3 new connected wallets appeared simultaneously. W10: First Base activity detected.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ENTITY HISTORY -->
+      <div class="intel-section">
+        <div class="intel-section-title">Entity History <span style="font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">— key milestones since first seen</span>
+          <button onclick="copyEntityReport()" style="font-size:11px;color:var(--blue);background:none;border:none;cursor:pointer;font-family:var(--sans);font-weight:400;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:4px"><i class="ti ti-copy" style="font-size:12px"></i> Copy as report</button>
+        </div>
+        <div class="card">
+          <div style="padding:13px 16px">
+            <div class="ehist-list">
+              <div class="ehist-item">
+                <div class="ehist-marker"><div class="ehist-dot" style="background:var(--muted)"></div><div class="ehist-line"></div></div>
+                <div class="ehist-body">
+                  <div class="ehist-date">2022-04-12</div>
+                  <div class="ehist-title">First seen</div>
+                  <div class="ehist-desc">Wallet 0xd8dA…1c3f first observed submitting transactions via Flashbots relay on Ethereum L1.</div>
+                </div>
+              </div>
+              <div class="ehist-item">
+                <div class="ehist-marker"><div class="ehist-dot" style="background:var(--red)"></div><div class="ehist-line"></div></div>
+                <div class="ehist-body">
+                  <div class="ehist-date">2026-04 · W3</div>
+                  <div class="ehist-title">Sandwich attack pattern confirmed</div>
+                  <div class="ehist-desc">sandwich_v2 detector confirmed first sim-verified sandwich on Uni v3 WETH/USDC. Entity reclassified Unknown → MEV Bot.</div>
+                </div>
+              </div>
+              <div class="ehist-item">
+                <div class="ehist-marker"><div class="ehist-dot" style="background:var(--amber)"></div><div class="ehist-line"></div></div>
+                <div class="ehist-body">
+                  <div class="ehist-date">2026-05 · W9</div>
+                  <div class="ehist-title">New funding source — Tornado Cash (2 hops)</div>
+                  <div class="ehist-desc">Inbound transfer traced through Tornado Cash mixer, 2 hops upstream. Coincided with appearance of 3 new connected wallets (0xcc1d, 0x71fe, 0x9f3b).</div>
+                </div>
+              </div>
+              <div class="ehist-item">
+                <div class="ehist-marker"><div class="ehist-dot" style="background:var(--purple)"></div><div class="ehist-line"></div></div>
+                <div class="ehist-body">
+                  <div class="ehist-date">2026-05 · W10</div>
+                  <div class="ehist-title">Expanded to Base</div>
+                  <div class="ehist-desc">First activity on Base detected — targeting Uni v3 USDC/cbETH pool. Per-incident profit increased 40% on the new chain.</div>
+                </div>
+              </div>
+              <div class="ehist-item">
+                <div class="ehist-marker"><div class="ehist-dot" style="background:var(--red)"></div></div>
+                <div class="ehist-body">
+                  <div class="ehist-date">2026-06 · W13 (now)</div>
+                  <div class="ehist-title">Oracle manipulation — Aave v3 (flagged, provisional)</div>
+                  <div class="ehist-desc">Wallet cluster co-present in block #21,847,202 alongside a flash-loan oracle manipulation incident. Correlation 0.88 with mev-bot-4c7e. Awaiting finalization.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ENTITY RELATIONSHIP GRAPH -->
+      <div class="intel-section">
+        <div class="intel-section-title">
+          Entity Relationship Graph
+          <div style="display:flex;gap:6px">
+            <button class="btn" style="padding:3px 9px;font-size:11px"><i class="ti ti-maximize"></i> Expand</button>
+          </div>
+        </div>
+        <div class="graph-wrap">
+          <div class="graph-canvas" id="graphCanvas">
+            <svg class="graph-edge" width="100%" height="320" id="graphEdges"></svg>
+
+            <!-- Nodes positioned by JS -->
+            <div class="graph-node focus" id="gn-jared" style="left:50%;top:45%">
+              <div class="graph-node-circle" style="width:52px;height:52px;background:rgba(240,168,64,.15);border-color:var(--amber);color:var(--amber);font-size:16px">⚡</div>
+              <div class="graph-node-label" style="color:var(--text)">jaredfromsubway</div>
+            </div>
+
+            <div class="graph-node" id="gn-wallet1" style="left:28%;top:22%">
+              <div class="graph-node-circle" style="width:34px;height:34px;background:rgba(240,168,64,.1);border-color:var(--amber-dim);color:var(--amber);font-size:11px;font-weight:600">W1</div>
+              <div class="graph-node-label">0x9f2a…</div>
+            </div>
+            <div class="graph-node" id="gn-wallet2" style="left:70%;top:18%">
+              <div class="graph-node-circle" style="width:34px;height:34px;background:rgba(240,168,64,.1);border-color:var(--amber-dim);color:var(--amber);font-size:11px;font-weight:600">W2</div>
+              <div class="graph-node-label">0x3b8c…</div>
+            </div>
+            <div class="graph-node" id="gn-wallet3" style="left:82%;top:55%">
+              <div class="graph-node-circle" style="width:28px;height:28px;background:rgba(240,168,64,.08);border-color:var(--amber-dim);color:var(--amber);font-size:10px;font-weight:600">W3</div>
+              <div class="graph-node-label">0xcc1d… <span style="color:var(--red);font-size:9px">NEW</span></div>
+            </div>
+            <div class="graph-node" id="gn-wallet4" style="left:16%;top:60%">
+              <div class="graph-node-circle" style="width:28px;height:28px;background:rgba(240,168,64,.08);border-color:var(--amber-dim);color:var(--amber);font-size:10px;font-weight:600">W4</div>
+              <div class="graph-node-label">0x71fe… <span style="color:var(--red);font-size:9px">NEW</span></div>
+            </div>
+
+            <div class="graph-node" id="gn-arb" style="left:72%;top:72%">
+              <div class="graph-node-circle" style="width:38px;height:38px;background:rgba(162,122,240,.12);border-color:var(--purple);color:var(--purple);font-size:14px">◈</div>
+              <div class="graph-node-label">arb-bot-9ba2</div>
+            </div>
+            <div class="graph-node" id="gn-bot2" style="left:26%;top:76%">
+              <div class="graph-node-circle" style="width:36px;height:36px;background:rgba(240,168,64,.1);border-color:var(--amber-dim);color:var(--amber);font-size:13px">⚡</div>
+              <div class="graph-node-label">mev-bot-4c7e</div>
+            </div>
+            <div class="graph-node" id="gn-flashbots" style="left:48%;top:12%">
+              <div class="graph-node-circle" style="width:32px;height:32px;background:var(--teal-bg);border-color:var(--teal-dim);color:var(--teal);font-size:12px">F</div>
+              <div class="graph-node-label">Flashbots relay</div>
+            </div>
+          </div>
+          <div class="graph-legend">
+            <div class="graph-legend-item"><div class="graph-legend-dot" style="background:var(--amber)"></div>Wallet cluster (jared)</div>
+            <div class="graph-legend-item"><div class="graph-legend-dot" style="background:var(--purple)"></div>Related MEV bot</div>
+            <div class="graph-legend-item"><div class="graph-legend-dot" style="background:var(--teal)"></div>Shared relay/builder</div>
+            <div style="width:1px;background:var(--border);margin:0 4px;align-self:stretch"></div>
+            <div class="graph-legend-item"><div style="width:18px;height:2px;background:var(--amber-dim);border-radius:1px"></div>Funded by</div>
+            <div class="graph-legend-item"><div style="width:18px;height:2px;background:var(--red);border-radius:1px"></div>Co-deployed</div>
+            <div class="graph-legend-item"><div style="width:18px;height:0;border-top:2px dashed var(--purple);opacity:.7"></div>Probabilistic link</div>
+            <div class="graph-legend-item" style="margin-left:auto"><span style="color:var(--red);font-size:10px">● NEW</span> = appeared in last 30d</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CROSS-ENTITY CORRELATION -->
+      <div class="intel-section">
+        <div class="intel-section-title">Cross-Entity Correlation <span style="font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">— entities sharing ≥2 attributes with jaredfromsubway</span></div>
+        <div class="card">
+          <table class="corr-table">
+            <thead>
+              <tr>
+                <th>Entity</th>
+                <th>Shared builder</th>
+                <th>Shared pool</th>
+                <th>Fund flow</th>
+                <th>Same timing</th>
+                <th>Correlation</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:7px">
+                    <div style="width:24px;height:24px;border-radius:4px;background:var(--amber-bg);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--amber)">⚡</div>
+                    <div><div style="font-size:11.5px;font-weight:500">mev-bot-4c7e</div><div style="font-family:var(--mono);font-size:10px;color:var(--blue)">0x4c7e…221b</div></div>
+                  </div>
+                </td>
+                <td><span class="tag tag-teal">✓ Flashbots</span></td>
+                <td><span class="tag tag-teal">✓ WETH/USDC</span></td>
+                <td><span class="tag tag-amber">✓ 0x9f2a…</span></td>
+                <td><span class="tag tag-teal">✓ &lt;2 blocks</span></td>
+                <td>
+                  <div class="corr-strength">
+                    <div class="corr-bar" style="width:88%"></div>
+                    <span style="font-family:var(--mono);font-size:11px;color:var(--purple)">0.88</span>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:7px">
+                    <div style="width:24px;height:24px;border-radius:4px;background:var(--purple-bg);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--purple)">◈</div>
+                    <div><div style="font-size:11.5px;font-weight:500">arb-bot-9ba2</div><div style="font-family:var(--mono);font-size:10px;color:var(--blue)">0x9ba2…c04f</div></div>
+                  </div>
+                </td>
+                <td><span class="tag tag-teal">✓ Titan</span></td>
+                <td><span class="tag tag-teal">✓ Uni v3</span></td>
+                <td><span class="tag tag-muted">—</span></td>
+                <td><span class="tag tag-teal">✓ same block</span></td>
+                <td>
+                  <div class="corr-strength">
+                    <div class="corr-bar" style="width:61%"></div>
+                    <span style="font-family:var(--mono);font-size:11px;color:var(--purple)">0.61</span>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:7px">
+                    <div style="width:24px;height:24px;border-radius:4px;background:var(--purple-bg);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--purple)">◈</div>
+                    <div><div style="font-size:11.5px;font-weight:500">cycle-arb-2f9c</div><div style="font-family:var(--mono);font-size:10px;color:var(--blue)">0x2f9c…77ab</div></div>
+                  </div>
+                </td>
+                <td><span class="tag tag-teal">✓ Flashbots</span></td>
+                <td><span class="tag tag-muted">—</span></td>
+                <td><span class="tag tag-amber">✓ 0x3b8c…</span></td>
+                <td><span class="tag tag-muted">—</span></td>
+                <td>
+                  <div class="corr-strength">
+                    <div class="corr-bar" style="width:42%"></div>
+                    <span style="font-family:var(--mono);font-size:11px;color:var(--purple)">0.42</span>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- RELATED ENTITIES (signal-based) -->
+      <div class="intel-section">
+        <div class="intel-section-title">Related Entities <span style="font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">— surface network effects invisible in single-entity view</span></div>
+        <div class="related-list">
+          <div class="related-item">
+            <div class="related-top">
+              <div class="related-avatar" style="background:var(--amber-bg);color:var(--amber)">⚡</div>
+              <div style="flex:1">
+                <div class="related-name">mev-bot-4c7e</div>
+                <div class="related-addr">0x4c7e…221b</div>
+              </div>
+              <div class="related-score" style="color:var(--amber)">74</div>
+            </div>
+            <div class="related-signals">
+              <span class="signal-chip signal-same-builder"><i class="ti ti-building-factory-2"></i>Same builder (Flashbots)</span>
+              <span class="signal-chip signal-same-pool"><i class="ti ti-pool"></i>Same pools (WETH/USDC)</span>
+              <span class="signal-chip signal-fund-flow"><i class="ti ti-arrows-exchange"></i>Fund flow via 0x9f2a</span>
+              <span class="signal-chip signal-shared"><i class="ti ti-clock"></i>Always within 2 blocks</span>
+            </div>
+          </div>
+          <div class="related-item">
+            <div class="related-top">
+              <div class="related-avatar" style="background:var(--purple-bg);color:var(--purple)">◈</div>
+              <div style="flex:1">
+                <div class="related-name">arb-bot-9ba2</div>
+                <div class="related-addr">0x9ba2…c04f</div>
+              </div>
+              <div class="related-score" style="color:var(--amber)">67</div>
+            </div>
+            <div class="related-signals">
+              <span class="signal-chip signal-same-pool"><i class="ti ti-pool"></i>Uni v3 WETH/ARB (same pool)</span>
+              <span class="signal-chip signal-shared"><i class="ti ti-clock"></i>Co-present in 14 blocks</span>
+            </div>
+          </div>
+          <div class="related-item">
+            <div class="related-top">
+              <div class="related-avatar" style="background:var(--bg3);color:var(--muted)">N</div>
+              <div style="flex:1">
+                <div class="related-name">0xcc1d… <span class="tag tag-red" style="font-size:9px">NEW WALLET</span></div>
+                <div class="related-addr">0xcc1d…4f82</div>
+              </div>
+              <div class="related-score" style="color:var(--red)">?</div>
+            </div>
+            <div class="related-signals">
+              <span class="signal-chip signal-fund-flow"><i class="ti ti-arrows-exchange"></i>Received 4.2 ETH from jared (W9)</span>
+              <span class="signal-chip signal-same-builder"><i class="ti ti-building-factory-2"></i>Same Flashbots account</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- INCIDENT HISTORY -->
+      <div class="intel-section">
+        <div class="intel-section-title">Incident History <button>View all 183 →</button></div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>Type</th><th>Chain</th><th>Block</th><th class="r">Profit</th><th>Victims</th><th>Conf.</th><th>Time</th></tr></thead>
+            <tbody>
+              <tr><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">ETH L1</td><td style="font-family:var(--mono);color:var(--blue)">#21,847,201</td><td class="r" style="font-family:var(--mono);color:var(--amber)">+$14,820</td><td style="color:var(--muted)">2</td><td style="font-family:var(--mono);color:var(--teal)">0.97</td><td style="color:var(--muted)">2m ago</td></tr>
+              <tr><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">ETH L1</td><td style="font-family:var(--mono);color:var(--blue)">#21,847,189</td><td class="r" style="font-family:var(--mono);color:var(--amber)">+$9,340</td><td style="color:var(--muted)">1</td><td style="font-family:var(--mono);color:var(--teal)">0.99</td><td style="color:var(--muted)">8m ago</td></tr>
+              <tr><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">Base</td><td style="font-family:var(--mono);color:var(--blue)">#32,917,980</td><td class="r" style="font-family:var(--mono);color:var(--amber)">+$6,100</td><td style="color:var(--muted)">1</td><td style="font-family:var(--mono);color:var(--teal)">0.95</td><td style="color:var(--muted)">14m ago <span class="tag tag-red" style="font-size:9px">NEW CHAIN</span></td></tr>
+              <tr><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">Arbitrum</td><td style="font-family:var(--mono);color:var(--blue)">#284,102,310</td><td class="r" style="font-family:var(--mono);color:var(--amber)">+$3,100</td><td style="color:var(--muted)">3</td><td style="font-family:var(--mono);color:var(--teal)">0.95</td><td style="color:var(--muted)">22m ago</td></tr>
+              <tr><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">ETH L1</td><td style="font-family:var(--mono);color:var(--blue)">#21,847,044</td><td class="r" style="font-family:var(--mono);color:var(--amber)">+$28,400</td><td style="color:var(--muted)">4</td><td style="font-family:var(--mono);color:var(--teal)">0.98</td><td style="color:var(--muted)">1h ago</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- INVESTIGATION THREAD -->
+      <div class="intel-section">
+        <div class="intel-section-title">Investigation Thread <span style="font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">— share analysis with your team</span></div>
+        <div class="thread-box">
+          <div class="thread-entry">
+            <div class="thread-avatar" style="background:var(--teal-bg);color:var(--teal)">AK</div>
+            <div class="thread-body">
+              <div class="thread-meta"><strong>alex.k</strong> · 2 hours ago</div>
+              <div class="thread-text">Activity spiked in W9 after 6-week quiet period. 3 new wallets (0xcc1d, 0x71fe, 0x9f3b) appeared at the same time. Possible wallet rotation to evade detection — same behavioral fingerprint though.</div>
+              <div class="thread-attach">
+                <span class="thread-chip">0xcc1d…4f82</span>
+                <span class="thread-chip">0x71fe…a831</span>
+                <span class="thread-chip">W9 timeline spike</span>
+              </div>
+            </div>
+          </div>
+          <div class="thread-entry">
+            <div class="thread-avatar" style="background:var(--purple-bg);color:var(--purple)">SR</div>
+            <div class="thread-body">
+              <div class="thread-meta"><strong>sara.r</strong> · 45 min ago</div>
+              <div class="thread-text">Confirmed fund flow from jared → 0xcc1d (4.2 ETH in W9). Also cross-correlates with mev-bot-4c7e — they're consistently within 2 blocks of each other on Flashbots. Coordinated operation.</div>
+              <div class="thread-attach">
+                <span class="thread-chip">Corr: 0.88 with mev-bot-4c7e</span>
+                <span class="thread-chip">Flashbots account match</span>
+              </div>
+            </div>
+          </div>
+          <div class="thread-entry">
+            <div class="thread-avatar" style="background:var(--amber-bg);color:var(--amber)">MV</div>
+            <div class="thread-body">
+              <div class="thread-meta"><strong>mike.v</strong> · 12 min ago</div>
+              <div class="thread-text">Base expansion is significant. Per-incident profit is up 40% since the Base wallets went live. They found a less-competitive pool on Base — USDC/cbETH. Recommend flagging the new wallet cluster for live alerting.</div>
+              <div class="thread-attach">
+                <span class="thread-chip">Base USDC/cbETH pool</span>
+                <span class="thread-chip">+40% profit/incident</span>
+              </div>
+            </div>
+          </div>
+          <div class="thread-input">
+            <input type="text" placeholder="Add a note, tag an address, or link an incident…">
+            <button class="btn primary" style="padding:5px 12px"><i class="ti ti-send"></i></button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- PAGE: BUILDERS -->
+<div id="page-builders" class="page">
+<div class="page-inner">
+  <div class="page-hdr">
+    <div class="page-hdr-left"><h1>Builder &amp; Relay Intelligence</h1><p>Searcher → builder → relay flows. Which builders include the most MEV?</p></div>
+    <div class="page-hdr-right"><select class="sel"><option>Last 24 hours</option><option>Last 7 days</option></select></div>
+  </div>
+  <div class="srow" style="grid-template-columns:repeat(4,1fr)">
+    <div class="sbox"><div class="v" style="color:var(--amber)">$2.41M</div><div class="l">MEV in blocks (24h)</div><div class="delta" style="color:var(--red)">↑ 12% vs yesterday</div></div>
+    <div class="sbox"><div class="v" style="color:var(--purple)">68%</div><div class="l">Flashbots relay share</div><div class="delta" style="color:var(--muted)">3,841 blocks</div></div>
+    <div class="sbox"><div class="v" style="color:var(--blue)">18</div><div class="l">Active searchers</div><div class="delta" style="color:var(--muted)">submitting bundles</div></div>
+    <div class="sbox"><div class="v" style="color:var(--red)">31</div><div class="l">Sandwich bundles</div><div class="delta" style="color:var(--muted)">Titan + Flashbots</div></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">Block Builders (24h)</span><span class="card-hdr-sub">by MEV extracted</span></div>
+      <table class="tbl">
+        <thead><tr><th>#</th><th>Builder</th><th class="r">Blocks</th><th class="r">Sandwich</th><th class="r">Flash</th><th class="r">Total MEV</th></tr></thead>
+        <tbody>
+          <tr><td style="color:var(--muted)">1</td><td><div style="display:flex;align-items:center;gap:7px"><div style="width:26px;height:26px;border-radius:var(--r);background:var(--teal-bg);color:var(--teal);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">F</div><span style="font-weight:500">Flashbots</span></div></td><td class="r" style="font-family:var(--mono)">3,841</td><td class="r"><span class="tag tag-red">12</span></td><td class="r"><span class="tag tag-amber">1</span></td><td class="r" style="font-family:var(--mono);color:var(--amber)">$1.04M</td></tr>
+          <tr><td style="color:var(--muted)">2</td><td><div style="display:flex;align-items:center;gap:7px"><div style="width:26px;height:26px;border-radius:var(--r);background:var(--purple-bg);color:var(--purple);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">T</div><span style="font-weight:500">Titan Builder</span></div></td><td class="r" style="font-family:var(--mono)">2,104</td><td class="r"><span class="tag tag-red">9</span></td><td class="r"><span class="tag tag-muted">0</span></td><td class="r" style="font-family:var(--mono);color:var(--amber)">$740K</td></tr>
+          <tr><td style="color:var(--muted)">3</td><td><div style="display:flex;align-items:center;gap:7px"><div style="width:26px;height:26px;border-radius:var(--r);background:var(--blue-bg);color:var(--blue);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">B</div><span style="font-weight:500">beaverbuild</span></div></td><td class="r" style="font-family:var(--mono)">1,892</td><td class="r"><span class="tag tag-red">6</span></td><td class="r"><span class="tag tag-amber">2</span></td><td class="r" style="font-family:var(--mono);color:var(--amber)">$430K</td></tr>
+          <tr><td style="color:var(--muted)">4</td><td><div style="display:flex;align-items:center;gap:7px"><div style="width:26px;height:26px;border-radius:var(--r);background:var(--coral-bg);color:var(--coral);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">R</div><span style="font-weight:500">rsync-builder</span></div></td><td class="r" style="font-family:var(--mono)">941</td><td class="r"><span class="tag tag-red">4</span></td><td class="r"><span class="tag tag-muted">0</span></td><td class="r" style="font-family:var(--mono);color:var(--amber)">$190K</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">Top Searchers (24h)</span><span class="card-hdr-sub">bundles by relay</span></div>
+      <table class="tbl">
+        <thead><tr><th>Searcher</th><th>Type</th><th>Relay</th><th class="r">Bundles</th><th class="r">Extracted</th></tr></thead>
+        <tbody>
+          <tr><td style="font-family:var(--mono);color:var(--blue)">0xd8dA…1c3f</td><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">Flashbots</td><td class="r" style="font-family:var(--mono)">31</td><td class="r" style="font-family:var(--mono);color:var(--amber)">$892K</td></tr>
+          <tr><td style="font-family:var(--mono);color:var(--blue)">0x9ba2…c04f</td><td><span class="tag tag-purple">Arb</span></td><td style="color:var(--muted)">Titan</td><td class="r" style="font-family:var(--mono)">48</td><td class="r" style="font-family:var(--mono);color:var(--amber)">$481K</td></tr>
+          <tr><td style="font-family:var(--mono);color:var(--blue)">0xf3a1₈88d0</td><td><span class="tag tag-amber">Flash</span></td><td style="color:var(--muted)">beaverbuild</td><td class="r" style="font-family:var(--mono)">3</td><td class="r" style="font-family:var(--mono);color:var(--amber)">$170K</td></tr>
+          <tr><td style="font-family:var(--mono);color:var(--blue)">0x4c7e…221b</td><td><span class="tag tag-red">Sandwich</span></td><td style="color:var(--muted)">Flashbots</td><td class="r" style="font-family:var(--mono)">19</td><td class="r" style="font-family:var(--mono);color:var(--amber)">$109K</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- PAGE: ANALYTICS -->
+<div id="page-analytics" class="page">
+<div class="page-inner">
+  <div class="page-hdr">
+    <div class="page-hdr-left"><h1>Analytics</h1><p>MEV trends, token risk scores, and economic impact. Powered by ClickHouse.</p></div>
+    <div class="page-hdr-right"><select class="sel"><option>Last 24 hours</option><option>Last 7 days</option></select><select class="sel"><option>All chains</option><option>Ethereum L1</option></select></div>
+  </div>
+  <div class="srow" style="grid-template-columns:repeat(6,1fr)">
+    <div class="sbox"><div class="v" style="color:var(--amber)">$2.41M</div><div class="l">Total MEV (24h)</div><div class="delta" style="color:var(--teal)">↑ 12% vs yesterday</div></div>
+    <div class="sbox"><div class="v" style="color:var(--red)">73</div><div class="l">Incidents (24h)</div><div class="delta" style="color:var(--red)">↑ 5 vs yesterday</div></div>
+    <div class="sbox"><div class="v" style="color:var(--purple)">18</div><div class="l">Unique attackers</div><div class="delta" style="color:var(--muted)">6 known bots</div></div>
+    <div class="sbox"><div class="v" style="color:var(--blue)">141</div><div class="l">Victim addresses</div><div class="delta" style="color:var(--muted)">avg $17K loss</div></div>
+    <div class="sbox"><div class="v" style="color:var(--teal)">1.84s</div><div class="l">Detect latency</div><div class="delta" style="color:var(--teal)">↓ 0.3s vs last wk</div></div>
+    <div class="sbox"><div class="v" style="color:var(--teal)">3.8%</div><div class="l">False positive rate</div><div class="delta" style="color:var(--teal)">↓ 0.4% vs last wk</div></div>
+  </div>
+  <div style="display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px">
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">MEV Extracted per Hour (last 24h)</span></div>
+      <div style="padding:12px 16px 10px">
+        <div style="display:flex;align-items:flex-end;gap:3px;height:80px">
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:45%;background:var(--amber);opacity:.6;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">00</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:30%;background:var(--amber);opacity:.5;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">04</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:60%;background:var(--amber);opacity:.7;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">08</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:100%;background:var(--amber);border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">09</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:78%;background:var(--amber);opacity:.85;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">10</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:65%;background:var(--amber);opacity:.75;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">12</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:88%;background:var(--amber);opacity:.9;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">13</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:50%;background:var(--amber);opacity:.6;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">15</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:75%;background:var(--amber);opacity:.8;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">18</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:82%;background:var(--amber);opacity:.88;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">19</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:63%;background:var(--amber);opacity:.7;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">21</div></div>
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px"><div style="width:100%;height:55%;background:var(--amber);opacity:.6;border-radius:2px 2px 0 0"></div><div style="font-size:9px;color:var(--faint)">23</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">MEV by Type</span></div>
+      <div style="padding:12px 14px;display:flex;flex-direction:column;gap:10px">
+        <div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;border-radius:2px;background:var(--red);display:inline-block"></span>Sandwich</span><span style="font-family:var(--mono);color:var(--amber)">$1.40M</span></div><div style="height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:58%;height:100%;background:var(--red)"></div></div></div>
+        <div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;border-radius:2px;background:var(--purple);display:inline-block"></span>Atomic Arb</span><span style="font-family:var(--mono);color:var(--amber)">$840K</span></div><div style="height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:35%;height:100%;background:var(--purple)"></div></div></div>
+        <div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;border-radius:2px;background:var(--amber);display:inline-block"></span>Flash Loan</span><span style="font-family:var(--mono);color:var(--amber)">$170K</span></div><div style="height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:7%;height:100%;background:var(--amber)"></div></div></div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-hdr"><span class="card-hdr-title">Token Risk Scores</span><span class="card-hdr-sub">0–100 · honeypot sim + deployer history + LP analysis</span></div>
+    <table class="tbl">
+      <thead><tr><th>Token</th><th>Contract</th><th>Risk Factors</th><th class="r">LP (USD)</th><th class="r">Risk Score</th></tr></thead>
+      <tbody>
+        <tr><td style="font-weight:500;color:var(--red)">$ZKFARM</td><td style="font-family:var(--mono);color:var(--blue)">0x8f2a…11cd</td><td><div style="display:flex;gap:4px;flex-wrap:wrap"><span class="tag tag-red">Honeypot</span><span class="tag tag-red">LP Drained</span><span class="tag tag-red">Deployer exited</span></div></td><td class="r" style="font-family:var(--mono);color:var(--muted)">$0</td><td class="r"><div style="display:flex;align-items:center;gap:5px;justify-content:flex-end"><div style="width:44px;height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:98%;height:100%;background:var(--red)"></div></div><span style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--red)">98</span></div></td></tr>
+        <tr><td style="font-weight:500;color:var(--amber)">$SWARM99</td><td style="font-family:var(--mono);color:var(--blue)">0x3c4b…7f20</td><td><div style="display:flex;gap:4px;flex-wrap:wrap"><span class="tag tag-amber">Mint fn</span><span class="tag tag-amber">New deployer</span></div></td><td class="r" style="font-family:var(--mono)">$42K</td><td class="r"><div style="display:flex;align-items:center;gap:5px;justify-content:flex-end"><div style="width:44px;height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:74%;height:100%;background:var(--amber)"></div></div><span style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--amber)">74</span></div></td></tr>
+        <tr><td style="font-weight:500">USDC</td><td style="font-family:var(--mono);color:var(--blue)">0xA0b8…eB48</td><td><div style="display:flex;gap:4px"><span class="tag tag-teal">Verified</span><span class="tag tag-teal">Circle issuer</span></div></td><td class="r" style="font-family:var(--mono)">$2.1B</td><td class="r"><div style="display:flex;align-items:center;gap:5px;justify-content:flex-end"><div style="width:44px;height:4px;background:var(--bg4);border-radius:2px;overflow:hidden"><div style="width:3%;height:100%;background:var(--teal)"></div></div><span style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--teal)">3</span></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<!-- PAGE: ALERTS -->
+<div id="page-alerts" class="page">
+<div class="page-inner">
+  <div class="page-hdr">
+    <div class="page-hdr-left"><h1>Alert Rules</h1><p>Get notified immediately. No dashboard watching required.</p></div>
+    <div class="page-hdr-right"><button class="btn primary" id="newRuleBtn"><i class="ti ti-plus"></i> New rule</button></div>
+  </div>
+
+  <!-- RULE BUILDER (hidden by default) -->
+  <div class="rule-builder" id="ruleBuilder" style="display:none">
+    <div style="font-size:12px;font-weight:600;margin-bottom:12px">New Alert Rule</div>
+
+    <div class="rule-row">
+      <span class="rule-keyword if">IF</span>
+      <select class="rule-select">
+        <option>Risk score</option>
+        <option>Confidence</option>
+        <option>Profit / loss amount</option>
+        <option>Entity type</option>
+        <option>Detector</option>
+        <option>Chain</option>
+      </select>
+      <select class="rule-select">
+        <option>&gt;</option>
+        <option>&gt;=</option>
+        <option>&lt;</option>
+        <option>=</option>
+      </select>
+      <input class="rule-input" type="text" value="80">
+    </div>
+
+    <div class="rule-row">
+      <span class="rule-keyword and">AND</span>
+      <select class="rule-select">
+        <option>Entity type</option>
+        <option>Risk score</option>
+        <option>Confidence</option>
+        <option>Chain</option>
+        <option>Detector</option>
+      </select>
+      <select class="rule-select">
+        <option>=</option>
+        <option>!=</option>
+      </select>
+      <select class="rule-select">
+        <option>MEV Bot</option>
+        <option>Scammer</option>
+        <option>Rug Deployer</option>
+        <option>Unknown</option>
+      </select>
+    </div>
+
+    <div class="rule-row">
+      <button class="rule-add-condition" id="addConditionBtn"><i class="ti ti-plus" style="font-size:11px;vertical-align:-1px"></i> Add condition</button>
+    </div>
+
+    <div class="rule-row" style="margin-top:4px;padding-top:10px;border-top:1px solid var(--border)">
+      <span class="rule-keyword then">THEN</span>
+      <select class="rule-select">
+        <option>Webhook</option>
+        <option>Email</option>
+        <option>Telegram</option>
+        <option>Slack</option>
+      </select>
+      <input class="rule-input" style="width:220px" type="text" placeholder="https://api.yourco.com/mev">
+    </div>
+
+    <div class="rule-row" style="margin-top:4px">
+      <span style="font-size:11px;color:var(--muted);width:42px;flex-shrink:0"></span>
+      <input class="rule-input" style="width:260px" type="text" placeholder="Rule name (e.g. High-risk MEV Bot alert)">
+    </div>
+
+    <div style="display:flex;gap:7px;margin-top:12px">
+      <button class="btn primary" id="saveRuleBtn"><i class="ti ti-check"></i> Save rule</button>
+      <button class="btn" id="testRuleBtn" onclick="testRule()"><i class="ti ti-player-play"></i> Test against last 24h</button>
+      <button class="btn" id="cancelRuleBtn">Cancel</button>
+    </div>
+    <!-- Test result panel -->
+    <div id="ruleTestResult" style="display:none;margin-top:12px;padding:11px 13px;background:var(--teal-bg);border:1px solid var(--teal-dim);border-radius:var(--r);font-size:11.5px">
+      <div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">
+        <i class="ti ti-check" style="color:var(--teal);font-size:14px"></i>
+        <span style="font-weight:600;color:var(--teal)">Dry-run complete — would have fired 7 times in last 24h</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)"><span style="width:7px;height:7px;background:var(--red);border-radius:50%;display:inline-block;flex-shrink:0"></span>4× High-Risk MEV Bot · jaredfromsubway.eth · $892K total</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)"><span style="width:7px;height:7px;background:var(--amber);border-radius:50%;display:inline-block;flex-shrink:0"></span>2× MEV Bot · arb-bot-9ba2 · risk score 67</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)"><span style="width:7px;height:7px;background:var(--amber);border-radius:50%;display:inline-block;flex-shrink:0"></span>1× MEV Bot · mev-bot-4c7e · risk score 74</div>
+      </div>
+      <div style="margin-top:7px;font-size:10.5px;color:var(--muted)">0 false positives detected in dry-run · <a href="#" style="color:var(--blue)">view matched incidents</a></div>
+    </div>
+  </div>
+
+  <div style="font-size:10.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:9px">Active Rules</div>
+  <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:22px">
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:13px 15px;display:flex;align-items:center;gap:12px">
+      <div style="width:32px;height:32px;border-radius:var(--r);background:var(--red-bg);color:var(--red);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0"><i class="ti ti-zoom-scan"></i></div>
+      <div style="flex:1">
+        <div style="font-size:12.5px;font-weight:500;margin-bottom:2px">High-Risk MEV Bot Activity</div>
+        <div style="font-size:11px;color:var(--muted);display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <span class="rule-keyword if" style="font-size:9px;padding:1px 5px">IF</span> Risk score &gt; 80
+          <span class="rule-keyword and" style="font-size:9px;padding:1px 5px">AND</span> Entity = MEV Bot
+          <span class="rule-keyword then" style="font-size:9px;padding:1px 5px">THEN</span> Webhook
+        </div>
+        <div style="display:flex;gap:5px;margin-top:5px;flex-wrap:wrap"><span class="tag tag-blue">Webhook → api.yourco.com/mev</span><span class="tag tag-teal" style="display:flex;align-items:center;gap:3px"><i class="ti ti-clock" style="font-size:10px"></i>Fired 2m ago</span><span class="tag tag-muted">847× today</span></div>
+      </div>
+      <label style="position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0"><input type="checkbox" checked style="opacity:0;width:0;height:0"><span style="position:absolute;inset:0;border-radius:9px;background:var(--teal);cursor:pointer"><span style="position:absolute;width:12px;height:12px;left:auto;right:3px;top:3px;border-radius:50%;background:#fff"></span></span></label>
+      <button class="btn" style="padding:4px 9px;font-size:11px">Edit</button>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:13px 15px;display:flex;align-items:center;gap:12px">
+      <div style="width:32px;height:32px;border-radius:var(--r);background:var(--amber-bg);color:var(--amber);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0"><i class="ti ti-bolt"></i></div>
+      <div style="flex:1"><div style="font-size:12.5px;font-weight:500;margin-bottom:2px">Flash Loan &gt; $50K</div><div style="font-size:11px;color:var(--muted)">Any chain · victim loss &gt; $50,000 · confidence &gt; 0.80</div><div style="display:flex;gap:5px;margin-top:5px;flex-wrap:wrap"><span class="tag tag-blue">Webhook → api.yourco.com/mev</span><span class="tag tag-teal" style="display:flex;align-items:center;gap:3px"><i class="ti ti-clock" style="font-size:10px"></i>Fired 1m ago</span><span class="tag tag-muted">3× today</span></div></div>
+      <label style="position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0"><input type="checkbox" checked style="opacity:0;width:0;height:0"><span style="position:absolute;inset:0;border-radius:9px;background:var(--teal);cursor:pointer"><span style="position:absolute;width:12px;height:12px;left:auto;right:3px;top:3px;border-radius:50%;background:#fff"></span></span></label>
+      <button class="btn" style="padding:4px 9px;font-size:11px">Edit</button>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:13px 15px;display:flex;align-items:center;gap:12px">
+      <div style="width:32px;height:32px;border-radius:var(--r);background:var(--red-bg);color:var(--red);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0"><i class="ti ti-crane"></i></div>
+      <div style="flex:1"><div style="font-size:12.5px;font-weight:500;margin-bottom:2px">Rug Pull — Any Amount</div><div style="font-size:11px;color:var(--muted)">Honeypot confirmed OR LP drain &gt; $5K · deployer exit</div><div style="display:flex;gap:5px;margin-top:5px;flex-wrap:wrap"><span class="tag tag-blue">Telegram → @mevwatch_alerts</span><span class="tag tag-teal" style="display:flex;align-items:center;gap:3px"><i class="ti ti-clock" style="font-size:10px"></i>Fired 9m ago</span><span class="tag tag-muted">1× today</span></div></div>
+      <label style="position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0"><input type="checkbox" checked style="opacity:0;width:0;height:0"><span style="position:absolute;inset:0;border-radius:9px;background:var(--teal);cursor:pointer"><span style="position:absolute;width:12px;height:12px;left:auto;right:3px;top:3px;border-radius:50%;background:#fff"></span></span></label>
+      <button class="btn" style="padding:4px 9px;font-size:11px">Edit</button>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);padding:13px 15px;display:flex;align-items:center;gap:12px">
+      <div style="width:32px;height:32px;border-radius:var(--r);background:var(--amber-bg);color:var(--amber);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0"><i class="ti ti-user-exclamation"></i></div>
+      <div style="flex:1"><div style="font-size:12.5px;font-weight:500;margin-bottom:2px">Known Scammer Activity</div><div style="font-size:11px;color:var(--muted)">Attacker label = "MEV Bot" OR risk score ≥ 80</div><div style="display:flex;gap:5px;margin-top:5px;flex-wrap:wrap"><span class="tag tag-blue">Webhook</span><span class="tag tag-blue">Email</span><span class="tag tag-muted">last fired 2m ago</span></div></div>
+      <label style="position:relative;display:inline-block;width:32px;height:18px;flex-shrink:0"><input type="checkbox" checked style="opacity:0;width:0;height:0"><span style="position:absolute;inset:0;border-radius:9px;background:var(--teal);cursor:pointer"><span style="position:absolute;width:12px;height:12px;left:auto;right:3px;top:3px;border-radius:50%;background:#fff"></span></span></label>
+      <button class="btn" style="padding:4px 9px;font-size:11px">Edit</button>
+    </div>
+  </div>
+  <div style="font-size:10.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:9px">Delivery Log</div>
+  <div class="card">
+    <table class="tbl">
+      <thead><tr><th>Rule</th><th>Incident</th><th>Channel</th><th>Status</th><th>Delivered</th></tr></thead>
+      <tbody>
+        <tr><td>Flash Loan &gt; $50K</td><td style="font-family:var(--mono);color:var(--blue)">inc_3cf9…a41e</td><td><span class="tag tag-blue">Webhook</span></td><td><span class="tag tag-teal">200 OK</span></td><td style="color:var(--muted)">1m ago</td></tr>
+        <tr><td>Known Scammer</td><td style="font-family:var(--mono);color:var(--blue)">inc_8fac…e221</td><td><span class="tag tag-blue">Webhook</span></td><td><span class="tag tag-teal">200 OK</span></td><td style="color:var(--muted)">2m ago</td></tr>
+        <tr><td>Rug Pull</td><td style="font-family:var(--mono);color:var(--blue)">inc_6ef2…7c3a</td><td><span class="tag tag-blue">Telegram</span></td><td><span class="tag tag-teal">Sent</span></td><td style="color:var(--muted)">9m ago</td></tr>
+        <tr><td>Flash Loan &gt; $50K</td><td style="font-family:var(--mono);color:var(--blue)">inc_9b3f…cc12</td><td><span class="tag tag-blue">Webhook</span></td><td><span class="tag tag-red">502 Error</span></td><td style="color:var(--muted)">1h ago</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<!-- PAGE: DETECTORS -->
+<div id="page-detectors" class="page">
+<div class="page-inner">
+  <div class="page-hdr">
+    <div class="page-hdr-left"><h1>Detector Configuration</h1><p>Per-detector thresholds, versioning, precision/recall. Changes gated on backtest metrics before live promotion.</p></div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:9px">
+    <div class="card">
+      <div class="card-hdr"><div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:var(--teal)"></div><span class="card-hdr-title">sandwich_v2</span><span class="card-hdr-sub">scope=PerBlock · deployed 3d ago</span></div><div style="display:flex;align-items:center;gap:9px"><span class="tag tag-teal">Live</span><span style="font-family:var(--mono);font-size:12px;color:var(--teal)">P 97.6%</span><span style="font-family:var(--mono);font-size:12px;color:var(--muted)">R 92.0%</span><button class="btn" style="padding:3px 9px;font-size:11px">Configure</button></div></div>
+      <div style="padding:11px 15px;display:grid;grid-template-columns:repeat(4,1fr);gap:13px;font-size:11.5px">
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Min profit</div><div style="font-family:var(--mono)">$100 USD</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Adjacency window</div><div style="font-family:var(--mono)">±10 positions</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Bot-label boost</div><div style="font-family:var(--mono)">+0.15 conf</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Sim-confirm required</div><div style="font-family:var(--mono);color:var(--teal)">Yes</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:var(--amber)"></div><span class="card-hdr-title">flash_loan_v1</span><span class="card-hdr-sub">scope=PerTx · borrow+repay + victim drain</span></div><div style="display:flex;align-items:center;gap:9px"><span class="tag tag-teal">Live</span><span style="font-family:var(--mono);font-size:12px;color:var(--amber)">P 88.0%</span><span style="font-family:var(--mono);font-size:12px;color:var(--muted)">R 79.0%</span><button class="btn primary" style="padding:3px 9px;font-size:11px">Tune ↗</button></div></div>
+      <div style="padding:11px 15px;background:rgba(240,168,64,.04);display:grid;grid-template-columns:repeat(4,1fr);gap:13px;font-size:11.5px">
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Min borrow</div><div style="font-family:var(--mono)">$500K</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Oracle dev. min</div><div style="font-family:var(--mono)">5%</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Victim loss min</div><div style="font-family:var(--mono)">$10K</div></div>
+        <div><div style="color:var(--muted);font-size:10px;margin-bottom:3px">Precision gate</div><div style="font-family:var(--mono);color:var(--amber)">Below 90% ⚠</div></div>
+      </div>
+    </div>
+    <div class="card" style="opacity:.58">
+      <div class="card-hdr"><div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:var(--faint)"></div><span class="card-hdr-title">wash_trading_v1</span><span class="card-hdr-sub">scope=CrossBlock · transfer graph cycle detection</span></div><div style="display:flex;align-items:center;gap:9px"><span class="tag tag-muted">Paused</span><button class="btn" style="padding:3px 9px;font-size:11px">Enable</button></div></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- PAGE: BILLING -->
+<div id="page-billing" class="page">
+<div class="page-inner">
+  <div class="page-hdr">
+    <div class="page-hdr-left"><h1>Billing &amp; Usage</h1><p>Track consumption against your plan. Billed monthly. Usage data from ClickHouse, updated every 60s.</p></div>
+    <div class="page-hdr-right">
+      <span style="font-size:11px;color:var(--muted)">Billing period:</span>
+      <span style="font-size:11.5px;font-weight:500">Jun 1 – Jun 30, 2026</span>
+      <button class="btn"><i class="ti ti-download"></i> Export invoice</button>
+    </div>
+  </div>
+
+  <!-- Plan + usage overview -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px">
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">Current Plan</span><span class="tag tag-purple" style="font-size:11px;padding:3px 9px">Pro</span></div>
+      <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--muted)">Monthly price</span><span style="font-family:var(--mono);font-weight:600">$499 / mo</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--muted)">Next invoice</span><span style="font-family:var(--mono)">Jul 1, 2026</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--muted)">Overage rate</span><span style="font-family:var(--mono)">$0.004 / API call</span></div>
+        <div style="height:1px;background:var(--border)"></div>
+        <div style="display:flex;gap:7px">
+          <button class="btn" style="flex:1;justify-content:center;font-size:11px"><i class="ti ti-arrow-up-circle"></i> Upgrade to Enterprise</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-hdr-title">Month-to-date charges</span></div>
+      <div style="padding:14px 16px">
+        <div style="font-family:var(--mono);font-size:28px;font-weight:700;color:var(--text);line-height:1;margin-bottom:4px">$499.00</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:14px">Base plan · no overage charges yet</div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--muted)">Base plan</span><span style="font-family:var(--mono)">$499.00</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--muted)">Overage API calls</span><span style="font-family:var(--mono);color:var(--teal)">$0.00</span></div>
+          <div style="height:1px;background:var(--border)"></div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:600"><span>Estimated total</span><span style="font-family:var(--mono)">$499.00</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Usage meters -->
+  <div style="font-size:10.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Plan Limits — June 2026</div>
+  <div class="card" style="margin-bottom:18px">
+    <div style="padding:14px 16px;display:flex;flex-direction:column;gap:14px">
+
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">
+          <span style="display:flex;align-items:center;gap:6px"><i class="ti ti-api" style="font-size:13px;color:var(--blue)"></i> API Calls</span>
+          <span><span style="font-family:var(--mono);font-weight:600">14,830</span><span style="color:var(--muted)"> / 50,000</span></span>
+        </div>
+        <div style="height:6px;background:var(--bg4);border-radius:3px;overflow:hidden"><div style="width:29.7%;height:100%;background:var(--blue)"></div></div>
+        <div style="font-size:10.5px;color:var(--muted);margin-top:3px">29.7% used · 35,170 remaining · resets Jul 1</div>
+      </div>
+
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">
+          <span style="display:flex;align-items:center;gap:6px"><i class="ti ti-bell-ringing" style="font-size:13px;color:var(--amber)"></i> Alert Deliveries</span>
+          <span><span style="font-family:var(--mono);font-weight:600">4,218</span><span style="color:var(--muted)"> / 10,000</span></span>
+        </div>
+        <div style="height:6px;background:var(--bg4);border-radius:3px;overflow:hidden"><div style="width:42.2%;height:100%;background:var(--amber)"></div></div>
+        <div style="font-size:10.5px;color:var(--muted);margin-top:3px">42.2% used · 5,782 remaining</div>
+      </div>
+
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">
+          <span style="display:flex;align-items:center;gap:6px"><i class="ti ti-cpu" style="font-size:13px;color:var(--purple)"></i> Simulations (revm)</span>
+          <span><span style="font-family:var(--mono);font-weight:600">83,441</span><span style="color:var(--muted)"> / 200,000</span></span>
+        </div>
+        <div style="height:6px;background:var(--bg4);border-radius:3px;overflow:hidden"><div style="width:41.7%;height:100%;background:var(--purple)"></div></div>
+        <div style="font-size:10.5px;color:var(--muted);margin-top:3px">41.7% used · 116,559 remaining</div>
+      </div>
+
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">
+          <span style="display:flex;align-items:center;gap:6px"><i class="ti ti-wallet" style="font-size:13px;color:var(--teal)"></i> Monitored Wallets</span>
+          <span><span style="font-family:var(--mono);font-weight:600">312</span><span style="color:var(--muted)"> / 500</span></span>
+        </div>
+        <div style="height:6px;background:var(--bg4);border-radius:3px;overflow:hidden"><div style="width:62.4%;height:100%;background:var(--teal)"></div></div>
+        <div style="font-size:10.5px;color:var(--muted);margin-top:3px">62.4% used · 188 slots remaining</div>
+      </div>
+
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">
+          <span style="display:flex;align-items:center;gap:6px"><i class="ti ti-adjustments-horizontal" style="font-size:13px;color:var(--coral)"></i> Active Rules</span>
+          <span><span style="font-family:var(--mono);font-weight:600">4</span><span style="color:var(--muted)"> / 25</span></span>
+        </div>
+        <div style="height:6px;background:var(--bg4);border-radius:3px;overflow:hidden"><div style="width:16%;height:100%;background:var(--coral)"></div></div>
+        <div style="font-size:10.5px;color:var(--muted);margin-top:3px">16% used · 21 slots remaining</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Invoice history -->
+  <div style="font-size:10.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Invoice History</div>
+  <div class="card">
+    <table class="tbl">
+      <thead><tr><th>Period</th><th>Plan</th><th class="r">API calls</th><th class="r">Overage</th><th class="r">Total</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        <tr><td style="color:var(--muted)">May 2026</td><td>Pro</td><td class="r" style="font-family:var(--mono)">48,220</td><td class="r" style="font-family:var(--mono);color:var(--muted)">$0.00</td><td class="r" style="font-family:var(--mono);font-weight:600">$499.00</td><td><span class="tag tag-teal">Paid</span></td><td><button class="btn" style="padding:3px 9px;font-size:10.5px"><i class="ti ti-download" style="font-size:11px"></i> PDF</button></td></tr>
+        <tr><td style="color:var(--muted)">Apr 2026</td><td>Pro</td><td class="r" style="font-family:var(--mono)">51,840</td><td class="r" style="font-family:var(--mono);color:var(--red)">$7.36</td><td class="r" style="font-family:var(--mono);font-weight:600">$506.36</td><td><span class="tag tag-teal">Paid</span></td><td><button class="btn" style="padding:3px 9px;font-size:10.5px"><i class="ti ti-download" style="font-size:11px"></i> PDF</button></td></tr>
+        <tr><td style="color:var(--muted)">Mar 2026</td><td>Starter</td><td class="r" style="font-family:var(--mono)">9,100</td><td class="r" style="font-family:var(--mono);color:var(--muted)">$0.00</td><td class="r" style="font-family:var(--mono);font-weight:600">$99.00</td><td><span class="tag tag-teal">Paid</span></td><td><button class="btn" style="padding:3px 9px;font-size:10.5px"><i class="ti ti-download" style="font-size:11px"></i> PDF</button></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<!-- DETAIL DRAWER -->
+<div class="drawer" id="detailDrawer">
+  <div class="drawer-hdr">
+    <div style="display:flex;align-items:center;gap:6px;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:500;background:var(--red-bg);color:var(--red);border:1px solid rgba(232,75,75,.2);flex-shrink:0"><i class="ti ti-sandwich" style="font-size:11px"></i> Sandwich</div>
+    <div class="drawer-title">Multi-victim sandwich — WETH/USDC</div>
+    <div style="display:flex;align-items:center;gap:3px;font-size:10px;padding:2px 5px;border-radius:4px;background:var(--teal-bg);color:var(--teal);flex-shrink:0"><i class="ti ti-check" style="font-size:9px"></i> Final</div>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0">
+      <span style="font-size:10px;color:var(--faint)"><kbd style="font-family:var(--mono);font-size:9px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:1px 4px">J</kbd><kbd style="font-family:var(--mono);font-size:9px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:1px 4px">K</kbd> navigate · <kbd style="font-family:var(--mono);font-size:9px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:1px 4px">Esc</kbd> close</span>
+    </div>
+    <div class="drawer-close" onclick="closeDrawer()"><i class="ti ti-x"></i></div>
+  </div>
+  <div class="drawer-tabs">
+    <button class="drawer-tab active" data-panel="summary">Summary</button>
+    <button class="drawer-tab" data-panel="simulation">Simulation</button>
+    <button class="drawer-tab" data-panel="trace">Trace Tree</button>
+    <button class="drawer-tab" data-panel="profit">Profit Calc</button>
+    <button class="drawer-tab" data-panel="feedback">Feedback</button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-panel active" id="panel-summary">
+      <div class="ds-title">Incident Details</div>
+      <div class="kv-row"><div class="kv-key">Chain</div><div class="kv-val">Ethereum L1</div></div>
+      <div class="kv-row"><div class="kv-key">Block</div><div class="kv-val hash">#21,847,201</div></div>
+      <div class="kv-row"><div class="kv-key">Incident ID</div><div class="kv-val hash">inc_8f3a1c…e221</div></div>
+      <div class="kv-row"><div class="kv-key">Attacker profit</div><div class="kv-val pos">+$14,820 (+0.31 ETH)</div></div>
+      <div class="kv-row"><div class="kv-key">Victim loss</div><div class="kv-val pos">−$22,440 total (sim)</div></div>
+      <div class="kv-row"><div class="kv-key">Risk score</div><div class="kv-val" style="color:var(--red)">94 / 100</div></div>
+      <div class="kv-row"><div class="kv-key">Confidence</div><div class="kv-val" style="color:var(--teal)">0.97 (sim-confirmed)</div></div>
+      <div class="kv-row"><div class="kv-key">Builder</div><div class="kv-val">Flashbots</div></div>
+      <div class="kv-row"><div class="kv-key">Detector</div><div class="kv-val">sandwich_v2 · PerBlock</div></div>
+      <div class="ds-title">Transaction Flow</div>
+      <div class="tx-flow">
+        <div class="tf-step"><div class="tf-num a">①</div><div class="tf-desc"><strong style="color:var(--red)">Frontrun</strong> — buy 42 WETH · pos 0</div><div class="tf-hash">0x8fac…e221</div></div>
+        <div class="tf-step"><div class="tf-num v">②</div><div class="tf-desc"><strong style="color:var(--blue)">Victim 1</strong> — 24K USDC→WETH · pos 4</div><div class="tf-hash">0x7a3b…e91a</div></div>
+        <div class="tf-step"><div class="tf-num v">③</div><div class="tf-desc"><strong style="color:var(--blue)">Victim 2</strong> — 18.5K USDC→WETH · pos 6</div><div class="tf-hash">0x2f9c…04bc</div></div>
+        <div class="tf-step"><div class="tf-num a">④</div><div class="tf-desc"><strong style="color:var(--red)">Backrun</strong> — sell 42 WETH · pos 9</div><div class="tf-hash">0x4e1a…9f30</div></div>
+      </div>
+      <div class="ds-title">Addresses</div>
+      <div class="kv-row"><div class="kv-key" style="color:var(--red)">Attacker</div><div class="kv-val hash">0xd8dA…1c3f <span style="color:var(--amber);font-size:9.5px">⚡ jaredfromsubway</span></div></div>
+      <div class="kv-row"><div class="kv-key" style="color:var(--blue)">Victim 1</div><div class="kv-val hash">0x7a3b…e91a</div></div>
+      <div class="kv-row"><div class="kv-key" style="color:var(--blue)">Victim 2</div><div class="kv-val hash">0x2f9c…04bc</div></div>
+      <div class="kv-row"><div class="kv-key">Pool</div><div class="kv-val hash">0x88e6…4f11 · Uni v3 WETH/USDC 0.05%</div></div>
+    </div>
+    <div class="drawer-panel" id="panel-simulation">
+      <div class="ds-title">Simulation Method</div>
+      <div class="kv-row"><div class="kv-key">Engine</div><div class="kv-val">revm (Rust EVM)</div></div>
+      <div class="kv-row"><div class="kv-key">State fork</div><div class="kv-val hash">block #21,847,200 (parent)</div></div>
+      <div class="kv-row"><div class="kv-key">Cache hit</div><div class="kv-val" style="color:var(--amber)">false</div></div>
+      <div class="kv-row"><div class="kv-key">Sim latency</div><div class="kv-val">38ms</div></div>
+      <div class="kv-row"><div class="kv-key">Counterfactual</div><div class="kv-val" style="color:var(--teal)">Replay without frontrun tx</div></div>
+      <div class="ds-title">Raw Evidence</div>
+      <div class="ev-block"><span class="ev-k">attacker_addr  </span><span class="ev-v">0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045</span>
+<span class="ev-k">label          </span><span class="ev-n">known_mev_bot · jaredfromsubway</span>
+<span class="ev-k">frontrun_buy   </span><span class="ev-n">42.000 WETH</span>
+<span class="ev-k">backrun_sell   </span><span class="ev-n">42.000 WETH</span>
+<span class="ev-k">net_profit     </span><span class="ev-n">+0.3104 ETH  ($14,820)</span>
+<span class="ev-k">victim_1_price </span><span class="ev-n">actual=3,241  fair=2,968 USDC/WETH</span>
+<span class="ev-k">victim_2_price </span><span class="ev-n">actual=3,289  fair=2,968 USDC/WETH</span>
+<span class="ev-k">victim_1_loss  </span><span class="ev-n">-$13,240  (counterfactual)</span>
+<span class="ev-k">victim_2_loss  </span><span class="ev-n">-$9,200   (counterfactual)</span>
+<span class="ev-k">confidence     </span><span class="ev-n">0.97</span></div>
+    </div>
+    <div class="drawer-panel" id="panel-trace">
+      <div class="ds-title">Call Trace — Frontrun Tx 0x8fac…e221</div>
+      <div class="trace-tree"><span class="trace-call">CALL</span> <span class="trace-fn">MEVBot.execute()</span> <span class="trace-gas">gas=420,000</span>
+<div class="trace-indent"><span class="trace-call">CALL</span> <span class="trace-fn">UniswapV3Pool.swap()</span> <span class="trace-gas">gas=112,040</span>
+<div class="trace-indent"><span class="trace-call">CALL</span> <span class="trace-fn">WETH.transfer()</span> <span class="trace-val">42.000 WETH → pool</span>
+<span class="trace-call">CALL</span> <span class="trace-fn">USDC.transfer()</span> <span class="trace-val">135,204 USDC ← pool</span></div>
+<span class="trace-call">CALL</span> <span class="trace-fn">FlashCallback.uniswapV3FlashCallback()</span>
+<div class="trace-indent"><span class="trace-call">CALL</span> <span class="trace-fn">WETH.approve(pool, 42)</span></div></div>
+<span class="trace-call">CALL</span> <span class="trace-fn">MEVBot.execute()</span> <span class="trace-gas">gas=310,000 [backrun]</span>
+<div class="trace-indent"><span class="trace-call">CALL</span> <span class="trace-fn">UniswapV3Pool.swap()</span>
+<div class="trace-indent"><span class="trace-call">CALL</span> <span class="trace-fn">WETH.transfer()</span> <span class="trace-val">42.000 WETH → pool</span>
+<span class="trace-call">CALL</span> <span class="trace-fn">USDC.transfer()</span> <span class="trace-val">149,842 USDC ← pool</span></div></div></div>
+      <div style="margin-top:9px;font-size:11px;color:var(--muted)">Total gas: 730,000 · fee: 0.021 ETH · net after gas: 0.310 ETH</div>
+    </div>
+    <div class="drawer-panel" id="panel-profit">
+      <div class="ds-title">Profit Breakdown</div>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:11px 13px;margin-bottom:13px">
+        <div class="profit-row"><span style="color:var(--muted)">USDC received (backrun)</span><span style="font-family:var(--mono);color:var(--teal)">+149,842 USDC</span></div>
+        <div class="profit-row"><span style="color:var(--muted)">USDC paid (frontrun)</span><span style="font-family:var(--mono);color:var(--red)">−135,204 USDC</span></div>
+        <div class="profit-row"><span style="color:var(--muted)">Gas cost (730K × 28 gwei)</span><span style="font-family:var(--mono);color:var(--red)">−0.021 ETH</span></div>
+        <div class="profit-row"><span style="color:var(--muted)">Flashbots builder tip</span><span style="font-family:var(--mono);color:var(--red)">−0.008 ETH</span></div>
+        <div class="profit-total"><span>Net profit</span><span style="font-family:var(--mono);color:var(--amber)">+0.310 ETH ($14,820)</span></div>
+      </div>
+      <div class="ds-title">Victim Impact (Counterfactual Sim)</div>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:11px 13px">
+        <div class="profit-row"><span style="color:var(--muted)">Victim 1 actual price</span><span style="font-family:var(--mono)">3,241 USDC/WETH</span></div>
+        <div class="profit-row"><span style="color:var(--muted)">Fair price (no sandwich)</span><span style="font-family:var(--mono);color:var(--teal)">2,968 USDC/WETH</span></div>
+        <div class="profit-row"><span style="color:var(--muted)">Victim 1 loss</span><span style="font-family:var(--mono);color:var(--red)">−$13,240</span></div>
+        <div class="profit-row" style="border-top:1px solid var(--border);padding-top:7px;margin-top:3px"><span style="color:var(--muted)">Victim 2 loss</span><span style="font-family:var(--mono);color:var(--red)">−$9,200</span></div>
+        <div class="profit-total"><span>Total victim harm</span><span style="font-family:var(--mono);color:var(--red)">−$22,440</span></div>
+      </div>
+    </div>
+    <div class="drawer-panel" id="panel-feedback">
+      <div class="ds-title">Analyst Verdict</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:11px;line-height:1.6">Trains the FP-suppression loop and updates per-detector precision/recall in real time.</div>
+      <div class="feedback-row" style="margin-bottom:14px">
+        <button class="fb-btn tp"><i class="ti ti-thumb-up"></i> True positive</button>
+        <button class="fb-btn fp"><i class="ti ti-thumb-down"></i> False positive</button>
+        <button class="fb-btn"><i class="ti ti-flag"></i> Needs review</button>
+      </div>
+      <div class="ds-title">Notes</div>
+      <textarea style="width:100%;height:78px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:12px;font-family:var(--sans);padding:7px 9px;resize:vertical;outline:none" placeholder="Optional analyst notes…"></textarea>
+      <button class="btn primary" style="margin-top:7px;width:100%;justify-content:center"><i class="ti ti-send"></i> Submit feedback</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── PIPELINE TOGGLE ─────────────────────────────────────
+const pipelineWrap = document.getElementById('pipelineWrap');
+const anomalyStrip = document.getElementById('anomalyStrip');
+const pipeChevron  = document.getElementById('pipeChevron');
+let pipelineOpen = false;
+
+document.getElementById('pipelineToggle').addEventListener('click', () => {
+  pipelineOpen = !pipelineOpen;
+  pipelineWrap.className = 'pipeline-wrap ' + (pipelineOpen ? 'expanded' : 'collapsed');
+  anomalyStrip.style.display = pipelineOpen ? 'none' : '';
+  pipeChevron.style.transform = pipelineOpen ? 'rotate(180deg)' : '';
+});
+
+// ── NAV TABS ────────────────────────────────────────────
+document.querySelectorAll('.nav-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const target = tab.dataset.tab;
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById('page-' + target).classList.add('active');
+    // pipeline bar only relevant on live monitor page
+    if (target === 'live') {
+      pipelineWrap.style.display = '';
+      anomalyStrip.style.display = pipelineOpen ? 'none' : '';
+    } else {
+      pipelineWrap.style.display = 'none';
+      anomalyStrip.style.display = 'none';
+    }
+    closeDrawer();
+  });
+});
+
+// ── FILTER PILLS ────────────────────────────────────────
+document.querySelectorAll('.main-toolbar .filter-pill').forEach(p => {
+  p.addEventListener('click', () => {
+    document.querySelectorAll('.main-toolbar .filter-pill').forEach(x => x.classList.remove('active'));
+    p.classList.add('active');
+  });
+});
+
+// ── CHAIN / DETECTOR ROWS ───────────────────────────────
+document.querySelectorAll('.chain-row').forEach(r => {
+  r.addEventListener('click', () => {
+    document.querySelectorAll('.chain-row').forEach(x => x.classList.remove('active'));
+    r.classList.add('active');
+  });
+});
+document.querySelectorAll('.det-item').forEach(r => {
+  r.addEventListener('click', () => {
+    document.querySelectorAll('.det-item').forEach(x => x.classList.remove('active'));
+    r.classList.add('active');
+  });
+});
+
+// ── INCIDENT CARDS ──────────────────────────────────────
+document.querySelectorAll('.inc-card:not(.retracted)').forEach(card => {
+  card.addEventListener('click', function() {
+    document.querySelectorAll('.inc-card').forEach(c => c.classList.remove('selected'));
+    this.classList.add('selected');
+    openDrawer();
+  });
+});
+
+// ── DRAWER ──────────────────────────────────────────────
+function openDrawer() { document.getElementById('detailDrawer').classList.add('open'); }
+function closeDrawer() { document.getElementById('detailDrawer').classList.remove('open'); }
+
+document.querySelectorAll('.drawer-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.drawer-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    document.querySelectorAll('.drawer-panel').forEach(p => p.classList.remove('active'));
+    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+  });
+});
+
+// ── ENTITY LIST ─────────────────────────────────────────
+function selectEntity(el, id) {
+  document.querySelectorAll('.entity-card').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+}
+
+// ── INTELLIGENCE FILTER PILLS ───────────────────────────
+document.querySelectorAll('#page-intelligence .filter-pill').forEach(p => {
+  p.addEventListener('click', () => {
+    document.querySelectorAll('#page-intelligence .filter-pill').forEach(x => x.classList.remove('active'));
+    p.classList.add('active');
+  });
+});
+
+// ── KEYBOARD SHORTCUTS ───────────────────────────────────
+document.addEventListener('keydown', e => {
+  const drawer = document.getElementById('detailDrawer');
+  const isOpen = drawer.classList.contains('open');
+  if (e.key === 'Escape' && isOpen) { closeDrawer(); return; }
+  if ((e.key === 'j' || e.key === 'J') && isOpen) {
+    const cards = [...document.querySelectorAll('.inc-card:not(.retracted)')];
+    const sel = document.querySelector('.inc-card.selected');
+    const idx = cards.indexOf(sel);
+    if (idx < cards.length - 1) { cards[idx].classList.remove('selected'); cards[idx+1].classList.add('selected'); }
+    return;
+  }
+  if ((e.key === 'k' || e.key === 'K') && isOpen) {
+    const cards = [...document.querySelectorAll('.inc-card:not(.retracted)')];
+    const sel = document.querySelector('.inc-card.selected');
+    const idx = cards.indexOf(sel);
+    if (idx > 0) { cards[idx].classList.remove('selected'); cards[idx-1].classList.add('selected'); }
+    return;
+  }
+});
+
+// ── EMPTY STATE (filter pills) ───────────────────────────
+function resetFilter() {
+  document.querySelectorAll('.main-toolbar .filter-pill').forEach((p,i) => p.classList.toggle('active', i===0));
+  document.getElementById('incidentEmpty').style.display = 'none';
+  document.querySelectorAll('.inc-card').forEach(c => c.style.display = '');
+}
+document.querySelectorAll('.main-toolbar .filter-pill').forEach((p,i) => {
+  p.addEventListener('click', () => {
+    document.querySelectorAll('.main-toolbar .filter-pill').forEach(x => x.classList.remove('active'));
+    p.classList.add('active');
+    // Simulate empty state for "Critical" filter (demo: hides all non-critical)
+    const showEmpty = p.textContent.trim().startsWith('Critical');
+    document.getElementById('incidentEmpty').style.display = showEmpty ? 'flex' : 'none';
+    document.querySelectorAll('.inc-card').forEach(c => c.style.display = showEmpty ? 'none' : '');
+  });
+});
+
+// ── RULE TEST (dry-run preview) ──────────────────────────
+function testRule() {
+  const btn = document.getElementById('testRuleBtn');
+  btn.innerHTML = '<i class="ti ti-loader" style="font-size:12px"></i> Running…';
+  btn.disabled = true;
+  setTimeout(() => {
+    btn.innerHTML = '<i class="ti ti-player-play"></i> Test against last 24h';
+    btn.disabled = false;
+    document.getElementById('ruleTestResult').style.display = 'block';
+  }, 1400);
+}
+
+// ── COPY ENTITY REPORT ───────────────────────────────────
+function copyEntityReport() {
+  const report = `MEVWatch Entity Report — jaredfromsubway.eth
+Generated: ${new Date().toISOString().slice(0,10)}
+Address: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
+Risk Score: 91/100  Confidence: 94%
+
+Key Milestones:
+2022-04-12  First seen via Flashbots relay on ETH L1
+2026-04 W3  Sandwich attack confirmed · reclassified Unknown → MEV Bot
+2026-05 W9  New funding source via Tornado Cash (2 hops) · 3 new wallets
+2026-05 W10 Expanded to Base · profit/incident +40%
+2026-06 W13 Oracle manipulation on Aave v3 (provisional, correlation 0.88)
+
+Lifetime profit: $8.2M · 183 incidents · 32 connected wallets`;
+  navigator.clipboard.writeText(report).catch(() => {});
+  const btn = event.target.closest('button');
+  btn.innerHTML = '<i class="ti ti-check"></i> Copied';
+  setTimeout(() => { btn.innerHTML = '<i class="ti ti-copy"></i> Copy as report'; }, 2000);
+}
+
+
+function drawGraphEdges() {
+  const canvas = document.getElementById('graphCanvas');
+  const svg    = document.getElementById('graphEdges');
+  if (!canvas || !svg) return;
+  const W = canvas.offsetWidth;
+  const H = canvas.offsetHeight;
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+
+  const nodes = {
+    'gn-jared':    [.50, .45],
+    'gn-wallet1':  [.28, .22],
+    'gn-wallet2':  [.70, .18],
+    'gn-wallet3':  [.82, .55],
+    'gn-wallet4':  [.16, .60],
+    'gn-arb':      [.72, .72],
+    'gn-bot2':     [.26, .76],
+    'gn-flashbots':[.48, .12],
+  };
+
+  const edges = [
+    ['gn-jared','gn-wallet1','var(--amber-dim)',2],
+    ['gn-jared','gn-wallet2','var(--amber-dim)',2],
+    ['gn-jared','gn-wallet3','var(--red)',1.5],
+    ['gn-jared','gn-wallet4','var(--red)',1.5],
+    ['gn-jared','gn-flashbots','var(--teal-dim)',1.5],
+    ['gn-jared','gn-bot2','var(--purple)',1,'5,4'],
+    ['gn-jared','gn-arb','var(--purple)',1,'5,4'],
+    ['gn-bot2','gn-flashbots','var(--teal-dim)',1],
+    ['gn-arb','gn-wallet2','var(--amber-dim)',1,'3,3'],
+  ];
+
+  let html = '';
+  edges.forEach(([a, b, color, w, dash]) => {
+    const [ax, ay] = nodes[a];
+    const [bx, by] = nodes[b];
+    const x1 = ax * W, y1 = ay * H, x2 = bx * W, y2 = by * H;
+    html += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}" stroke-opacity="0.5" ${dash ? `stroke-dasharray="${dash}"` : ''}/>`;
+  });
+  svg.innerHTML = html;
+}
+
+// Run after a short delay to ensure layout is complete
+setTimeout(drawGraphEdges, 120);
+window.addEventListener('resize', drawGraphEdges);
+
+// ── ALERT RULE BUILDER ───────────────────────────────────
+const ruleBuilder = document.getElementById('ruleBuilder');
+const newRuleBtn = document.getElementById('newRuleBtn');
+const cancelRuleBtn = document.getElementById('cancelRuleBtn');
+const saveRuleBtn = document.getElementById('saveRuleBtn');
+const addConditionBtn = document.getElementById('addConditionBtn');
+
+if (newRuleBtn) {
+  newRuleBtn.addEventListener('click', () => {
+    ruleBuilder.style.display = ruleBuilder.style.display === 'none' ? 'block' : 'none';
+  });
+}
+if (cancelRuleBtn) {
+  cancelRuleBtn.addEventListener('click', () => { ruleBuilder.style.display = 'none'; });
+}
+if (saveRuleBtn) {
+  saveRuleBtn.addEventListener('click', () => { ruleBuilder.style.display = 'none'; });
+}
+if (addConditionBtn) {
+  addConditionBtn.addEventListener('click', () => {
+    const row = document.createElement('div');
+    row.className = 'rule-row';
+    row.innerHTML = `
+      <span class="rule-keyword and">AND</span>
+      <select class="rule-select">
+        <option>Confidence</option>
+        <option>Risk score</option>
+        <option>Chain</option>
+        <option>Detector</option>
+      </select>
+      <select class="rule-select">
+        <option>&gt;</option>
+        <option>&gt;=</option>
+        <option>&lt;</option>
+        <option>=</option>
+      </select>
+      <input class="rule-input" type="text" value="0.8">`;
+    addConditionBtn.parentElement.insertAdjacentElement('beforebegin', row);
+  });
+}
+
+</script>
+</body>
+</html>

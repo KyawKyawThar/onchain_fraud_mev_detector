@@ -54,6 +54,14 @@ predefined detectors: *"alert when any wallet within 2 hops of a
 sanctions-listed address interacts with our protocol contracts with value above
 $10K."* That is a rule, not a detector. Rules are the enterprise pricing tier.
 
+**The screening API turns the graph into an inline product.** Detection and
+rules are things you *watch*. The Counterparty Screening API is something you
+*call* — a single synchronous request (`POST /v1/address/{addr}/screen`) that
+returns an `allow` / `review` / `block` decision in under 100ms, for exchanges
+and custodians to run inline on every withdrawal and onboarding. It is a thin
+decision layer over the same intelligence graph, metered per call — the
+highest-leverage way to sell the moat to non-dashboard buyers.
+
 ---
 
 ## Architecture
@@ -153,6 +161,7 @@ backed only by heuristic labels.
 ## API surface
 
 ```
+POST /v1/address/{addr}/screen        synchronous allow/review/block decision (pre-tx screening)
 GET  /v1/address/{addr}/risk          risk score + confidence + factor breakdown
 GET  /v1/address/{addr}/labels        all labels with provenance
 GET  /v1/entity/{id}                  full entity profile
@@ -167,6 +176,11 @@ WS   /v1/stream                       live incident stream (provisional + confir
 
 WebSocket clients handle three lifecycle transitions:
 `provisional_alert` → `alert_confirmed` (with sim data) → `alert_retracted`
+
+The screening endpoint is the exception to the async model — it answers
+synchronously (`allow` / `review` / `block`) over the intelligence cache, with a
+customer-configurable, versioned decision policy and a hard-block-on-sanctions
+override. Every decision carries the factor breakdown so a block is auditable.
 
 ---
 
@@ -204,9 +218,23 @@ confirmation rate, false-positive rate.
 | Pro | $499 | 50K API calls, 25 rules, full entity graph |
 | Enterprise | Custom | Unlimited + SLA + SAR export |
 
+**Counterparty Screening API — metered, per-call (billed separately from seats):**
+
+| Tier | Price | Applies when |
+|------|-------|--------------|
+| Developer | $0.01 / call | first 1,000 free, no commit |
+| Growth | $0.007 / call | volume ≥ 100K / mo |
+| Scale | $0.004 / call | volume ≥ 1M / mo |
+| Enterprise | Custom | SLA · on-prem · raw feed |
+
+The dashboard exposes nine surfaces — Intelligence, Live Monitor, Audit Trail,
+Screening API, Builders, Analytics, Alerts, Detectors, and Billing — over the
+same event-sourced backbone.
+
 Target customers: compliance teams at crypto exchanges (regulatory obligation
-to file SARs), DeFi protocol risk officers (attack attribution and blocking),
-and quantitative researchers (MEV landscape data).
+to file SARs, plus inline withdrawal screening), DeFi protocol risk officers
+(attack attribution and blocking), and quantitative researchers (MEV landscape
+data).
 
 ---
 

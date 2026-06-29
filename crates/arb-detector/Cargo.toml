@@ -25,6 +25,10 @@ alloy-primitives = { workspace = true }
 [dev-dependencies]
 # Shared fixtures (`CtxBuilder`, `addr`/`b256`/`swap`) for the detector tests.
 detector-api = { workspace = true, features = ["test-util"] }
+# Property tests (§18, task 4): a closed-cycle arb planted in arbitrary block
+# noise is always found, every finding is a genuine net-positive closed cycle,
+# and the profit gate is monotone.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

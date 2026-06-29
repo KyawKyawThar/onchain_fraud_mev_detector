@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/@tabler/icons-webfont@3.8.0/dist/tabler-icons.min.css">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html{scroll-behavior:smooth;}
+  body{background:#0a0d12;}
+  ::selection{background:rgba(34,211,168,.3);}
+  @keyframes mwl-rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+  @keyframes mwl-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes mwl-grid{to{background-position:0 60px}}
+  :focus-visible{outline:2px solid #4f9cf5;outline-offset:2px;border-radius:6px;}
+</style>
+</helmet>
+<div style="--bg:#0a0d12;--s1:#10141b;--s2:#161b24;--s3:#1e2531;--bd:rgba(255,255,255,.07);--bd2:rgba(255,255,255,.14);--tx:#e7eaf2;--mu:#8b92a7;--ft:#525a72;--teal:#22d3a8;--amber:#f5b544;--red:#f0564f;--violet:#9d7bf0;--blue:#4f9cf5;--mono:'JetBrains Mono',monospace;--disp:'Space Grotesk',sans-serif;font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden;">
+
+  <!-- NAV -->
+  <header style="position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:18px;height:64px;padding:0 max(24px,5vw);background:rgba(10,13,18,.82);backdrop-filter:blur(14px);border-bottom:1px solid var(--bd);">
+    <a href="#top" style="display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--tx);">
+      <div style="width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--teal),var(--violet));display:flex;align-items:center;justify-content:center;box-shadow:0 0 18px rgba(34,211,168,.4);"><i class="ti ti-eye-bolt" style="font-size:18px;color:#06140f;"></i></div>
+      <span style="font-family:var(--disp);font-weight:700;font-size:18px;letter-spacing:-.01em;">MEVWatch</span>
+    </a>
+    <nav style="display:flex;gap:4px;margin-left:14px;" aria-label="Primary">
+      <a href="#product" style="padding:7px 12px;border-radius:8px;color:var(--mu);text-decoration:none;font-size:14px;" style-hover="color:var(--tx);background:var(--s2);">Product</a>
+      <a href="#screening" style="padding:7px 12px;border-radius:8px;color:var(--mu);text-decoration:none;font-size:14px;" style-hover="color:var(--tx);background:var(--s2);">Screening API</a>
+      <a href="#pricing" style="padding:7px 12px;border-radius:8px;color:var(--mu);text-decoration:none;font-size:14px;" style-hover="color:var(--tx);background:var(--s2);">Pricing</a>
+    </nav>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+      <a href="#access" style="display:none;padding:8px 14px;border-radius:9px;color:var(--mu);text-decoration:none;font-size:14px;" style-hover="color:var(--tx);">Sign in</a>
+      <a href="#access" style="display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:9px;background:var(--teal);color:#06140f;text-decoration:none;font-size:14px;font-weight:600;" style-hover="background:#3ee0b8;"><i class="ti ti-arrow-right" style="font-size:16px;"></i>Request access</a>
+    </div>
+  </header>
+
+  <!-- HERO -->
+  <section id="top" style="position:relative;padding:80px max(24px,5vw) 70px;overflow:hidden;">
+    <div style="position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);background-size:60px 60px;mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000 40%,transparent 78%);animation:mwl-grid 6s linear infinite;" aria-hidden="true"></div>
+    <div style="position:relative;max-width:1180px;margin:0 auto;display:grid;grid-template-columns:1.05fr .95fr;gap:54px;align-items:center;">
+      <div style="animation:mwl-rise .6s ease both;">
+        <div style="display:inline-flex;align-items:center;gap:8px;padding:6px 13px;border:1px solid var(--bd);border-radius:20px;background:var(--s1);font-size:12.5px;color:var(--mu);margin-bottom:22px;"><span style="width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 8px var(--teal);animation:mwl-pulse 2s infinite;"></span>Simulation-confirmed · false-positive rate &lt; 4%</div>
+        <h1 style="font-family:var(--disp);font-size:54px;line-height:1.05;font-weight:700;letter-spacing:-.02em;margin-bottom:20px;">Know who you're<br>transacting with —<br><span style="background:linear-gradient(120deg,var(--teal),var(--violet));-webkit-background-clip:text;background-clip:text;color:transparent;">before the block lands.</span></h1>
+        <p style="font-size:17px;color:var(--mu);max-width:520px;margin-bottom:30px;">MEVWatch is real-time, simulation-backed on-chain risk intelligence. Detect sandwich attacks, flash-loan exploits and rug pulls — and screen any counterparty for an <strong style="color:var(--tx);">allow / review / block</strong> decision in a single API call.</p>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+          <a href="#access" style="display:inline-flex;align-items:center;gap:7px;padding:13px 22px;border-radius:11px;background:var(--teal);color:#06140f;text-decoration:none;font-size:15px;font-weight:600;" style-hover="background:#3ee0b8;"><i class="ti ti-key" style="font-size:18px;"></i>Get API access</a>
+          <a href="#screening" style="display:inline-flex;align-items:center;gap:7px;padding:13px 22px;border-radius:11px;background:var(--s2);border:1px solid var(--bd);color:var(--tx);text-decoration:none;font-size:15px;font-weight:600;" style-hover="border-color:var(--bd2);"><i class="ti ti-player-play" style="font-size:18px;"></i>See it work</a>
+        </div>
+        <div style="display:flex;gap:26px;margin-top:34px;flex-wrap:wrap;">
+          <div><div style="font-family:var(--disp);font-weight:700;font-size:24px;">4</div><div style="font-size:12.5px;color:var(--mu);">chains monitored</div></div>
+          <div style="width:1px;background:var(--bd);"></div>
+          <div><div style="font-family:var(--disp);font-weight:700;font-size:24px;">&lt;100<span style="font-size:15px;color:var(--mu);">ms</span></div><div style="font-size:12.5px;color:var(--mu);">screening p50</div></div>
+          <div style="width:1px;background:var(--bd);"></div>
+          <div><div style="font-family:var(--disp);font-weight:700;font-size:24px;">7</div><div style="font-size:12.5px;color:var(--mu);">attack detectors</div></div>
+        </div>
+      </div>
+      <!-- hero terminal -->
+      <div style="animation:mwl-rise .6s ease .12s both;">
+        <div style="background:var(--s1);border:1px solid var(--bd);border-radius:16px;overflow:hidden;box-shadow:0 30px 70px -30px rgba(0,0,0,.7);">
+          <div style="display:flex;align-items:center;gap:7px;padding:11px 15px;border-bottom:1px solid var(--bd);background:var(--s2);">
+            <span style="width:11px;height:11px;border-radius:50%;background:#f0564f;"></span><span style="width:11px;height:11px;border-radius:50%;background:#f5b544;"></span><span style="width:11px;height:11px;border-radius:50%;background:#22d3a8;"></span>
+            <span style="margin-left:8px;font-family:var(--mono);font-size:12px;color:var(--mu);">POST /v1/address/{addr}/screen</span>
+          </div>
+          <div style="padding:18px;font-family:var(--mono);font-size:12.5px;line-height:1.85;">
+            <div style="color:var(--ft);">// screen a withdrawal counterparty</div>
+            <div><span style="color:var(--violet);">curl</span> <span style="color:var(--teal);">api.mevwatch.io/v1/address/0xd8dA…1c3f/screen</span></div>
+            <div style="color:var(--mu);">&nbsp;&nbsp;-H <span style="color:var(--amber);">"Authorization: Bearer sk_live_••••"</span></div>
+            <div style="height:12px;"></div>
+            <div style="border-top:1px solid var(--bd);padding-top:12px;">
+              <div><span style="color:var(--blue);">"decision"</span><span style="color:var(--mu);">: </span><span style="color:var(--red);">"block"</span><span style="color:var(--mu);">,</span></div>
+              <div><span style="color:var(--blue);">"risk"</span><span style="color:var(--mu);">: { </span><span style="color:var(--blue);">"score"</span><span style="color:var(--mu);">: </span><span style="color:var(--amber);">91</span><span style="color:var(--mu);">, </span><span style="color:var(--blue);">"confidence"</span><span style="color:var(--mu);">: </span><span style="color:var(--amber);">0.94</span><span style="color:var(--mu);"> },</span></div>
+              <div><span style="color:var(--blue);">"sanctions"</span><span style="color:var(--mu);">: { </span><span style="color:var(--blue);">"match"</span><span style="color:var(--mu);">: </span><span style="color:var(--violet);">false</span><span style="color:var(--mu);"> },</span></div>
+              <div><span style="color:var(--blue);">"entity"</span><span style="color:var(--mu);">: </span><span style="color:var(--teal);">"entity-183 (MevBot)"</span></div>
+            </div>
+            <div style="margin-top:14px;display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:8px;background:rgba(240,86,79,.1);border:1px solid rgba(240,86,79,.3);color:var(--red);font-family:var(--disp);font-weight:700;"><i class="ti ti-ban" style="font-size:16px;"></i>BLOCK · 84ms</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOGO / PROBLEM STRIP -->
+  <section style="border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);background:var(--s1);">
+    <div style="max-width:1180px;margin:0 auto;padding:26px max(24px,5vw);display:flex;align-items:center;justify-content:space-between;gap:30px;flex-wrap:wrap;">
+      <div style="font-size:14px;color:var(--mu);max-width:340px;">MEV extraction costs traders <strong style="color:var(--tx);">hundreds of millions</strong> a year. Exchanges are <strong style="color:var(--tx);">legally required</strong> to screen withdrawals.</div>
+      <div style="display:flex;gap:40px;flex-wrap:wrap;">
+        <div><div style="font-family:var(--disp);font-weight:700;font-size:22px;color:var(--amber);">$2.41M</div><div style="font-size:12px;color:var(--mu);">MEV extracted / 24h</div></div>
+        <div><div style="font-family:var(--disp);font-weight:700;font-size:22px;color:var(--red);">73</div><div style="font-size:12px;color:var(--mu);">incidents / 24h</div></div>
+        <div><div style="font-family:var(--disp);font-weight:700;font-size:22px;color:var(--teal);">96.2%</div><div style="font-size:12px;color:var(--mu);">detection precision</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRODUCT PILLARS -->
+  <section id="product" style="padding:80px max(24px,5vw);max-width:1180px;margin:0 auto;">
+    <div style="text-align:center;margin-bottom:48px;">
+      <div style="font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--teal);font-weight:600;margin-bottom:12px;">Why MEVWatch</div>
+      <h2 style="font-family:var(--disp);font-size:36px;font-weight:600;letter-spacing:-.01em;">Detection commoditizes. The graph compounds.</h2>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:18px;">
+      <sc-for list="{{ pillars }}" as="p" hint-placeholder-count="3">
+        <div style="background:var(--s1);border:1px solid var(--bd);border-radius:16px;padding:26px 24px;" style-hover="border-color:var(--bd2);">
+          <div style="width:46px;height:46px;border-radius:12px;background:{{ p.bg }};color:{{ p.col }};display:flex;align-items:center;justify-content:center;margin-bottom:18px;"><i class="ti {{ p.icon }}" style="font-size:24px;"></i></div>
+          <h3 style="font-family:var(--disp);font-size:19px;font-weight:600;margin-bottom:9px;">{{ p.title }}</h3>
+          <p style="font-size:14.5px;color:var(--mu);">{{ p.body }}</p>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <!-- SCREENING SPOTLIGHT -->
+  <section id="screening" style="background:var(--s1);border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);">
+    <div style="max-width:1180px;margin:0 auto;padding:80px max(24px,5vw);display:grid;grid-template-columns:1fr 1fr;gap:54px;align-items:center;">
+      <div>
+        <div style="display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:8px;background:var(--violetb,rgba(157,123,240,.12));color:var(--violet);font-size:12.5px;font-weight:600;margin-bottom:18px;"><i class="ti ti-shield-check" style="font-size:15px;"></i>The product wedge</div>
+        <h2 style="font-family:var(--disp);font-size:34px;font-weight:600;letter-spacing:-.01em;margin-bottom:16px;">Counterparty screening, in one call.</h2>
+        <p style="font-size:16px;color:var(--mu);margin-bottom:24px;">Drop a synchronous risk check inline on every withdrawal, deposit and onboarding. Policy-driven <strong style="color:var(--tx);">allow / review / block</strong>, a hard stop on sanctions matches, and a full evidence breakdown behind every decision — so a block is defensible, not a black box.</p>
+        <div style="display:flex;flex-direction:column;gap:13px;">
+          <sc-for list="{{ screenFeatures }}" as="f" hint-placeholder-count="4">
+            <div style="display:flex;align-items:flex-start;gap:11px;"><i class="ti ti-circle-check-filled" style="font-size:18px;color:var(--teal);flex-shrink:0;margin-top:1px;"></i><span style="font-size:14.5px;"><strong style="color:var(--tx);">{{ f.h }}</strong> <span style="color:var(--mu);">{{ f.b }}</span></span></div>
+          </sc-for>
+        </div>
+      </div>
+      <!-- interactive decision demo -->
+      <div style="background:var(--bg);border:1px solid var(--bd);border-radius:16px;overflow:hidden;">
+        <div style="padding:14px 18px;border-bottom:1px solid var(--bd);font-size:13px;color:var(--mu);">Try it — pick a counterparty</div>
+        <div style="padding:16px 18px;display:flex;flex-direction:column;gap:7px;">
+          <sc-for list="{{ demoSamples }}" as="s" hint-placeholder-count="3">
+            <button type="button" onClick="{{ s.go }}" style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid {{ s.bd }};border-radius:10px;background:{{ s.bg }};cursor:pointer;font-family:inherit;text-align:left;" style-hover="border-color:var(--bd2);">
+              <span style="width:8px;height:8px;border-radius:50%;background:{{ s.dot }};flex-shrink:0;"></span>
+              <span style="flex:1;font-size:14px;color:{{ s.tc }};">{{ s.label }}</span>
+              <code style="font-family:var(--mono);font-size:11.5px;color:var(--ft);">{{ s.addr }}</code>
+            </button>
+          </sc-for>
+        </div>
+        <div style="margin:4px 18px 18px;border:1px solid {{ demo.bd }};background:{{ demo.bg }};border-radius:12px;padding:16px 18px;display:flex;align-items:center;gap:14px;">
+          <span style="width:50px;height:50px;border-radius:12px;background:{{ demo.bg }};border:1px solid {{ demo.bd }};color:{{ demo.col }};display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="ti {{ demo.icon }}" style="font-size:26px;"></i></span>
+          <div style="flex:1;"><div style="font-family:var(--disp);font-weight:700;font-size:21px;color:{{ demo.col }};letter-spacing:.02em;">{{ demo.label }}</div><div style="font-size:12.5px;color:var(--mu);margin-top:2px;">{{ demo.note }}</div></div>
+          <div style="text-align:right;"><div style="font-family:var(--disp);font-weight:700;font-size:19px;color:{{ demo.col }};">{{ demo.score }}</div><div style="font-size:10px;color:var(--mu);">risk</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section id="pricing" style="padding:80px max(24px,5vw);max-width:1180px;margin:0 auto;">
+    <div style="text-align:center;margin-bottom:44px;">
+      <div style="font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--teal);font-weight:600;margin-bottom:12px;">Pricing</div>
+      <h2 style="font-family:var(--disp);font-size:36px;font-weight:600;letter-spacing:-.01em;">Metered where it matters.</h2>
+      <p style="font-size:15px;color:var(--mu);margin-top:10px;">Screening is pay-per-call so you only pay for the traffic you screen.</p>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;">
+      <sc-for list="{{ pricing }}" as="t" hint-placeholder-count="4">
+        <div style="background:{{ t.bg }};border:1px solid {{ t.bd }};border-radius:16px;padding:26px 22px;display:flex;flex-direction:column;">
+          <div style="display:flex;align-items:center;justify-content:space-between;"><span style="font-family:var(--disp);font-weight:600;font-size:17px;color:{{ t.nc }};">{{ t.name }}</span><sc-if value="{{ t.tag }}" hint-placeholder-val=""><span style="font-size:10px;font-weight:600;color:var(--violet);background:rgba(157,123,240,.16);padding:2px 8px;border-radius:6px;">{{ t.tag }}</span></sc-if></div>
+          <div style="margin:16px 0 4px;"><span style="font-family:var(--disp);font-weight:700;font-size:30px;">{{ t.price }}</span><span style="font-size:13px;color:var(--mu);"> {{ t.unit }}</span></div>
+          <div style="font-size:13px;color:var(--mu);margin-bottom:18px;min-height:34px;">{{ t.note }}</div>
+          <a href="#access" style="margin-top:auto;text-align:center;padding:10px;border-radius:9px;background:{{ t.btnbg }};border:1px solid {{ t.btnbd }};color:{{ t.btnc }};text-decoration:none;font-size:13.5px;font-weight:600;" style-hover="border-color:var(--bd2);">{{ t.cta }}</a>
+        </div>
+      </sc-for>
+    </div>
+    <p style="text-align:center;font-size:13px;color:var(--ft);margin-top:18px;">Dashboard seat plans (Free · Pro · Enterprise) available alongside metered screening. <a href="#access" style="color:var(--blue);text-decoration:none;">Talk to us →</a></p>
+  </section>
+
+  <!-- LEAD CAPTURE -->
+  <section id="access" style="padding:10px max(24px,5vw) 90px;">
+    <div style="max-width:760px;margin:0 auto;background:linear-gradient(160deg,var(--s2),var(--s1));border:1px solid var(--bd);border-radius:22px;padding:48px max(24px,5vw);text-align:center;position:relative;overflow:hidden;">
+      <div style="position:absolute;top:-40%;left:50%;transform:translateX(-50%);width:480px;height:480px;background:radial-gradient(circle,rgba(34,211,168,.12),transparent 65%);" aria-hidden="true"></div>
+      <div style="position:relative;">
+        <h2 style="font-family:var(--disp);font-size:32px;font-weight:600;letter-spacing:-.01em;margin-bottom:10px;">Become a design partner.</h2>
+        <p style="font-size:16px;color:var(--mu);max-width:480px;margin:0 auto 28px;">We're onboarding a small group of exchanges, custodians and protocols. Early partners get hands-on integration, input on the roadmap, and founder pricing.</p>
+        <sc-if value="{{ submitted }}" hint-placeholder-val="">
+          <div style="display:inline-flex;align-items:center;gap:10px;padding:18px 26px;border-radius:14px;background:rgba(34,211,168,.1);border:1px solid rgba(34,211,168,.3);color:var(--teal);font-family:var(--disp);font-weight:600;font-size:17px;"><i class="ti ti-circle-check" style="font-size:22px;"></i>Thanks — we'll be in touch within 48 hours.</div>
+        </sc-if>
+        <sc-if value="{{ showForm }}" hint-placeholder-val="{{ true }}">
+          <form onSubmit="{{ submit }}" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:560px;margin:0 auto;text-align:left;">
+            <input required placeholder="Full name" aria-label="Full name" style="padding:13px 15px;background:var(--bg);border:1px solid var(--bd);border-radius:11px;color:var(--tx);font-family:inherit;font-size:14.5px;" style-focus="border-color:var(--teal);outline:none;">
+            <input required type="email" placeholder="Work email" aria-label="Work email" style="padding:13px 15px;background:var(--bg);border:1px solid var(--bd);border-radius:11px;color:var(--tx);font-family:inherit;font-size:14.5px;" style-focus="border-color:var(--teal);outline:none;">
+            <input required placeholder="Company" aria-label="Company" style="padding:13px 15px;background:var(--bg);border:1px solid var(--bd);border-radius:11px;color:var(--tx);font-family:inherit;font-size:14.5px;grid-column:1 / 2;" style-focus="border-color:var(--teal);outline:none;">
+            <select aria-label="Use case" style="padding:13px 15px;background:var(--bg);border:1px solid var(--bd);border-radius:11px;color:var(--tx);font-family:inherit;font-size:14.5px;cursor:pointer;"><option>Withdrawal screening</option><option>Protocol monitoring</option><option>Compliance / SAR</option><option>MEV research</option></select>
+            <button type="submit" style="grid-column:1 / 3;padding:14px;border-radius:11px;background:var(--teal);border:none;color:#06140f;font-family:inherit;font-size:15px;font-weight:600;cursor:pointer;" style-hover="background:#3ee0b8;">Request access →</button>
+          </form>
+        </sc-if>
+        <div style="font-size:12.5px;color:var(--ft);margin-top:16px;">No spam. We'll only use your email to set up your trial.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer style="border-top:1px solid var(--bd);padding:30px max(24px,5vw);">
+    <div style="max-width:1180px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:9px;"><div style="width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,var(--teal),var(--violet));display:flex;align-items:center;justify-content:center;"><i class="ti ti-eye-bolt" style="font-size:15px;color:#06140f;"></i></div><span style="font-family:var(--disp);font-weight:600;font-size:15px;">MEVWatch</span><span style="font-size:12.5px;color:var(--ft);margin-left:6px;">Real-time on-chain risk intelligence</span></div>
+      <div style="font-size:12.5px;color:var(--ft);">© 2026 MEVWatch · Built in Rust</div>
+    </div>
+  </footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;100%&quot;,&quot;height&quot;:&quot;100%&quot;}}">
+class Component extends DCLogic {
+  state = { demoIdx:0, submitted:false };
+  C(){ return {teal:'#22d3a8',amber:'#f5b544',red:'#f0564f',violet:'#9d7bf0',blue:'#4f9cf5',mu:'#8b92a7',ft:'#525a72',tx:'#e7eaf2'}; }
+  renderVals(){
+    const C=this.C(), st=this.state;
+    const pillars=[
+      {icon:'ti-cpu',col:C.teal,bg:'rgba(34,211,168,.1)',title:'Simulation-confirmed',body:'Every detection is replayed in a forked EVM with revm — exact attacker profit and victim loss, not a heuristic guess. False-positive rate under 4%.'},
+      {icon:'ti-affiliate',col:C.violet,bg:'rgba(157,123,240,.1)',title:'The intelligence graph',body:'Clustered wallets, traced funding, multi-year behavioral history across four chains. The moat that compounds with every incident — and competitors can\u2019t copy.'},
+      {icon:'ti-shield-search',col:C.blue,bg:'rgba(79,156,245,.1)',title:'Inline screening',body:'A synchronous allow / review / block decision over the same graph, in <100ms. Built for exchanges that must screen every withdrawal in real time.'}
+    ];
+    const screenFeatures=[
+      {h:'Policy-driven decisions.',b:'Configurable, versioned allow / review / block thresholds per customer.'},
+      {h:'Hard stop on sanctions.',b:'OFAC / EU matches bypass the score and block outright.'},
+      {h:'Every block is explainable.',b:'Full factor breakdown with evidence refs — defensible to a regulator.'},
+      {h:'<100ms p50, 99.95% uptime.',b:'A latency SLO, because it sits on your critical path.'}
+    ];
+    const dRaw=[
+      {label:'jaredfromsubway.eth',addr:'0xd8dA…1c3f',score:91,dec:'block'},
+      {label:'arb-bot-9ba2',addr:'0x9ba2…c04f',score:67,dec:'review'},
+      {label:'fresh EOA (clean)',addr:'0x7F36…9C2e',score:6,dec:'allow'},
+      {label:'Tornado Cash: Router',addr:'0x8589…b9D8',score:100,dec:'block',sanc:true}
+    ];
+    const dm={allow:{col:C.teal,bg:'rgba(34,211,168,.1)',bd:'rgba(34,211,168,.3)',icon:'ti-circle-check',label:'ALLOW',note:'No blocking signals — proceed'},review:{col:C.amber,bg:'rgba(245,181,68,.1)',bd:'rgba(245,181,68,.3)',icon:'ti-alert-triangle',label:'REVIEW',note:'Hold for manual compliance review'},block:{col:C.red,bg:'rgba(240,86,79,.1)',bd:'rgba(240,86,79,.3)',icon:'ti-ban',label:'BLOCK',note:'Reject — high-risk counterparty'}};
+    const cur=dRaw[st.demoIdx];
+    const curDec=dm[cur.dec];
+    const demoSamples=dRaw.map((s,i)=>({label:s.label,addr:s.addr,go:()=>this.setState({demoIdx:i}),dot:dm[s.dec].col,bd:i===st.demoIdx?dm[s.dec].col:'var(--bd)',bg:i===st.demoIdx?dm[s.dec].bg:'var(--s2)',tc:i===st.demoIdx?'var(--tx)':'var(--mu)'}));
+    const pricing=[
+      {name:'Developer',price:'$0.01',unit:'/ call',note:'First 1,000 calls free. No commitment.',tag:'',bg:'var(--s1)',bd:'var(--bd)',nc:C.tx,cta:'Start free',btnbg:'var(--s2)',btnbd:'var(--bd)',btnc:C.tx},
+      {name:'Growth',price:'$0.007',unit:'/ call',note:'For volume \u2265 100K calls / month.',tag:'Popular',bg:'rgba(157,123,240,.07)',bd:'rgba(157,123,240,.4)',nc:C.violet,cta:'Request access',btnbg:'var(--violet)',btnbd:'var(--violet)',btnc:'#0a0d12'},
+      {name:'Scale',price:'$0.004',unit:'/ call',note:'For volume \u2265 1M calls / month.',tag:'',bg:'var(--s1)',bd:'var(--bd)',nc:C.tx,cta:'Request access',btnbg:'var(--s2)',btnbd:'var(--bd)',btnc:C.tx},
+      {name:'Enterprise',price:'Custom',unit:'',note:'SLA, on-prem deployment, raw intelligence feed.',tag:'',bg:'var(--s1)',bd:'var(--bd)',nc:C.tx,cta:'Talk to us',btnbg:'var(--s2)',btnbd:'var(--bd)',btnc:C.tx}
+    ];
+    return {
+      pillars, screenFeatures, demoSamples,
+      demo:{col:curDec.col,bg:curDec.bg,bd:curDec.bd,icon:curDec.icon,label:curDec.label,note:cur.sanc?'Sanctions match — hard block':curDec.note,score:cur.score},
+      pricing,
+      submitted:st.submitted, showForm:!st.submitted,
+      submit:(e)=>{ e.preventDefault(); this.setState({submitted:true}); }
+    };
+  }
+}
+</script>
+</body>
+</html>
