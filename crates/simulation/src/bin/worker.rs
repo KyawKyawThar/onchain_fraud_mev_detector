@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use event_bus::KafkaEventSink;
+use simulation::cache::CachingSimulator;
 use simulation::config::Config;
 use simulation::consumer::RabbitJobSource;
 use simulation::resolver::UnresolvedJobResolver;
@@ -44,9 +45,13 @@ async fn run(cfg: Config) -> Result<()> {
         .context("declaring the RabbitMQ sim.jobs topology")?;
 
     // The shared seams: the revm engine, the (stubbed) resolver, the rayon pool
-    // revm runs on, and the Kafka sink results re-enter the backbone through.
+    // revm runs on, and the Kafka sink results re-enter the backbone through. The
+    // engine is hardened with gas/step caps + a panic sandbox and wrapped in the
+    // `(block, tx_set)` memoization cache (§7) so a redelivered/replayed bundle is a
+    // hit, not duplicate revm work.
     let resolver = Arc::new(UnresolvedJobResolver);
-    let simulator = Arc::new(RevmSimulator::new(cfg.worker.min_profit));
+    let engine = RevmSimulator::with_limits(cfg.worker.min_profit, cfg.worker.sim_limits);
+    let simulator = Arc::new(CachingSimulator::new(engine, cfg.worker.cache_capacity));
     let pool = Arc::new(build_pool(cfg.worker.pool_threads)?);
     let event_sink =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);

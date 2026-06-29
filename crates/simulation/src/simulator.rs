@@ -29,9 +29,33 @@
 //! diff — the simulation answers "who ended up with the money", not "what did this
 //! cost to run". Reverted/halted transactions are a *valid* outcome (the bundle
 //! simply didn't extract value), not an error — only a malformed tx or a database
-//! fault is an `Err`. Gas/step caps and the hostile-bytecode sandbox are **Sprint 5
-//! t4**; [`SimError`] already splits transient from poison so t4's caps slot in as
-//! new poison cases without reshaping the worker.
+//! fault is an `Err`.
+//!
+//! ## Hardening — hostile bytecode (§7, Sprint 5 t4)
+//!
+//! Honeypot-token bytecode runs *here*, in our interpreter, so it is treated as
+//! hostile input. Three layers bound it ([`SimLimits`]):
+//!
+//! - **Per-tx gas cap.** Each tx's `gas_limit` is clamped to
+//!   [`SimLimits::per_tx_gas`]. Gas is the EVM's native step meter (every opcode
+//!   costs ≥ 1 gas), so the cap is a hard ceiling on opcodes executed — a contract
+//!   that loops forever exhausts its budget and *halts* (`OutOfGas`), which is a
+//!   valid "no value extracted" outcome, not an error. This is why the step cap
+//!   needs no tracing inspector (the heavy revm subtree the workspace `Cargo.toml`
+//!   deliberately trims): the meter is already in the interpreter.
+//! - **Bundle gas budget.** The whole bundle's cumulative gas is capped at
+//!   [`SimLimits::bundle_gas_budget`]; a bundle that blows past it is abandoned as
+//!   **poison** (deterministic on retry → dead-letter, don't loop), guarding against
+//!   a pathological many-tx bundle the per-tx cap alone wouldn't bound.
+//! - **Panic sandbox.** The revm run is wrapped in [`std::panic::catch_unwind`]; a
+//!   panic provoked by malformed bytecode becomes poison rather than unwinding the
+//!   rayon worker thread. The seeded pre-state already runs over `EmptyDB`, so there
+//!   is no chain I/O to escape to.
+//!
+//! [`SimError`] splits transient from poison, so the new cap/sandbox failures slot
+//! in as poison cases without reshaping the worker's ack/redelivery logic. Result
+//! memoization keyed by `(block, tx_set)` — the other half of §7 hardening — is the
+//! [`crate::cache`] decorator, kept separate so the engine stays a pure function.
 
 use std::sync::Arc;
 
@@ -131,8 +155,8 @@ pub struct SeededAccount {
     pub address: Address,
     pub balance: U256,
     /// Contract bytecode, if this account is a contract. `None` is a plain EOA.
-    /// Honeypot bytecode is hostile input executed here (§7) — the t4 sandbox caps
-    /// it; the engine already treats a malformed result as poison, not a crash.
+    /// Honeypot bytecode is hostile input executed here (§7) — the [`SimLimits`] gas
+    /// caps + panic sandbox bound it, and a malformed result is poison, not a crash.
     pub code: Option<Bytes>,
 }
 
@@ -198,8 +222,8 @@ pub enum SimError {
     Transient(String),
 
     /// A fault identical on every retry — a malformed transaction the EVM rejects
-    /// outright, or (t4) a gas/step cap tripped by hostile bytecode. The worker
-    /// **dead-letters** it rather than looping.
+    /// outright, the bundle gas budget tripped by hostile bytecode, or a revm panic
+    /// caught by the sandbox. The worker **dead-letters** it rather than looping.
     #[error("unsimulatable job (poison): {0}")]
     Poison(String),
 }
@@ -219,9 +243,40 @@ pub trait Simulator: Send + Sync {
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError>;
 }
 
-impl Simulator for Arc<dyn Simulator> {
+/// Forward through an `Arc`, so both `Arc<dyn Simulator>` (the worker's erased
+/// handle) and `Arc<RevmSimulator>` / `Arc<CountingSimulator>` (a shared concrete
+/// engine) are themselves `Simulator`s.
+impl<S: Simulator + ?Sized> Simulator for Arc<S> {
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
         (**self).simulate(req)
+    }
+}
+
+/// Compute bounds that keep hostile honeypot bytecode from running unbounded in the
+/// interpreter (§7 hardening). Both are gas figures because gas *is* the EVM's step
+/// meter — every opcode costs ≥ 1 gas — so a gas ceiling is a step ceiling without
+/// needing a tracing inspector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimLimits {
+    /// Max gas any single tx may consume; each tx's `gas_limit` is clamped to this.
+    /// A contract that loops forever exhausts it and **halts** (`OutOfGas`) — a valid
+    /// "no value extracted" outcome, not an error.
+    pub per_tx_gas: u64,
+    /// Max cumulative gas the whole bundle may consume. A bundle that exceeds it is
+    /// abandoned as **poison** (deterministic on retry → dead-letter), bounding a
+    /// pathological many-tx bundle the per-tx cap alone wouldn't catch.
+    pub bundle_gas_budget: u64,
+}
+
+impl Default for SimLimits {
+    fn default() -> Self {
+        // Per-tx: one mainnet block's gas — generous for any honest bundle, but a
+        // hard stop on a runaway loop. Bundle: a few txs' worth (a sandwich is three),
+        // so an honest bundle clears it while an absurd one trips the budget.
+        Self {
+            per_tx_gas: 30_000_000,
+            bundle_gas_budget: 90_000_000,
+        }
     }
 }
 
@@ -232,18 +287,35 @@ pub struct RevmSimulator {
     /// Minimum attacker profit for the alert to be `confirmed`. Below it the
     /// simulation *retracts* — the heuristic fired but the money didn't move.
     min_profit: MinProfit,
+    /// Gas/step bounds on hostile bytecode (§7 hardening).
+    limits: SimLimits,
 }
 
 impl RevmSimulator {
     /// Build an engine that confirms only bundles whose attacker profit clears
-    /// `min_profit`.
+    /// `min_profit`, with the default hostile-bytecode [`SimLimits`].
     pub fn new(min_profit: MinProfit) -> Self {
-        Self { min_profit }
+        Self::with_limits(min_profit, SimLimits::default())
+    }
+
+    /// Build an engine with explicit gas/step [`SimLimits`] — the worker binary wires
+    /// the operator-tuned caps here; tests pin tight caps to exercise the bounds.
+    pub fn with_limits(min_profit: MinProfit, limits: SimLimits) -> Self {
+        Self { min_profit, limits }
     }
 }
 
 impl Simulator for RevmSimulator {
+    /// Run one scenario, wrapped in the panic sandbox: hostile bytecode that drives
+    /// revm into a panic becomes poison rather than unwinding the rayon worker.
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
+        run_sandboxed(|| self.simulate_inner(req))
+    }
+}
+
+impl RevmSimulator {
+    /// The engine proper, called inside [`run_sandboxed`].
+    fn simulate_inner(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
         // 1. Seed the in-memory pre-state. `EmptyDB` returns empty accounts for
         //    anything unseeded, so a tx from an unfunded caller fails validation
         //    (poison) rather than reading phantom funds.
@@ -280,7 +352,11 @@ impl Simulator for RevmSimulator {
 
         // 4. Replay the bundle in order, committing each tx's state so the next tx
         //    sees it. A revert/halt is a legitimate "no value extracted" outcome —
-        //    only an EVM-level error (malformed tx / db fault) aborts.
+        //    only an EVM-level error (malformed tx / db fault) aborts. Hostile
+        //    bytecode is bounded by the gas caps (§7): each tx's gas is clamped to
+        //    `per_tx_gas` so a runaway loop halts `OutOfGas`, and the running total is
+        //    held under `bundle_gas_budget` so a pathological bundle dead-letters.
+        let mut bundle_gas: u64 = 0;
         for tx in &req.bundle {
             // Match the tx nonce to the caller's current nonce so the bundle isn't
             // rejected for replay protection; reads the committed state each step.
@@ -293,13 +369,23 @@ impl Simulator for RevmSimulator {
                 },
                 value: tx.value,
                 data: tx.data.clone(),
-                gas_limit: tx.gas_limit,
+                // Clamp to the per-tx cap so an unbounded loop in hostile bytecode
+                // halts `OutOfGas` (a valid outcome) instead of running for ever.
+                gas_limit: tx.gas_limit.min(self.limits.per_tx_gas),
                 gas_price: 0, // fee-free: balances reflect value flow only
                 nonce,
                 chain_id: None, // skip EIP-155 chain binding in simulation
                 ..Default::default()
             };
-            evm.transact_commit(tx_env).map_err(map_evm_error)?;
+            let result = evm.transact_commit(tx_env).map_err(map_evm_error)?;
+            bundle_gas = bundle_gas.saturating_add(result.tx_gas_used());
+            if bundle_gas > self.limits.bundle_gas_budget {
+                return Err(SimError::Poison(format!(
+                    "bundle exceeded gas budget ({bundle_gas} > {} gas) — abandoning \
+                     hostile/pathological scenario",
+                    self.limits.bundle_gas_budget
+                )));
+            }
         }
 
         // 5. Re-read balances and diff. Profit is the attacker's gain; victim loss is
@@ -359,6 +445,23 @@ fn map_evm_error<DBErr: std::fmt::Display, TxErr: std::fmt::Display>(
         EVMError::Header(e) => SimError::Poison(e.to_string()),
         EVMError::Custom(e) => SimError::Poison(e),
         EVMError::CustomAny(e) => SimError::Poison(e.to_string()),
+    }
+}
+
+/// Run the engine inside a panic sandbox (§7 hardening). Hostile bytecode that
+/// drives revm into a panic is caught and reported as **poison** — the worker
+/// dead-letters it instead of the panic unwinding the rayon thread the simulation
+/// runs on. `AssertUnwindSafe` is sound here because a caught panic discards the
+/// half-built EVM entirely (we never read state back out of `f` on the panic path).
+fn run_sandboxed<F>(f: F) -> Result<SimulationOutcome, SimError>
+where
+    F: FnOnce() -> Result<SimulationOutcome, SimError>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => Err(SimError::Poison(
+            "revm panicked executing hostile bytecode (sandboxed)".into(),
+        )),
     }
 }
 
@@ -537,6 +640,118 @@ mod tests {
         assert!(
             !err.is_transient(),
             "a malformed tx is poison, not transient"
+        );
+    }
+
+    /// Bytecode that loops forever: `JUMPDEST; PUSH1 0; JUMP`. Each iteration burns
+    /// gas (JUMPDEST 1 + PUSH1 3 + JUMP 8), so under a finite gas cap it must halt
+    /// `OutOfGas` rather than spin — the per-tx cap is the step ceiling (§7).
+    fn infinite_loop_code() -> Bytes {
+        Bytes::from(vec![0x5b, 0x60, 0x00, 0x56])
+    }
+
+    /// A contract whose bytecode loops forever is **bounded** by the per-tx gas cap:
+    /// it halts `OutOfGas`, which is a *valid* "no value extracted" outcome (profit 0,
+    /// not confirmed), not an error. This is the step cap doing its job on hostile
+    /// honeypot bytecode.
+    #[test]
+    fn per_tx_gas_cap_halts_runaway_bytecode_as_valid_outcome() {
+        let honeypot = Address::repeat_byte(0xCC);
+        let sim = RevmSimulator::with_limits(
+            MinProfit::try_new(1.0).unwrap(),
+            // A tight per-tx cap; a generous bundle budget so this exercises the
+            // *per-tx* halt, not the bundle abort.
+            SimLimits {
+                per_tx_gas: 100_000,
+                bundle_gas_budget: 90_000_000,
+            },
+        );
+        let req = request(
+            vec![
+                SeededAccount {
+                    address: attacker(),
+                    balance: eth(1),
+                    code: None,
+                },
+                SeededAccount {
+                    address: honeypot,
+                    balance: U256::ZERO,
+                    code: Some(infinite_loop_code()),
+                },
+            ],
+            // Call the honeypot; its loop would never return without the cap. The tx
+            // asks for far more gas than the cap allows — the engine clamps it.
+            vec![SimTx {
+                caller: attacker(),
+                to: Some(honeypot),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 30_000_000,
+            }],
+        );
+
+        let out = sim
+            .simulate(&req)
+            .expect("a capped runaway loop halts, it does not error");
+        assert_eq!(out.profit, 0.0, "the honeypot extracted no value");
+        assert!(!out.confirmed);
+    }
+
+    /// A bundle whose cumulative gas blows past the budget is **poison** — abandoned
+    /// and dead-lettered, not requeued, because it fails identically every retry.
+    #[test]
+    fn bundle_gas_budget_exceeded_is_poison() {
+        let honeypot = Address::repeat_byte(0xCC);
+        let sim = RevmSimulator::with_limits(
+            MinProfit::try_new(1.0).unwrap(),
+            // The single capped tx burns its full 100k (it halts OutOfGas), which
+            // already exceeds the 50k bundle budget.
+            SimLimits {
+                per_tx_gas: 100_000,
+                bundle_gas_budget: 50_000,
+            },
+        );
+        let req = request(
+            vec![
+                SeededAccount {
+                    address: attacker(),
+                    balance: eth(1),
+                    code: None,
+                },
+                SeededAccount {
+                    address: honeypot,
+                    balance: U256::ZERO,
+                    code: Some(infinite_loop_code()),
+                },
+            ],
+            vec![SimTx {
+                caller: attacker(),
+                to: Some(honeypot),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 30_000_000,
+            }],
+        );
+
+        let err = sim
+            .simulate(&req)
+            .expect_err("blowing the gas budget aborts the simulation");
+        assert!(
+            !err.is_transient(),
+            "a gas-budget trip is poison (deterministic), not transient"
+        );
+    }
+
+    /// The panic sandbox turns a panic inside the engine into poison rather than
+    /// letting it unwind the worker thread. Tested at the wrapper so it doesn't depend
+    /// on coaxing revm itself into a panic.
+    #[test]
+    fn sandbox_maps_a_panic_to_poison() {
+        let err = run_sandboxed(|| panic!("hostile bytecode tripped a panic"))
+            .expect_err("a panic is caught");
+        assert!(
+            !err.is_transient(),
+            "a caught panic is poison, not transient"
         );
     }
 }

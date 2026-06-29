@@ -33,7 +33,11 @@
 //! - [`resolver`] — the [`JobResolver`](resolver::JobResolver) seam turning a job
 //!   into a runnable scenario (stubbed; chain-fork resolution is a follow-up).
 //! - [`simulator`] — the revm engine: re-execute a bundle, diff balances, decide
-//!   confirm/retract. Runs on the rayon pool, off the async reactor (§17).
+//!   confirm/retract. Runs on the rayon pool, off the async reactor (§17). Hardened
+//!   against hostile honeypot bytecode with gas/step caps + a panic sandbox (§7).
+//! - [`cache`] — the [`CachingSimulator`](cache::CachingSimulator) decorator:
+//!   memoize outcomes by `(block, tx_set)` so a redelivered or replayed bundle is a
+//!   cache hit, not duplicate revm work (§7 hardening).
 //! - [`result`] — the pure `SimulationOutcome → {SimulationCompleted, IncidentCreated}`
 //!   mapping.
 //! - [`worker`] — the [`Worker`](worker::Worker): drain → resolve → simulate on
@@ -41,6 +45,7 @@
 //!
 //! - [`config`] — env-resolved [`Config`](config::Config), shared by both binaries.
 
+pub mod cache;
 pub mod command;
 pub mod config;
 pub mod consumer;
