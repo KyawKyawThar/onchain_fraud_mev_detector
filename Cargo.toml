@@ -34,6 +34,13 @@ arb-detector      = { path = "crates/arb-detector" }
 # tx content, so the per-detector metrics + emit path can be demoed while the live
 # source is header-only. Linked only behind detection's `demo` feature.
 demo-detector     = { path = "crates/demo-detector" }
+# Simulation service (§7) — the slow path. Sprint 5 builds its front half: the
+# `dispatcher` (a thin Kafka consumer on `PreliminaryAlertCreated` that publishes
+# the one `SimulationJob` *command* onto RabbitMQ, §2/§7) plus the `JobSink` seam
+# the worker pool (task 3) will drain. The command is deliberately *not* a
+# `DomainEvent` and never touches the event store — only its result re-enters the
+# backbone — so it lives here, not in `events`.
+simulation = { path = "crates/simulation" }
 
 # Errors.
 anyhow = "1"
@@ -84,6 +91,20 @@ url = "2"
 # `net`/`signal`/`time` are for network services (axum listener, SIGTERM-driven
 # graceful shutdown) — added when the event-store service landed (§4).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+
+# RabbitMQ work-queue client (§7) — the one *command* broker. The simulation
+# dispatcher publishes a `SimulationJob` to the durable `sim.jobs` quorum queue;
+# the worker pool (Sprint 5 t3) drains it with per-job ack/redelivery. `lapin` is
+# the de-facto async AMQP 0.9.1 client; it speaks publisher *confirms* (the
+# at-least-once ack we need so a queued job is never silently lost) and per-message
+# `priority`/`delivery_mode` (durable + priority 0–9, §7). lapin is executor-
+# agnostic, so on tokio we hand it tokio's executor+reactor via these two adapter
+# crates rather than letting it spin up its own `async-global-executor` threads —
+# one runtime, no surprise thread pool. (The queue *topology* — quorum, priority
+# args, dead-letter exchange — is declared in Sprint 5 t2, not here.)
+lapin = "2"
+tokio-executor-trait = "2"
+tokio-reactor-trait = "1"
 
 # CPU-bound work pool (§17): the detection service fans each block's Block-scoped
 # detectors out over rayon (off the async reactor) — and the simulation workers
