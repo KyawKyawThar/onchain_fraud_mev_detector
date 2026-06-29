@@ -1,0 +1,66 @@
+[package]
+name = "simulation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Simulation service (§7) — the slow path that confirms or retracts a provisional
+# alert with revm. Sprint 5 builds its *front half*:
+#
+#   `dispatcher` — a thin Kafka consumer on `PreliminaryAlertCreated` that, for
+#     every provisional alert, publishes one `SimulationJob` *command* onto the
+#     RabbitMQ `sim.jobs` work queue (§2/§7) and emits a `SimulationRequested`
+#     domain event back on Kafka so the *request* is auditable even though the
+#     command itself is deliberately not (the audit log records facts, and a
+#     command is not one — only its result re-enters the backbone).
+#   `command` — the `SimulationJob` type + the pure `PreliminaryAlertCreated →
+#     (SimulationJob, SimulationRequested)` mapping (Kafka/RabbitMQ-free, so it is
+#     `assert_eq!`-testable).
+#   `queue` — the `JobSink` publish seam (mirrors `event-bus`'s `EventSink`): an
+#     object-safe trait + the lapin-backed `RabbitJobSink` + the at-least-once
+#     `publish_resilient` policy, so the worker pool (task 3) and the dispatcher
+#     share one place that knows how to talk to RabbitMQ.
+#
+# The worker pool (revm on rayon, task 3) and the result→incident path (Sprint 6)
+# land on top of this seam.
+
+[[bin]]
+name = "simulation"
+path = "src/main.rs"
+
+[dependencies]
+events = { workspace = true }
+# Shared Kafka producer seam (§20) — the dispatcher ships its `SimulationRequested`
+# audit event through the same `EventSink`/`publish_resilient` ingestion/detection
+# use, so the at-least-once policy lives in one place.
+event-bus = { workspace = true }
+telemetry = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# The async dispatcher runs on tokio with a `CancellationToken` for graceful
+# drain; `rdkafka` is the `PreliminaryAlertCreated` consumer; `async-trait` for
+# the `JobSink`/`EventSink` seams.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+rdkafka = { workspace = true }
+async-trait = { workspace = true }
+
+# RabbitMQ command broker (§7) — see the workspace note. lapin is handed tokio's
+# executor+reactor so it shares the service's single runtime.
+lapin = { workspace = true }
+tokio-executor-trait = { workspace = true }
+tokio-reactor-trait = { workspace = true }
+
+[dev-dependencies]
+# Only the tests construct on-chain addresses directly; non-test code reaches
+# alloy's `Address` through `events::primitives::AccountAddress`.
+alloy-primitives = { workspace = true }
+
+[lints]
+workspace = true
