@@ -104,10 +104,7 @@ async fn declares_quorum_topology_idempotently_and_routes_a_published_job() {
     // Pull it straight back off the declared queue and check it survived the trip.
     let (_conn, channel) = open_channel(&url).await;
     let got = channel
-        .basic_get(
-            &cfg.queue,
-            BasicGetOptions { no_ack: true },
-        )
+        .basic_get(&cfg.queue, BasicGetOptions { no_ack: true })
         .await
         .expect("basic_get")
         .expect("a message is waiting on sim.jobs");
@@ -134,7 +131,10 @@ async fn quorum_queue_rejects_x_max_priority() {
     let (_conn, channel) = open_channel(&url).await;
 
     let mut args = FieldTable::default();
-    args.insert("x-queue-type".into(), AMQPValue::LongString("quorum".into()));
+    args.insert(
+        "x-queue-type".into(),
+        AMQPValue::LongString("quorum".into()),
+    );
     args.insert("x-max-priority".into(), AMQPValue::LongInt(9));
 
     let result = channel
