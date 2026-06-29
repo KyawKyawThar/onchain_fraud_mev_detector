@@ -16,3 +16,19 @@ scrape_configs:
       - targets: ["host.docker.internal:9100"] # DETECTION_METRICS_ADDR
         labels:
           service: detection
+
+  # RabbitMQ sim.jobs work queue (§7/§20) — queue depth is the simulation
+  # backpressure signal. Unlike the host-run services above, the broker runs in
+  # this compose stack, so it's reachable by service name on the `backend`
+  # network (no host port mapping needed); its `rabbitmq_prometheus` plugin is
+  # enabled by default and serves metrics on :15692.
+  #
+  # `/metrics/per-object` (not the default aggregate `/metrics`) so each series
+  # carries a `queue` label — required to tell sim.jobs apart from sim.jobs.dlq.
+  # Cardinality is trivial here (two queues).
+  - job_name: rabbitmq
+    metrics_path: /metrics/per-object
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+        labels:
+          service: simulation

@@ -1,0 +1,150 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["simulation", "rabbitmq", "mev", "§7", "§20"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Simulation — sim.jobs queue (§7)",
+  "uid": "simulation-sim-jobs",
+  "version": 1,
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "sim.jobs backlog (ready)",
+      "description": "Messages ready to be delivered to a worker — the §7 backpressure signal and the autoscaling input. Climbing = simulation falling behind.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 100 },
+            { "color": "red", "value": 1000 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rabbitmq_queue_messages_ready{queue=\"sim.jobs\"})",
+          "legendFormat": "ready"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Dead-letter queue depth (sim.jobs.dlq)",
+      "description": "Jobs that exhausted x-delivery-limit and were dead-lettered to sim.jobs.dlx for quarantine (§7). Should normally be 0 — any non-zero value is poison jobs awaiting inspection.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rabbitmq_queue_messages_ready{queue=\"sim.jobs.dlq\"})",
+          "legendFormat": "dlq"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Queue depth over time",
+      "description": "Ready (waiting) vs unacked (in-flight, a worker is processing them). Unacked jumps back to ready on a worker crash — that's the at-least-once redelivery (§7).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rabbitmq_queue_messages_ready{queue=\"sim.jobs\"})",
+          "legendFormat": "ready (backlog)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rabbitmq_queue_messages_unacked{queue=\"sim.jobs\"})",
+          "legendFormat": "unacked (in-flight)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Throughput (msgs / sec)",
+      "description": "Publish = dispatcher enqueueing jobs; deliver = workers receiving; ack = workers finishing. Sustained publish > ack is what grows the backlog above.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_published_total{queue=\"sim.jobs\"}[$__rate_interval]))",
+          "legendFormat": "published"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_delivered_total{queue=\"sim.jobs\"}[$__rate_interval]))",
+          "legendFormat": "delivered"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_delivered_ack_total{queue=\"sim.jobs\"}[$__rate_interval]))",
+          "legendFormat": "acked"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Consumers on sim.jobs",
+      "description": "Number of competing-consumer workers attached to the queue (§7). 0 with a growing backlog means nothing is draining it.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "stepAfter" } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rabbitmq_queue_consumers{queue=\"sim.jobs\"})",
+          "legendFormat": "consumers"
+        }
+      ]
+    }
+  ]
+}

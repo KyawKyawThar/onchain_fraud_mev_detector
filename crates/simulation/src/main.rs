@@ -14,6 +14,7 @@ use event_bus::KafkaEventSink;
 use simulation::config::Config;
 use simulation::dispatcher::{build_consumer, Dispatcher};
 use simulation::queue::RabbitJobSink;
+use simulation::topology::declare_sim_topology;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -30,6 +31,14 @@ async fn run(cfg: Config) -> Result<()> {
         queue = %cfg.rabbitmq.queue,
         "starting simulation dispatcher"
     );
+
+    // Declare the sim.jobs topology (durable quorum queue + DLX, §7/§20) once,
+    // before anything publishes — the sink deliberately never declares, so the
+    // queue must exist with the right arguments first. Fails fast at boot if the
+    // declaration conflicts with an existing queue.
+    declare_sim_topology(&cfg.rabbitmq.url, &cfg.rabbitmq)
+        .await
+        .context("declaring the RabbitMQ sim.jobs topology")?;
 
     // The two ends of the dispatch fan-out: the RabbitMQ command queue and the
     // Kafka audit stream. Both connect at boot so a misconfigured broker fails
