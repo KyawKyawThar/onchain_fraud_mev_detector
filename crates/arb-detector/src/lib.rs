@@ -59,6 +59,17 @@ fn default_min_profit_usd() -> UsdPrice {
     UsdPrice::try_new(DEFAULT_MIN_PROFIT_USD).expect("default min profit is a valid USD price")
 }
 
+/// Facts-only confidence (§6) for a matched cycle: a base set by whether we could
+/// value the profit, plus a small bonus per swap beyond the minimal two-hop loop
+/// (a longer cycle is even less likely to be incidental), capped at
+/// [`MAX_EXTRA_HOPS`]. Kept beside the policy constants so the whole scoring curve
+/// is reviewable — and unit-testable — in one place, off the detection hot path.
+fn confidence_for(valued: bool, hops: usize) -> Confidence {
+    let base = if valued { CONF_VALUED } else { CONF_UNVALUED };
+    let extra_hops = hops.saturating_sub(2).min(MAX_EXTRA_HOPS);
+    Confidence::new(base + CONF_PER_EXTRA_HOP * (extra_hops as f64))
+}
+
 /// Tunable thresholds for the arb detector. Serialized into the model registry's
 /// `config_hash` (§6, task 2/5), so two builds with different gates are
 /// distinguishable when replaying historical evidence; deserializable so the
@@ -150,16 +161,12 @@ impl DetectorPlugin for ArbDetector {
     }
 
     fn detect(&self, ctx: &DetectionCtx) -> Vec<Evidence> {
-        let mut findings = Vec::new();
-        for tx_hash in ctx.txs() {
-            let Some(tx) = ctx.enrichment().tx(*tx_hash) else {
-                continue;
-            };
-            if let Some(ev) = self.detect_in_tx(ctx, tx) {
-                findings.push(ev);
-            }
-        }
-        findings
+        // Each tx maps to at most one finding (a tx is one closed cycle or none).
+        ctx.txs()
+            .iter()
+            .filter_map(|tx_hash| ctx.enrichment().tx(*tx_hash))
+            .filter_map(|tx| self.detect_in_tx(ctx, tx))
+            .collect()
     }
 }
 
@@ -185,9 +192,10 @@ impl ArbDetector {
         }
 
         let (profit_token, profit_amount) = closed_cycle_profit(&received, &spent)?;
-        if profit_amount.is_zero() {
-            return None;
-        }
+        // `closed_cycle_profit` only returns a strictly-positive gain (its `Greater`
+        // arm, where `r > s`), so this can't be zero — a guard against that contract
+        // changing, not a reachable branch.
+        debug_assert!(!profit_amount.is_zero());
 
         let profit_usd = ctx.enrichment().usd_value(profit_token, profit_amount);
         if profit_usd.is_some_and(|usd| usd < self.config.min_profit_usd.get()) {
@@ -195,14 +203,7 @@ impl ArbDetector {
         }
 
         let hops = tx.swaps.len();
-        let mut score = if profit_usd.is_some() {
-            CONF_VALUED
-        } else {
-            CONF_UNVALUED
-        };
-        let extra_hops = hops.saturating_sub(2).min(MAX_EXTRA_HOPS);
-        score += CONF_PER_EXTRA_HOP * (extra_hops as f64);
-        let confidence = Confidence::new(score);
+        let confidence = confidence_for(profit_usd.is_some(), hops);
 
         let detail = ArbDetail {
             profit_token,
@@ -401,6 +402,20 @@ mod tests {
         assert!(serde_json::from_str::<ArbConfig>(r#"{"min_profit_usd": -1.0}"#).is_err());
         let defaulted: ArbConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted, ArbConfig::default());
+    }
+
+    #[test]
+    fn confidence_curve_bases_on_valuation_and_saturates_extra_hops() {
+        // Base is set by whether the profit could be valued.
+        assert!((confidence_for(true, 2).get() - CONF_VALUED).abs() < 1e-9);
+        assert!((confidence_for(false, 2).get() - CONF_UNVALUED).abs() < 1e-9);
+        // Each hop beyond the two-hop minimum adds a fixed bonus...
+        assert!((confidence_for(true, 3).get() - (CONF_VALUED + CONF_PER_EXTRA_HOP)).abs() < 1e-9);
+        // ...until the bonus saturates at MAX_EXTRA_HOPS (a 9-hop loop scores the
+        // same as a `2 + MAX_EXTRA_HOPS`-hop one).
+        let capped = CONF_VALUED + CONF_PER_EXTRA_HOP * MAX_EXTRA_HOPS as f64;
+        assert!((confidence_for(true, 2 + MAX_EXTRA_HOPS).get() - capped).abs() < 1e-9);
+        assert!((confidence_for(true, 9).get() - capped).abs() < 1e-9);
     }
 
     #[test]

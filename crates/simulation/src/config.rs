@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use events::primitives::Chain;
 
-use crate::simulator::MinProfit;
+use crate::simulator::{MinProfit, SimLimits};
 
 /// All runtime configuration for the simulation service (§7) — shared by both
 /// binaries: the `simulation` dispatcher (Sprint 5 t1) and the `simulation-worker`
@@ -40,6 +40,12 @@ pub struct WorkerConfig {
     /// Minimum attacker profit to *confirm* an alert into an incident; below it the
     /// simulation retracts. A validated newtype so a bad threshold fails at boot.
     pub min_profit: MinProfit,
+    /// Gas/step caps bounding hostile honeypot bytecode in the revm engine (§7
+    /// hardening).
+    pub sim_limits: SimLimits,
+    /// How many `(block, tx_set)` outcomes the [`CachingSimulator`](crate::cache)
+    /// memoizes before FIFO-evicting. `0` disables the cache.
+    pub cache_capacity: usize,
 }
 
 /// How to reach Kafka: the broker list, and the consumer group whose committed
@@ -99,6 +105,17 @@ impl Config {
                 pool_threads: env_parse("SIMULATION_POOL_THREADS", 0usize)?,
                 min_profit: MinProfit::try_new(env_parse("SIMULATION_MIN_PROFIT_ETH", 0.05f64)?)
                     .context("SIMULATION_MIN_PROFIT_ETH")?,
+                sim_limits: SimLimits {
+                    per_tx_gas: env_parse(
+                        "SIMULATION_PER_TX_GAS",
+                        SimLimits::default().per_tx_gas,
+                    )?,
+                    bundle_gas_budget: env_parse(
+                        "SIMULATION_BUNDLE_GAS_BUDGET",
+                        SimLimits::default().bundle_gas_budget,
+                    )?,
+                },
+                cache_capacity: env_parse("SIMULATION_CACHE_CAPACITY", 1024usize)?,
             },
         })
     }
