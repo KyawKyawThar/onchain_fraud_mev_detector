@@ -29,6 +29,13 @@ publish.workspace = true
 name = "simulation"
 path = "src/main.rs"
 
+# The worker pool that drains `sim.jobs` (Sprint 5 t3) — a separate binary so it
+# scales independently of the dispatcher (§20: "scale aggressively — revm CPU is
+# the bottleneck"; competing consumers = run N replicas).
+[[bin]]
+name = "simulation-worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
 events = { workspace = true }
 # Shared Kafka producer seam (§20) — the dispatcher ships its `SimulationRequested`
@@ -45,9 +52,11 @@ tracing = { workspace = true }
 
 # The async dispatcher runs on tokio with a `CancellationToken` for graceful
 # drain; `rdkafka` is the `PreliminaryAlertCreated` consumer; `async-trait` for
-# the `JobSink`/`EventSink` seams.
+# the `JobSink`/`EventSink` seams. `tokio-stream` drains the worker pool's lapin
+# `Consumer` (the competing-consumer side of `sim.jobs`).
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
 rdkafka = { workspace = true }
 async-trait = { workspace = true }
 
@@ -57,7 +66,22 @@ lapin = { workspace = true }
 tokio-executor-trait = { workspace = true }
 tokio-reactor-trait = { workspace = true }
 
+# The simulation engine (§7): the worker pool re-executes a job's bundle in revm.
+# `rayon` is the CPU worker pool the revm runs land on, off the async reactor
+# (§17); the async worker bridges to it via a oneshot. See the workspace notes.
+revm = { workspace = true }
+rayon = { workspace = true }
+
+[features]
+# Exposes `simulation::test_util` (recording sinks, canned scenarios + ack handle).
+# Enabled for this crate's own integration tests via the self dev-dependency below,
+# so `tests/` and the in-crate unit tests share one set of doubles.
+test-util = []
+
 [dev-dependencies]
+# Self-dependency with `test-util` on, so the `tests/` integration crate sees
+# `simulation::test_util` (the in-crate unit tests get it under `cfg(test)`).
+simulation = { path = ".", features = ["test-util"] }
 # Only the tests construct on-chain addresses directly; non-test code reaches
 # alloy's `Address` through `events::primitives::AccountAddress`.
 alloy-primitives = { workspace = true }

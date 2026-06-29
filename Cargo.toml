@@ -112,6 +112,26 @@ tokio-reactor-trait = "1"
 # bridges to it via `spawn_blocking` so the reactor is never blocked.
 rayon = "1"
 
+# revm (§7) — the EVM the simulation worker pool runs each `SimulationJob` on. The
+# slow path forks chain state and re-executes a `(block, tx_set)` bundle to confirm
+# attacker profit / victim loss, so revm is the CPU bottleneck §20 scales hardest.
+# `default-features = false` then re-add the precompile set we keep (secp256k1 +
+# c-kzg + blst, pure-Rust, needing only the C toolchain the rdkafka build already
+# requires) but drop the inspector `tracer` we don't use — trimming the heavy
+# subtree (and the `cargo deny` surface) without losing precompile correctness.
+# revm 41 unifies on `alloy-primitives` 1.x (the event schema's `Address`/`U256`),
+# so engine types pass straight through. The `alloydb` fork-from-chain backend is
+# deliberately NOT enabled here: it pins `alloy-provider` 2.0, which would clash
+# with ingestion's 1.x — the live fork lands with the real `JobResolver` (Sprint 5
+# t4 / Sprint 6), which is also where bundle resolution from the alert evidence is.
+revm = { version = "41", default-features = false, features = [
+    "std",
+    "secp256k1",
+    "c-kzg",
+    "blst",
+    "portable",
+] }
+
 # Event-store service (§4): HTTP append API + ClickHouse storage + Kafka ingest.
 # axum    — internal append API (write-authenticated).
 # clickhouse — official client; RowBinary inserts via `#[derive(Row)]`. The
@@ -135,6 +155,9 @@ rdkafka = { version = "0.39", features = ["tokio"] }
 # subtle     — audited constant-time comparison for the bearer token.
 tower-http = { version = "0.7", features = ["trace", "timeout"] }
 tokio-util = "0.7"
+# `StreamExt::next` for draining lapin's `Consumer` stream in the simulation worker
+# pool (§7) — tokio-native, so no second futures ecosystem is pulled in.
+tokio-stream = "0.1"
 secrecy = "0.10"
 subtle = "2"
 
@@ -159,6 +182,10 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse", "kafka"] 
 # schema crate stays dependency-free unless a service opts in.
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
+# `utoipa-axum` binds the two: its `OpenApiRouter` + `routes!` register an axum
+# route and its OpenAPI path from one `#[utoipa::path]` annotation, so the served
+# routes and the spec can't drift (no hand-maintained `paths(...)` list).
+utoipa-axum = "0.2"
 
 # Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"

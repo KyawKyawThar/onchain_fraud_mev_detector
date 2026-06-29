@@ -37,9 +37,11 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
-# OpenAPI spec generation + Swagger UI for the append API.
+# OpenAPI spec generation + Swagger UI for the append API. `utoipa-axum` keeps the
+# routes and the spec in sync (one `#[utoipa::path]` feeds both).
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
+utoipa-axum.workspace = true
 
 # Observability.
 tracing.workspace = true

@@ -3,10 +3,14 @@
 //! `event-store`). Everything downstream takes an explicit [`Config`] so the rest
 //! of the service stays pure and testable.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use events::primitives::Chain;
 
-/// All runtime configuration for the simulation dispatcher (§7, Sprint 5 t1).
+use crate::simulator::MinProfit;
+
+/// All runtime configuration for the simulation service (§7) — shared by both
+/// binaries: the `simulation` dispatcher (Sprint 5 t1) and the `simulation-worker`
+/// pool (t3). Each binary reads the fields it needs.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Which chain this instance dispatches for (§5 — one instance per chain). The
@@ -15,6 +19,27 @@ pub struct Config {
     pub chain: Chain,
     pub kafka: KafkaConfig,
     pub rabbitmq: RabbitConfig,
+    /// Worker-pool tuning — read by `simulation-worker`, ignored by the dispatcher.
+    pub worker: WorkerConfig,
+}
+
+/// Tuning for the revm worker pool (§7, §17). Competing-consumer concurrency
+/// (`workers` × `prefetch`), the rayon pool size revm runs on, and the confirmation
+/// threshold.
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    /// Unacked jobs each consumer holds (`basic_qos` prefetch). Bounds in-flight
+    /// work per consumer — the backpressure knob (§17).
+    pub prefetch: u16,
+    /// In-process competing consumers (each its own consume channel). Horizontal
+    /// scale is more *replicas* (§20); this is per-replica concurrency.
+    pub workers: usize,
+    /// rayon pool threads revm runs on. `0` = rayon's default (one per core) — the
+    /// usual choice, since revm CPU is the bottleneck §20 scales hardest.
+    pub pool_threads: usize,
+    /// Minimum attacker profit to *confirm* an alert into an incident; below it the
+    /// simulation retracts. A validated newtype so a bad threshold fails at boot.
+    pub min_profit: MinProfit,
 }
 
 /// How to reach Kafka: the broker list, and the consumer group whose committed
@@ -67,6 +92,13 @@ impl Config {
                 dlx: env_or("RABBITMQ_SIM_DLX", "sim.jobs.dlx"),
                 dead_letter_queue: env_or("RABBITMQ_SIM_DLQ", "sim.jobs.dlq"),
                 delivery_limit: env_parse("RABBITMQ_SIM_DELIVERY_LIMIT", 5i64)?,
+            },
+            worker: WorkerConfig {
+                prefetch: env_parse("RABBITMQ_PREFETCH", 16u16)?,
+                workers: env_parse("SIMULATION_WORKERS", 4usize)?,
+                pool_threads: env_parse("SIMULATION_POOL_THREADS", 0usize)?,
+                min_profit: MinProfit::try_new(env_parse("SIMULATION_MIN_PROFIT_ETH", 0.05f64)?)
+                    .context("SIMULATION_MIN_PROFIT_ETH")?,
             },
         })
     }

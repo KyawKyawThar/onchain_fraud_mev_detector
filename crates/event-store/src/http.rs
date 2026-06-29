@@ -16,7 +16,6 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use events::primitives::{AccountAddress, IncidentId};
@@ -27,6 +26,8 @@ use subtle::ConstantTimeEq;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::query::{Cursor, EventPage, Filters, QueryError};
@@ -40,12 +41,21 @@ const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 /// Hard ceiling on how long any request may run before the server cancels it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// OpenAPI spec for the event-store API. Nested event schemas
-/// ([`EventEnvelope`] → `DomainEvent` → every variant) are pulled in
-/// automatically from the `events` crate's `ToSchema` derives.
+/// The OpenAPI **base** for the event-store API: metadata, security scheme, and the
+/// component schemas. The *paths* are deliberately **not** listed here — they're
+/// collected from the handlers' `#[utoipa::path]` annotations by the
+/// [`OpenApiRouter`] in [`router`], so the spec can't drift from the routes actually
+/// served (add a route → it appears in the docs, automatically).
+///
+/// Nested event schemas ([`EventEnvelope`] → `DomainEvent` → every variant) are
+/// pulled in automatically from the `events` crate's `ToSchema` derives.
 #[derive(OpenApi)]
 #[openapi(
-    paths(append, healthz, audit_incident, events_by_address, replay),
+    info(
+        title = "event-store",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "Immutable event store — append + query API (§4, §18)",
+    ),
     components(schemas(EventEnvelope, AppendResponse, EventPageResponse)),
     modifiers(&SecurityAddon),
     tags((name = "event-store", description = "Immutable event store — append + query API (§4, §18)")),
@@ -76,6 +86,37 @@ pub struct AppState {
     pub write_token: SecretString,
 }
 
+/// Assemble the routed surface **and** its OpenAPI spec from one source of truth.
+/// Each [`routes!`] call registers the axum route and the OpenAPI path from the same
+/// `#[utoipa::path]` handler annotation, so the two can never drift; the bearer gate
+/// is a `route_layer` on the protected sub-router only.
+///
+/// Returns the bare [`Router`] (still needing `with_state`) and the collected spec —
+/// shared by [`router`] (which serves both) and the spec test, so the test exercises
+/// the exact docs that ship.
+fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
+    // The one write endpoint, behind the bearer-token gate.
+    let protected = OpenApiRouter::new()
+        .routes(routes!(append))
+        .route_layer(middleware::from_fn_with_state(state, require_write_token));
+
+    // Internal read surface: the §4 query API and §18 replay source, plus the
+    // `/healthz` probe. Unauthenticated by design — these are reached only over
+    // the internal network and are fronted by the public §11 API service, which
+    // owns end-user auth. They are strictly read-only; every write goes through
+    // the bearer-gated append above.
+    let read = OpenApiRouter::new()
+        .routes(routes!(healthz))
+        .routes(routes!(audit_incident))
+        .routes(routes!(events_by_address))
+        .routes(routes!(replay));
+
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(protected)
+        .merge(read)
+        .split_for_parts()
+}
+
 /// Build the router: `/v1/events` behind the bearer-token gate, `/healthz` open,
 /// and the Swagger UI + spec at `/swagger-ui` and `/api-docs/openapi.json`.
 ///
@@ -83,24 +124,10 @@ pub struct AppState {
 /// limit, and an HTTP `TraceLayer` whose spans stitch into the existing OTel
 /// trace context (§19).
 pub fn router(state: AppState) -> Router {
-    let protected = Router::new().route("/v1/events", post(append)).route_layer(
-        middleware::from_fn_with_state(state.clone(), require_write_token),
-    );
+    let (router, api) = build_router(state.clone());
 
-    // Internal read surface: the §4 query API and §18 replay source, plus the
-    // `/healthz` probe. Unauthenticated by design — these are reached only over
-    // the internal network and are fronted by the public §11 API service, which
-    // owns end-user auth. They are strictly read-only; every write goes through
-    // the bearer-gated append above.
-    let read = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/audit/incident/{incident_id}", get(audit_incident))
-        .route("/v1/address/{address}/events", get(events_by_address))
-        .route("/v1/replay", get(replay));
-
-    protected
-        .merge(read)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+    router
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -412,16 +439,31 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, ApiDoc};
-    use utoipa::OpenApi;
+    use super::{build_router, constant_time_eq, AppState};
+    use crate::store::EventStore;
+    use clickhouse::Client;
+    use secrecy::SecretString;
+
+    /// A throwaway state — `Client::default()` does no I/O (the store connects
+    /// lazily), so the router/spec can be built without a live ClickHouse.
+    fn test_state() -> AppState {
+        AppState {
+            store: EventStore::new(Client::default()),
+            write_token: SecretString::from("test-token"),
+        }
+    }
 
     #[test]
-    fn openapi_spec_resolves_event_schemas_and_security() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).expect("serialize spec");
-        let schemas = &spec["components"]["schemas"];
+    fn openapi_spec_collects_paths_schemas_and_security() {
+        // The spec is built by the *router* from the handler annotations — the same
+        // spec that ships at `/api-docs/openapi.json` — so this guards against
+        // route/doc drift, not just against a missing derive.
+        let (_router, api) = build_router(test_state());
+        let spec = serde_json::to_value(&api).expect("serialize spec");
 
-        // The request-body type and a few nested event schemas must be collected
-        // automatically (proves the `events/openapi` derives are reachable).
+        // Nested event schemas are collected automatically (proves the
+        // `events/openapi` derives are reachable through `EventEnvelope`).
+        let schemas = &spec["components"]["schemas"];
         for name in [
             "EventEnvelope",
             "DomainEvent",
@@ -436,12 +478,21 @@ mod tests {
 
         // The bearer scheme backs Swagger's Authorize button.
         assert!(spec["components"]["securitySchemes"]["bearer_token"].is_object());
-        // The append, probe, and query/replay endpoints are all documented.
-        assert!(spec["paths"]["/v1/events"]["post"].is_object());
-        assert!(spec["paths"]["/healthz"]["get"].is_object());
-        assert!(spec["paths"]["/v1/audit/incident/{incident_id}"]["get"].is_object());
-        assert!(spec["paths"]["/v1/address/{address}/events"]["get"].is_object());
-        assert!(spec["paths"]["/v1/replay"]["get"].is_object());
+
+        // Every served route appears in the docs — collected from `routes!`, not a
+        // hand-maintained list, so a new route can't silently go undocumented.
+        for (path, method) in [
+            ("/v1/events", "post"),
+            ("/healthz", "get"),
+            ("/v1/audit/incident/{incident_id}", "get"),
+            ("/v1/address/{address}/events", "get"),
+            ("/v1/replay", "get"),
+        ] {
+            assert!(
+                spec["paths"][path][method].is_object(),
+                "OpenAPI paths missing `{method} {path}`"
+            );
+        }
     }
 
     #[test]

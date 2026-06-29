@@ -5,6 +5,11 @@ shared library every service builds on, or (from Sprint 1 onward) a deployable
 service binary. The `crates/*` glob in the root `Cargo.toml` auto-includes new
 crates — scaffold them with `just new-lib <name>` / `just new-bin <name>`.
 
+> **New crate or service?** Hold it to the
+> [engineering conventions](../docs/engineering-conventions.md) — the project's
+> definition of done (seams, typed errors, test layers, backpressure, idempotency,
+> observability). Match the nearest reference implementation listed there.
+
 ## Shared libraries (the foundation — Sprint 0)
 
 | Crate | Role |
