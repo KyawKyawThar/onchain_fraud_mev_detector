@@ -27,14 +27,28 @@ pub struct KafkaConfig {
     pub group_id: String,
 }
 
-/// How to reach RabbitMQ: the AMQP URL and the work-queue name the dispatcher
-/// publishes commands to.
+/// How to reach RabbitMQ, plus the names of the `sim.jobs` topology the dispatcher
+/// declares at boot (§7, §20): the work queue, its dead-letter exchange, and the
+/// dead-letter queue bound behind it.
 #[derive(Debug, Clone)]
 pub struct RabbitConfig {
     /// Full AMQP URI (`amqp://user:pass@host:5672/vhost`).
     pub url: String,
     /// The `sim.jobs` work queue (§7); the routing key on the default exchange.
+    /// Declared as a durable **quorum** queue (replicated for HA, §20).
     pub queue: String,
+    /// The dead-letter exchange `sim.jobs.dlx` (§7, §20). A job that exceeds
+    /// [`delivery_limit`](Self::delivery_limit) redeliveries is routed here instead
+    /// of looping forever — operators get a quarantine, not an outage.
+    pub dlx: String,
+    /// The queue bound behind [`dlx`](Self::dlx) where dead-lettered jobs land for
+    /// inspection. Without it, dead-lettered messages would be dropped unrouted.
+    pub dead_letter_queue: String,
+    /// Quorum-queue redelivery cap (`x-delivery-limit`): after this many failed
+    /// deliveries a job dead-letters to [`dlx`](Self::dlx). This is the native
+    /// "fails N times → DLX" mechanism (§7) — a quorum-queue feature a classic
+    /// queue lacks.
+    pub delivery_limit: i64,
 }
 
 impl Config {
@@ -50,6 +64,9 @@ impl Config {
             rabbitmq: RabbitConfig {
                 url: env("RABBITMQ_URL")?,
                 queue: env_or("RABBITMQ_SIM_QUEUE", "sim.jobs"),
+                dlx: env_or("RABBITMQ_SIM_DLX", "sim.jobs.dlx"),
+                dead_letter_queue: env_or("RABBITMQ_SIM_DLQ", "sim.jobs.dlq"),
+                delivery_limit: env_parse("RABBITMQ_SIM_DELIVERY_LIMIT", 5i64)?,
             },
         })
     }

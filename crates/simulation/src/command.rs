@@ -19,9 +19,14 @@ use events::simulation::SimulationRequested;
 use serde::{Deserialize, Serialize};
 
 /// RabbitMQ message priority, `0..=9` (§7). Enterprise-tier and high-provisional-
-/// profit alerts ride a higher priority so they jump the free-tier backlog; the
-/// `sim.jobs` queue is declared with `x-max-priority = 9` (Sprint 5 t2) to honour
-/// it.
+/// profit alerts ride a higher priority so they jump the free-tier backlog.
+///
+/// The `sim.jobs` queue is a **quorum** queue (durable + replicated for HA, §20),
+/// and quorum queues collapse priority to a built-in **two-level** scheme: a
+/// message published with `priority > 4` is high, `≤ 4` is normal (they reject the
+/// classic `x-max-priority` arg — see [`crate::topology`]). We keep the full `0..=9`
+/// on the wire so the policy here is unchanged and the two-tier split is honoured by
+/// the broker; the band just maps to high/normal rather than ten distinct levels.
 ///
 /// Constructed clamped so an out-of-range value can never reach the wire and be
 /// silently dropped by the broker (RabbitMQ caps anything above the queue's max).

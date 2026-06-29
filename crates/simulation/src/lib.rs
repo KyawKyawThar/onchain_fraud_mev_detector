@@ -17,6 +17,9 @@
 //!   pure `PreliminaryAlertCreated → (SimulationJob, SimulationRequested)` mapping.
 //! - [`queue`] — the [`JobSink`](queue::JobSink) RabbitMQ publish seam + the
 //!   at-least-once `publish_resilient` policy.
+//! - [`topology`] — the one-time `sim.jobs` queue + DLX declaration
+//!   ([`declare_sim_topology`](topology::declare_sim_topology)) the sink publishes
+//!   into.
 //! - [`dispatcher`] — the [`Dispatcher`](dispatcher::Dispatcher): consume alerts,
 //!   queue jobs, emit the audit event, commit.
 //! - [`config`] — env-resolved [`Config`](config::Config).
@@ -28,3 +31,4 @@ pub mod command;
 pub mod config;
 pub mod dispatcher;
 pub mod queue;
+pub mod topology;

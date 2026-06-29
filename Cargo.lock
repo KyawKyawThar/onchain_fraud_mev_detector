@@ -5368,6 +5368,8 @@ dependencies = [
  "serde",
  "serde_json",
  "telemetry",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-executor-trait",

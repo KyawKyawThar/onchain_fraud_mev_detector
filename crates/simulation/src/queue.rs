@@ -15,10 +15,10 @@
 //! broker blip until it succeeds or shutdown, and only gives up on a permanent
 //! (encode) failure that can never succeed.
 //!
-//! The queue *topology* (the durable, quorum, priority `0..=9`, dead-letter `sim.jobs.dlx`
-//! declaration) is **not** here — it is provisioned in Sprint 5 t2. This sink
-//! publishes to the queue by name via the default exchange; it does not declare it,
-//! so it can't conflict with that declaration's arguments.
+//! The queue *topology* (the durable, quorum, dead-letter `sim.jobs.dlx` declaration)
+//! lives in [`crate::topology`], declared once at boot. This sink publishes to the
+//! queue by name via the default exchange; it does not declare it, so it can't
+//! conflict with that declaration's arguments.
 
 use std::time::Duration;
 
@@ -39,6 +39,20 @@ pub const PUBLISH_BACKOFF: Duration = Duration::from_secs(1);
 /// message survives a broker restart; pairing a transient message with a durable
 /// queue would silently lose jobs across a bounce.
 const DELIVERY_MODE_PERSISTENT: u8 = 2;
+
+/// Open a RabbitMQ connection, handing lapin tokio's executor + reactor so it runs
+/// on the service's single runtime rather than spinning up its own threads. Shared
+/// by the publish sink ([`RabbitJobSink::connect`]) and the one-time topology
+/// declaration ([`crate::topology::declare_sim_topology`]) so the connection setup
+/// lives in one place.
+pub(crate) async fn amqp_connect(url: &str) -> Result<Connection> {
+    let options = ConnectionProperties::default()
+        .with_executor(tokio_executor_trait::Tokio::current())
+        .with_reactor(tokio_reactor_trait::Tokio);
+    Connection::connect(url, options)
+        .await
+        .context("connecting to RabbitMQ")
+}
 
 /// Why publishing one command failed. Transport-agnostic (the delivery detail is a
 /// `String`, not a `lapin` type) so the [`JobSink`] seam doesn't leak AMQP into the
@@ -92,12 +106,7 @@ impl RabbitJobSink {
     ///
     /// Does **not** declare the queue — topology is Sprint 5 t2 (see module docs).
     pub async fn connect(url: &str, queue: String) -> Result<Self> {
-        let options = ConnectionProperties::default()
-            .with_executor(tokio_executor_trait::Tokio::current())
-            .with_reactor(tokio_reactor_trait::Tokio);
-        let connection = Connection::connect(url, options)
-            .await
-            .context("connecting to RabbitMQ")?;
+        let connection = amqp_connect(url).await?;
         let channel = connection
             .create_channel()
             .await

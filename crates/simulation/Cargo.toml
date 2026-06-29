@@ -61,6 +61,11 @@ tokio-reactor-trait = { workspace = true }
 # Only the tests construct on-chain addresses directly; non-test code reaches
 # alloy's `Address` through `events::primitives::AccountAddress`.
 alloy-primitives = { workspace = true }
+# Live-broker integration test (`tests/topology.rs`, `#[ignore]`): spin a real
+# RabbitMQ in a container so the topology declaration is exercised against the
+# broker that actually enforces quorum-vs-priority, not just the arg builders.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
 
 [lints]
 workspace = true
