@@ -165,6 +165,15 @@ run-detection:
 run-detection-demo:
     cargo run -p detection --features detectors,demo
 
+# Run the simulation dispatcher (§7, slow-path front half). Declares the sim.jobs
+# topology (quorum + DLX) at boot, then consumes PreliminaryAlertCreated off Kafka
+# and publishes a SimulationJob command to RabbitMQ for each. Needs Kafka + RabbitMQ
+# up (`just up`) and detection producing alerts. Queue depth shows on the
+# 'Simulation — sim.jobs queue (§7)' Grafana dashboard; with no worker pool draining
+# sim.jobs yet (Sprint 5 t3) the backlog grows — that's the §7 backpressure signal.
+run-simulation:
+    cargo run -p simulation
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon
