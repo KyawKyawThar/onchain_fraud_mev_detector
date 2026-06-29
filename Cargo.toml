@@ -117,6 +117,15 @@ tokio-util = "0.7"
 secrecy = "0.10"
 subtle = "2"
 
+# Property-based testing (§18, Sprint 4 task 4): generate the *whole value space*
+# of an input and assert an invariant holds across all of it, shrinking to a
+# minimal counterexample on failure. Used for the detector invariants (a planted
+# MEV pattern in arbitrary block noise is always found; every emitted finding is
+# structurally valid) and the `DomainEvent` codec-totality round trip
+# (`deserialize(serialize(x)) == x`) — the schema follow-up carried from Sprint 1.
+# A dev-dependency only, never linked into a shipped binary.
+proptest = "1"
+
 # Integration testing against real ClickHouse/Kafka via throwaway containers
 # (the `#[ignore]` tests CI's integration-test job runs).
 testcontainers = "0.27"

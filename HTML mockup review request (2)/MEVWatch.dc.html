@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/@tabler/icons-webfont@3.8.0/dist/tabler-icons.min.css">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{background:#0a0d12;}
+  ::-webkit-scrollbar{width:9px;height:9px;}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.09);border-radius:5px;}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.16);}
+  ::-webkit-scrollbar-track{background:transparent;}
+  @keyframes mw-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  @keyframes mw-flow{to{left:130%}}
+  @keyframes mw-spin{to{transform:rotate(360deg)}}
+  @keyframes mw-shimmer{0%{background-position:-420px 0}100%{background-position:420px 0}}
+  @keyframes mw-rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @keyframes mw-ring{0%{transform:scale(.85);opacity:.7}70%{transform:scale(1.5);opacity:0}100%{opacity:0}}
+  @keyframes mw-sweep{to{stroke-dashoffset:0}}
+  :focus-visible{outline:2px solid #4f9cf5;outline-offset:2px;border-radius:4px;}
+  [data-mw] ::selection{background:rgba(34,211,168,.3);}
+</style>
+</helmet>
+<template id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="20" fill="#0a0d12"/><rect x="30" y="30" width="40" height="40" rx="11" fill="url(#g)"/><path d="M50 41l-7 11h6l-2 8 9-12h-6z" fill="#06140f"/><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22d3a8"/><stop offset="1" stop-color="#9d7bf0"/></linearGradient></defs></svg></template>
+<div data-mw style="--bg:#0a0d12;--s1:#10141b;--s2:#161b24;--s3:#1e2531;--s4:#283041;--bd:rgba(255,255,255,.06);--bd2:rgba(255,255,255,.13);--tx:#e7eaf2;--mu:#8b92a7;--ft:#525a72;--teal:#22d3a8;--tealb:rgba(34,211,168,.10);--amber:#f5b544;--amberb:rgba(245,181,68,.10);--red:#f0564f;--redb:rgba(240,86,79,.10);--violet:#9d7bf0;--violetb:rgba(157,123,240,.10);--blue:#4f9cf5;--blueb:rgba(79,156,245,.10);--coral:#f0794a;--mono:'JetBrains Mono',ui-monospace,monospace;--disp:'Space Grotesk',sans-serif;font-family:'IBM Plex Sans',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column;">
+
+  <!-- ============ TOP NAV ============ -->
+  <header style="display:flex;align-items:center;gap:14px;height:56px;padding:0 18px;background:rgba(16,20,27,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:200;flex-shrink:0;">
+    <div style="display:flex;align-items:center;gap:9px;flex-shrink:0;">
+      <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--teal),var(--violet));display:flex;align-items:center;justify-content:center;box-shadow:0 0 16px rgba(34,211,168,.35);" aria-hidden="true"><i class="ti ti-eye-bolt" style="font-size:17px;color:#06140f;"></i></div>
+      <div style="display:flex;flex-direction:column;line-height:1.05;">
+        <span style="font-family:var(--disp);font-weight:700;font-size:16px;letter-spacing:-.01em;">MEVWatch</span>
+        <span style="font-size:9.5px;color:var(--mu);letter-spacing:.14em;text-transform:uppercase;font-weight:500;">Risk Intelligence</span>
+      </div>
+    </div>
+    <nav aria-label="Primary" style="display:flex;gap:2px;overflow-x:auto;flex:1;scrollbar-width:none;">
+      <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="8">
+        <button type="button" onClick="{{ t.go }}" aria-current="{{ t.cur }}" title="{{ t.label }}" style="display:flex;align-items:center;gap:6px;padding:7px 12px;border:none;border-radius:7px;background:{{ t.bg }};color:{{ t.col }};font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s;" style-hover="background:var(--s3);color:var(--tx);">
+          <i class="ti {{ t.icon }}" style="font-size:15px;" aria-hidden="true"></i>{{ t.label }}
+          <sc-if value="{{ t.badge }}" hint-placeholder-val=""><span style="font-family:var(--mono);font-size:9.5px;font-weight:600;padding:1px 5px;border-radius:8px;background:var(--redb);color:var(--red);">{{ t.badge }}</span></sc-if>
+        </button>
+      </sc-for>
+    </nav>
+    <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+      <label style="display:flex;align-items:center;gap:7px;padding:7px 12px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;width:230px;" style-focus-within="border-color:var(--teal);">
+        <i class="ti ti-search" style="font-size:14px;color:var(--mu);" aria-hidden="true"></i>
+        <input placeholder="Search address, entity, token, tx…" aria-label="Search" style="background:none;border:none;outline:none;color:var(--tx);font-family:inherit;font-size:12.5px;width:100%;">
+        <kbd style="font-family:var(--mono);font-size:10px;color:var(--ft);border:1px solid var(--bd);border-radius:4px;padding:0 4px;">/</kbd>
+      </label>
+      <button type="button" title="Connected chains: live" style="display:flex;align-items:center;gap:6px;padding:7px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:20px;color:var(--mu);font-size:12px;font-family:inherit;cursor:pointer;" style-hover="border-color:var(--bd2);color:var(--tx);">
+        <span style="width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 7px var(--teal);animation:mw-pulse 2s infinite;" aria-hidden="true"></span>4 chains
+      </button>
+      <button type="button" aria-label="Notifications" style="position:relative;width:34px;height:34px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--mu);cursor:pointer;display:flex;align-items:center;justify-content:center;" style-hover="background:var(--s3);color:var(--tx);"><i class="ti ti-bell" style="font-size:16px;" aria-hidden="true"></i><span style="position:absolute;top:7px;right:8px;width:6px;height:6px;border-radius:50%;background:var(--red);" aria-hidden="true"></span></button>
+      <div style="width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--violet),var(--blue));display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:#fff;" title="Account: Sigma Capital (Pro)">S</div>
+    </div>
+  </header>
+
+  <!-- ============ REORG / SYSTEM STRIP ============ -->
+  <sc-if value="{{ showReorg }}" hint-placeholder-val="">
+    <div role="status" style="display:flex;align-items:center;gap:10px;padding:7px 18px;background:rgba(245,181,68,.07);border-bottom:1px solid rgba(245,181,68,.2);font-size:12.5px;color:var(--amber);animation:mw-rise .3s ease;">
+      <i class="ti ti-git-branch" style="font-size:15px;" aria-hidden="true"></i>
+      <strong style="font-weight:600;">Reorg detected</strong>
+      <span style="color:var(--tx);opacity:.85;">L1 #21,847,198–200 orphaned · 2 incidents auto-retracted · projections rolled back to common ancestor</span>
+      <span style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--mu);">30s ago</span>
+      <button type="button" onClick="{{ dismissReorg }}" aria-label="Dismiss" style="background:none;border:none;color:var(--amber);cursor:pointer;display:flex;"><i class="ti ti-x" style="font-size:15px;"></i></button>
+    </div>
+  </sc-if>
+
+  <!-- ============ PAGE BODY ============ -->
+  <main style="flex:1;min-height:0;">
+
+  <!-- ========== INTELLIGENCE ========== -->
+  <sc-if value="{{ isIntel }}" hint-placeholder-val="{{ true }}">
+    <div style="display:grid;grid-template-columns:340px 1fr;height:100%;min-height:0;">
+      <!-- entity list -->
+      <aside style="border-right:1px solid var(--bd);background:var(--s1);display:flex;flex-direction:column;min-height:0;">
+        <div style="padding:14px 16px 10px;border-bottom:1px solid var(--bd);">
+          <label style="display:flex;align-items:center;gap:7px;padding:8px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;" style-focus-within="border-color:var(--teal);">
+            <i class="ti ti-fingerprint" style="font-size:14px;color:var(--mu);" aria-hidden="true"></i>
+            <input placeholder="Address, ENS, label…" aria-label="Filter entities" style="background:none;border:none;outline:none;color:var(--tx);font-family:inherit;font-size:12.5px;width:100%;">
+          </label>
+          <div role="tablist" style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+            <sc-for list="{{ intelFilters }}" as="f" hint-placeholder-count="4">
+              <button type="button" onClick="{{ f.go }}" style="padding:4px 10px;border:1px solid {{ f.bd }};border-radius:20px;background:{{ f.bg }};color:{{ f.col }};font-family:inherit;font-size:11.5px;font-weight:500;cursor:pointer;">{{ f.label }}</button>
+            </sc-for>
+          </div>
+        </div>
+        <div style="overflow-y:auto;flex:1;min-height:0;">
+          <sc-for list="{{ entities }}" as="e" hint-placeholder-count="6">
+            <button type="button" onClick="{{ e.go }}" style="display:block;width:100%;text-align:left;padding:13px 16px;border:none;border-left:2px solid {{ e.sel }};border-bottom:1px solid var(--bd);background:{{ e.selbg }};cursor:pointer;font-family:inherit;" style-hover="background:var(--s2);">
+              <div style="display:flex;align-items:center;gap:10px;">
+                <div style="width:32px;height:32px;border-radius:8px;background:{{ e.iconbg }};color:{{ e.iconc }};display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="ti {{ e.icon }}" style="font-size:16px;" aria-hidden="true"></i></div>
+                <div style="flex:1;min-width:0;">
+                  <div style="font-weight:600;font-size:13px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ e.name }}</div>
+                  <div style="font-family:var(--mono);font-size:11px;color:var(--blue);">{{ e.addr }}</div>
+                </div>
+                <div style="text-align:right;flex-shrink:0;">
+                  <div style="font-family:var(--disp);font-weight:700;font-size:19px;color:{{ e.scorec }};line-height:1;">{{ e.score }}</div>
+                  <div style="font-size:9.5px;color:var(--mu);font-family:var(--mono);">{{ e.conf }} conf</div>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:5px;margin-top:9px;flex-wrap:wrap;">
+                <sc-for list="{{ e.tags }}" as="tg" hint-placeholder-count="2"><span style="padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:500;background:{{ tg.bg }};color:{{ tg.col }};">{{ tg.t }}</span></sc-for>
+                <span style="margin-left:auto;font-size:10.5px;color:var(--ft);font-family:var(--mono);">{{ e.meta }}</span>
+              </div>
+            </button>
+          </sc-for>
+        </div>
+      </aside>
+
+      <!-- entity detail -->
+      <section style="overflow-y:auto;min-height:0;padding:22px 26px;">
+        <div style="max-width:980px;margin:0 auto;display:flex;flex-direction:column;gap:16px;">
+          <!-- header card -->
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:20px 22px;display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;">
+            <div>
+              <div style="display:flex;align-items:center;gap:11px;flex-wrap:wrap;">
+                <div style="width:44px;height:44px;border-radius:11px;background:var(--amberb);color:var(--amber);display:flex;align-items:center;justify-content:center;"><i class="ti ti-bolt" style="font-size:22px;" aria-hidden="true"></i></div>
+                <h1 style="font-family:var(--disp);font-size:22px;font-weight:600;letter-spacing:-.01em;">{{ det.name }}</h1>
+                <span style="display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:6px;background:var(--violetb);color:var(--violet);font-size:11.5px;font-weight:600;"><i class="ti ti-robot" style="font-size:13px;"></i>MEV Bot</span>
+                <span style="display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:6px;background:var(--redb);color:var(--red);font-size:11.5px;font-weight:600;"><i class="ti ti-alert-triangle" style="font-size:13px;"></i>High Risk</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:11px;flex-wrap:wrap;">
+                <code style="font-family:var(--mono);font-size:12.5px;color:var(--blue);background:var(--s3);padding:3px 8px;border-radius:6px;">{{ det.addr }}</code>
+                <button type="button" aria-label="Copy address" style="width:26px;height:26px;border:1px solid var(--bd);border-radius:6px;background:var(--s2);color:var(--mu);cursor:pointer;display:flex;align-items:center;justify-content:center;" style-hover="color:var(--tx);"><i class="ti ti-copy" style="font-size:13px;"></i></button>
+                <span style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:6px;background:var(--s3);font-size:11.5px;color:var(--mu);"><i class="ti ti-link" style="font-size:13px;"></i>Entity #183</span>
+              </div>
+              <div style="display:flex;gap:18px;margin-top:13px;font-size:12px;color:var(--mu);flex-wrap:wrap;">
+                <span><i class="ti ti-world" style="font-size:13px;color:var(--ft);"></i> ETH · ARB · Base</span>
+                <span><i class="ti ti-calendar" style="font-size:13px;color:var(--ft);"></i> First seen 2022-04-12</span>
+                <span><i class="ti ti-clock" style="font-size:13px;color:var(--ft);"></i> Active 2m ago</span>
+              </div>
+            </div>
+            <!-- two axis rings -->
+            <div style="display:flex;gap:22px;align-items:center;">
+              <div style="text-align:center;">{{ ringScore }}<div style="font-size:11px;color:var(--mu);margin-top:5px;font-weight:500;">Risk Score</div></div>
+              <div style="text-align:center;">{{ ringConf }}<div style="font-size:11px;color:var(--mu);margin-top:5px;font-weight:500;">Confidence</div></div>
+            </div>
+          </div>
+
+          <!-- two-axis explainer -->
+          <div style="display:flex;gap:10px;align-items:flex-start;padding:11px 15px;background:var(--blueb);border:1px solid rgba(79,156,245,.2);border-radius:11px;font-size:12.5px;color:var(--tx);">
+            <i class="ti ti-info-circle" style="font-size:16px;color:var(--blue);flex-shrink:0;margin-top:1px;" aria-hidden="true"></i>
+            <span style="opacity:.9;"><strong style="color:var(--blue);">Two independent axes.</strong> Score answers “how risky?” — confidence answers “how sure?”. This entity is high-risk <em>and</em> high-confidence because the score is driven by sim-confirmed incidents and an on-chain-verified wallet cluster, not heuristic labels alone.</span>
+          </div>
+
+          <!-- risk factors -->
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;">
+            <div style="padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+              <div style="display:flex;align-items:center;gap:9px;"><span style="font-family:var(--disp);font-weight:600;font-size:14px;color:var(--red);">Risk factors — why 91?</span><span style="font-size:11.5px;color:var(--teal);font-family:var(--mono);">↑ +16 vs 3d ago</span></div>
+              <span style="font-size:11.5px;color:var(--mu);">model v1.4.2 · time-decayed · every delta has evidence</span>
+            </div>
+            <div style="padding:6px 0;">
+              <sc-for list="{{ det.factors }}" as="rf" hint-placeholder-count="6">
+                <div style="display:grid;grid-template-columns:1fr 200px 52px;gap:14px;align-items:center;padding:11px 18px;border-bottom:1px solid var(--bd);" style-hover="background:var(--s2);">
+                  <div style="display:flex;align-items:center;gap:9px;">
+                    <i class="ti {{ rf.icon }}" style="font-size:15px;color:{{ rf.col }};" aria-hidden="true"></i>
+                    <span style="font-size:13px;">{{ rf.label }}</span>
+                    <sc-if value="{{ rf.soft }}" hint-placeholder-val=""><span style="font-size:10px;color:var(--ft);border:1px solid var(--bd);border-radius:4px;padding:0 5px;">heuristic</span></sc-if>
+                  </div>
+                  <div style="height:7px;background:var(--s3);border-radius:4px;overflow:hidden;"><div style="width:{{ rf.pct }};height:100%;background:{{ rf.col }};border-radius:4px;"></div></div>
+                  <span style="text-align:right;font-family:var(--mono);font-weight:600;font-size:14px;color:{{ rf.col }};">{{ rf.delta }}</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;background:var(--s2);">
+              <span style="font-size:12.5px;color:var(--mu);">Sum of factors</span>
+              <span style="font-family:var(--disp);font-weight:700;font-size:18px;color:var(--red);">91 <span style="color:var(--ft);font-size:14px;">/ 100</span></span>
+            </div>
+          </div>
+
+          <!-- reputation timeseries + timeline -->
+          <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:16px;">
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;"><span style="font-weight:600;font-size:13px;">MEV extracted / month</span><span style="font-family:var(--mono);font-size:11.5px;color:var(--amber);">$8.2M lifetime</span></div>
+              {{ chartReputation }}
+            </div>
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+              <div style="font-weight:600;font-size:13px;margin-bottom:12px;">Entity timeline</div>
+              <div style="display:flex;flex-direction:column;gap:0;">
+                <sc-for list="{{ det.timeline }}" as="tl" hint-placeholder-count="4">
+                  <div style="display:grid;grid-template-columns:14px 1fr;gap:11px;">
+                    <div style="display:flex;flex-direction:column;align-items:center;"><span style="width:9px;height:9px;border-radius:50%;background:{{ tl.col }};margin-top:4px;flex-shrink:0;"></span><span style="width:1px;flex:1;background:var(--bd);"></span></div>
+                    <div style="padding-bottom:14px;"><div style="font-size:12.5px;color:var(--tx);font-weight:500;">{{ tl.label }}</div><div style="font-size:11px;color:var(--ft);font-family:var(--mono);">{{ tl.date }}</div></div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </sc-if>
+
+  <!-- ========== LIVE MONITOR ========== -->
+  <sc-if value="{{ isLive }}" hint-placeholder-val="">
+    <div style="display:grid;grid-template-columns:230px 1fr 290px;height:100%;min-height:0;">
+      <!-- left rail: chains + detectors -->
+      <aside style="border-right:1px solid var(--bd);background:var(--s1);overflow-y:auto;padding:16px 14px;min-height:0;">
+        <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:9px;">Chains</div>
+        <div style="display:flex;flex-direction:column;gap:5px;margin-bottom:22px;">
+          <sc-for list="{{ chains }}" as="c" hint-placeholder-count="4">
+            <button type="button" onClick="{{ c.go }}" style="display:flex;align-items:center;gap:9px;padding:9px 10px;border:none;border-radius:8px;background:{{ c.bg }};cursor:pointer;font-family:inherit;text-align:left;" style-hover="background:var(--s2);">
+              <span style="width:24px;height:24px;border-radius:6px;background:{{ c.iconbg }};color:{{ c.iconc }};display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:600;font-size:11px;flex-shrink:0;">{{ c.sym }}</span>
+              <span style="flex:1;min-width:0;"><span style="display:block;font-size:12.5px;font-weight:500;color:var(--tx);">{{ c.name }}</span><span style="display:block;font-family:var(--mono);font-size:10.5px;color:var(--mu);">#{{ c.block }}</span></span>
+              <span style="width:7px;height:7px;border-radius:50%;background:{{ c.dot }};box-shadow:0 0 6px {{ c.dot }};flex-shrink:0;" title="{{ c.health }}"></span>
+            </button>
+          </sc-for>
+        </div>
+        <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:9px;">Detectors</div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <sc-for list="{{ detectors }}" as="d" hint-placeholder-count="7">
+            <button type="button" style="display:flex;align-items:center;gap:9px;padding:8px 10px;border:none;border-radius:7px;background:transparent;cursor:pointer;font-family:inherit;" style-hover="background:var(--s2);">
+              <span style="width:8px;height:8px;border-radius:2px;background:{{ d.col }};flex-shrink:0;{{ d.off }}"></span>
+              <span style="flex:1;text-align:left;font-size:12.5px;color:{{ d.txtc }};">{{ d.name }}</span>
+              <span style="font-family:var(--mono);font-size:11px;font-weight:600;color:{{ d.cntc }};background:{{ d.cntbg }};padding:1px 6px;border-radius:6px;min-width:24px;text-align:center;">{{ d.count }}</span>
+            </button>
+          </sc-for>
+        </div>
+      </aside>
+
+      <!-- center: incident feed -->
+      <section style="overflow-y:auto;min-height:0;display:flex;flex-direction:column;">
+        <div style="position:sticky;top:0;z-index:10;background:var(--bg);padding:14px 20px 10px;border-bottom:1px solid var(--bd);">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <div role="tablist" style="display:flex;gap:6px;">
+              <sc-for list="{{ liveFilters }}" as="lf" hint-placeholder-count="4"><button type="button" onClick="{{ lf.go }}" style="padding:5px 12px;border:1px solid {{ lf.bd }};border-radius:8px;background:{{ lf.bg }};color:{{ lf.col }};font-family:inherit;font-size:12px;font-weight:500;cursor:pointer;">{{ lf.label }}</button></sc-for>
+            </div>
+            <div style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--mu);"><span style="width:6px;height:6px;border-radius:50%;background:var(--teal);box-shadow:0 0 6px var(--teal);animation:mw-pulse 2s infinite;"></span>streaming · {{ feedCount }} incidents</div>
+          </div>
+        </div>
+        <div style="padding:14px 20px;display:flex;flex-direction:column;gap:11px;">
+          <!-- ANIMATED LIFECYCLE HERO -->
+          {{ lifecycleCard }}
+          <!-- skeleton while booting -->
+          <sc-if value="{{ booting }}" hint-placeholder-val="{{ true }}">
+            <sc-for list="{{ skeletons }}" as="sk" hint-placeholder-count="3">
+              <div style="border:1px solid var(--bd);border-radius:12px;padding:16px;background:var(--s1);">
+                <div style="height:14px;width:60%;border-radius:5px;background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);background-size:840px 100%;animation:mw-shimmer 1.4s infinite;margin-bottom:11px;"></div>
+                <div style="height:10px;width:38%;border-radius:5px;background:linear-gradient(90deg,var(--s3) 25%,var(--s4) 50%,var(--s3) 75%);background-size:840px 100%;animation:mw-shimmer 1.4s infinite;"></div>
+              </div>
+            </sc-for>
+          </sc-if>
+          <!-- incident cards -->
+          <sc-if value="{{ hasIncidents }}" hint-placeholder-val="">
+            <sc-for list="{{ incidents }}" as="i" hint-placeholder-count="5">
+              <article onClick="{{ i.go }}" tabindex="0" style="border:1px solid {{ i.bd }};border-left:3px solid {{ i.accent }};border-radius:12px;background:{{ i.cardbg }};padding:15px 17px;cursor:pointer;opacity:{{ i.op }};transition:border-color .15s,transform .12s;" style-hover="border-color:var(--bd2);transform:translateY(-1px);">
+                <div style="display:flex;align-items:flex-start;gap:13px;">
+                  <span style="display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:7px;background:{{ i.kindbg }};color:{{ i.kindc }};font-size:11.5px;font-weight:600;flex-shrink:0;"><i class="ti {{ i.kindi }}" style="font-size:13px;"></i>{{ i.kind }}</span>
+                  <div style="flex:1;min-width:0;">
+                    <div style="font-weight:600;font-size:14px;color:var(--tx);{{ i.strike }}">{{ i.title }}</div>
+                    <div style="font-size:11.5px;color:var(--mu);font-family:var(--mono);margin-top:3px;">{{ i.sub }}</div>
+                  </div>
+                  <div style="text-align:right;flex-shrink:0;">
+                    <div style="font-family:var(--disp);font-weight:700;font-size:16px;color:{{ i.valc }};">{{ i.value }}</div>
+                    <div style="font-size:10.5px;color:var(--mu);">{{ i.valLabel }}</div>
+                  </div>
+                  <div style="text-align:center;flex-shrink:0;width:42px;"><div style="font-family:var(--disp);font-weight:700;font-size:17px;color:{{ i.riskc }};">{{ i.risk }}</div><div style="font-size:9px;color:var(--mu);">risk</div></div>
+                </div>
+                <div style="display:flex;align-items:center;gap:7px;margin-top:11px;flex-wrap:wrap;">
+                  <span style="display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:600;color:{{ i.statc }};">{{ i.statusIcon }}{{ i.status }}</span>
+                  <span style="font-size:10.5px;color:var(--ft);font-family:var(--mono);">{{ i.chain }}</span>
+                  <sc-for list="{{ i.addrs }}" as="a" hint-placeholder-count="2"><code style="font-family:var(--mono);font-size:10.5px;color:{{ a.col }};background:var(--s3);padding:1px 6px;border-radius:5px;">{{ a.t }}</code></sc-for>
+                  <span style="margin-left:auto;font-size:10.5px;color:var(--ft);font-family:var(--mono);">{{ i.time }}</span>
+                </div>
+              </article>
+            </sc-for>
+          </sc-if>
+          <!-- empty state -->
+          <sc-if value="{{ feedEmpty }}" hint-placeholder-val="">
+            <div style="text-align:center;padding:60px 20px;color:var(--mu);">
+              <div style="width:54px;height:54px;border-radius:14px;background:var(--s2);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;"><i class="ti ti-shield-check" style="font-size:26px;color:var(--teal);"></i></div>
+              <div style="font-weight:600;font-size:15px;color:var(--tx);font-family:var(--disp);">No incidents match this filter</div>
+              <div style="font-size:12.5px;margin-top:4px;">The feed is live — confirmed incidents will appear here as simulation clears them.</div>
+            </div>
+          </sc-if>
+        </div>
+      </section>
+
+      <!-- right rail: live stats -->
+      <aside style="border-left:1px solid var(--bd);background:var(--s1);overflow-y:auto;padding:16px;min-height:0;display:flex;flex-direction:column;gap:18px;">
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;"><span style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;">24h summary</span><button type="button" style="font-size:11px;color:var(--blue);background:none;border:none;cursor:pointer;font-family:inherit;display:flex;align-items:center;gap:3px;"><i class="ti ti-download" style="font-size:12px;"></i>CSV</button></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <sc-for list="{{ liveStats }}" as="s" hint-placeholder-count="4"><div style="background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:11px 12px;"><div style="font-family:var(--disp);font-weight:700;font-size:18px;color:{{ s.col }};">{{ s.v }}</div><div style="font-size:10.5px;color:var(--mu);">{{ s.l }}</div></div></sc-for>
+          </div>
+        </div>
+        <div>
+          <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:10px;">Detector precision</div>
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            <sc-for list="{{ precision }}" as="p" hint-placeholder-count="4"><div><div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:4px;"><span>{{ p.name }}</span><span style="font-family:var(--mono);color:{{ p.col }};">{{ p.val }}</span></div><div style="height:5px;background:var(--s3);border-radius:3px;overflow:hidden;"><div style="width:{{ p.pct }};height:100%;background:{{ p.col }};"></div></div></div></sc-for>
+          </div>
+        </div>
+        <div>
+          <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:10px;">Pipeline latency p50/p95</div>
+          <div style="display:flex;flex-direction:column;gap:9px;">
+            <sc-for list="{{ pipeline }}" as="pl" hint-placeholder-count="4"><div style="display:flex;align-items:center;gap:9px;"><span style="width:62px;font-size:11.5px;color:var(--mu);">{{ pl.name }}</span><div style="flex:1;height:5px;background:var(--s3);border-radius:3px;overflow:hidden;"><div style="width:{{ pl.pct }};height:100%;background:{{ pl.col }};"></div></div><span style="font-family:var(--mono);font-size:10.5px;color:var(--mu);width:48px;text-align:right;">{{ pl.val }}</span></div></sc-for>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </sc-if>
+
+  <!-- ========== AUDIT (placeholder, filled next) ========== -->
+  <sc-if value="{{ isAudit }}" hint-placeholder-val="">
+    <div style="display:grid;grid-template-columns:300px 1fr;height:100%;min-height:0;">
+      <aside style="border-right:1px solid var(--bd);background:var(--s1);overflow-y:auto;padding:14px;min-height:0;">
+        <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:10px;">Recent incidents</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <sc-for list="{{ auditIncidents }}" as="a" hint-placeholder-count="5">
+            <button type="button" onClick="{{ a.go }}" style="display:block;width:100%;text-align:left;padding:11px 12px;border:1px solid {{ a.bd }};border-radius:9px;background:{{ a.bg }};cursor:pointer;font-family:inherit;" style-hover="border-color:var(--bd2);">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><span style="font-family:var(--mono);font-size:12px;font-weight:600;color:{{ a.idc }};">{{ a.id }}</span><span style="display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:600;color:{{ a.statc }};">{{ a.statusIcon }}{{ a.status }}</span></div>
+              <div style="font-size:12px;color:var(--tx);margin-top:5px;">{{ a.title }}</div>
+              <div style="font-size:10.5px;color:var(--ft);font-family:var(--mono);margin-top:3px;">{{ a.meta }}</div>
+            </button>
+          </sc-for>
+        </div>
+      </aside>
+      <section style="overflow-y:auto;min-height:0;padding:22px 26px;">
+        <div style="max-width:840px;margin:0 auto;">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
+            <div>
+              <h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Audit trail — “why did you alert?”</h1>
+              <p style="font-size:12.5px;color:var(--mu);margin-top:4px;max-width:560px;">Event-sourced &amp; replayable. The complete, immutable sequence of domain events behind <code style="font-family:var(--mono);color:var(--blue);">incident-42</code> — sometimes a legal answer, always reproducible from the event store.</p>
+            </div>
+            <div style="display:flex;gap:8px;flex-shrink:0;">
+              <button type="button" style="display:inline-flex;align-items:center;gap:6px;padding:8px 13px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;" style-hover="border-color:var(--bd2);"><i class="ti ti-player-play" style="font-size:14px;"></i>Replay</button>
+              <button type="button" style="display:inline-flex;align-items:center;gap:6px;padding:8px 13px;background:var(--tealb);border:1px solid rgba(34,211,168,.3);border-radius:9px;color:var(--teal);font-family:inherit;font-size:12.5px;cursor:pointer;"><i class="ti ti-file-export" style="font-size:14px;"></i>Export JSON</button>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:9px;margin:16px 0 22px;flex-wrap:wrap;">
+            <sc-for list="{{ auditLayers }}" as="ly" hint-placeholder-count="5"><span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--mu);"><span style="width:9px;height:9px;border-radius:3px;background:{{ ly.col }};"></span>{{ ly.name }}</span></sc-for>
+          </div>
+
+          <div style="position:relative;padding-left:8px;">
+            <sc-for list="{{ auditEvents }}" as="ev" hint-placeholder-count="8">
+              <div style="display:grid;grid-template-columns:32px 1fr;gap:16px;">
+                <div style="display:flex;flex-direction:column;align-items:center;">
+                  <span style="width:32px;height:32px;border-radius:9px;background:{{ ev.bg }};color:{{ ev.col }};display:flex;align-items:center;justify-content:center;flex-shrink:0;z-index:1;"><i class="ti {{ ev.icon }}" style="font-size:16px;" aria-hidden="true"></i></span>
+                  <span style="width:2px;flex:1;background:var(--bd);min-height:14px;"></span>
+                </div>
+                <div style="padding-bottom:18px;min-width:0;">
+                  <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;">
+                    <code style="font-family:var(--mono);font-size:13px;font-weight:600;color:{{ ev.col }};">{{ ev.type }}</code>
+                    <span style="font-size:10px;font-weight:600;color:{{ ev.col }};background:{{ ev.bg }};padding:1px 7px;border-radius:5px;">{{ ev.service }}</span>
+                    <sc-if value="{{ ev.cmd }}" hint-placeholder-val=""><span style="font-size:10px;color:var(--ft);border:1px solid var(--bd);border-radius:5px;padding:1px 6px;" title="A command, not a domain event — lives on RabbitMQ, never written to the event store">command · not stored</span></sc-if>
+                    <span style="margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--ft);">{{ ev.time }}</span>
+                  </div>
+                  <div style="font-family:var(--mono);font-size:11.5px;color:var(--mu);margin-top:5px;background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:8px 11px;overflow-x:auto;">{{ ev.payload }}</div>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="display:flex;gap:10px;align-items:flex-start;padding:13px 16px;background:var(--tealb);border:1px solid rgba(34,211,168,.2);border-radius:11px;font-size:12.5px;margin-top:4px;">
+            <i class="ti ti-lock-check" style="font-size:17px;color:var(--teal);flex-shrink:0;margin-top:1px;" aria-hidden="true"></i>
+            <span style="opacity:.92;"><strong style="color:var(--teal);">Immutable &amp; complete.</strong> Every state change above is appended to ClickHouse, retained indefinitely, and replayable deterministically. The <code style="font-family:var(--mono);">SimulationJob</code> that triggered the revm run is deliberately absent — a command is an instruction, not a fact, so only its <em>result</em> re-enters the log.</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </sc-if>
+  <!-- ========== SCREENING API ========== -->
+  <sc-if value="{{ isScreening }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:1180px;margin:0 auto;padding:22px 26px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px;">
+          <div>
+            <div style="display:flex;align-items:center;gap:9px;"><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Counterparty Screening API</h1><span style="font-size:10px;font-weight:600;color:var(--violet);background:var(--violetb);padding:2px 8px;border-radius:6px;">PRODUCT</span></div>
+            <p style="font-size:12.5px;color:var(--mu);margin-top:5px;max-width:580px;">Pre-transaction address risk in a single synchronous call. Screen withdrawals, onboarding and counterparties against the intelligence graph — labels, entity clusters, sanctions and risk score, with a policy-driven allow / review / block decision.</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+            <span style="display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:7px 11px;"><span style="font-weight:600;color:var(--teal);">POST</span><span style="color:var(--mu);">/v1/address/{addr}/screen</span></span>
+            <button type="button" style="display:inline-flex;align-items:center;gap:6px;padding:8px 13px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;" style-hover="border-color:var(--bd2);"><i class="ti ti-book" style="font-size:14px;"></i>Docs</button>
+          </div>
+        </div>
+
+        <!-- playground -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <!-- request -->
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;display:flex;flex-direction:column;">
+            <div style="padding:13px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;"><span style="font-weight:600;font-size:13px;">Request</span><span style="font-size:11px;color:var(--mu);font-family:var(--mono);">live playground</span></div>
+            <div style="padding:16px 18px;display:flex;flex-direction:column;gap:14px;">
+              <div>
+                <label style="font-size:11px;color:var(--mu);font-weight:500;display:block;margin-bottom:6px;">Address</label>
+                <div style="display:flex;align-items:center;gap:8px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;padding:9px 12px;"><i class="ti ti-wallet" style="font-size:15px;color:var(--mu);"></i><code style="font-family:var(--mono);font-size:12.5px;color:var(--blue);flex:1;overflow:hidden;text-overflow:ellipsis;">{{ screenSel.full }}</code></div>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div><label style="font-size:11px;color:var(--mu);font-weight:500;display:block;margin-bottom:6px;">Chain</label><select aria-label="Chain" style="width:100%;padding:9px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;"><option>ethereum</option><option>arbitrum</option><option>base</option></select></div>
+                <div><label style="font-size:11px;color:var(--mu);font-weight:500;display:block;margin-bottom:6px;">Policy</label><select aria-label="Policy" style="width:100%;padding:9px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;"><option>default</option><option>strict (block ≥ 60)</option><option>monitor-only</option></select></div>
+              </div>
+              <div>
+                <label style="font-size:11px;color:var(--mu);font-weight:500;display:block;margin-bottom:6px;">API key</label>
+                <div style="display:flex;align-items:center;gap:8px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;padding:9px 12px;"><i class="ti ti-key" style="font-size:15px;color:var(--mu);"></i><code style="font-family:var(--mono);font-size:12.5px;color:var(--mu);flex:1;">sk_live_••••••••••••2f9a</code></div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--mu);font-weight:500;margin-bottom:8px;">Try a sample counterparty</div>
+                <div style="display:flex;flex-direction:column;gap:6px;">
+                  <sc-for list="{{ screenSamples }}" as="s" hint-placeholder-count="5">
+                    <button type="button" onClick="{{ s.go }}" style="display:flex;align-items:center;gap:9px;padding:8px 11px;border:1px solid {{ s.bd }};border-radius:8px;background:{{ s.bg }};cursor:pointer;font-family:inherit;text-align:left;" style-hover="border-color:var(--bd2);">
+                      <span style="width:7px;height:7px;border-radius:50%;background:{{ s.dotc }};flex-shrink:0;"></span>
+                      <span style="font-size:12.5px;color:{{ s.labc }};flex:1;">{{ s.label }}</span>
+                      <code style="font-family:var(--mono);font-size:11px;color:var(--ft);">{{ s.short }}</code>
+                    </button>
+                  </sc-for>
+                </div>
+              </div>
+              <button type="button" style="display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:11px;background:var(--tealb);border:1px solid rgba(34,211,168,.35);border-radius:9px;color:var(--teal);font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;" style-hover="background:rgba(34,211,168,.16);"><i class="ti ti-send" style="font-size:16px;"></i>Send request</button>
+            </div>
+          </div>
+
+          <!-- response -->
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;display:flex;flex-direction:column;">
+            <div style="padding:13px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <span style="font-weight:600;font-size:13px;">Response</span>
+              <span style="display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11px;color:var(--teal);"><span style="width:6px;height:6px;border-radius:50%;background:var(--teal);"></span>{{ screenStatus.code }}</span>
+              <span style="font-family:var(--mono);font-size:11px;color:var(--mu);"><i class="ti ti-clock" style="font-size:12px;"></i> {{ screenStatus.latency }}</span>
+              <span style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ft);">model {{ screenStatus.ver }}</span>
+            </div>
+            <!-- decision banner -->
+            <div style="margin:14px 18px 0;border:1px solid {{ screenDec.bd }};background:{{ screenDec.bg }};border-radius:11px;padding:14px 16px;display:flex;align-items:center;gap:14px;">
+              <span style="width:46px;height:46px;border-radius:11px;background:{{ screenDec.bg }};border:1px solid {{ screenDec.bd }};color:{{ screenDec.c }};display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="ti {{ screenDec.icon }}" style="font-size:24px;"></i></span>
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:9px;"><span style="font-family:var(--disp);font-weight:700;font-size:19px;color:{{ screenDec.c }};letter-spacing:.02em;">{{ screenDec.label }}</span><sc-if value="{{ screenDec.sanc }}" hint-placeholder-val=""><span style="font-size:10px;font-weight:600;color:var(--red);background:var(--redb);padding:2px 7px;border-radius:5px;">SANCTIONS</span></sc-if></div>
+                <div style="font-size:12px;color:var(--mu);margin-top:3px;">{{ screenDec.note }}</div>
+              </div>
+              <div style="display:flex;gap:16px;flex-shrink:0;text-align:right;">
+                <div><div style="font-family:var(--disp);font-weight:700;font-size:18px;color:{{ screenDec.c }};">{{ screenDec.score }}</div><div style="font-size:9.5px;color:var(--mu);">risk</div></div>
+                <div><div style="font-family:var(--disp);font-weight:700;font-size:18px;color:var(--tx);">{{ screenDec.conf }}</div><div style="font-size:9.5px;color:var(--mu);">conf</div></div>
+              </div>
+            </div>
+            <div style="margin:14px 18px 18px;background:#0a0d12;border:1px solid var(--bd);border-radius:10px;padding:14px 16px;flex:1;">{{ screenResp }}</div>
+          </div>
+        </div>
+
+        <!-- code snippets -->
+        <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;margin-bottom:16px;">
+          <div style="padding:11px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;">
+            <span style="font-weight:600;font-size:13px;margin-right:6px;">Integrate</span>
+            <div style="display:flex;gap:4px;">
+              <sc-for list="{{ codeTabs }}" as="c" hint-placeholder-count="3"><button type="button" onClick="{{ c.go }}" style="padding:5px 12px;border:none;border-radius:7px;background:{{ c.bg }};color:{{ c.col }};font-family:inherit;font-size:12px;font-weight:500;cursor:pointer;">{{ c.name }}</button></sc-for>
+            </div>
+            <button type="button" aria-label="Copy code" style="margin-left:auto;display:inline-flex;align-items:center;gap:5px;padding:5px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:7px;color:var(--mu);font-family:inherit;font-size:11.5px;cursor:pointer;" style-hover="color:var(--tx);"><i class="ti ti-copy" style="font-size:13px;"></i>Copy</button>
+          </div>
+          <pre style="margin:0;padding:16px 18px;font-family:var(--mono);font-size:12.5px;line-height:1.7;color:var(--tx);overflow-x:auto;background:#0a0d12;">{{ screenCode }}</pre>
+        </div>
+
+        <!-- policy + pricing -->
+        <div style="display:grid;grid-template-columns:1fr 1.2fr;gap:16px;">
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+            <div style="font-weight:600;font-size:13px;margin-bottom:14px;">Decision policy</div>
+            <div style="height:9px;border-radius:5px;overflow:hidden;display:flex;margin-bottom:7px;"><div style="width:40%;background:var(--teal);"></div><div style="width:40%;background:var(--amber);"></div><div style="width:20%;background:var(--red);"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--mu);font-family:var(--mono);margin-bottom:16px;"><span>0 · allow</span><span>40 · review</span><span>80 · block</span><span>100</span></div>
+            <div style="display:flex;flex-direction:column;gap:11px;">
+              <sc-for list="{{ policyToggles }}" as="p" hint-placeholder-count="4">
+                <div style="display:flex;align-items:center;gap:10px;"><span style="flex:1;font-size:12.5px;color:var(--tx);">{{ p.l }}</span><button role="switch" aria-checked="{{ p.ariac }}" aria-label="Toggle policy" style="width:36px;height:21px;border-radius:11px;background:{{ p.toggle }};border:none;position:relative;cursor:pointer;flex-shrink:0;"><span style="position:absolute;top:2px;left:{{ p.knob }};width:17px;height:17px;border-radius:50%;background:#fff;transition:left .2s;"></span></button></div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:13px;"><span style="font-weight:600;font-size:13px;">Metered pricing</span><span style="font-size:11.5px;color:var(--mu);">pay per call · volume tiers</span></div>
+              <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:9px;">
+                <sc-for list="{{ pricingTierCards }}" as="t" hint-placeholder-count="4">
+                  <div style="border:1px solid {{ t.bd }};background:{{ t.bg }};border-radius:11px;padding:13px 12px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;"><span style="font-size:11.5px;font-weight:600;color:{{ t.pc }};">{{ t.name }}</span><sc-if value="{{ t.tag }}" hint-placeholder-val=""><span style="font-size:8.5px;font-weight:600;color:var(--violet);background:rgba(157,123,240,.16);padding:1px 5px;border-radius:4px;">{{ t.tag }}</span></sc-if></div>
+                    <div style="margin-top:9px;"><span style="font-family:var(--disp);font-weight:700;font-size:18px;color:var(--tx);">{{ t.price }}</span><span style="font-size:10.5px;color:var(--mu);"> {{ t.unit }}</span></div>
+                    <div style="font-size:10.5px;color:var(--mu);margin-top:6px;line-height:1.4;">{{ t.note }}</div>
+                  </div>
+                </sc-for>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;margin-top:14px;padding-top:13px;border-top:1px solid var(--bd);">
+                <i class="ti ti-calculator" style="font-size:16px;color:var(--violet);"></i>
+                <span style="font-size:12.5px;color:var(--mu);">Your projected usage <strong style="color:var(--tx);">312,400 calls</strong> this month →</span>
+                <span style="margin-left:auto;font-family:var(--disp);font-weight:700;font-size:17px;color:var(--violet);">$2,487</span>
+              </div>
+            </div>
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:14px 18px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
+              <sc-for list="{{ slaStats }}" as="s" hint-placeholder-count="4"><div><div style="font-family:var(--disp);font-weight:700;font-size:17px;color:var(--teal);">{{ s.v }}</div><div style="font-size:10.5px;color:var(--mu);margin-top:2px;">{{ s.l }}</div></div></sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  <!-- ========== BUILDERS ========== -->
+  <sc-if value="{{ isBuilders }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:1180px;margin:0 auto;padding:22px 26px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;">
+          <div><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Builder &amp; Relay Intelligence</h1><p style="font-size:12.5px;color:var(--mu);margin-top:4px;">Searcher → builder → relay flows. Which builders include the most MEV?</p></div>
+          <select aria-label="Time range" style="padding:8px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;"><option>Last 24 hours</option><option>Last 7 days</option></select>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+          <sc-for list="{{ builderStats }}" as="s" hint-placeholder-count="4"><div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:15px 16px;"><div style="font-family:var(--disp);font-weight:700;font-size:23px;color:{{ s.col }};">{{ s.v }}</div><div style="font-size:12px;color:var(--mu);margin-top:2px;">{{ s.l }}</div><div style="font-size:11px;color:{{ s.dc }};margin-top:6px;">{{ s.delta }}</div></div></sc-for>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;">
+            <div style="padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;"><span style="font-weight:600;font-size:13px;">Block builders (24h)</span><span style="font-size:11.5px;color:var(--mu);">by MEV extracted</span></div>
+            <div style="padding:6px 0;">
+              <sc-for list="{{ builders }}" as="b" hint-placeholder-count="4">
+                <div style="display:grid;grid-template-columns:20px 1fr auto;gap:12px;align-items:center;padding:11px 18px;border-bottom:1px solid var(--bd);" style-hover="background:var(--s2);">
+                  <span style="font-family:var(--mono);font-size:12px;color:var(--ft);">{{ b.rank }}</span>
+                  <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                    <span style="width:28px;height:28px;border-radius:7px;background:{{ b.col }};color:#0a0d12;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:13px;flex-shrink:0;">{{ b.sym }}</span>
+                    <div style="min-width:0;"><div style="font-weight:500;font-size:13px;color:var(--tx);">{{ b.name }}</div><div style="font-family:var(--mono);font-size:10.5px;color:var(--mu);">{{ b.blocks }} blocks · {{ b.sandwich }} sandwich · {{ b.flash }} flash</div></div>
+                  </div>
+                  <div style="text-align:right;min-width:96px;"><div style="font-family:var(--disp);font-weight:700;font-size:15px;color:var(--amber);">{{ b.mev }}</div><div style="height:4px;width:90px;background:var(--s3);border-radius:2px;overflow:hidden;margin-top:5px;margin-left:auto;"><div style="width:{{ b.pct }};height:100%;background:{{ b.col }};"></div></div></div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;">
+            <div style="padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;"><span style="font-weight:600;font-size:13px;">Top searchers (24h)</span><span style="font-size:11.5px;color:var(--mu);">bundles by relay</span></div>
+            <table style="width:100%;border-collapse:collapse;">
+              <thead><tr><th style="text-align:left;padding:9px 18px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Searcher</th><th style="text-align:left;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Type</th><th style="text-align:left;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Relay</th><th style="text-align:right;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Bundles</th><th style="text-align:right;padding:9px 18px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Extracted</th></tr></thead>
+              <tbody>
+                <sc-for list="{{ searchers }}" as="s" hint-placeholder-count="4">
+                  <tr style-hover="background:var(--s2);"><td style="padding:11px 18px;border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:12px;color:var(--blue);">{{ s.addr }}</td><td style="padding:11px 8px;border-bottom:1px solid var(--bd);"><span style="padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:500;background:{{ s.tbg }};color:{{ s.tc }};">{{ s.type }}</span></td><td style="padding:11px 8px;border-bottom:1px solid var(--bd);font-size:12px;color:var(--tx);">{{ s.relay }}</td><td style="padding:11px 8px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--tx);">{{ s.bundles }}</td><td style="padding:11px 18px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--amber);">{{ s.extracted }}</td></tr>
+                </sc-for>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  <!-- ========== ANALYTICS ========== -->
+  <sc-if value="{{ isAnalytics }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:1180px;margin:0 auto;padding:22px 26px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;">
+          <div><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Analytics</h1><p style="font-size:12.5px;color:var(--mu);margin-top:4px;">MEV trends, token risk scores, and economic impact. Powered by ClickHouse.</p></div>
+          <div style="display:flex;gap:8px;"><select aria-label="Range" style="padding:8px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;"><option>Last 24 hours</option><option>Last 7 days</option></select><select aria-label="Chain" style="padding:8px 11px;background:var(--s2);border:1px solid var(--bd);border-radius:9px;color:var(--tx);font-family:inherit;font-size:12.5px;cursor:pointer;"><option>All chains</option><option>Ethereum L1</option></select></div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:16px;">
+          <sc-for list="{{ analyticsStats }}" as="s" hint-placeholder-count="6"><div style="background:var(--s1);border:1px solid var(--bd);border-radius:11px;padding:13px 13px;"><div style="font-family:var(--disp);font-weight:700;font-size:19px;color:{{ s.col }};">{{ s.v }}</div><div style="font-size:11px;color:var(--mu);margin-top:2px;">{{ s.l }}</div><div style="font-size:10px;color:{{ s.dc }};margin-top:5px;">{{ s.delta }}</div></div></sc-for>
+        </div>
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px;">
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-weight:600;font-size:13px;">MEV extracted per hour (last 24h)</span><span style="font-family:var(--mono);font-size:11.5px;color:var(--amber);">peak 09:00 · $88K</span></div>
+            {{ chartMevHour }}
+          </div>
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+            <div style="font-weight:600;font-size:13px;margin-bottom:14px;">MEV by type</div>
+            <div style="display:flex;flex-direction:column;gap:13px;">
+              <sc-for list="{{ mevByType }}" as="m" hint-placeholder-count="3"><div><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;"><span style="display:flex;align-items:center;gap:6px;"><span style="width:8px;height:8px;border-radius:2px;background:{{ m.col }};"></span>{{ m.name }}</span><span style="font-family:var(--mono);color:var(--amber);">{{ m.val }}</span></div><div style="height:6px;background:var(--s3);border-radius:3px;overflow:hidden;"><div style="width:{{ m.pct }};height:100%;background:{{ m.col }};"></div></div></div></sc-for>
+            </div>
+            <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--bd);"><div style="font-weight:600;font-size:12px;color:var(--mu);margin-bottom:8px;">7-day MEV trend ($M)</div>{{ chartTrend }}</div>
+          </div>
+        </div>
+        <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;"><span style="font-weight:600;font-size:13px;">Token risk scores</span><span style="font-size:11.5px;color:var(--mu);">0–100 · honeypot sim + deployer history + LP analysis</span></div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr><th style="text-align:left;padding:9px 18px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Token</th><th style="text-align:left;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Contract</th><th style="text-align:left;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Risk factors</th><th style="text-align:right;padding:9px 8px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">LP (USD)</th><th style="text-align:right;padding:9px 18px;font-size:10.5px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Risk score</th></tr></thead>
+            <tbody>
+              <sc-for list="{{ tokenRisks }}" as="t" hint-placeholder-count="3">
+                <tr style-hover="background:var(--s2);">
+                  <td style="padding:12px 18px;border-bottom:1px solid var(--bd);font-weight:600;font-size:13px;color:{{ t.symc }};">{{ t.sym }}</td>
+                  <td style="padding:12px 8px;border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:12px;color:var(--blue);">{{ t.addr }}</td>
+                  <td style="padding:12px 8px;border-bottom:1px solid var(--bd);"><div style="display:flex;gap:5px;flex-wrap:wrap;"><sc-for list="{{ t.tags }}" as="tg" hint-placeholder-count="2"><span style="padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:500;background:{{ tg.bg }};color:{{ tg.col }};">{{ tg.t }}</span></sc-for></div></td>
+                  <td style="padding:12px 8px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--mu);">{{ t.lp }}</td>
+                  <td style="padding:12px 18px;border-bottom:1px solid var(--bd);"><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><div style="width:48px;height:5px;background:var(--s3);border-radius:3px;overflow:hidden;"><div style="width:{{ t.pct }};height:100%;background:{{ t.col }};"></div></div><span style="font-family:var(--disp);font-weight:700;font-size:15px;color:{{ t.col }};">{{ t.score }}</span></div></td>
+                </tr>
+              </sc-for>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  <!-- ========== ALERTS ========== -->
+  <sc-if value="{{ isAlerts }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:920px;margin:0 auto;padding:22px 26px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;">
+          <div><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Alert rules</h1><p style="font-size:12.5px;color:var(--mu);margin-top:4px;">Custom rules over the intelligence graph. Get notified immediately — no dashboard watching required.</p></div>
+          <button type="button" style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:var(--tealb);border:1px solid rgba(34,211,168,.3);border-radius:9px;color:var(--teal);font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;"><i class="ti ti-plus" style="font-size:15px;"></i>New rule</button>
+        </div>
+        <div style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ft);font-weight:600;margin-bottom:10px;">Active rules · 4</div>
+        <div style="display:flex;flex-direction:column;gap:11px;">
+          <sc-for list="{{ alertRules }}" as="r" hint-placeholder-count="4">
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:13px;padding:16px 18px;display:grid;grid-template-columns:40px 1fr auto;gap:14px;align-items:center;" style-hover="border-color:var(--bd2);">
+              <span style="width:40px;height:40px;border-radius:10px;background:{{ r.iconbg }};color:{{ r.iconc }};display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="ti {{ r.icon }}" style="font-size:19px;"></i></span>
+              <div style="min-width:0;">
+                <div style="font-weight:600;font-size:14px;color:var(--tx);">{{ r.name }}</div>
+                <div style="font-family:var(--mono);font-size:11.5px;color:var(--mu);margin-top:4px;">{{ r.cond }}</div>
+                <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;"><span style="font-size:11px;color:var(--blue);">{{ r.chan }}</span><span style="font-size:11px;color:var(--teal);">{{ r.fired }}</span><span style="font-size:11px;color:var(--ft);font-family:var(--mono);">{{ r.count }}</span></div>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
+                <button role="switch" aria-checked="true" aria-label="Toggle rule" style="width:38px;height:22px;border-radius:11px;background:{{ r.toggle }};border:none;position:relative;cursor:pointer;"><span style="position:absolute;top:2px;left:{{ r.knob }};width:18px;height:18px;border-radius:50%;background:#fff;transition:left .2s;"></span></button>
+                <button type="button" style="padding:6px 12px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-family:inherit;font-size:12px;cursor:pointer;" style-hover="border-color:var(--bd2);">Edit</button>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  <!-- ========== DETECTORS ========== -->
+  <sc-if value="{{ isDetectors }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:1100px;margin:0 auto;padding:22px 26px;">
+        <div style="margin-bottom:18px;"><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Detector configuration</h1><p style="font-size:12.5px;color:var(--mu);margin-top:4px;max-width:620px;">Per-detector thresholds, versioning and precision/recall. Changes are gated on backtest metrics before live promotion — every <code style="font-family:var(--mono);color:var(--blue);">DetectorTriggered</code> event carries its exact <code style="font-family:var(--mono);color:var(--blue);">(id, version, config_hash)</code>.</p></div>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <sc-for list="{{ detectorConfigs }}" as="d" hint-placeholder-count="7">
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:13px;padding:15px 18px;display:grid;grid-template-columns:1.6fr 1fr 1.3fr auto;gap:18px;align-items:center;opacity:{{ d.op }};" style-hover="border-color:var(--bd2);">
+              <div style="display:flex;align-items:center;gap:11px;min-width:0;">
+                <span style="width:10px;height:10px;border-radius:3px;background:{{ d.col }};flex-shrink:0;"></span>
+                <div style="min-width:0;"><div style="display:flex;align-items:center;gap:8px;"><span style="font-weight:600;font-size:14px;color:var(--tx);">{{ d.name }}</span><span style="font-family:var(--mono);font-size:11px;color:var(--mu);">{{ d.ver }}</span><span style="font-size:10px;color:var(--mu);background:{{ d.kindbg }};padding:1px 6px;border-radius:5px;">{{ d.kind }}</span></div><div style="font-family:var(--mono);font-size:11px;color:var(--ft);margin-top:4px;">{{ d.thresh }}</div></div>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;">{{ d.spark }}<div style="font-size:10.5px;color:var(--mu);">7d hits</div></div>
+              <div style="display:flex;flex-direction:column;gap:6px;">
+                <div><div style="display:flex;justify-content:space-between;font-size:10.5px;margin-bottom:3px;"><span style="color:var(--mu);">Precision</span><span style="font-family:var(--mono);color:{{ d.col }};">{{ d.prec }}</span></div><div style="height:4px;background:var(--s3);border-radius:2px;overflow:hidden;"><div style="width:{{ d.precpct }};height:100%;background:{{ d.col }};"></div></div></div>
+                <div><div style="display:flex;justify-content:space-between;font-size:10.5px;margin-bottom:3px;"><span style="color:var(--mu);">Recall</span><span style="font-family:var(--mono);color:var(--mu);">{{ d.recall }}</span></div><div style="height:4px;background:var(--s3);border-radius:2px;overflow:hidden;"><div style="width:{{ d.recallpct }};height:100%;background:var(--mu);"></div></div></div>
+              </div>
+              <button role="switch" aria-checked="true" aria-label="Toggle detector" style="width:38px;height:22px;border-radius:11px;background:{{ d.toggle }};border:none;position:relative;cursor:pointer;flex-shrink:0;"><span style="position:absolute;top:2px;left:{{ d.knob }};width:18px;height:18px;border-radius:50%;background:#fff;transition:left .2s;"></span></button>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  <!-- ========== BILLING ========== -->
+  <sc-if value="{{ isBilling }}" hint-placeholder-val="">
+    <section style="overflow-y:auto;height:100%;min-height:0;">
+      <div style="max-width:1100px;margin:0 auto;padding:22px 26px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;">
+          <div><h1 style="font-family:var(--disp);font-size:21px;font-weight:600;letter-spacing:-.01em;">Billing &amp; usage</h1><p style="font-size:12.5px;color:var(--mu);margin-top:4px;">Consumption against your plan. Usage metered from ClickHouse, updated every 60s.</p></div>
+          <div style="display:flex;align-items:center;gap:10px;"><span style="display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border-radius:8px;background:var(--violetb);color:var(--violet);font-size:12px;font-weight:600;"><i class="ti ti-star" style="font-size:14px;"></i>Pro plan</span><span style="font-size:12px;color:var(--mu);">Jun 1 – Jun 30, 2026</span></div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+          <sc-for list="{{ billingUsage }}" as="u" hint-placeholder-count="4">
+            <div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:15px 16px;">
+              <div style="font-size:12px;color:var(--mu);">{{ u.l }}</div>
+              <div style="display:flex;align-items:baseline;gap:5px;margin:7px 0 9px;"><span style="font-family:var(--disp);font-weight:700;font-size:21px;color:var(--tx);">{{ u.used }}</span><span style="font-size:12px;color:var(--ft);">/ {{ u.cap }}</span></div>
+              <div style="height:5px;background:var(--s3);border-radius:3px;overflow:hidden;"><div style="width:{{ u.pct }};height:100%;background:{{ u.col }};"></div></div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;">
+            <div style="font-weight:600;font-size:13px;margin-bottom:13px;">Metered this period</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:13px;">
+              <sc-for list="{{ billingMeter }}" as="m" hint-placeholder-count="4"><div><div style="font-family:var(--disp);font-weight:700;font-size:20px;color:{{ m.col }};">{{ m.v }}</div><div style="font-size:11.5px;color:var(--mu);margin-top:2px;">{{ m.l }}</div></div></sc-for>
+            </div>
+          </div>
+          <div style="background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;">
+            <div style="padding:13px 18px;border-bottom:1px solid var(--bd);font-weight:600;font-size:13px;">Plan tiers</div>
+            <table style="width:100%;border-collapse:collapse;">
+              <thead><tr><th style="text-align:left;padding:8px 18px;font-size:10px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Tier</th><th style="text-align:right;padding:8px 6px;font-size:10px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Chains</th><th style="text-align:right;padding:8px 6px;font-size:10px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Wallets</th><th style="text-align:right;padding:8px 6px;font-size:10px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">API/mo</th><th style="text-align:right;padding:8px 18px;font-size:10px;font-weight:500;color:var(--mu);border-bottom:1px solid var(--bd);">Rules</th></tr></thead>
+              <tbody>
+                <sc-for list="{{ tiers }}" as="t" hint-placeholder-count="3">
+                  <tr style="background:{{ t.rowbg }};"><td style="padding:11px 18px;border-bottom:1px solid var(--bd);font-size:13px;font-weight:600;color:{{ t.namec }};">{{ t.name }}{{ t.curtag }}</td><td style="padding:11px 6px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--tx);">{{ t.chains }}</td><td style="padding:11px 6px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--tx);">{{ t.wallets }}</td><td style="padding:11px 6px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--tx);">{{ t.api }}</td><td style="padding:11px 18px;border-bottom:1px solid var(--bd);text-align:right;font-family:var(--mono);font-size:12px;color:var(--tx);">{{ t.rules }}</td></tr>
+                </sc-for>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </sc-if>
+
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;100%&quot;,&quot;height&quot;:&quot;100%&quot;}}">
+class Component extends DCLogic {
+  state = { tab:'intelligence', intelFilter:'all', liveFilter:'all', selEntity:0, demo:'provisional', booting:true, reorg:true, screenIdx:0, codeTab:'curl', sent:false, blocks:{eth:21847203,arb:284102441,base:32918004,op:128441009} };
+
+  componentDidMount(){
+    this._boot = setTimeout(()=>this.setState({booting:false}), 650);
+    this._demo = setInterval(()=>{
+      this.setState(s=>({demo: s.demo==='provisional' ? 'simulating' : s.demo==='simulating' ? 'confirmed' : 'provisional'}));
+    }, 2600);
+    this._tick = setInterval(()=>{
+      this.setState(s=>({blocks:{eth:s.blocks.eth+1, arb:s.blocks.arb+ (Math.random()<.5?3:4), base:s.blocks.base+2, op:s.blocks.op+1}}));
+    }, 2400);
+  }
+  componentWillUnmount(){ clearTimeout(this._boot); clearInterval(this._demo); clearInterval(this._tick); }
+
+  C(){ return {teal:'#22d3a8',amber:'#f5b544',red:'#f0564f',violet:'#9d7bf0',blue:'#4f9cf5',coral:'#f0794a',mu:'#8b92a7',ft:'#525a72',tx:'#e7eaf2'}; }
+  stub(name, icon){
+    return React.createElement('div',{style:{height:'100%',display:'flex',alignItems:'center',justifyContent:'center',padding:'40px'}},
+      React.createElement('div',{style:{textAlign:'center',maxWidth:'420px'}},
+        React.createElement('div',{style:{width:'58px',height:'58px',borderRadius:'15px',background:'var(--s2)',border:'1px solid var(--bd)',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 16px'}},
+          React.createElement('i',{className:'ti '+icon,style:{fontSize:'28px',color:'#4f9cf5'}})),
+        React.createElement('div',{style:{fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:'18px',color:'#e7eaf2'}},name),
+        React.createElement('div',{style:{fontSize:'13px',color:'#8b92a7',marginTop:'6px'}},'This view is being rebuilt in the new design system. Intelligence, Live Monitor and Audit Trail are ready to explore.')
+      ));
+  }
+
+  // ---- SVG helpers ----
+  ring(value, color, suffix){
+    const r=34, c=2*Math.PI*r, off=c*(1-value/100);
+    return React.createElement('div',{style:{position:'relative',width:'84px',height:'84px'}},
+      React.createElement('svg',{viewBox:'0 0 84 84',style:{width:'84px',height:'84px',transform:'rotate(-90deg)'}},
+        React.createElement('circle',{cx:42,cy:42,r:r,fill:'none',stroke:'rgba(255,255,255,.07)',strokeWidth:7}),
+        React.createElement('circle',{cx:42,cy:42,r:r,fill:'none',stroke:color,strokeWidth:7,strokeLinecap:'round',strokeDasharray:c,strokeDashoffset:off,style:{transition:'stroke-dashoffset .8s ease'}})
+      ),
+      React.createElement('div',{style:{position:'absolute',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center'}},
+        React.createElement('span',{style:{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:suffix?'20px':'24px',color:color,lineHeight:1}}, value+(suffix||'')),
+        React.createElement('span',{style:{fontSize:'9px',color:'#8b92a7'}}, suffix?'':'/100')
+      )
+    );
+  }
+  barChart(data, color, h){
+    const W=520, H=h||130, padB=20, padT=10, padL=4, max=Math.max.apply(null,data.map(d=>d.v))*1.1;
+    const bw=(W-padL*2)/data.length;
+    const bars = data.map((d,idx)=>{
+      const bh=(d.v/max)*(H-padB-padT);
+      const x=padL+idx*bw, y=H-padB-bh;
+      const op = d.peak?1:(.4+.5*(d.v/max));
+      return React.createElement('g',{key:idx},
+        React.createElement('rect',{x:x+1.5,y:y,width:bw-3,height:bh,rx:2.5,fill:color,opacity:op}),
+        idx%3===0?React.createElement('text',{x:x+bw/2,y:H-6,fill:'#525a72',fontSize:9,textAnchor:'middle',fontFamily:"'JetBrains Mono',monospace"}, d.l):null
+      );
+    });
+    const grid=[0,.5,1].map((g,i)=>React.createElement('line',{key:'g'+i,x1:0,x2:W,y1:padT+(H-padB-padT)*g,y2:padT+(H-padB-padT)*g,stroke:'rgba(255,255,255,.05)',strokeWidth:1}));
+    return React.createElement('svg',{viewBox:'0 0 '+W+' '+H,preserveAspectRatio:'none',style:{width:'100%',height:H+'px',display:'block'}}, grid, bars);
+  }
+  areaChart(data, color){
+    const W=520,H=110,pad=6,max=Math.max.apply(null,data.map(d=>d.v))*1.15,min=0;
+    const pts=data.map((d,i)=>[pad+i*((W-pad*2)/(data.length-1)), H-pad-((d.v-min)/(max-min))*(H-pad*2)]);
+    const line=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
+    const area=line+' L'+pts[pts.length-1][0].toFixed(1)+' '+(H-pad)+' L'+pts[0][0].toFixed(1)+' '+(H-pad)+' Z';
+    const gid='ag'+color.replace('#','');
+    return React.createElement('svg',{viewBox:'0 0 '+W+' '+H,preserveAspectRatio:'none',style:{width:'100%',height:'110px',display:'block'}},
+      React.createElement('defs',null,React.createElement('linearGradient',{id:gid,x1:0,y1:0,x2:0,y2:1},
+        React.createElement('stop',{offset:'0%',stopColor:color,stopOpacity:.35}),
+        React.createElement('stop',{offset:'100%',stopColor:color,stopOpacity:0}))),
+      React.createElement('path',{d:area,fill:'url(#'+gid+')'}),
+      React.createElement('path',{d:line,fill:'none',stroke:color,strokeWidth:2,strokeLinejoin:'round'})
+    );
+  }
+  spark(data,color){
+    const W=80,H=26,max=Math.max.apply(null,data),min=Math.min.apply(null,data);
+    const pts=data.map((v,i)=>[i*(W/(data.length-1)),H-2-((v-min)/((max-min)||1))*(H-4)]);
+    const line=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
+    return React.createElement('svg',{viewBox:'0 0 '+W+' '+H,style:{width:W+'px',height:H+'px'}},
+      React.createElement('path',{d:line,fill:'none',stroke:color,strokeWidth:1.6,strokeLinecap:'round',strokeLinejoin:'round'}));
+  }
+
+  tag(t,col,bg){ return {t,col,bg}; }
+
+  // ---- JSON syntax-colored viewer ----
+  flattenJson(v, lines, indent, keyName, comma){
+    const col={key:'#4f9cf5',str:'#22d3a8',num:'#f5b544',bool:'#9d7bf0',pun:'#8b92a7'};
+    const pre = keyName!=null ? [{t:'"'+keyName+'"',c:col.key},{t:': ',c:col.pun}] : [];
+    if(Array.isArray(v)){
+      if(v.length===0){ lines.push({i:indent,p:[...pre,{t:'[]'+(comma?',':''),c:col.pun}]}); return; }
+      lines.push({i:indent,p:[...pre,{t:'[',c:col.pun}]});
+      v.forEach((it,k)=>this.flattenJson(it,lines,indent+1,null,k<v.length-1));
+      lines.push({i:indent,p:[{t:']'+(comma?',':''),c:col.pun}]});
+    } else if(v && typeof v==='object'){
+      const ks=Object.keys(v);
+      if(ks.length===0){ lines.push({i:indent,p:[...pre,{t:'{}'+(comma?',':''),c:col.pun}]}); return; }
+      lines.push({i:indent,p:[...pre,{t:'{',c:col.pun}]});
+      ks.forEach((k,j)=>this.flattenJson(v[k],lines,indent+1,k,j<ks.length-1));
+      lines.push({i:indent,p:[{t:'}'+(comma?',':''),c:col.pun}]});
+    } else {
+      let tok;
+      if(v===null) tok={t:'null',c:col.pun};
+      else if(typeof v==='string') tok={t:'"'+v+'"',c:col.str};
+      else if(typeof v==='number') tok={t:String(v),c:col.num};
+      else tok={t:String(v),c:col.bool};
+      lines.push({i:indent,p:[...pre,tok,{t:comma?',':'',c:col.pun}]});
+    }
+  }
+  jsonView(obj){
+    const lines=[]; this.flattenJson(obj,lines,0,null,false);
+    return React.createElement('div',{style:{fontFamily:"'JetBrains Mono',monospace",fontSize:'12px',lineHeight:1.7,whiteSpace:'pre',overflowX:'auto'}},
+      lines.map((ln,idx)=>React.createElement('div',{key:idx},
+        '  '.repeat(ln.i), ln.p.map((s,k)=>React.createElement('span',{key:k,style:{color:s.c}},s.t)))));
+  }
+
+  // ---- lifecycle hero card (animated) ----
+  lifecycleCard(){
+    const C=this.C(), d=this.state.demo;
+    const map={
+      provisional:{ac:C.amber,bg:'rgba(245,181,68,.06)',bd:'rgba(245,181,68,.3)',badge:'Provisional',bi:'ti-bolt',bc:C.amber,bbg:'rgba(245,181,68,.12)',note:'Heuristic match · emitted in 0.8s · simulation queued',val:'~$14,820',vl:'est. profit',vc:C.amber,sub:'Awaiting revm confirmation'},
+      simulating:{ac:C.blue,bg:'rgba(79,156,245,.06)',bd:'rgba(79,156,245,.3)',badge:'Simulating',bi:'ti-loader-2',bc:C.blue,bbg:'rgba(79,156,245,.12)',note:'revm replaying bundle · diffing balances · counterfactual swap',val:'$14,820',vl:'est. profit',vc:C.blue,sub:'Worker draining sim.jobs queue'},
+      confirmed:{ac:C.teal,bg:'rgba(34,211,168,.06)',bd:'rgba(34,211,168,.3)',badge:'Confirmed',bi:'ti-circle-check',bc:C.teal,bbg:'rgba(34,211,168,.12)',note:'Sim confirmed · victim loss $840 · attacker profit $14,820 · incident-42 created',val:'+$14,820',vl:'confirmed profit',vc:C.teal,sub:'Promoted from provisional → confirmed'}
+    };
+    const m=map[d];
+    const spin = d==='simulating'?{animation:'mw-spin 1s linear infinite'}:{};
+    const steps=[['Detected',true],['Simulated',d!=='provisional'],['Confirmed',d==='confirmed']];
+    return React.createElement('article',{style:{position:'relative',border:'1px solid '+m.bd,borderLeft:'3px solid '+m.ac,borderRadius:'12px',background:m.bg,padding:'16px 18px',overflow:'hidden',transition:'all .4s ease'}},
+      React.createElement('div',{style:{position:'absolute',top:'10px',right:'14px',fontSize:'10px',color:C.ft,letterSpacing:'.1em',textTransform:'uppercase',fontWeight:600}},'live demo · fast→slow path'),
+      React.createElement('div',{style:{display:'flex',alignItems:'flex-start',gap:'13px'}},
+        React.createElement('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',padding:'4px 9px',borderRadius:'7px',background:'rgba(240,86,79,.1)',color:C.red,fontSize:'11.5px',fontWeight:600,flexShrink:0}},React.createElement('i',{className:'ti ti-layers-subtract',style:{fontSize:'13px'}}),'Sandwich'),
+        React.createElement('div',{style:{flex:1,minWidth:0}},
+          React.createElement('div',{style:{fontWeight:600,fontSize:'14px',color:C.tx}},'Multi-victim sandwich — Uniswap v3 WETH/USDC'),
+          React.createElement('div',{style:{fontSize:'11.5px',color:m.bc,fontFamily:"'JetBrains Mono',monospace",marginTop:'3px',display:'flex',alignItems:'center',gap:'6px'}},
+            React.createElement('i',{className:'ti '+m.bi,style:Object.assign({fontSize:'13px'},spin)}), m.note)
+        ),
+        React.createElement('div',{style:{textAlign:'right',flexShrink:0}},
+          React.createElement('div',{style:{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:'17px',color:m.vc,transition:'color .4s'}},m.val),
+          React.createElement('div',{style:{fontSize:'10.5px',color:C.mu}},m.vl))
+      ),
+      React.createElement('div',{style:{display:'flex',alignItems:'center',gap:'10px',marginTop:'13px'}},
+        React.createElement('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',padding:'3px 9px',borderRadius:'6px',background:m.bbg,color:m.bc,fontSize:'11px',fontWeight:600}},
+          React.createElement('i',{className:'ti '+m.bi,style:Object.assign({fontSize:'12px'},spin)}),m.badge),
+        React.createElement('div',{style:{display:'flex',alignItems:'center',gap:'6px',flex:1}},
+          steps.map((st,i)=>React.createElement('div',{key:i,style:{display:'flex',alignItems:'center',gap:'6px',flex:i<2?1:'none'}},
+            React.createElement('span',{style:{display:'inline-flex',alignItems:'center',gap:'4px',fontSize:'10.5px',color:st[1]?m.bc:C.ft,fontWeight:500}},
+              React.createElement('i',{className:'ti '+(st[1]?'ti-circle-check-filled':'ti-circle'),style:{fontSize:'13px'}}),st[0]),
+            i<2?React.createElement('span',{style:{flex:1,height:'2px',borderRadius:'2px',background:steps[i+1][1]?m.bc:'rgba(255,255,255,.08)',transition:'background .4s'}}):null))
+        ),
+        React.createElement('span',{style:{fontSize:'10.5px',color:C.ft,fontFamily:"'JetBrains Mono',monospace"}},m.sub)
+      )
+    );
+  }
+
+  renderVals(){
+    const C=this.C(), st=this.state, T=t=>this.state.tab===t;
+    const setTab=t=>()=>this.setState({tab:t});
+    const tabDef=[['intelligence','Intelligence','ti-fingerprint',''],['live','Live Monitor','ti-radar-2',''],['audit','Audit Trail','ti-history-toggle',''],['screening','Screening API','ti-shield-search','API'],['builders','Builders','ti-building-factory-2',''],['analytics','Analytics','ti-chart-line',''],['alerts','Alerts','ti-bell-ringing','4'],['detectors','Detectors','ti-adjustments','7'],['billing','Billing','ti-credit-card','']];
+    const tabs=tabDef.map(d=>({label:d[1],icon:d[2],badge:d[3],go:setTab(d[0]),cur:T(d[0])?'page':'false',bg:T(d[0])?'var(--s4)':'transparent',col:T(d[0])?'var(--tx)':'var(--mu)'}));
+
+    // intel filters
+    const iF=['all','MEV Bot','Scammer','Unknown'];
+    const intelFilters=iF.map((f,i)=>{const a=st.intelFilter===f;return{label:i===0?'All (312)':f,go:()=>this.setState({intelFilter:f}),bd:a?'var(--teal)':'var(--bd)',bg:a?'var(--tealb)':'var(--s2)',col:a?'var(--teal)':'var(--mu)'};});
+
+    // entities
+    const eData=[
+      {name:'jaredfromsubway.eth',addr:'0xd8dA…1c3f',score:91,conf:'94%',scorec:C.red,icon:'ti-bolt',iconbg:'var(--amberb)',iconc:C.amber,tags:[this.tag('MEV Bot','#9d7bf0','rgba(157,123,240,.12)'),this.tag('High Volume','#f5b544','rgba(245,181,68,.12)')],meta:'2m · 183 inc'},
+      {name:'arb-bot-9ba2',addr:'0x9ba2…c04f',score:67,conf:'81%',scorec:C.amber,icon:'ti-arrows-shuffle',iconbg:'var(--violetb)',iconc:C.violet,tags:[this.tag('Arb Bot','#9d7bf0','rgba(157,123,240,.12)')],meta:'4m · 48 inc'},
+      {name:'$ZKFARM deployer',addr:'0x1f3d…09ab',score:98,conf:'99%',scorec:C.red,icon:'ti-skull',iconbg:'var(--redb)',iconc:C.red,tags:[this.tag('Rug Deployer','#f0564f','rgba(240,86,79,.12)')],meta:'9m · 1 inc'},
+      {name:'Unknown entity',addr:'0xf3a1…88d0',score:44,conf:'38%',scorec:C.amber,icon:'ti-question-mark',iconbg:'var(--s3)',iconc:C.mu,tags:[this.tag('Unclassified','#8b92a7','rgba(139,146,167,.12)')],meta:'1h · 3 inc'},
+      {name:'titanbuilder.eth',addr:'0x4c7e…221b',score:22,conf:'88%',scorec:C.teal,icon:'ti-building-factory-2',iconbg:'var(--blueb)',iconc:C.blue,tags:[this.tag('Builder','#4f9cf5','rgba(79,156,245,.12)')],meta:'30s · infra'},
+      {name:'sandwich-cluster-7',addr:'0x7a3b…e91a',score:79,conf:'90%',scorec:C.red,icon:'ti-layers-subtract',iconbg:'var(--redb)',iconc:C.red,tags:[this.tag('MEV Bot','#9d7bf0','rgba(157,123,240,.12)')],meta:'6m · 62 inc'}
+    ];
+    const entities=eData.map((e,i)=>Object.assign({},e,{go:()=>this.setState({selEntity:i}),sel:i===st.selEntity?'var(--teal)':'transparent',selbg:i===st.selEntity?'var(--s2)':'transparent'}));
+
+    // detail (entity 0 canonical)
+    const det={ name:'jaredfromsubway.eth', addr:'0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',
+      factors:[
+        {label:'2 confirmed sandwich attacks (profit $18,400)',delta:'+25',col:C.red,pct:'72%',icon:'ti-circle-check'},
+        {label:'Same builder/wallet cluster as 2 known MEV bots',delta:'+20',col:C.red,pct:'58%',icon:'ti-affiliate'},
+        {label:'1 flash-loan exploit (victim loss $240,000)',delta:'+15',col:C.coral,pct:'44%',icon:'ti-bolt'},
+        {label:'Funded via mixer-adjacent address (2 hops)',delta:'+12',col:C.amber,pct:'35%',icon:'ti-wash',soft:true},
+        {label:'$8.2M lifetime extraction, +40% profit/incident (30d)',delta:'+10',col:C.amber,pct:'29%',icon:'ti-trending-up'},
+        {label:'4 new connected wallets + Base expansion (30d)',delta:'+9',col:C.amber,pct:'26%',icon:'ti-git-fork',soft:true}
+      ],
+      timeline:[
+        {label:'First seen — funded from Tornado Cash',date:'2022-04-12',col:C.violet},
+        {label:'Reclassified heuristic → MEV Bot (sim-confirmed)',date:'2023-01-08',col:C.amber},
+        {label:'Entity merge: +3 wallets (shared deployer)',date:'2024-06-21',col:C.blue},
+        {label:'Expanded to Base · flash-loan exploit',date:'2025-11-02',col:C.red}
+      ]
+    };
+
+    // chains
+    const cData=[
+      {sym:'Ξ',name:'Ethereum L1',block:st.blocks.eth.toLocaleString(),dot:C.teal,health:'healthy',iconbg:'var(--blueb)',iconc:C.blue,active:true},
+      {sym:'A',name:'Arbitrum',block:st.blocks.arb.toLocaleString(),dot:C.teal,health:'healthy',iconbg:'var(--violetb)',iconc:C.violet},
+      {sym:'B',name:'Base',block:st.blocks.base.toLocaleString(),dot:C.teal,health:'healthy',iconbg:'var(--tealb)',iconc:C.teal},
+      {sym:'O',name:'Optimism',block:st.blocks.op.toLocaleString(),dot:C.amber,health:'degraded · 3 RPC timeouts/min',iconbg:'var(--redb)',iconc:C.red}
+    ];
+    const chains=cData.map((c,i)=>Object.assign({},c,{go:()=>{},bg:c.active?'var(--s2)':'transparent'}));
+
+    // detectors
+    const dData=[['Sandwich',C.red,12,true],['Atomic Arb',C.violet,48,true],['Flash Loan',C.amber,3,true],['Liquidation',C.blue,7,true],['Rug Pull',C.coral,1,true],['Wash Trading',C.teal,2,true],['Addr Poisoning',C.mu,0,false]];
+    const detectors=dData.map(d=>({name:d[0],col:d[1],count:d[2],off:d[3]?'':'opacity:.4;',txtc:d[3]?'var(--tx)':'var(--ft)',cntc:d[2]>0?d[1]:'var(--ft)',cntbg:d[2]>0?'rgba(255,255,255,.04)':'transparent'}));
+
+    // live filters
+    const lF=[['all','All (73)'],['critical','Critical'],['provisional','Provisional'],['confirmed','Confirmed']];
+    const liveFilters=lF.map(f=>{const a=st.liveFilter===f[0];return{label:f[1],go:()=>this.setState({liveFilter:f[0]}),bd:a?'var(--teal)':'var(--bd)',bg:a?'var(--tealb)':'var(--s2)',col:a?'var(--teal)':'var(--mu)'};});
+
+    // incidents
+    const statusChip=(s)=>{
+      if(s==='confirmed')return{status:'Confirmed',statc:C.teal,statusIcon:React.createElement('i',{className:'ti ti-circle-check-filled',style:{fontSize:'12px'}})};
+      if(s==='provisional')return{status:'Provisional',statc:C.amber,statusIcon:React.createElement('i',{className:'ti ti-clock-hour-4',style:{fontSize:'12px'}})};
+      return{status:'Retracted',statc:C.ft,statusIcon:React.createElement('i',{className:'ti ti-circle-x',style:{fontSize:'12px'}})};
+    };
+    const iData=[
+      {kind:'Flash Loan',kindi:'ti-bolt',kindc:C.coral,kindbg:'rgba(240,121,74,.12)',title:'Oracle manipulation attack — Aave v3',sub:'ETH L1 · #21,847,202 · pos 3',value:'−$170K',valLabel:'victim loss',valc:C.red,risk:82,riskc:C.red,status:'provisional',chain:'ETH L1',addrs:[{t:'0xExploiter…',col:C.red}],time:'1m ago',op:1},
+      {kind:'Rug Pull',kindi:'ti-skull',kindc:C.red,kindbg:'rgba(240,86,79,.12)',title:'LP drain + honeypot confirmed — $ZKFARM',sub:'Base · #32,917,991 · deployer exit',value:'$88.3K',valLabel:'drained',valc:C.red,risk:98,riskc:C.red,status:'confirmed',chain:'Base',addrs:[{t:'0x1f3d…09ab',col:C.blue}],time:'9m ago',op:1},
+      {kind:'Atomic Arb',kindi:'ti-arrows-shuffle',kindc:C.violet,kindbg:'rgba(157,123,240,.12)',title:'3-hop cycle — Uni v3 → Curve → Balancer',sub:'Arbitrum · #284,102,438',value:'+$3,210',valLabel:'profit',valc:C.teal,risk:61,riskc:C.amber,status:'confirmed',chain:'ARB',addrs:[{t:'0x9ba2…c04f',col:C.blue}],time:'12m ago',op:1},
+      {kind:'Sandwich',kindi:'ti-layers-subtract',kindc:C.red,kindbg:'rgba(240,86,79,.12)',title:'Sandwich retracted — block reorged',sub:'ETH L1 · #21,847,199 · orphaned',value:'—',valLabel:'voided',valc:C.ft,risk:0,riskc:C.ft,status:'retracted',chain:'ETH L1',addrs:[],time:'30s ago',op:.5,strike:true},
+      {kind:'Liquidation',kindi:'ti-droplet',kindc:C.blue,kindbg:'rgba(79,156,245,.12)',title:'Cascade liquidation — Compound v3',sub:'ETH L1 · #21,847,205',value:'$420K',valLabel:'liquidated',valc:C.amber,risk:54,riskc:C.amber,status:'confirmed',chain:'ETH L1',addrs:[{t:'0xLiquidator…',col:C.blue}],time:'15m ago',op:1}
+    ];
+    let inc=iData;
+    if(st.liveFilter==='critical')inc=iData.filter(i=>i.risk>=80);
+    else if(st.liveFilter==='provisional')inc=iData.filter(i=>i.status==='provisional');
+    else if(st.liveFilter==='confirmed')inc=iData.filter(i=>i.status==='confirmed');
+    const incidents=inc.map((i,idx)=>{const sc=statusChip(i.status);return Object.assign({},i,sc,{go:()=>{},bd:'var(--bd)',accent:i.statc||(i.status==='confirmed'?C.teal:i.status==='provisional'?C.amber:C.ft),cardbg:'var(--s1)',strike:i.strike?'text-decoration:line-through;opacity:.6;':''});});
+
+    const liveStats=[{v:'73',l:'Incidents',col:C.tx},{v:'$2.41M',l:'MEV extracted',col:C.amber},{v:'96.2%',l:'Precision',col:C.teal},{v:'1.84s',l:'Detect latency',col:C.blue}];
+    const precision=[{name:'Sandwich',val:'97%',pct:'97%',col:C.teal},{name:'Atomic Arb',val:'94%',pct:'94%',col:C.teal},{name:'Flash Loan',val:'88%',pct:'88%',col:C.amber},{name:'Rug Pull',val:'91%',pct:'91%',col:C.teal}];
+    const pipeline=[{name:'Ingest',val:'8 / 14ms',pct:'18%',col:C.teal},{name:'Detect',val:'0.8 / 1.4s',pct:'40%',col:C.teal},{name:'Simulate',val:'12 / 38s',pct:'78%',col:C.amber},{name:'Notify',val:'40 / 90ms',pct:'24%',col:C.teal}];
+
+    // ---- AUDIT ----
+    const aiData=[
+      {id:'incident-42',title:'Multi-victim sandwich — Uniswap v3',status:'confirmed',statc:C.teal,idc:C.teal,meta:'ETH L1 · block 19,800,001',sel:true},
+      {id:'incident-41',title:'Oracle manipulation — Aave v3',status:'provisional',statc:C.amber,idc:C.amber,meta:'ETH L1 · block 21,847,202'},
+      {id:'incident-39',title:'LP drain — $ZKFARM',status:'confirmed',statc:C.teal,idc:C.teal,meta:'Base · block 32,917,991'},
+      {id:'incident-37',title:'Sandwich — reorged',status:'retracted',statc:C.ft,idc:C.ft,meta:'ETH L1 · block 21,847,199'},
+      {id:'incident-35',title:'3-hop atomic arb',status:'confirmed',statc:C.teal,idc:C.teal,meta:'Arbitrum · block 284,102,438'}
+    ];
+    const auditIncidents=aiData.map(a=>Object.assign({},a,{go:()=>{},statusIcon:statusChip(a.status).statusIcon,bd:a.sel?'var(--teal)':'var(--bd)',bg:a.sel?'var(--tealb)':'var(--s1)'}));
+    const auditLayers=[{name:'Chain',col:C.blue},{name:'Detection',col:C.amber},{name:'Simulation',col:C.violet},{name:'Intelligence',col:C.teal},{name:'System',col:C.mu}];
+    const L={chain:[C.blue,'var(--blueb)'],det:[C.amber,'var(--amberb)'],sim:[C.violet,'var(--violetb)'],intel:[C.teal,'var(--tealb)']};
+    const evData=[
+      ['chain','RawBlockReceived','ingestion','ti-cube','{ chain: ETH, number: 19,800,000, hash: 0x4a…e2, timestamp: 1718…412 }','17:42:01.004',false],
+      ['chain','BlockAssembled','ingestion','ti-stack-2','{ number: 19,800,000, tx_count: 184, trace_available: true }','17:42:01.061',false],
+      ['det','DetectorTriggered','detection','ti-radar','{ detector: sandwich-v1.2, config_hash: 9f2a…, raw_confidence: 0.71, evidence: [tx 0,4,9] }','17:42:01.139',false],
+      ['det','PreliminaryAlertCreated','detection','ti-bolt','{ alert_id: alert-88, kind: Sandwich, confidence: 0.71, provisional: true }','17:42:01.142',false],
+      ['sim','SimulationRequested','simulation','ti-arrow-right-bar','{ alert_id: alert-88 }  →  dispatched as SimulationJob command on RabbitMQ','17:42:01.180',true],
+      ['sim','SimulationCompleted','simulation','ti-circle-check','{ alert_id: alert-88, profit: $12,400, victim_loss: $840, confirmed: true }','17:42:13.902',false],
+      ['sim','IncidentCreated','simulation','ti-alert-hexagon','{ incident_id: incident-42, kind: Sandwich, severity: high, txs: [0,4,9] }','17:42:13.945',false],
+      ['intel','LabelAdded','intelligence','ti-tag','{ address: 0xabc…, kind: MevBot, value: sandwich-cluster-7, confidence: 0.9 }','17:42:14.210',false],
+      ['intel','AttributionUpdated','intelligence','ti-affiliate','{ incident_id: incident-42, entity_id: entity-183, labels: [MevBot] }','17:42:14.255',false],
+      ['intel','RiskScoreUpdated','intelligence','ti-gauge','{ address: 0xabc…, score: 87/100, delta: +16, model_version: v1.4.2 }','17:42:14.301',false],
+      ['sim','IncidentFinalized','simulation','ti-lock-check','{ incident_id: incident-42, block_hash: 0x…d4, finalized_at: 19,800,002 }','17:42:25.000',false]
+    ];
+    const auditEvents=evData.map((e,i)=>({type:e[1],service:e[2],icon:e[3],payload:e[4],time:e[5],cmd:e[6],col:L[e[0]][0],bg:L[e[0]][1],lastLine:i===evData.length-1?'opacity:0;':''}));
+
+    // ---- BUILDERS ----
+    const builderStats=[{v:'$2.41M',l:'MEV in blocks (24h)',col:C.amber,delta:'↑ 12% vs yesterday',dc:C.teal},{v:'68%',l:'Flashbots relay share',col:C.tx,delta:'3,841 blocks',dc:C.mu},{v:'18',l:'Active searchers',col:C.blue,delta:'submitting bundles',dc:C.mu},{v:'31',l:'Sandwich bundles',col:C.red,delta:'Titan + Flashbots',dc:C.mu}];
+    const bData=[['F',1,'Flashbots','3,841',12,1,'$1.04M',100,C.coral],['T',2,'Titan Builder','2,104',9,0,'$740K',71,C.violet],['B',3,'beaverbuild','1,892',6,2,'$430K',41,C.teal],['R',4,'rsync-builder','941',4,0,'$190K',18,C.blue]];
+    const builders=bData.map(b=>({sym:b[0],rank:b[1],name:b[2],blocks:b[3],sandwich:b[4],flash:b[5],mev:b[6],pct:b[7]+'%',col:b[8]}));
+    const sData=[['0xd8dA…1c3f','Sandwich',C.red,'rgba(240,86,79,.12)','Flashbots',31,'$892K'],['0x9ba2…c04f','Arb',C.violet,'rgba(157,123,240,.12)','Titan',48,'$481K'],['0xf3a1…88d0','Flash',C.amber,'rgba(245,181,68,.12)','beaverbuild',3,'$170K'],['0x4c7e…221b','Sandwich',C.red,'rgba(240,86,79,.12)','Flashbots',19,'$109K']];
+    const searchers=sData.map(s=>({addr:s[0],type:s[1],tc:s[2],tbg:s[3],relay:s[4],bundles:s[5],extracted:s[6]}));
+
+    // ---- ANALYTICS ----
+    const analyticsStats=[{v:'$2.41M',l:'Total MEV (24h)',col:C.amber,delta:'↑ 12% vs yesterday',dc:C.teal},{v:'73',l:'Incidents (24h)',col:C.red,delta:'↑ 5 vs yesterday',dc:C.red},{v:'18',l:'Unique attackers',col:C.violet,delta:'6 known bots',dc:C.mu},{v:'141',l:'Victim addresses',col:C.blue,delta:'avg $17K loss',dc:C.mu},{v:'1.84s',l:'Detect latency',col:C.teal,delta:'↓ 0.3s vs last wk',dc:C.teal},{v:'3.8%',l:'False-positive rate',col:C.teal,delta:'↓ 0.4% vs last wk',dc:C.teal}];
+    const mevH=[12,9,7,8,11,18,42,38,55,88,78,65,72,80,68,52,61,74,66,82,71,58,49,40].map((v,i)=>({l:(i<10?'0'+i:''+i),v:v,peak:v>=82}));
+    const chartMevHour=this.barChart(mevH,C.amber,150);
+    const mevByType=[{name:'Sandwich',val:'$1.40M',pct:'58%',col:C.red},{name:'Atomic Arb',val:'$840K',pct:'35%',col:C.violet},{name:'Flash Loan',val:'$170K',pct:'7%',col:C.amber}];
+    const chartTrend=this.areaChart([{v:1.2},{v:1.6},{v:1.4},{v:2.1},{v:1.9},{v:2.6},{v:2.3},{v:2.9},{v:2.4},{v:3.1},{v:2.8},{v:2.41}],C.teal);
+    const trData=[['$ZKFARM',C.red,'0x8f2a…11cd',[['Honeypot',C.red],['LP Drained',C.red],['Deployer exited',C.red]],'$0',98,C.red],['$SWARM99',C.amber,'0x3c4b…7f20',[['Mint fn',C.amber],['New deployer',C.amber]],'$42K',74,C.amber],['USDC',C.tx,'0xA0b8…eB48',[['Verified',C.teal],['Circle issuer',C.teal]],'$2.1B',3,C.teal]];
+    const tokenRisks=trData.map(t=>({sym:t[0],symc:t[1],addr:t[2],tags:t[3].map(x=>({t:x[0],col:x[1],bg:x[1]==='#22d3a8'?'rgba(34,211,168,.12)':x[1]==='#f5b544'?'rgba(245,181,68,.12)':'rgba(240,86,79,.12)'})),lp:t[4],score:t[5],col:t[6],pct:t[5]+'%'}));
+
+    // ---- ALERTS ----
+    const arData=[['High-Risk MEV Bot Activity','Risk score > 80  AND  Entity = MEV Bot','ti-webhook','Webhook → api.yourco.com/mev',C.violet,'rgba(157,123,240,.12)','Fired 2m ago','847× today',true],['Flash Loan > $50K','Any chain · victim loss > $50,000 · confidence > 0.80','ti-bolt','Webhook → api.yourco.com/mev',C.coral,'rgba(240,121,74,.12)','Fired 1m ago','3× today',true],['Rug Pull — Any Amount','Honeypot confirmed  OR  LP drain > $5K · deployer exit','ti-skull','Telegram → @mevwatch_alerts',C.red,'rgba(240,86,79,.12)','Fired 9m ago','1× today',true],['Known Scammer Activity','Attacker label = “MEV Bot”  OR  risk score ≥ 80','ti-user-x','Webhook · Email',C.blue,'rgba(79,156,245,.12)','last fired 2m ago','',true]];
+    const alertRules=arData.map(a=>({name:a[0],cond:a[1],icon:a[2],iconc:a[4],iconbg:a[5],chan:a[3],fired:a[6],count:a[7],on:a[8],toggle:a[8]?'var(--teal)':'var(--ft)',knob:a[8]?'18px':'2px'}));
+
+    // ---- DETECTORS ----
+    const dcData=[['Sandwich','v1.2','Hybrid',C.red,97,94,'min_profit_usd = 10.0',true,[30,42,38,55,48,62,58,71,66,80]],['Atomic Arb','v1.0','Rule',C.violet,94,90,'min_cycle = 2 hops',true,[48,52,44,60,55,58,62,57,64,61]],['Flash Loan','v2.1','Hybrid',C.amber,88,85,'enabled',true,[8,12,6,14,9,11,16,10,13,15]],['Liquidation','v1.1','Rule',C.blue,91,88,'cascade_depth ≥ 2',true,[5,7,4,8,6,9,7,5,8,7]],['Rug Pull','v1.0','ML',C.coral,90,79,'behind paid plan',false,[1,0,1,2,0,1,1,0,1,1]],['Wash Trading','v1.3','Hybrid',C.teal,86,82,'window_blocks = 100',true,[2,3,1,4,2,3,2,1,3,2]],['Addr Poisoning','v0.9','Rule',C.mu,0,0,'disabled — backtest pending',false,[0,0,0,0,0,0,0,0,0,0]]];
+    const detectorConfigs=dcData.map(d=>({name:d[0],ver:d[1],kind:d[2],col:d[3],prec:d[4]+'%',precpct:d[4]+'%',recall:d[5]+'%',recallpct:d[5]+'%',thresh:d[6],on:d[7],toggle:d[7]?'var(--teal)':'var(--ft)',knob:d[7]?'18px':'2px',spark:this.spark(d[8],d[3]),kindbg:'rgba(255,255,255,.05)',op:d[7]?'1':'.55'}));
+
+    // ---- BILLING ----
+    const billingUsage=[{l:'API calls',used:'312,400',pct:'62%',cap:'500,000',col:C.teal},{l:'Wallets watched',used:'74',pct:'74%',cap:'100',col:C.amber},{l:'Chains monitored',used:'3',pct:'100%',cap:'3',col:C.red},{l:'Custom rules',used:'4',pct:'40%',cap:'10',col:C.teal}];
+    const billingMeter=[{l:'Simulations run',v:'18,400',col:C.violet},{l:'Incidents generated',v:'73',col:C.red},{l:'Alerts delivered',v:'1,204',col:C.blue},{l:'Events processed',v:'4.8M',col:C.teal}];
+    const tierRaw=[{name:'Free',chains:'1',wallets:'5',api:'10K',rules:'0',cur:false},{name:'Pro',chains:'3',wallets:'100',api:'500K',rules:'10',cur:true},{name:'Enterprise',chains:'All',wallets:'∞',api:'∞',rules:'∞',cur:false}];
+    const tiers=tierRaw.map(t=>({name:t.name,chains:t.chains,wallets:t.wallets,api:t.api,rules:t.rules,rowbg:t.cur?'var(--violetb)':'transparent',namec:t.cur?C.violet:C.tx,curtag:t.cur?'  ← current':''}));
+
+    // ---- SCREENING API ----
+    const decide=(s,sanc)=> sanc?'block':(s>=80?'block':(s>=40?'review':'allow'));
+    const decMeta={allow:{c:C.teal,bg:'rgba(34,211,168,.1)',bd:'rgba(34,211,168,.3)',i:'ti-circle-check',t:'ALLOW',note:'Proceed — no blocking signals'},review:{c:C.amber,bg:'rgba(245,181,68,.1)',bd:'rgba(245,181,68,.3)',i:'ti-alert-triangle',t:'REVIEW',note:'Hold for manual compliance review'},block:{c:C.red,bg:'rgba(240,86,79,.1)',bd:'rgba(240,86,79,.3)',i:'ti-ban',t:'BLOCK',note:'Reject — high-risk counterparty'}};
+    const scRaw=[
+      {label:'jaredfromsubway.eth',short:'0xd8dA…1c3f',full:'0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045',score:91,conf:0.94,ver:'v1.4.2',labels:[{kind:'MevBot',value:'sandwich-cluster-7',confidence:0.9,source:'heuristic'},{kind:'HighVolume',value:'top-1%-extractor',confidence:0.8,source:'derived'}],entity:{id:'entity-183',kind:'MevBot',linked_addresses:7},sanc:false,sancLists:[],lat:84},
+      {label:'arb-bot-9ba2',short:'0x9ba2…c04f',full:'0x9ba2C7E2a1A4c044bF1d2a9c61f088a3c04f17e3',score:67,conf:0.81,ver:'v1.4.2',labels:[{kind:'ArbBot',value:'atomic-arb',confidence:0.85,source:'heuristic'}],entity:{id:'entity-204',kind:'ArbBot',linked_addresses:3},sanc:false,sancLists:[],lat:72},
+      {label:'$ZKFARM deployer',short:'0x1f3d…09ab',full:'0x1f3dA4Bc7E09e2D5a8b1C6f0934e7aB2c5d909ab',score:98,conf:0.99,ver:'v1.4.2',labels:[{kind:'RugDeployer',value:'$ZKFARM',confidence:1.0,source:'manual'},{kind:'Honeypot',value:'confirmed',confidence:0.95,source:'simulation'}],entity:{id:'entity-291',kind:'Scammer',linked_addresses:1},sanc:false,sancLists:[],lat:91},
+      {label:'fresh EOA (clean)',short:'0x7F36…9C2e',full:'0x7F36c9a02b41E7d0f5A8c3B12e6D4f90a1bb9C2e',score:6,conf:0.72,ver:'v1.4.2',labels:[],entity:null,sanc:false,sancLists:[],lat:61},
+      {label:'Tornado Cash: Router',short:'0x8589…b9D8',full:'0x8589427373D6D84E98730D7795D8f6f8731FDA16',score:100,conf:1.0,ver:'v1.4.2',labels:[{kind:'SanctionedEntity',value:'OFAC SDN #2025-447',confidence:1.0,source:'ofac'}],entity:{id:'entity-1',kind:'Mixer',linked_addresses:'1.2M+'},sanc:true,sancLists:['OFAC SDN','EU Consolidated'],lat:38}
+    ];
+    const sel=scRaw[st.screenIdx]||scRaw[0];
+    const selDec=decide(sel.score, sel.sanc);
+    const dm=decMeta[selDec];
+    const respObj={ address:sel.full, chain:'ethereum', decision:selDec, risk:{score:sel.score,confidence:sel.conf,model_version:sel.ver}, sanctions:{match:sel.sanc,lists:sel.sancLists}, entity:sel.entity, labels:sel.labels, latency_ms:sel.lat };
+    const screenSamples=scRaw.map((s,i)=>{const d=decide(s.score,s.sanc);return{label:s.label,short:s.short,go:()=>this.setState({screenIdx:i,sent:true}),active:i===st.screenIdx,dotc:decMeta[d].c,bd:i===st.screenIdx?decMeta[d].c:'var(--bd)',bg:i===st.screenIdx?decMeta[d].bg:'var(--s2)',labc:i===st.screenIdx?'var(--tx)':'var(--mu)'};});
+    const codeTabs=['curl','js','py'].map(t=>({name:t==='js'?'Node':t==='py'?'Python':'cURL',go:()=>this.setState({codeTab:t}),active:st.codeTab===t,bg:st.codeTab===t?'var(--s4)':'transparent',col:st.codeTab===t?'var(--tx)':'var(--mu)'}));
+    const snip={
+      curl:'curl https://api.mevwatch.io/v1/address/'+sel.short+'/screen \\\n  -H "Authorization: Bearer sk_live_••••2f9a" \\\n  -G --data-urlencode "chain=ethereum" \\\n     --data-urlencode "policy=default"',
+      js:'import { MevWatch } from "@mevwatch/sdk";\nconst mw = new MevWatch(process.env.MEVWATCH_KEY);\n\nconst res = await mw.address.screen({\n  address: "'+sel.short+'",\n  chain: "ethereum",\n  policy: "default",\n});\n\nif (res.decision === "block")  rejectWithdrawal(res);\nif (res.decision === "review") queueForCompliance(res);',
+      py:'from mevwatch import MevWatch\nmw = MevWatch(os.environ["MEVWATCH_KEY"])\n\nres = mw.address.screen(\n    address="'+sel.short+'",\n    chain="ethereum",\n    policy="default",\n)\n\nif res.decision == "block":\n    reject_withdrawal(res)\nelif res.decision == "review":\n    queue_for_compliance(res)'
+    };
+    const policyToggles=[{l:'Hard-block on OFAC / sanctions match',on:true},{l:'Block when risk score ≥ 80',on:true},{l:'Review when confidence < 0.50',on:false},{l:'Auto-review new addresses (< 7 days old)',on:true}];
+    const pricingTiers=[{name:'Developer',price:'$0.01',unit:'/ call',note:'First 1,000 free · no commit',cur:false},{name:'Growth',price:'$0.007',unit:'/ call',note:'Volume ≥ 100K / mo',cur:true},{name:'Scale',price:'$0.004',unit:'/ call',note:'Volume ≥ 1M / mo',cur:false},{name:'Enterprise',price:'Custom',unit:'',note:'SLA · on-prem · raw feed',cur:false}];
+    const pricingTierCards=pricingTiers.map(t=>({name:t.name,price:t.price,unit:t.unit,note:t.note,bd:t.cur?'rgba(157,123,240,.4)':'var(--bd)',bg:t.cur?'var(--violetb)':'var(--s1)',tag:t.cur?'Current':'',pc:t.cur?C.violet:C.tx}));
+    const slaStats=[{v:'84ms',l:'p50 latency'},{v:'210ms',l:'p99 latency'},{v:'99.95%',l:'uptime SLA'},{v:'12',l:'chains covered'}];
+
+    return {
+      screenSamples, screenSel:{short:sel.short,full:sel.full,label:sel.label},
+      screenResp:this.jsonView(respObj), screenStatus:{code:'200 OK',latency:sel.lat+'ms',ver:sel.ver},
+      screenDec:{c:dm.c,bg:dm.bg,bd:dm.bd,icon:dm.i,label:dm.t,note:sel.sanc?'Reject — sanctions match (hard block)':dm.note,score:sel.score,conf:Math.round(sel.conf*100)+'%',sanc:sel.sanc},
+      codeTabs, screenCode:snip[st.codeTab], policyToggles:policyToggles.map(p=>({l:p.l,toggle:p.on?'var(--teal)':'var(--ft)',knob:p.on?'18px':'2px',ariac:p.on?'true':'false'})),
+      pricingTierCards, slaStats, isScreening:T('screening'),
+      builderStats, builders, searchers,
+      analyticsStats, chartMevHour, chartTrend, mevByType, tokenRisks,
+      alertRules, detectorConfigs, billingUsage, billingMeter, tiers,
+      auditIncidents, auditLayers, auditEvents,
+      tabs, showReorg:st.reorg, dismissReorg:()=>this.setState({reorg:false}),
+      isIntel:T('intelligence'), isLive:T('live'), isAudit:T('audit'), isBuilders:T('builders'), isAnalytics:T('analytics'), isAlerts:T('alerts'), isDetectors:T('detectors'), isBilling:T('billing'),
+      intelFilters, entities, det,
+      ringScore:this.ring(91,C.red), ringConf:this.ring(94,C.teal,'%'),
+      chartReputation:this.barChart([{l:'Jul',v:280},{l:'Aug',v:340},{l:'Sep',v:420},{l:'Oct',v:680,peak:true},{l:'Nov',v:520},{l:'Dec',v:610},{l:'Jan',v:790,peak:true},{l:'Feb',v:540},{l:'Mar',v:660},{l:'Apr',v:720},{l:'May',v:610},{l:'Jun',v:880,peak:true}],C.amber,120),
+      chains, detectors, liveFilters, feedCount:incidents.length,
+      lifecycleCard:this.lifecycleCard(),
+      booting:st.booting, skeletons:[1,2,3],
+      hasIncidents:!st.booting && incidents.length>0, feedEmpty:!st.booting && incidents.length===0,
+      incidents, liveStats, precision, pipeline
+    };
+  }
+}
+</script>
+</body>
+</html>

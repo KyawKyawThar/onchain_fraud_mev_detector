@@ -293,3 +293,122 @@ impl CtxBuilder {
         )
     }
 }
+
+// ── Scenario scaffolding for detector property tests ─────────────────────────
+// The detector property tests (task 4) all share one shape: build a block of
+// transactions, run the detector, and cross-check each finding against the tx it
+// came from. Shared here — like `CtxBuilder` above — so every detector crate
+// (sandwich, arb, and the five to come) expresses that the same way instead of
+// re-rolling a `(B256, Address, Vec<Swap>)` tuple plus parallel look-up maps.
+//
+// The proptest *strategies* (which block noise to generate) stay in each detector
+// crate's test: noise is detector-specific (a sandwich wants a dense shared pool,
+// an arb wants multi-hop txs), and keeping them out leaves this seam crate free
+// of a `proptest` dependency.
+
+/// One transaction a test wants in a block: its hash, sender, and decoded swaps.
+/// The unit [`Scenario`] threads through, replacing an ad-hoc
+/// `(B256, Address, Vec<Swap>)` tuple so a finding's sender/swaps can be looked
+/// up by name rather than tracked in a side map.
+#[derive(Clone, Debug)]
+pub struct TxSpec {
+    pub hash: B256,
+    pub from: Address,
+    pub swaps: Vec<Swap>,
+}
+
+impl TxSpec {
+    pub fn new(hash: B256, from: Address, swaps: Vec<Swap>) -> Self {
+        Self { hash, from, swaps }
+    }
+}
+
+/// A built block scenario: the [`DetectionCtx`] a detector runs over, plus an
+/// index from tx hash back to its [`TxSpec`], so a property test can cross-check
+/// a finding against the transaction it came from (the sender behind a swap, the
+/// swaps behind a tx) without re-threading the inputs by hand.
+pub struct Scenario {
+    ctx: DetectionCtx,
+    by_hash: std::collections::HashMap<B256, TxSpec>,
+}
+
+impl Scenario {
+    /// Materialize `txs` (already in block order) into a context, pricing each
+    /// token in `prices` as `(address, decimals, usd_per_whole)`. Tokens absent
+    /// from `prices` are deliberately left *unpriced* — the honest "no reference
+    /// price" path, where a structural finding is still reported but unvalued.
+    ///
+    /// Panics on a duplicate tx hash: that would silently overwrite an entry in
+    /// the cross-check index and weaken the test, and it can only be a
+    /// fixture-construction bug, never detector input.
+    pub fn from_specs(prices: &[(Address, u8, f64)], txs: Vec<TxSpec>) -> Self {
+        let mut builder = CtxBuilder::new();
+        for &(token, decimals, usd) in prices {
+            builder = builder.priced_token(token, decimals, usd);
+        }
+        let mut by_hash = std::collections::HashMap::with_capacity(txs.len());
+        for tx in &txs {
+            assert!(
+                !by_hash.contains_key(&tx.hash),
+                "scenario has two transactions with hash {} — colliding test fixtures",
+                tx.hash,
+            );
+            by_hash.insert(tx.hash, tx.clone());
+            builder = builder.tx(tx.hash, tx.from, tx.swaps.clone());
+        }
+        Self {
+            ctx: builder.build(),
+            by_hash,
+        }
+    }
+
+    /// The context a detector runs over.
+    pub fn ctx(&self) -> &DetectionCtx {
+        &self.ctx
+    }
+
+    /// The sender of transaction `hash`. Panics if `hash` isn't in the scenario —
+    /// a finding that names a tx outside its own block is a detector bug worth a
+    /// loud failure, not a silent `None`.
+    pub fn sender_of(&self, hash: B256) -> Address {
+        self.tx(hash).from
+    }
+
+    /// The decoded swaps of transaction `hash` (same panic contract as
+    /// [`sender_of`](Self::sender_of)).
+    pub fn swaps_of(&self, hash: B256) -> &[Swap] {
+        &self.tx(hash).swaps
+    }
+
+    fn tx(&self, hash: B256) -> &TxSpec {
+        self.by_hash
+            .get(&hash)
+            .unwrap_or_else(|| panic!("tx {hash} is not in the scenario"))
+    }
+}
+
+/// Splice a planted pattern into arbitrary block `noise`, returning the full
+/// ordered tx list. Each noise entry is `(sender_byte, swaps)`; noise tx `i` is
+/// assigned hash `b256(i as u8)`, so a caller must keep the noise count below its
+/// planted hash bytes to avoid a collision (which [`Scenario::from_specs`]
+/// asserts against regardless). `planted` is inserted as a contiguous run at
+/// position `at` (clamped to the block length), preserving its internal order.
+pub fn planted_in_noise(noise: &[(u8, Vec<Swap>)], at: usize, planted: &[TxSpec]) -> Vec<TxSpec> {
+    let mut order: Vec<TxSpec> = noise
+        .iter()
+        .enumerate()
+        .map(|(i, (from, swaps))| TxSpec::new(b256(i as u8), addr(*from), swaps.clone()))
+        .collect();
+    let at = at.min(order.len());
+    for (offset, tx) in planted.iter().enumerate() {
+        order.insert(at + offset, tx.clone());
+    }
+    order
+}
+
+/// Deserialize a finding's `detail` payload into a detector's typed evidence
+/// struct (e.g. `SandwichDetail`/`ArbDetail`). Shared so each detector test
+/// stops re-declaring the same one-liner.
+pub fn detail<T: serde::de::DeserializeOwned>(ev: &Evidence) -> T {
+    serde_json::from_value(ev.detail.clone()).expect("evidence detail deserializes into T")
+}
