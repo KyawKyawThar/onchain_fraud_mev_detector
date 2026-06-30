@@ -1,0 +1,18 @@
+# cargo-audit config — drives the `audit + deny` CI job's `cargo audit` step.
+# https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# Advisories we consciously accept, with the reason. Keep this list short and
+# justified — every entry is a CVE we are choosing not to fix, so it must be one
+# we genuinely can't act on *and* that doesn't affect us.
+ignore = [
+  # tracing-subscriber 0.2.25 — ANSI-escape log poisoning (RUSTSEC-2025-0055).
+  # Not in our active graph: it is dragged in transitively by revm-precompile's
+  # bn128 chain (ark-bn254 → ark-r1cs-std → ark-relations, which pins the ancient
+  # 0.2.x), which we can't drop without losing the EVM precompile set. All of our
+  # *own* logging goes through tracing-subscriber 0.3.x (the `telemetry` crate),
+  # so the vulnerable 0.2 formatter never touches our logs. `cargo deny` already
+  # filters this out as feature-inactive; this mirrors the decision for `cargo
+  # audit`, which scans the raw lockfile. Revisit if the ark chain ever bumps.
+  "RUSTSEC-2025-0055",
+]
