@@ -43,6 +43,13 @@
 //! - [`worker`] — the [`Worker`](worker::Worker): drain → resolve → simulate on
 //!   rayon → publish → ack/requeue/dead-letter.
 //!
+//! **Result → incident read model (Sprint 6):**
+//! - [`projection`] — the [`IncidentProjection`](projection::IncidentProjection):
+//!   the pure, idempotent, commutative fold that reasserts ordering at the
+//!   projection (§7), so a redelivered `SimulationCompleted` is a no-op and the
+//!   confirm/retract/finalize lifecycle lands correctly regardless of partition
+//!   arrival order. The read-model core the Postgres/ClickHouse store plugs into.
+//!
 //! - [`config`] — env-resolved [`Config`](config::Config), shared by both binaries.
 
 pub mod cache;
@@ -50,6 +57,7 @@ pub mod command;
 pub mod config;
 pub mod consumer;
 pub mod dispatcher;
+pub mod projection;
 pub mod queue;
 pub mod resolver;
 pub mod result;

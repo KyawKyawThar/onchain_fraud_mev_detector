@@ -49,6 +49,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Event-time (`occurred_at`) drives the incident projection's last-writer-wins
+# figure updates + reorder tolerance (§7); the type comes from the envelope.
+chrono = { workspace = true }
 
 # The async dispatcher runs on tokio with a `CancellationToken` for graceful
 # drain; `rdkafka` is the `PreliminaryAlertCreated` consumer; `async-trait` for
@@ -85,6 +88,8 @@ simulation = { path = ".", features = ["test-util"] }
 # Only the tests construct on-chain addresses directly; non-test code reaches
 # alloy's `Address` through `events::primitives::AccountAddress`.
 alloy-primitives = { workspace = true }
+# The projection tests mint explicit envelope event ids to model redelivery.
+uuid = { workspace = true }
 # Live-broker integration test (`tests/topology.rs`, `#[ignore]`): spin a real
 # RabbitMQ in a container so the topology declaration is exercised against the
 # broker that actually enforces quorum-vs-priority, not just the arg builders.
