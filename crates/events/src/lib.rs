@@ -27,7 +27,7 @@ pub mod simulation;
 pub mod system;
 
 use chrono::{DateTime, Utc};
-use primitives::{AccountAddress, Chain, IncidentId};
+use primitives::{AccountAddress, AlertId, Chain, IncidentId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -63,6 +63,40 @@ pub fn topic_for(event_type: &str) -> String {
 pub fn all_topics() -> impl Iterator<Item = String> {
     use strum::VariantNames;
     DomainEvent::VARIANTS.iter().map(|name| topic_for(name))
+}
+
+/// The Kafka record key an [`EventEnvelope`] is partitioned under. A closed set
+/// rather than a bare `String` so the *reason* an event is keyed the way it is
+/// stays legible at the call site and in tests: a chain key (`"1"`) and an alert
+/// key (a UUID) are otherwise indistinguishable strings.
+///
+/// The wire key is the [`Display`](std::fmt::Display) form — what the producer
+/// hands Kafka. The `Chain` arm renders the numeric chain id, deliberately *not*
+/// [`Chain`]'s own `chain-1` display, so that easily-missed distinction lives in
+/// exactly one place instead of every call site remembering `.id()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionKey {
+    /// Per-chain ordering for the backbone — a chain's events share a partition (§20).
+    Chain(Chain),
+    /// The simulation result path while the incident is still tied to its
+    /// provisional alert: `SimulationCompleted`/`IncidentCreated` co-partition
+    /// under the alert so they dedup and stay ordered together (§7).
+    Alert(AlertId),
+    /// The simulation result path once only the incident is named:
+    /// `IncidentRetracted`/`IncidentFinalized` (§7).
+    Incident(IncidentId),
+}
+
+impl std::fmt::Display for PartitionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The chain *id* (`1`), not Chain's `chain-1` Display — the historical
+            // wire key producers have always used (§20).
+            PartitionKey::Chain(chain) => write!(f, "{}", chain.id()),
+            PartitionKey::Alert(alert) => write!(f, "{alert}"),
+            PartitionKey::Incident(incident) => write!(f, "{incident}"),
+        }
+    }
 }
 
 /// Errors from working with events (serialization, version mismatches).
@@ -251,6 +285,60 @@ impl DomainEvent {
         }
     }
 
+    /// The [`PartitionKey`] override for the **simulation result path** (§7), or
+    /// `None` for every event that stays chain-partitioned (§20 — see
+    /// [`EventEnvelope::partition_key`], which supplies the `Chain` default).
+    ///
+    /// The confirm/retract lifecycle is keyed by its *incident business key* so a
+    /// redelivered or replayed result is deduped and same-key events keep their
+    /// order on one partition: [`PartitionKey::Alert`] while the incident is still
+    /// tied to its provisional alert
+    /// ([`SimulationCompleted`](simulation::SimulationCompleted) /
+    /// [`IncidentCreated`](simulation::IncidentCreated)), then
+    /// [`PartitionKey::Incident`] once the alert has been upgraded and only the
+    /// incident is named ([`IncidentRetracted`](simulation::IncidentRetracted) /
+    /// [`IncidentFinalized`](simulation::IncidentFinalized)). The two id spaces
+    /// share one keyspace deliberately — the projections are commutative over the
+    /// key (`provisional → confirmed → retracted` is monotonic), so order is
+    /// reasserted at the projection, not demanded of the partition (§7).
+    ///
+    /// Exhaustive on purpose, like [`DomainEvent::incident_id`]: a future
+    /// result-path event must be classified here or it silently falls back to
+    /// chain-partitioning and loses its per-incident dedup key. Note
+    /// `SimulationRequested` is deliberately *not* here — it is the dispatcher's
+    /// audit fact, not part of the confirm/retract result path, so it stays
+    /// chain-keyed with the rest of the request side.
+    pub fn result_partition_key(&self) -> Option<PartitionKey> {
+        use DomainEvent::*;
+        match self {
+            SimulationCompleted(e) => Some(PartitionKey::Alert(e.alert_id)),
+            IncidentCreated(e) => Some(PartitionKey::Alert(e.alert_id)),
+            IncidentRetracted(e) => Some(PartitionKey::Incident(e.incident_id)),
+            IncidentFinalized(e) => Some(PartitionKey::Incident(e.incident_id)),
+            RawBlockReceived(_)
+            | BlockAssembled(_)
+            | BlockCanonicalized(_)
+            | BlockReverted(_)
+            | BlockFinalized(_)
+            | DetectorTriggered(_)
+            | PreliminaryAlertCreated(_)
+            | SimulationRequested(_)
+            | LabelAdded(_)
+            | LabelUpdated(_)
+            | LabelRevoked(_)
+            | EntityCreated(_)
+            | EntityMerged(_)
+            | EntitySplit(_)
+            | AttributionUpdated(_)
+            | RiskScoreUpdated(_)
+            | SanctionHit(_)
+            | RuleCreated(_)
+            | RuleTriggered(_)
+            | RuleAlertCreated(_)
+            | UsageRecorded(_) => None,
+        }
+    }
+
     /// The on-chain account addresses this event references — the business key
     /// for the §4 by-address query. Denormalized into an indexed `Array(String)`
     /// column by the event-store so an address lookup prunes granules instead of
@@ -349,6 +437,21 @@ impl EventEnvelope {
     /// consumer share one definition.
     pub fn topic(&self) -> String {
         topic_for(self.event_type())
+    }
+
+    /// The [`PartitionKey`] this envelope is published under. Simulation-result
+    /// events carry their incident business key so the confirm/retract lifecycle
+    /// dedups and stays ordered per incident (§7 —
+    /// [`DomainEvent::result_partition_key`]); every other event falls back to
+    /// `chain` so a chain's events keep their order on one partition (§20).
+    ///
+    /// Producers derive the key from here rather than hard-coding chain, so the
+    /// §7 result-path keying and the §20 default live in one place. The wire key
+    /// is the returned value's [`Display`](std::fmt::Display).
+    pub fn partition_key(&self) -> PartitionKey {
+        self.payload
+            .result_partition_key()
+            .unwrap_or(PartitionKey::Chain(self.chain))
     }
 
     /// Serialize to JSON bytes for transport (Kafka record value / event-store
@@ -528,6 +631,119 @@ mod tests {
             trace_available: false,
         });
         assert_eq!(chain_event.incident_id(), None);
+    }
+
+    #[test]
+    fn result_path_events_are_keyed_by_their_incident_business_key() {
+        use crate::primitives::{AlertId, AlertKind, IncidentId, Severity};
+        use crate::simulation::{
+            IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted,
+        };
+
+        let alert = AlertId(uuid::Uuid::from_u128(0xA1));
+        let incident = IncidentId(uuid::Uuid::from_u128(0x1C));
+
+        // SimulationCompleted / IncidentCreated: keyed by alert_id, while the
+        // incident is still tied to its provisional alert.
+        let completed = DomainEvent::SimulationCompleted(SimulationCompleted {
+            alert_id: alert,
+            profit: 1.0,
+            victim_loss: 0.0,
+            confirmed: true,
+        });
+        assert_eq!(
+            completed.result_partition_key(),
+            Some(PartitionKey::Alert(alert))
+        );
+
+        let created = DomainEvent::IncidentCreated(IncidentCreated {
+            incident_id: incident,
+            alert_id: alert,
+            kind: AlertKind::Sandwich,
+            txs: vec![],
+            profit: 1.0,
+            victim_loss: 0.0,
+            severity: Severity::High,
+        });
+        // Keyed by the *alert*, not the incident — co-partitioned with its
+        // SimulationCompleted so the two dedup/order together.
+        assert_eq!(
+            created.result_partition_key(),
+            Some(PartitionKey::Alert(alert))
+        );
+
+        // IncidentRetracted / IncidentFinalized only name the incident, so they
+        // key by incident_id.
+        let retracted = DomainEvent::IncidentRetracted(IncidentRetracted {
+            incident_id: incident,
+            reason: "block reverted".into(),
+        });
+        assert_eq!(
+            retracted.result_partition_key(),
+            Some(PartitionKey::Incident(incident))
+        );
+
+        let finalized = DomainEvent::IncidentFinalized(IncidentFinalized {
+            incident_id: incident,
+            block_hash: B256::repeat_byte(0x11),
+        });
+        assert_eq!(
+            finalized.result_partition_key(),
+            Some(PartitionKey::Incident(incident))
+        );
+
+        // The wire key renders to the plain id (what the producer hands Kafka).
+        assert_eq!(PartitionKey::Alert(alert).to_string(), alert.to_string());
+    }
+
+    #[test]
+    fn non_result_events_fall_back_to_chain_partitioning() {
+        use crate::simulation::SimulationRequested;
+
+        // A chain event keys by chain (§20).
+        let chain_env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockAssembled(BlockAssembled {
+                block: sample_block(),
+                tx_count: 1,
+                trace_available: false,
+            }),
+        );
+        assert_eq!(chain_env.payload.result_partition_key(), None);
+        assert_eq!(
+            chain_env.partition_key(),
+            PartitionKey::Chain(Chain::ETHEREUM)
+        );
+        // The chain arm renders the numeric id ("1"), not Chain's "chain-1".
+        assert_eq!(chain_env.partition_key().to_string(), "1");
+
+        // SimulationRequested is the dispatcher's audit fact, not part of the
+        // result path — it stays chain-keyed even though it carries an alert_id.
+        let requested = DomainEvent::SimulationRequested(SimulationRequested {
+            alert_id: crate::primitives::AlertId::new(),
+            evidence: serde_json::json!({}),
+        });
+        assert_eq!(requested.result_partition_key(), None);
+    }
+
+    #[test]
+    fn envelope_partition_key_uses_the_result_key_when_present() {
+        use crate::primitives::AlertId;
+        use crate::simulation::SimulationCompleted;
+
+        let alert = AlertId(uuid::Uuid::from_u128(0xA1));
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::SimulationCompleted(SimulationCompleted {
+                alert_id: alert,
+                profit: 1.0,
+                victim_loss: 0.0,
+                confirmed: false,
+            }),
+        );
+        // Not the chain — the alert_id drives the partition for the result path.
+        assert_eq!(env.partition_key(), PartitionKey::Alert(alert));
+        assert_ne!(env.partition_key(), PartitionKey::Chain(Chain::ETHEREUM));
     }
 
     #[test]

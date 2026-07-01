@@ -5,8 +5,10 @@
 //! the interesting parts (the ingestion reorg walk, the detection fan-out) can be
 //! unit-tested against an in-memory sink with no broker. [`KafkaEventSink`] is the
 //! production impl: it routes each envelope to its schema-derived topic
-//! ([`EventEnvelope::topic`]), keys it by chain so a chain's events keep their
-//! order on one partition (§20), and injects the current W3C trace context into
+//! ([`EventEnvelope::topic`]), keys it via [`EventEnvelope::partition_key`] (by
+//! chain for per-chain order, §20 — but the simulation result path by its
+//! incident business key so it dedups per incident, §7), and injects the current
+//! W3C trace context into
 //! the record headers so a downstream consumer continues the same distributed
 //! trace across the broker (§19).
 //!
@@ -104,9 +106,13 @@ impl KafkaEventSink {
 impl EventSink for KafkaEventSink {
     async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
         let topic = envelope.topic();
-        // Chain is the partition key (§20): every event for one chain lands on
-        // the same partition, preserving the per-chain order producers emit in.
-        let key = envelope.chain.id().to_string();
+        // The record key: chain by default, so a chain's events keep their order
+        // on one partition (§20) — but the simulation confirm/retract result path
+        // is keyed by its incident business key (`alert_id`/`incident_id`) so a
+        // redelivered result dedups and stays ordered per incident (§7). The
+        // choice lives on the envelope (a typed `PartitionKey`) so producers
+        // can't drift from it; `Display` is the wire rendering.
+        let key = envelope.partition_key().to_string();
         let payload = envelope.to_json_vec()?; // EventError → PublishError::Encode
         let headers = trace_headers();
 
