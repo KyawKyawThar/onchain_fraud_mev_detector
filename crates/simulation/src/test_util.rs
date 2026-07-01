@@ -15,7 +15,7 @@ use revm::primitives::Address;
 use crate::command::{Priority, SimulationJob};
 use crate::consumer::{DeliveryAck, Disposition};
 use crate::resolver::{JobResolver, ResolveError};
-use crate::simulator::{BlockParams, SimulationRequest};
+use crate::simulator::{BlockParams, Scenario, SimulationRequest};
 
 /// A canonical `SimulationJob` for tests that just need *a* job.
 pub fn sample_job() -> SimulationJob {
@@ -43,9 +43,11 @@ pub fn empty_request(job: &SimulationJob) -> SimulationRequest {
         kind: job.kind,
         block: BlockParams::default(),
         accounts: vec![],
-        bundle: vec![],
-        attacker: Address::ZERO,
-        victim: None,
+        scenario: Scenario::ValueExtraction {
+            bundle: vec![],
+            attacker: Address::ZERO,
+            victim: None,
+        },
         txs: vec![],
     }
 }
