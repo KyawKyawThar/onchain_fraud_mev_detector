@@ -1,8 +1,25 @@
 //! The revm simulation engine (§7) — the CPU-bound core a worker runs each
 //! `SimulationJob` on. Given a fully-described scenario (a block environment, the
-//! seeded pre-state, and the transaction bundle to replay), it re-executes the
-//! bundle in revm and **diffs balances** to estimate attacker profit / victim loss,
+//! seeded pre-state, and the confirmation [`Scenario`] to run), it re-executes
+//! bundles in revm and **diffs balances** to estimate attacker profit / victim loss,
 //! then decides whether the alert is confirmed (§7 "what simulation confirms").
+//!
+//! ## The four confirmations (§7), as one [`Scenario`] enum
+//!
+//! §7 names four things a simulation confirms; they are genuinely different
+//! computations over the same seeded pre-state, so the request carries a [`Scenario`]
+//! that the resolver picks from the alert's `AlertKind`:
+//!
+//! - **Attacker profit + victim loss** ([`Scenario::ValueExtraction`]) — replay the
+//!   bundle once, diff the attacker's balance (profit) and the victim's (loss).
+//!   Arbitrage / generic value extraction.
+//! - **Counterfactual** ([`Scenario::Sandwich`]) — replay the full attack for attacker
+//!   profit, then re-simulate the victim's swap *alone* (the frontrun removed) from
+//!   the same pre-state and diff the victim's outcome: the loss the sandwich actually
+//!   caused, not merely the victim's raw balance move.
+//! - **Honeypot** ([`Scenario::Honeypot`]) — from a fresh funded address, buy the token
+//!   then sell it; a buy that succeeds while the sell reverts/halts is the honeypot
+//!   signature (detected from revm's per-tx `ExecutionResult`, no token accounting).
 //!
 //! ## The seam
 //!
@@ -184,15 +201,60 @@ pub struct SimulationRequest {
     pub block: BlockParams,
     /// Pre-state: every account the bundle reads or whose balance we diff.
     pub accounts: Vec<SeededAccount>,
-    /// The transactions to replay, in order.
-    pub bundle: Vec<SimTx>,
-    /// The account whose balance gain is the attacker profit.
-    pub attacker: Address,
-    /// The account whose balance loss is the victim loss, if the pattern names one.
-    pub victim: Option<Address>,
+    /// Which of the §7 confirmations to run, and its executable inputs (bundle,
+    /// implicated accounts). The resolver picks the variant from the alert's `kind`.
+    pub scenario: Scenario,
     /// The on-chain tx hashes the alert implicated — the incident's `txs` (identity,
-    /// not executed here; the executable form is [`bundle`](Self::bundle)).
+    /// not executed here; the executable bundle lives on the [`Scenario`]).
     pub txs: Vec<B256>,
+}
+
+/// How an alert is confirmed (§7 "what simulation confirms") — the strategy plus its
+/// executable inputs. Each variant runs a different diff over the request's shared
+/// seeded pre-state; the engine dispatches on it and every variant produces the same
+/// uniform [`SimulationOutcome`].
+#[derive(Debug, Clone)]
+pub enum Scenario {
+    /// Replay the bundle once and diff balances: the attacker's gain is the profit,
+    /// the victim's drop (if the pattern names one) is the loss. Arbitrage and
+    /// generic value extraction (§7 attacker profit / victim loss).
+    ValueExtraction {
+        /// The transactions to replay, in order.
+        bundle: Vec<SimTx>,
+        /// The account whose balance gain is the attacker profit.
+        attacker: Address,
+        /// The account whose balance drop is the victim loss, if any.
+        victim: Option<Address>,
+    },
+
+    /// Sandwich **counterfactual** (§7): replay the full attack bundle for attacker
+    /// profit, then re-simulate the victim's own swap in isolation — the frontrun
+    /// removed — from the *same* pre-state, and take the victim's loss as how much
+    /// better their swap executed without the frontrun. Measures the harm the
+    /// sandwich caused, not the victim's raw balance move.
+    Sandwich {
+        /// The full attack: frontrun, victim swap, backrun, in order.
+        bundle: Vec<SimTx>,
+        /// The account whose balance gain is the attacker profit.
+        attacker: Address,
+        /// The sandwiched account, whose counterfactual outcome we diff.
+        victim: Address,
+        /// The victim's transaction(s) alone — the counterfactual bundle, replayed
+        /// against the untouched pre-state (no frontrun).
+        victim_swap: Vec<SimTx>,
+    },
+
+    /// **Honeypot** probe (§7): from a fresh funded address, buy the token then sell
+    /// it. A buy that succeeds while the sell reverts/halts is the honeypot
+    /// signature — you can get in but not out.
+    Honeypot {
+        /// The fresh, funded probing address whose trapped ETH is the victim loss.
+        prober: Address,
+        /// The buy transaction (ETH → token).
+        buy: SimTx,
+        /// The sell transaction (token → ETH); a honeypot makes this revert.
+        sell: SimTx,
+    },
 }
 
 /// What the engine concluded. ETH-denominated; the [`crate::result`] mapping turns
@@ -313,14 +375,215 @@ impl Simulator for RevmSimulator {
     }
 }
 
+/// The financial verdict a [`Scenario`] arm computes, before it is stamped with the
+/// request's identity into a [`SimulationOutcome`]. Keeps each arm to the numbers it
+/// actually decides.
+struct Verdict {
+    profit: f64,
+    victim_loss: f64,
+    confirmed: bool,
+    severity: Severity,
+}
+
+/// One probed account's balance either side of a replay.
+struct ProbedBalance {
+    address: Address,
+    pre: U256,
+    post: U256,
+}
+
+/// What one bundle replay produced over a freshly-seeded pre-state: each tx's
+/// execution success (for the honeypot buy/sell check) and the probed accounts'
+/// before/after balances. Queried **by address** (not by position), so a caller reads
+/// the account it means without tracking where it sat in the probe slice.
+struct RunResult {
+    tx_success: Vec<bool>,
+    balances: Vec<ProbedBalance>,
+}
+
+impl RunResult {
+    /// The probed account — a caller only ever asks for one it probed, so a miss is a
+    /// programming error, not a runtime condition.
+    fn probed(&self, address: Address) -> &ProbedBalance {
+        self.balances
+            .iter()
+            .find(|b| b.address == address)
+            .expect("queried an address that was not probed in this run")
+    }
+
+    /// ETH the account **gained** across the run (post − pre) — the attacker-profit
+    /// direction. Sign-aware, so a net loss reads negative.
+    fn gain(&self, address: Address) -> f64 {
+        let b = self.probed(address);
+        signed_eth_delta(b.post, b.pre)
+    }
+
+    /// ETH the account **lost** across the run (pre − post) — the victim-loss
+    /// direction. Sign-aware, so an unexpected gain reads negative.
+    fn loss(&self, address: Address) -> f64 {
+        let b = self.probed(address);
+        signed_eth_delta(b.pre, b.post)
+    }
+
+    /// The account's absolute balance after the run — for diffing the *same* account
+    /// across two runs (the sandwich counterfactual).
+    fn balance_after(&self, address: Address) -> U256 {
+        self.probed(address).post
+    }
+}
+
 impl RevmSimulator {
-    /// The engine proper, called inside [`run_sandboxed`].
+    /// The engine proper, called inside [`run_sandboxed`]. Dispatches on the
+    /// scenario, each arm running one or more [`RevmSimulator::run`]s over the shared
+    /// pre-state and reducing them to a [`Verdict`] (§7 "what simulation confirms").
     fn simulate_inner(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
-        // 1. Seed the in-memory pre-state. `EmptyDB` returns empty accounts for
-        //    anything unseeded, so a tx from an unfunded caller fails validation
-        //    (poison) rather than reading phantom funds.
+        let verdict = match &req.scenario {
+            Scenario::ValueExtraction {
+                bundle,
+                attacker,
+                victim,
+            } => self.value_extraction(&req.block, &req.accounts, bundle, *attacker, *victim)?,
+            Scenario::Sandwich {
+                bundle,
+                attacker,
+                victim,
+                victim_swap,
+            } => self.sandwich(
+                &req.block,
+                &req.accounts,
+                bundle,
+                *attacker,
+                *victim,
+                victim_swap,
+            )?,
+            Scenario::Honeypot { prober, buy, sell } => {
+                self.honeypot(&req.block, &req.accounts, *prober, buy, sell)?
+            }
+        };
+
+        Ok(SimulationOutcome {
+            alert_id: req.alert_id,
+            kind: req.kind,
+            profit: verdict.profit,
+            victim_loss: verdict.victim_loss,
+            confirmed: verdict.confirmed,
+            severity: verdict.severity,
+            txs: req.txs.clone(),
+        })
+    }
+
+    /// Build the verdict for a profit-threshold strategy (value extraction, sandwich):
+    /// confirm above `min_profit`, severity from the profit band. The one home for the
+    /// "did the money clear the bar" rule the two balance-diff confirmations share.
+    fn profit_verdict(&self, profit: f64, victim_loss: f64) -> Verdict {
+        Verdict {
+            profit,
+            victim_loss,
+            confirmed: profit > self.min_profit.get(),
+            severity: severity_for(profit),
+        }
+    }
+
+    /// Attacker profit + victim loss from one replay (§7): the attacker's balance gain
+    /// is the profit, the victim's drop (if named) the loss. Confirms above the profit
+    /// threshold.
+    fn value_extraction(
+        &self,
+        block: &BlockParams,
+        accounts: &[SeededAccount],
+        bundle: &[SimTx],
+        attacker: Address,
+        victim: Option<Address>,
+    ) -> Result<Verdict, SimError> {
+        // Probe the attacker, and the victim too when the pattern names one.
+        let mut probe = vec![attacker];
+        probe.extend(victim);
+        let run = self.run(block, accounts, bundle, &probe)?;
+
+        let profit = run.gain(attacker);
+        let victim_loss = victim.map_or(0.0, |v| run.loss(v));
+        Ok(self.profit_verdict(profit, victim_loss))
+    }
+
+    /// Sandwich counterfactual (§7): attacker profit from the full attack, victim loss
+    /// from re-running the victim's swap *without* the frontrun. The loss is how much
+    /// better the victim did in the counterfactual — the harm the sandwich caused.
+    fn sandwich(
+        &self,
+        block: &BlockParams,
+        accounts: &[SeededAccount],
+        bundle: &[SimTx],
+        attacker: Address,
+        victim: Address,
+        victim_swap: &[SimTx],
+    ) -> Result<Verdict, SimError> {
+        // The full attack: attacker profit, and the victim's balance *with* the
+        // frontrun in place.
+        let full = self.run(block, accounts, bundle, &[attacker, victim])?;
+        let profit = full.gain(attacker);
+
+        // The counterfactual: the victim's swap alone against the same untouched
+        // pre-state (no frontrun) — the outcome they'd have had unsandwiched.
+        let cf = self.run(block, accounts, victim_swap, &[victim])?;
+
+        // The harm: how much better off the victim was without the frontrun. Positive
+        // when the sandwich cost them; sign-aware so a no-harm case reads exactly 0.
+        let victim_loss = signed_eth_delta(cf.balance_after(victim), full.balance_after(victim));
+        Ok(self.profit_verdict(profit, victim_loss))
+    }
+
+    /// Honeypot probe (§7): buy then sell from the fresh prober. The honeypot
+    /// signature is a buy that succeeds while the sell reverts/halts — read straight
+    /// off revm's per-tx `ExecutionResult`, no token accounting. The prober's trapped
+    /// ETH (what it put in and can't recover) is reported as the victim loss.
+    fn honeypot(
+        &self,
+        block: &BlockParams,
+        accounts: &[SeededAccount],
+        prober: Address,
+        buy: &SimTx,
+        sell: &SimTx,
+    ) -> Result<Verdict, SimError> {
+        let run = self.run(block, accounts, &[buy.clone(), sell.clone()], &[prober])?;
+        let bought = run.tx_success[0];
+        let sold = run.tx_success[1];
+        let confirmed = bought && !sold;
+
+        // ETH the prober spent and couldn't get back out — what a victim loses to the
+        // trap.
+        let victim_loss = run.loss(prober);
+        Ok(Verdict {
+            profit: 0.0, // the probe measures a trap, not an attacker's balance gain
+            victim_loss,
+            confirmed,
+            // Profit is 0 here so the profit bands don't apply; a confirmed honeypot is
+            // treated High, unconfirmed Low. Placeholder banding, like `severity_for`.
+            severity: if confirmed {
+                Severity::High
+            } else {
+                Severity::Low
+            },
+        })
+    }
+
+    /// Seed a fresh `CacheDB<EmptyDB>` from `accounts`, build the mainnet EVM with
+    /// `block`, snapshot the `probe` balances, replay `bundle` in order under the §7
+    /// gas caps, and re-read the `probe` balances. Returns each tx's execution success
+    /// plus the probed accounts' before/after balances (queried by address, not
+    /// position). The whole EVM is local, so every arm gets an independent run over the
+    /// same pre-state.
+    fn run(
+        &self,
+        block: &BlockParams,
+        accounts: &[SeededAccount],
+        bundle: &[SimTx],
+        probe: &[Address],
+    ) -> Result<RunResult, SimError> {
+        // Seed the in-memory pre-state. `EmptyDB` returns empty accounts for anything
+        // unseeded, so a tx from an unfunded caller fails validation (poison) rather
+        // than reading phantom funds.
         let mut db = CacheDB::new(EmptyDB::default());
-        for acc in &req.accounts {
+        for acc in accounts {
             let mut info = AccountInfo::from_balance(acc.balance);
             if let Some(code) = &acc.code {
                 let bytecode = Bytecode::new_raw(code.clone());
@@ -330,8 +593,7 @@ impl RevmSimulator {
             db.insert_account_info(acc.address, info);
         }
 
-        // 2. Build the EVM over the seeded state with the scenario's block env.
-        let block = &req.block;
+        // Build the EVM over the seeded state with the scenario's block env.
         let mut evm = Context::mainnet()
             .with_db(db)
             .modify_block_chained(|b| {
@@ -343,21 +605,21 @@ impl RevmSimulator {
             })
             .build_mainnet();
 
-        // 3. Snapshot the implicated balances before the bundle runs.
-        let attacker_pre = balance_of(evm.db_ref(), req.attacker)?;
-        let victim_pre = match req.victim {
-            Some(v) => Some(balance_of(evm.db_ref(), v)?),
-            None => None,
-        };
+        // Snapshot the probed balances before the bundle runs.
+        let pre = probe
+            .iter()
+            .map(|a| balance_of(evm.db_ref(), *a))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // 4. Replay the bundle in order, committing each tx's state so the next tx
-        //    sees it. A revert/halt is a legitimate "no value extracted" outcome —
-        //    only an EVM-level error (malformed tx / db fault) aborts. Hostile
-        //    bytecode is bounded by the gas caps (§7): each tx's gas is clamped to
-        //    `per_tx_gas` so a runaway loop halts `OutOfGas`, and the running total is
-        //    held under `bundle_gas_budget` so a pathological bundle dead-letters.
+        // Replay the bundle in order, committing each tx's state so the next tx sees
+        // it. A revert/halt is a legitimate "no value extracted" outcome (recorded in
+        // `tx_success`) — only an EVM-level error (malformed tx / db fault) aborts.
+        // Hostile bytecode is bounded by the gas caps (§7): each tx's gas is clamped
+        // to `per_tx_gas` so a runaway loop halts `OutOfGas`, and the running total is
+        // held under `bundle_gas_budget` so a pathological bundle dead-letters.
+        let mut tx_success = Vec::with_capacity(bundle.len());
         let mut bundle_gas: u64 = 0;
-        for tx in &req.bundle {
+        for tx in bundle {
             // Match the tx nonce to the caller's current nonce so the bundle isn't
             // rejected for replay protection; reads the committed state each step.
             let nonce = balance_and_nonce(evm.db_ref(), tx.caller)?.1;
@@ -379,6 +641,7 @@ impl RevmSimulator {
             };
             let result = evm.transact_commit(tx_env).map_err(map_evm_error)?;
             bundle_gas = bundle_gas.saturating_add(result.tx_gas_used());
+            tx_success.push(result.is_success());
             if bundle_gas > self.limits.bundle_gas_budget {
                 return Err(SimError::Poison(format!(
                     "bundle exceeded gas budget ({bundle_gas} > {} gas) — abandoning \
@@ -388,25 +651,23 @@ impl RevmSimulator {
             }
         }
 
-        // 5. Re-read balances and diff. Profit is the attacker's gain; victim loss is
-        //    the victim's drop (each sign-aware so an unexpected direction is honest,
-        //    not clamped).
-        let attacker_post = balance_of(evm.db_ref(), req.attacker)?;
-        let profit = signed_eth_delta(attacker_post, attacker_pre);
-        let victim_loss = match (req.victim, victim_pre) {
-            (Some(v), Some(pre)) => signed_eth_delta(pre, balance_of(evm.db_ref(), v)?),
-            _ => 0.0,
-        };
+        // Re-read the probed balances after the bundle, and pair each with its address
+        // and pre-balance so the result is queried by address rather than position.
+        let balances = probe
+            .iter()
+            .zip(pre)
+            .map(|(&address, pre)| {
+                Ok(ProbedBalance {
+                    address,
+                    pre,
+                    post: balance_of(evm.db_ref(), address)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SimError>>()?;
 
-        let confirmed = profit > self.min_profit.get();
-        Ok(SimulationOutcome {
-            alert_id: req.alert_id,
-            kind: req.kind,
-            profit,
-            victim_loss,
-            confirmed,
-            severity: severity_for(profit),
-            txs: req.txs.clone(),
+        Ok(RunResult {
+            tx_success,
+            balances,
         })
     }
 }
@@ -510,15 +771,19 @@ mod tests {
         Address::repeat_byte(0xBB)
     }
 
+    /// A value-extraction request over `bundle`, probing the canonical attacker and
+    /// victim — the shape the balance-diff tests below assert against.
     fn request(accounts: Vec<SeededAccount>, bundle: Vec<SimTx>) -> SimulationRequest {
         SimulationRequest {
             alert_id: AlertId::new(),
             kind: AlertKind::Sandwich,
             block: BlockParams::default(),
             accounts,
-            bundle,
-            attacker: attacker(),
-            victim: Some(victim()),
+            scenario: Scenario::ValueExtraction {
+                bundle,
+                attacker: attacker(),
+                victim: Some(victim()),
+            },
             txs: vec![B256::repeat_byte(0x01)],
         }
     }
@@ -753,5 +1018,257 @@ mod tests {
             !err.is_transient(),
             "a caught panic is poison, not transient"
         );
+    }
+
+    // --- §7 counterfactual (sandwich) & honeypot strategies ---------------------
+
+    fn pool() -> Address {
+        Address::repeat_byte(0xDD)
+    }
+
+    /// A "pool" contract that, on any call, sends its **entire** balance to the caller
+    /// (`CALL(caller, SELFBALANCE)`), then stops. Standing in for AMM liquidity: the
+    /// first caller drains it, a later caller gets nothing — so a frontrun changes what
+    /// the victim's swap yields, without any hand-written pricing math. A call to an
+    /// already-empty pool sends 0 and still succeeds (no revert, no poison).
+    fn drain_to_caller_code() -> Bytes {
+        Bytes::from(vec![
+            0x60, 0x00, // PUSH1 0   retSize
+            0x60, 0x00, // PUSH1 0   retOffset
+            0x60, 0x00, // PUSH1 0   argsSize
+            0x60, 0x00, // PUSH1 0   argsOffset
+            0x47, // SELFBALANCE     value
+            0x33, // CALLER          addr
+            0x5a, // GAS             gas
+            0xf1, // CALL
+            0x00, // STOP
+        ])
+    }
+
+    /// The canonical sandwich counterfactual (§7): the attacker's frontrun drains the
+    /// pool, so the victim's swap — replayed inside the full attack — yields nothing,
+    /// while the same swap alone against the untouched pool yields 5 ETH. Victim loss
+    /// is that counterfactual difference; attacker profit is what the frontrun took.
+    #[test]
+    fn sandwich_counterfactual_measures_the_frontrun_harm() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        let accounts = vec![
+            SeededAccount {
+                address: pool(),
+                balance: eth(5),
+                code: Some(drain_to_caller_code()),
+            },
+            SeededAccount {
+                address: attacker(),
+                balance: eth(1),
+                code: None,
+            },
+            SeededAccount {
+                address: victim(),
+                balance: eth(1),
+                code: None,
+            },
+        ];
+        // The victim's own swap: call the pool to draw its liquidity.
+        let victim_swap = SimTx {
+            caller: victim(),
+            to: Some(pool()),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 100_000,
+        };
+        // The full attack: the attacker frontruns the pool, then the victim swaps into
+        // the now-empty pool.
+        let frontrun = SimTx {
+            caller: attacker(),
+            to: Some(pool()),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 100_000,
+        };
+        let req = SimulationRequest {
+            alert_id: AlertId::new(),
+            kind: AlertKind::Sandwich,
+            block: BlockParams::default(),
+            accounts,
+            scenario: Scenario::Sandwich {
+                bundle: vec![frontrun, victim_swap.clone()],
+                attacker: attacker(),
+                victim: victim(),
+                victim_swap: vec![victim_swap],
+            },
+            txs: vec![B256::repeat_byte(0x01)],
+        };
+
+        let out = sim.simulate(&req).expect("sandwich simulates");
+        assert_eq!(out.profit, 5.0, "the frontrun drained 5 ETH from the pool");
+        assert_eq!(
+            out.victim_loss, 5.0,
+            "the victim got 5 ETH unsandwiched but 0 with the frontrun ahead of them"
+        );
+        assert!(out.confirmed, "5 ETH profit clears the 1 ETH bar");
+        assert_eq!(out.severity, Severity::Medium);
+    }
+
+    /// A frontrun that leaves the victim's swap untouched inflicts no counterfactual
+    /// harm: the victim draws the same liquidity with or without it, so victim loss is
+    /// exactly 0 (the sign-aware diff, not a clamp).
+    #[test]
+    fn sandwich_with_no_counterfactual_harm_is_zero_loss() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        let accounts = vec![
+            SeededAccount {
+                address: pool(),
+                balance: eth(5),
+                code: Some(drain_to_caller_code()),
+            },
+            SeededAccount {
+                address: attacker(),
+                balance: eth(1),
+                code: None,
+            },
+            SeededAccount {
+                address: victim(),
+                balance: eth(1),
+                code: None,
+            },
+        ];
+        let victim_swap = SimTx {
+            caller: victim(),
+            to: Some(pool()),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 100_000,
+        };
+        // A benign "frontrun" that touches neither the pool nor the victim.
+        let harmless = SimTx {
+            caller: attacker(),
+            to: Some(victim()),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+        let req = SimulationRequest {
+            alert_id: AlertId::new(),
+            kind: AlertKind::Sandwich,
+            block: BlockParams::default(),
+            accounts,
+            scenario: Scenario::Sandwich {
+                bundle: vec![harmless, victim_swap.clone()],
+                attacker: attacker(),
+                victim: victim(),
+                victim_swap: vec![victim_swap],
+            },
+            txs: vec![B256::repeat_byte(0x01)],
+        };
+
+        let out = sim.simulate(&req).expect("sandwich simulates");
+        assert_eq!(out.victim_loss, 0.0, "the victim's swap was unaffected");
+    }
+
+    fn prober() -> Address {
+        Address::repeat_byte(0xEE)
+    }
+    fn token() -> Address {
+        Address::repeat_byte(0xCC)
+    }
+
+    /// A honeypot token: `if CALLVALUE != 0 { STOP } else { REVERT }` — it accepts a
+    /// buy (ETH in) but reverts the sell (a zero-value call). The buy/sell signature
+    /// is exactly what the honeypot probe looks for.
+    fn honeypot_token_code() -> Bytes {
+        Bytes::from(vec![
+            0x34, // CALLVALUE
+            0x60, 0x09, // PUSH1 9   (buy path: the JUMPDEST below)
+            0x57, // JUMPI          value != 0 → jump to STOP
+            0x60, 0x00, // PUSH1 0   sell path: REVERT(0, 0)
+            0x60, 0x00, // PUSH1 0
+            0xfd, // REVERT
+            0x5b, // JUMPDEST (offset 9)
+            0x00, // STOP
+        ])
+    }
+
+    fn honeypot_request(token_code: Bytes) -> SimulationRequest {
+        let accounts = vec![
+            SeededAccount {
+                address: token(),
+                balance: U256::ZERO,
+                code: Some(token_code),
+            },
+            SeededAccount {
+                address: prober(),
+                balance: eth(5),
+                code: None,
+            },
+        ];
+        SimulationRequest {
+            alert_id: AlertId::new(),
+            kind: AlertKind::Rugpull,
+            block: BlockParams::default(),
+            accounts,
+            scenario: Scenario::Honeypot {
+                prober: prober(),
+                // Buy: send 1 ETH into the token.
+                buy: SimTx {
+                    caller: prober(),
+                    to: Some(token()),
+                    value: eth(1),
+                    data: Bytes::new(),
+                    gas_limit: 100_000,
+                },
+                // Sell: a zero-value call back — a honeypot reverts here.
+                sell: SimTx {
+                    caller: prober(),
+                    to: Some(token()),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 100_000,
+                },
+            },
+            txs: vec![B256::repeat_byte(0x01)],
+        }
+    }
+
+    /// Buy succeeds, sell reverts → confirmed honeypot. The 1 ETH the prober spent is
+    /// trapped in the token, surfaced as the victim loss; a confirmed honeypot is High.
+    #[test]
+    fn honeypot_buy_ok_sell_reverts_is_confirmed() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        let out = sim
+            .simulate(&honeypot_request(honeypot_token_code()))
+            .expect("honeypot probe simulates");
+        assert!(
+            out.confirmed,
+            "bought in but couldn't sell out — a honeypot"
+        );
+        assert_eq!(out.profit, 0.0, "the probe measures a trap, not a gain");
+        assert_eq!(out.victim_loss, 1.0, "1 ETH is trapped in the token");
+        assert_eq!(out.severity, Severity::High);
+    }
+
+    /// A clean token whose sell also succeeds is **not** flagged — the honeypot
+    /// signature is specifically buy-ok/sell-fails.
+    #[test]
+    fn honeypot_clean_token_when_sell_succeeds_is_not_confirmed() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        // A token that always stops (both buy and sell succeed).
+        let out = sim
+            .simulate(&honeypot_request(Bytes::from(vec![0x00])))
+            .expect("clean token simulates");
+        assert!(!out.confirmed, "a sellable token is not a honeypot");
+    }
+
+    /// If the buy itself reverts, the prober never got in — not a honeypot (the trap
+    /// needs a successful entry followed by a blocked exit).
+    #[test]
+    fn honeypot_when_buy_fails_is_not_confirmed() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        // A token that always reverts — the buy can't even land.
+        let always_revert = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+        let out = sim
+            .simulate(&honeypot_request(always_revert))
+            .expect("a reverting buy is a valid, non-erroring outcome");
+        assert!(!out.confirmed, "no successful entry → not a honeypot");
     }
 }

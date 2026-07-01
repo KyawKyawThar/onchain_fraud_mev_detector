@@ -157,7 +157,7 @@ mod tests {
     use revm::primitives::Address;
 
     use super::*;
-    use crate::simulator::BlockParams;
+    use crate::simulator::{BlockParams, Scenario};
 
     /// A `Simulator` double that counts how many times the real engine ran and returns
     /// a deterministic outcome derived from the request — so a test can prove a hit
@@ -198,9 +198,11 @@ mod tests {
                 ..BlockParams::default()
             },
             accounts: vec![],
-            bundle: vec![],
-            attacker: Address::ZERO,
-            victim: None,
+            scenario: Scenario::ValueExtraction {
+                bundle: vec![],
+                attacker: Address::ZERO,
+                victim: None,
+            },
             txs,
         }
     }
