@@ -14,6 +14,7 @@ use event_bus::KafkaEventSink;
 use simulation::config::Config;
 use simulation::dispatcher::{build_consumer, Dispatcher};
 use simulation::queue::RabbitJobSink;
+use simulation::reorg::{self, EmptyIncidentIndex, ReorgConsumer};
 use simulation::topology::declare_sim_topology;
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +54,13 @@ async fn run(cfg: Config) -> Result<()> {
     let consumer = build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)
         .context("building Kafka consumer")?;
 
+    // The service-side reorg consumer: react to `BlockReverted` by retracting incidents
+    // from orphaned blocks (§15). Its own consumer group so it tracks `BlockReverted`
+    // independently of the alert stream. The block→incident join is stubbed today
+    // (`EmptyIncidentIndex`) — see `simulation::reorg`.
+    let reorg_consumer = reorg::build_consumer(&cfg.kafka.brokers, &cfg.kafka.reorg_group_id)
+        .context("building Kafka BlockReverted consumer")?;
+
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -63,13 +71,47 @@ async fn run(cfg: Config) -> Result<()> {
         }
     });
 
-    Dispatcher::new(job_sink, event_sink, shutdown)
-        .run(consumer)
-        .await
-        .context("dispatcher loop failed")?;
+    // Run the dispatcher and the reorg (retraction) consumer concurrently under one
+    // shutdown. If either loop exits (graceful stop or a fatal subscribe error), cancel
+    // the other so a single failure drains the whole process rather than leaving a half-
+    // dead service.
+    let mut dispatcher =
+        tokio::spawn(Dispatcher::new(job_sink, event_sink.clone(), shutdown.clone()).run(consumer));
+    let mut retractor = tokio::spawn(
+        ReorgConsumer::new(Arc::new(EmptyIncidentIndex), event_sink, shutdown.clone())
+            .run(reorg_consumer),
+    );
+
+    // Whichever loop finishes first, cancel the peer and await *only* it (re-awaiting
+    // the already-finished handle would panic), so both drain before we exit.
+    tokio::select! {
+        res = &mut dispatcher => {
+            log_task("dispatcher", res);
+            shutdown.cancel();
+            log_task("reorg consumer", retractor.await);
+        }
+        res = &mut retractor => {
+            log_task("reorg consumer", res);
+            shutdown.cancel();
+            log_task("dispatcher", dispatcher.await);
+        }
+    }
 
     tracing::info!("simulation dispatcher shut down");
     Ok(())
+}
+
+/// Log how one of the concurrent service loops exited (a fatal loop error or a panicked
+/// task is surfaced, not swallowed; awaiting an already-finished handle is a no-op).
+fn log_task(name: &str, res: Result<Result<()>, tokio::task::JoinError>) {
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(task = name, error = %err, "service loop exited with error")
+        }
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => tracing::error!(task = name, error = %err, "service task panicked"),
+    }
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM.

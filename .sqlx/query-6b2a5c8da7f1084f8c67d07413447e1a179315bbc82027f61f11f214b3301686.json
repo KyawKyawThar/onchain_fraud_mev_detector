@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO incidents (\n                 alert_id, incident_id, status, kind, severity, profit, victim_loss,\n                 txs, retraction_reason, finalized_block, figures_at, retracted_at,\n                 finalized_at, updated_at\n             )\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())\n             ON CONFLICT (alert_id) DO UPDATE SET\n                 incident_id       = EXCLUDED.incident_id,\n                 status            = EXCLUDED.status,\n                 kind              = EXCLUDED.kind,\n                 severity          = EXCLUDED.severity,\n                 profit            = EXCLUDED.profit,\n                 victim_loss       = EXCLUDED.victim_loss,\n                 txs               = EXCLUDED.txs,\n                 retraction_reason = EXCLUDED.retraction_reason,\n                 finalized_block   = EXCLUDED.finalized_block,\n                 figures_at        = EXCLUDED.figures_at,\n                 retracted_at      = EXCLUDED.retracted_at,\n                 finalized_at      = EXCLUDED.finalized_at,\n                 updated_at        = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Float8",
+        "Float8",
+        "TextArray",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6b2a5c8da7f1084f8c67d07413447e1a179315bbc82027f61f11f214b3301686"
+}

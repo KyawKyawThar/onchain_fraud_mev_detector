@@ -11,3 +11,10 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+# The Postgres OLTP store (§14). This crate owns only the *shared* plumbing — the
+# connection-pool builder — so every service that needs Postgres constructs its pool
+# the same way; the per-service tables/repositories live in the owning service crate
+# (no shared tables, §14). `tokio` is sqlx's async runtime.
+sqlx.workspace = true
+tokio.workspace = true

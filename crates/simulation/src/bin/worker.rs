@@ -15,6 +15,7 @@ use event_bus::KafkaEventSink;
 use simulation::cache::CachingSimulator;
 use simulation::config::Config;
 use simulation::consumer::RabbitJobSource;
+use simulation::reorg::{self, SharedOrphanedBlocks};
 use simulation::resolver::UnresolvedJobResolver;
 use simulation::simulator::RevmSimulator;
 use simulation::topology::declare_sim_topology;
@@ -56,6 +57,11 @@ async fn run(cfg: Config) -> Result<()> {
     let event_sink =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
 
+    // The reorg generation-check state (§7, §15): this replica's own view of orphaned
+    // blocks, fed by a broadcast `BlockReverted` consumer below and read by the workers
+    // before simulating a resolved job.
+    let orphaned = SharedOrphanedBlocks::new();
+
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -66,7 +72,32 @@ async fn run(cfg: Config) -> Result<()> {
         }
     });
 
-    let worker = Worker::new(resolver, simulator, pool, event_sink, shutdown.clone());
+    // Feed the generation-check state from `BlockReverted`. A unique-per-process group
+    // (so every replica sees every revert — a broadcast, not a shared consumer group)
+    // reading `latest`. Best-effort defence-in-depth: the authoritative correction for a
+    // reverted block is the dispatcher's offset-committed `IncidentRetracted`, not this.
+    let revert_group = format!(
+        "{}-revert-tracker-{}-{}",
+        cfg.kafka.group_id,
+        std::process::id(),
+        now_nanos()
+    );
+    let revert_consumer = reorg::build_broadcast_consumer(&cfg.kafka.brokers, &revert_group)
+        .context("building the BlockReverted broadcast consumer")?;
+    let tracker = tokio::spawn(reorg::run_revert_tracker(
+        revert_consumer,
+        orphaned.clone(),
+        shutdown.clone(),
+    ));
+
+    let worker = Worker::new(
+        resolver,
+        orphaned,
+        simulator,
+        pool,
+        event_sink,
+        shutdown.clone(),
+    );
 
     // One competing consumer per worker slot: each opens its own consume channel
     // over the *same* queue, so the broker load-balances jobs across them.
@@ -90,9 +121,24 @@ async fn run(cfg: Config) -> Result<()> {
             Err(err) => tracing::error!(error = %err, "worker task panicked"),
         }
     }
+    // The revert tracker stops on the same shutdown token; collect it too.
+    match tracker.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::error!(error = %err, "revert tracker exited with error"),
+        Err(err) => tracing::error!(error = %err, "revert tracker task panicked"),
+    }
 
     tracing::info!("simulation worker pool shut down");
     Ok(())
+}
+
+/// Nanoseconds since the epoch — a cheap uniqueness suffix for this replica's broadcast
+/// consumer group, so two replicas (or a fast restart reusing a pid) never collide.
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Build the rayon pool revm runs on. `0` threads = rayon's default (one per core),

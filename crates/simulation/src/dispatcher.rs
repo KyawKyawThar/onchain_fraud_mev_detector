@@ -8,10 +8,11 @@
 //! - `Dispatcher::process` is the **core**: given one `PreliminaryAlertCreated`
 //!   (and its chain), it publishes the [`SimulationJob`](crate::command::SimulationJob)
 //!   command to RabbitMQ and emits the `SimulationRequested` audit event to Kafka,
-//!   returning what to do with the offset. Testable against in-memory sinks.
-//! - [`Dispatcher::run`] is the **async loop**: it pulls `PreliminaryAlertCreated`
-//!   records off Kafka, runs `process`, and commits the offset once the alert is
-//!   dispatched — at-least-once, so a crash re-delivers rather than drops.
+//!   returning a [`Handled`] verdict. Testable against in-memory sinks.
+//! - The [`EventHandler`] impl + [`Dispatcher::run`] plug that core into the shared
+//!   [`event_bus::run_consumer`] loop — the subscribe/decode/trace/commit mechanics
+//!   live there, once, so the dispatcher carries only its per-alert decision.
+//!   At-least-once, so a crash re-delivers rather than drops.
 //!
 //! ## Why a thin consumer, and what at-least-once buys us
 //!
@@ -29,19 +30,16 @@
 //! constraint to preserve here — a single in-line commit suffices.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use event_bus::EventSink;
+use async_trait::async_trait;
+use event_bus::{run_consumer, EventHandler, EventSink, Handled};
 use events::detection::PreliminaryAlertCreated;
 use events::primitives::Chain;
 use events::{DomainEvent, EventEnvelope};
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::Headers;
-use rdkafka::Message;
-use std::time::Duration;
-use telemetry::propagation::{self, HeaderCarrier};
+use rdkafka::consumer::StreamConsumer;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
 use crate::command::job_for_alert;
 use crate::queue::{self, JobSink};
@@ -64,15 +62,6 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
         .set("auto.offset.reset", "earliest")
         .create()
         .context("creating Kafka consumer")
-}
-
-/// Decode one envelope into the provisional alert the dispatcher acts on, or `None`
-/// for any other event type (belt-and-braces — it subscribes only to the one topic).
-pub fn alert_from_envelope(envelope: EventEnvelope) -> Option<PreliminaryAlertCreated> {
-    match envelope.payload {
-        DomainEvent::PreliminaryAlertCreated(alert) => Some(alert),
-        _ => None,
-    }
 }
 
 /// The dispatcher: holds the two publish seams and turns each provisional alert into
@@ -108,7 +97,7 @@ impl Dispatcher {
     /// Publishes the `SimulationJob` command to RabbitMQ first (the actual work
     /// dispatch), then emits the `SimulationRequested` audit event to Kafka — so a
     /// successful audit fact implies the job really was queued.
-    async fn process(&self, chain: Chain, alert: &PreliminaryAlertCreated) -> Disposition {
+    async fn process(&self, chain: Chain, alert: &PreliminaryAlertCreated) -> Handled {
         let (job, requested) = job_for_alert(chain, alert);
 
         // The command is the critical step. `publish_resilient` returns `false` for
@@ -124,10 +113,10 @@ impl Dispatcher {
         .await
         {
             return if self.shutdown.is_cancelled() {
-                Disposition::Abandon
+                Handled::Stop
             } else {
                 tracing::error!(alert_id = %alert.alert_id, "dropping un-queueable job (poison); skipping");
-                Disposition::Commit
+                Handled::Commit
             };
         }
 
@@ -145,115 +134,48 @@ impl Dispatcher {
         // wire — leave the offset so redelivery re-dispatches (idempotent) and
         // re-audits, rather than committing past an un-audited alert.
         if self.shutdown.is_cancelled() {
-            Disposition::Abandon
+            Handled::Stop
         } else {
-            Disposition::Commit
+            Handled::Commit
         }
     }
 
-    /// Drive the dispatcher off Kafka until shutdown or a fatal subscribe error.
-    /// For each `PreliminaryAlertCreated`: run `process`, and commit
-    /// the offset once the alert is dispatched. Continues the producer's distributed
-    /// trace across the broker (§19).
+    /// Drive the dispatcher off Kafka until shutdown or a fatal subscribe error, via
+    /// the shared [`run_consumer`] loop (subscribe, decode, trace, commit). The
+    /// dispatcher supplies only the per-alert decision ([`EventHandler`]).
     pub async fn run(self, consumer: StreamConsumer) -> Result<()> {
         let topic = consumed_topic();
-        consumer
-            .subscribe(&[topic.as_str()])
-            .with_context(|| format!("subscribing to {topic}"))?;
-        tracing::info!(%topic, "dispatcher subscribed");
-
-        loop {
-            let msg = tokio::select! {
-                biased;
-                () = self.shutdown.cancelled() => {
-                    tracing::info!("dispatcher stopping");
-                    return Ok(());
-                }
-                received = consumer.recv() => match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Kafka receive error");
-                        continue;
-                    }
-                },
-            };
-
-            // Continue the producer's trace as this alert's dispatch span parent.
-            let span = tracing::info_span!(
-                "dispatch_alert",
-                topic = msg.topic(),
-                partition = msg.partition(),
-                offset = msg.offset(),
-            );
-            propagation::set_parent_from_headers(&span, &header_carrier(&msg));
-
-            match self.handle_message(&msg).instrument(span).await {
-                Disposition::Commit => {
-                    if let Err(err) = consumer.commit_message(&msg, CommitMode::Async) {
-                        tracing::error!(error = %err, "offset commit failed");
-                    }
-                }
-                Disposition::Abandon => {
-                    // Shutting down before this alert was dispatched — stop without
-                    // committing, so redelivery on restart re-dispatches it.
-                    tracing::info!("dispatcher stopping (alert left for redelivery)");
-                    return Ok(());
-                }
-            }
-        }
+        let shutdown = self.shutdown.clone();
+        let backoff = self.publish_backoff;
+        run_consumer(
+            consumer,
+            &[topic.as_str()],
+            "dispatcher",
+            backoff,
+            self,
+            &shutdown,
+        )
+        .await
     }
+}
 
-    /// Decode one record and dispatch it, returning what to do with its offset. A
-    /// poison record (no payload / undecodable / wrong type) is skipped — committed
-    /// so it can't wedge the stream, the same discipline as the event-store consumer.
-    async fn handle_message(&self, msg: &rdkafka::message::BorrowedMessage<'_>) -> Disposition {
-        let Some(payload) = msg.payload() else {
-            tracing::error!("record has no payload; skipping");
-            return Disposition::Commit;
-        };
-        let envelope = match EventEnvelope::from_json_slice(payload) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                tracing::error!(error = %err, "undecodable event; skipping");
-                return Disposition::Commit;
-            }
-        };
+#[async_trait]
+impl EventHandler for Dispatcher {
+    /// Dispatch a `PreliminaryAlertCreated`; any other event type on the topic is a
+    /// no-op (belt-and-braces — the subscription is single-topic).
+    async fn handle(&self, envelope: EventEnvelope) -> Handled {
         let chain = envelope.chain;
-        let Some(alert) = alert_from_envelope(envelope) else {
-            // A type we don't act on slipped through the single-topic subscription.
-            tracing::warn!("unexpected event type on alert topic; skipping");
-            return Disposition::Commit;
-        };
-
-        self.process(chain, &alert).await
-    }
-}
-
-/// What to do with a consumed message's offset after handling it.
-enum Disposition {
-    /// Handled — advance the offset. Either the alert was dispatched (job queued
-    /// *and* audited) or the record was un-actionable poison skipped so it can't
-    /// wedge the stream.
-    Commit,
-    /// Shutting down before the alert was fully dispatched — leave the offset so
-    /// redelivery on restart re-dispatches it (at-least-once, §7).
-    Abandon,
-}
-
-/// Lift a record's headers into a [`HeaderCarrier`] (UTF-8 values only, as W3C
-/// `traceparent`/`tracestate` are). Mirrors the detection/event-store consumers.
-fn header_carrier(msg: &rdkafka::message::BorrowedMessage<'_>) -> HeaderCarrier {
-    let mut map = std::collections::HashMap::new();
-    if let Some(headers) = msg.headers() {
-        for header in headers.iter() {
-            if let Some(value) = header.value {
-                if let Ok(value) = std::str::from_utf8(value) {
-                    map.insert(header.key.to_owned(), value.to_owned());
-                }
+        match envelope.payload {
+            DomainEvent::PreliminaryAlertCreated(alert) => self.process(chain, &alert).await,
+            other => {
+                tracing::warn!(
+                    event = other.event_type(),
+                    "unexpected event on alert topic; skipping"
+                );
+                Handled::Commit
             }
         }
     }
-    HeaderCarrier::from_map(map)
 }
 
 #[cfg(test)]
@@ -320,11 +242,9 @@ mod tests {
         let dispatcher = Dispatcher::new(jobs.clone(), events.clone(), CancellationToken::new());
 
         let alert = an_alert();
-        assert!(
-            matches!(
-                dispatcher.process(Chain::ETHEREUM, &alert).await,
-                Disposition::Commit
-            ),
+        assert_eq!(
+            dispatcher.process(Chain::ETHEREUM, &alert).await,
+            Handled::Commit,
             "a fully dispatched alert is committable"
         );
 
@@ -361,11 +281,9 @@ mod tests {
         shutdown.cancel(); // so the retry loop gives up immediately
         let dispatcher = Dispatcher::new(Arc::new(DeadSink), events.clone(), shutdown);
 
-        assert!(
-            matches!(
-                dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
-                Disposition::Abandon
-            ),
+        assert_eq!(
+            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+            Handled::Stop,
             "a job left un-queued by shutdown must leave the offset for redelivery"
         );
         // The audit event must not be emitted for a job that was never queued.
@@ -397,32 +315,38 @@ mod tests {
             CancellationToken::new(),
         );
 
-        assert!(
-            matches!(
-                dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
-                Disposition::Commit
-            ),
+        assert_eq!(
+            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+            Handled::Commit,
             "a job that can never be queued is skipped, not retried forever"
         );
         // No audit fact for a job that was never queued.
         assert!(events.events.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn alert_from_envelope_decodes_only_preliminary_alerts() {
-        let alert_env = EventEnvelope::new(
-            Chain::ETHEREUM,
-            DomainEvent::PreliminaryAlertCreated(an_alert()),
-        );
-        assert!(alert_from_envelope(alert_env).is_some());
+    #[tokio::test]
+    async fn handle_dispatches_alerts_and_ignores_other_event_types() {
+        let jobs = Arc::new(RecordingJobSink::default());
+        let events = Arc::new(RecordingEventSink::default());
+        let dispatcher = Dispatcher::new(jobs.clone(), events.clone(), CancellationToken::new());
 
+        // A non-alert event on the topic is a committable no-op — nothing queued.
         let other = EventEnvelope::new(
             Chain::ETHEREUM,
             DomainEvent::BlockFinalized(events::chain::BlockFinalized {
                 block: events::primitives::BlockRef::new(1, Default::default()),
             }),
         );
-        assert!(alert_from_envelope(other).is_none());
+        assert_eq!(dispatcher.handle(other).await, Handled::Commit);
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+
+        // A provisional alert is dispatched: one job queued.
+        let alert_env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::PreliminaryAlertCreated(an_alert()),
+        );
+        assert_eq!(dispatcher.handle(alert_env).await, Handled::Commit);
+        assert_eq!(jobs.jobs.lock().unwrap().len(), 1);
     }
 
     #[test]

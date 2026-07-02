@@ -50,18 +50,41 @@
 //!   confirm/retract/finalize lifecycle lands correctly regardless of partition
 //!   arrival order. The read-model core the Postgres/ClickHouse store plugs into.
 //!
+//! **Persistence (§14, Sprint 6 t5) — the `simulation-projection` binary:**
+//! - [`store`] — the write-through seams behind the fold:
+//!   [`IncidentStore`](store::IncidentStore) (Postgres — the mutable in-flight-job +
+//!   confirmed-incident read model) and [`IncidentAnalytics`](store::IncidentAnalytics)
+//!   (ClickHouse — the append-only incident-analytics firehose).
+//! - [`ch_migrate`] — the ClickHouse migration runner for the analytics table (ported
+//!   from the event store); Postgres migrations live in `crates/db/migrations`, applied
+//!   by sqlx-cli.
+//! - [`projection_consumer`] — the [`ProjectionConsumer`](projection_consumer::ProjectionConsumer):
+//!   consume the result path, fold, and write through to both stores, at-least-once.
+//!
+//! **Reorg handling (§15, Sprint 6 t4):**
+//! - [`reorg`] — the two `BlockReverted` reactions: the worker-side generation check
+//!   ([`OrphanedBlocks`](reorg::OrphanedBlocks) + [`OrphanGuard`](reorg::OrphanGuard))
+//!   that cancels a resolved job for an orphaned block (§7), and the service-side
+//!   [`ReorgConsumer`](reorg::ReorgConsumer) that retracts incidents from orphaned
+//!   blocks via `IncidentRetracted` ([`plan_retractions`](reorg::plan_retractions) +
+//!   the [`IncidentIndex`](reorg::IncidentIndex) block→incident seam).
+//!
 //! - [`config`] — env-resolved [`Config`](config::Config), shared by both binaries.
 
 pub mod cache;
+pub mod ch_migrate;
 pub mod command;
 pub mod config;
 pub mod consumer;
 pub mod dispatcher;
 pub mod projection;
+pub mod projection_consumer;
 pub mod queue;
+pub mod reorg;
 pub mod resolver;
 pub mod result;
 pub mod simulator;
+pub mod store;
 pub mod topology;
 pub mod worker;
 

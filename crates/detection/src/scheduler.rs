@@ -53,14 +53,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use event_bus::{publish_resilient, EventSink};
+use event_bus::{header_carrier, publish_resilient, EventSink};
 use events::chain::BlockReverted;
 use events::primitives::Chain;
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::Headers;
 use rdkafka::{Message, Offset, TopicPartitionList};
-use telemetry::propagation::{self, HeaderCarrier};
+use telemetry::propagation;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -357,22 +356,6 @@ pub async fn run_committer(consumer: Arc<StreamConsumer>, mut done: mpsc::Receiv
             tracing::error!(error = %err, "offset commit failed");
         }
     }
-}
-
-/// Lift a record's headers into a [`HeaderCarrier`] (UTF-8 values only, as W3C
-/// `traceparent`/`tracestate` are). Mirrors the event-store consumer.
-fn header_carrier(msg: &rdkafka::message::BorrowedMessage<'_>) -> HeaderCarrier {
-    let mut map = std::collections::HashMap::new();
-    if let Some(headers) = msg.headers() {
-        for header in headers.iter() {
-            if let Some(value) = header.value {
-                if let Ok(value) = std::str::from_utf8(value) {
-                    map.insert(header.key.to_owned(), value.to_owned());
-                }
-            }
-        }
-    }
-    HeaderCarrier::from_map(map)
 }
 
 #[cfg(test)]

@@ -123,6 +123,23 @@ ch-migrate-down:
 ch-migrate-info:
     cargo run -p event-store -- migrate info
 
+# ── ClickHouse migrations (simulation incident analytics, §7/§14) ─
+# The simulation-projection binary owns its own ClickHouse schema (migrations under
+# crates/simulation/migrations, applied automatically on boot). These recipes drive
+# them explicitly, mirroring the event-store ones above.
+
+# Apply all pending simulation-analytics ClickHouse migrations
+sim-ch-migrate-up:
+    cargo run -p simulation --bin simulation-projection -- migrate up
+
+# Revert the last one (destructive — drops the incident_analytics table)
+sim-ch-migrate-down:
+    cargo run -p simulation --bin simulation-projection -- migrate down
+
+# Show simulation-analytics ClickHouse migration status
+sim-ch-migrate-info:
+    cargo run -p simulation --bin simulation-projection -- migrate info
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

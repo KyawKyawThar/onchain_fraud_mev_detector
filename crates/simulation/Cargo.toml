@@ -36,6 +36,15 @@ path = "src/main.rs"
 name = "simulation-worker"
 path = "src/bin/worker.rs"
 
+# The incident/job persistence consumer (Sprint 6 t5) — a separate binary so it
+# scales independently of the dispatcher + worker (it is a Kafka projection, not a
+# revm worker). Consumes the result-path events, folds them via the pure
+# `IncidentProjection`, and write-throughs to Postgres (mutable read model) +
+# ClickHouse (append-only analytics), §14.
+[[bin]]
+name = "simulation-projection"
+path = "src/bin/projection.rs"
+
 [dependencies]
 events = { workspace = true }
 # Shared Kafka producer seam (§20) — the dispatcher ships its `SimulationRequested`
@@ -75,6 +84,20 @@ tokio-reactor-trait = { workspace = true }
 revm = { workspace = true }
 rayon = { workspace = true }
 
+# Sprint 6 t5 — the projection consumer's persistence (§14). Postgres (via sqlx +
+# the shared `db` pool builder) is the mutable read model of in-flight jobs +
+# confirmed incidents; ClickHouse is the append-only incident-analytics firehose,
+# written RowBinary through the same `clickhouse` client the event store uses.
+# `secrecy` keeps the ClickHouse password out of `Debug`/logs (mirrors event-store);
+# `uuid` maps the `alert_id`/`incident_id` columns; `alloy-primitives` renders `B256`
+# tx/block hashes to hex for the stored rows (non-test code now needs it directly).
+db = { workspace = true }
+sqlx = { workspace = true }
+clickhouse = { workspace = true }
+secrecy = { workspace = true }
+uuid = { workspace = true }
+alloy-primitives = { workspace = true }
+
 [features]
 # Exposes `simulation::test_util` (recording sinks, canned scenarios + ack handle).
 # Enabled for this crate's own integration tests via the self dev-dependency below,
@@ -85,16 +108,17 @@ test-util = []
 # Self-dependency with `test-util` on, so the `tests/` integration crate sees
 # `simulation::test_util` (the in-crate unit tests get it under `cfg(test)`).
 simulation = { path = ".", features = ["test-util"] }
-# Only the tests construct on-chain addresses directly; non-test code reaches
-# alloy's `Address` through `events::primitives::AccountAddress`.
-alloy-primitives = { workspace = true }
-# The projection tests mint explicit envelope event ids to model redelivery.
-uuid = { workspace = true }
-# Live-broker integration test (`tests/topology.rs`, `#[ignore]`): spin a real
-# RabbitMQ in a container so the topology declaration is exercised against the
-# broker that actually enforces quorum-vs-priority, not just the arg builders.
+# `alloy-primitives` and `uuid` are also normal deps now (the store renders hashes
+# and maps id columns), so tests get them transitively — no separate dev entry.
+# Live-broker integration tests (`#[ignore]`): a real RabbitMQ for the `sim.jobs`
+# topology (`tests/topology.rs`, `tests/worker.rs`), a real Postgres + ClickHouse for
+# the projection store write-through (`tests/projection_store.rs`).
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["rabbitmq"] }
+testcontainers-modules = { workspace = true, features = [
+    "rabbitmq",
+    "postgres",
+    "clickhouse",
+] }
 
 [lints]
 workspace = true
