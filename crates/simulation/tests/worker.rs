@@ -21,6 +21,7 @@ use simulation::command::{job_for_alert, Priority, SimulationJob};
 use simulation::config::RabbitConfig;
 use simulation::consumer::{JobSource, RabbitJobSource};
 use simulation::queue::{JobSink, RabbitJobSink};
+use simulation::reorg::NeverOrphaned;
 use simulation::resolver::{JobResolver, UnresolvedJobResolver};
 use simulation::simulator::{MinProfit, RevmSimulator, Simulator};
 use simulation::test_util::{test_pool, EmptyScenarioResolver, RecordingEventSink};
@@ -116,6 +117,7 @@ fn worker(
 ) -> Worker {
     Worker::new(
         resolver,
+        Arc::new(NeverOrphaned),
         simulator,
         test_pool(),
         events,

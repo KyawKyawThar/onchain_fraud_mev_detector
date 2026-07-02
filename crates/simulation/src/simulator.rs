@@ -76,7 +76,7 @@
 
 use std::sync::Arc;
 
-use events::primitives::{AlertId, AlertKind, Severity};
+use events::primitives::{AlertId, AlertKind, BlockRef, Severity};
 use revm::bytecode::Bytecode;
 use revm::context::{ContextTr, TxEnv};
 use revm::database::{CacheDB, DatabaseRef, EmptyDB};
@@ -140,6 +140,12 @@ impl TryFrom<f64> for MinProfit {
 #[derive(Debug, Clone)]
 pub struct BlockParams {
     pub number: u64,
+    /// The forked block's hash — the reorg-safe identity of the block this scenario
+    /// was resolved against (§15). Not read by the EVM; carried so the worker's reorg
+    /// generation check can cancel a resolved job whose block was orphaned
+    /// ([`crate::reorg`]). The resolver stamps it from the block it forks; defaults to
+    /// [`B256::ZERO`] for scenarios that don't fork chain state (tests).
+    pub hash: B256,
     pub timestamp: u64,
     /// EIP-1559 base fee. Left `0` so a `gas_price = 0` bundle is always admissible
     /// (a non-zero base fee would reject it) — the engine measures value flow, not
@@ -156,6 +162,7 @@ impl Default for BlockParams {
     fn default() -> Self {
         Self {
             number: 0,
+            hash: B256::ZERO,
             timestamp: 0,
             basefee: 0,
             gas_limit: 30_000_000,
@@ -207,6 +214,15 @@ pub struct SimulationRequest {
     /// The on-chain tx hashes the alert implicated — the incident's `txs` (identity,
     /// not executed here; the executable bundle lives on the [`Scenario`]).
     pub txs: Vec<B256>,
+}
+
+impl SimulationRequest {
+    /// The block this scenario was resolved against, as a [`BlockRef`] — the identity
+    /// the worker's reorg generation check ([`crate::reorg`]) matches against the
+    /// orphaned-block set before simulating.
+    pub fn block_ref(&self) -> BlockRef {
+        BlockRef::new(self.block.number, self.block.hash)
+    }
 }
 
 /// How an alert is confirmed (§7 "what simulation confirms") — the strategy plus its

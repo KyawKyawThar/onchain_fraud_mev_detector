@@ -125,6 +125,18 @@ impl IncidentStatus {
             IncidentStatus::Retracted => 3,
         }
     }
+
+    /// The stable string this status is persisted as (Postgres `incidents.status`,
+    /// ClickHouse `incident_analytics.status`). Exhaustive, so a new lifecycle stage
+    /// can't silently persist as the wrong string.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            IncidentStatus::Unconfirmed => "unconfirmed",
+            IncidentStatus::Confirmed => "confirmed",
+            IncidentStatus::Finalized => "finalized",
+            IncidentStatus::Retracted => "retracted",
+        }
+    }
 }
 
 /// One incident's read-model row — the join of every result-path event that references
@@ -169,6 +181,23 @@ pub struct IncidentRecord {
 }
 
 impl IncidentRecord {
+    /// Event-time of the result that last set the monetary figures — the
+    /// last-writer-wins watermark the store persists so a re-projection can't let a
+    /// stale event overwrite newer numbers. Read by [`crate::store`].
+    pub(crate) fn figures_at(&self) -> DateTime<Utc> {
+        self.figures_at
+    }
+
+    /// Event-time watermark for the retraction reason, if retracted.
+    pub(crate) fn retracted_at(&self) -> Option<DateTime<Utc>> {
+        self.retracted_at
+    }
+
+    /// Event-time watermark for the finalized block, if finalized.
+    pub(crate) fn finalized_at(&self) -> Option<DateTime<Utc>> {
+        self.finalized_at
+    }
+
     /// Raise `status` to `new` iff it is strictly further along the lifecycle ladder.
     /// Returns whether the status actually advanced.
     fn advance_status(&mut self, new: IncidentStatus) -> bool {

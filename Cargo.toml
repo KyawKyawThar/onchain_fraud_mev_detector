@@ -161,6 +161,27 @@ tokio-stream = "0.1"
 secrecy = "0.10"
 subtle = "2"
 
+# Postgres (§14) — the mutable, transactional OLTP store for simulation's in-flight
+# jobs + confirmed incidents (Sprint 6 t5), and later intelligence/rule-engine/
+# notification/billing. sqlx is the async, compile-time-checked SQL toolkit: queries
+# are verified against the live schema at build time and the check is cached into the
+# committed `.sqlx/` dir so CI builds offline (`SQLX_OFFLINE=true`). `default-features
+# = false` then re-add only what we use — `runtime-tokio` (share the service runtime),
+# `tls-rustls` (pure-Rust TLS, same self-contained-image goal as rdkafka/alloy),
+# `postgres`, the `macros` (compile-time `query!`), `migrate` (the sqlx migration
+# machinery; the Postgres schema itself is applied by sqlx-cli via `just migrate-*`),
+# and the `uuid`/`chrono` type integrations for the id/timestamp columns. Version
+# tracks the installed sqlx-cli so the committed `.sqlx` cache format matches.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+
 # Property-based testing (§18, Sprint 4 task 4): generate the *whole value space*
 # of an input and assert an invariant holds across all of it, shrinking to a
 # minimal counterexample on failure. Used for the detector invariants (a planted

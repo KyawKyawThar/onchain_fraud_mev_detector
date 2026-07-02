@@ -5,9 +5,10 @@
 //!
 //! Split pure-decision / drain-loop like the dispatcher:
 //!
-//! - [`Worker::process`] is the **core**: resolve the job to a scenario, simulate it
-//!   on rayon, publish the result events, and return the [`Disposition`] — what to do
-//!   with the delivery. Testable against in-memory doubles with no broker and no EVM.
+//! - [`Worker::process`] is the **core**: resolve the job to a scenario, apply the
+//!   reorg generation check, simulate it on rayon, publish the result events, and
+//!   return the [`Disposition`] — what to do with the delivery. Testable against
+//!   in-memory doubles with no broker and no EVM.
 //! - [`Worker::run`] is the **drain loop**: pull a [`JobDelivery`] off a
 //!   [`JobSource`], run `process`, and settle the delivery (ack / requeue /
 //!   dead-letter). `select!` on the shutdown token for a graceful drain.
@@ -25,6 +26,10 @@
 //!   `dead_letter`. Quarantine to the DLX rather than loop. The quorum queue's
 //!   `x-delivery-limit` is the backstop for a worker that *crashes* mid-run (the job
 //!   redelivers, and after N failed deliveries dead-letters automatically).
+//! - **Reorg-cancelled** (the resolved block was orphaned, §15) → `ack`. The §7
+//!   "generation check on the consumer" ([`crate::reorg`]): the job is obsolete, not
+//!   poison, so it is dropped cleanly (no result published, no DLX noise) rather than
+//!   simulating an orphaned block into a phantom incident.
 //!
 //! ## revm on rayon (§17)
 //!
@@ -47,6 +52,7 @@ use crate::consumer::JobSource;
 // also what `process` returns — re-export it so `worker::Disposition` still resolves.
 pub use crate::consumer::Disposition;
 use crate::queue::PUBLISH_BACKOFF;
+use crate::reorg::OrphanGuard;
 use crate::resolver::JobResolver;
 use crate::result::events_for_outcome;
 use crate::simulator::{SimError, SimulationOutcome, SimulationRequest, Simulator};
@@ -69,6 +75,12 @@ pub struct Worker {
     /// Turns a queued command into a runnable scenario (event-store evidence +
     /// chain fork in production; a stub today — see [`crate::resolver`]).
     resolver: Arc<dyn JobResolver>,
+    /// The reorg generation check (§7, §15): after resolving a job, the worker cancels
+    /// it if its block was orphaned rather than simulating an orphaned block into a
+    /// phantom incident. Fed by each replica's `BlockReverted` consumer
+    /// ([`crate::reorg::run_revert_tracker`]); [`NeverOrphaned`](crate::reorg::NeverOrphaned)
+    /// disables it.
+    orphaned: Arc<dyn OrphanGuard>,
     /// The revm engine — runs on the rayon pool, never the reactor.
     simulator: Arc<dyn Simulator>,
     /// *The* worker pool: the shared rayon pool every simulation runs on (§17).
@@ -82,9 +94,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Build a worker over its seams and the shared rayon pool.
+    /// Build a worker over its seams and the shared rayon pool. `orphaned` is the reorg
+    /// generation check; pass [`NeverOrphaned`](crate::reorg::NeverOrphaned) to disable
+    /// cancellation.
     pub fn new(
         resolver: Arc<dyn JobResolver>,
+        orphaned: Arc<dyn OrphanGuard>,
         simulator: Arc<dyn Simulator>,
         pool: Arc<rayon::ThreadPool>,
         event_sink: Arc<dyn EventSink>,
@@ -92,6 +107,7 @@ impl Worker {
     ) -> Self {
         Self {
             resolver,
+            orphaned,
             simulator,
             pool,
             event_sink,
@@ -112,6 +128,21 @@ impl Worker {
                 return disposition;
             }
         };
+
+        // 1a. Reorg generation check (§7, §15): the job carries no block, but resolving
+        //     it revealed one. If that block was orphaned by a reorg, the job is
+        //     obsolete — drop it (ack, publish nothing) rather than simulate an orphaned
+        //     block into a phantom incident. Acking (not dead-lettering) because a
+        //     reorg-cancelled job is expected, not poison needing inspection.
+        let block = request.block_ref();
+        if self.orphaned.is_orphaned(&block) {
+            tracing::info!(
+                alert_id = %job.alert_id,
+                block = block.number,
+                "cancelling job for orphaned block (reorg); publishing no result"
+            );
+            return Disposition::Ack;
+        }
 
         // 2. Run revm on the rayon pool — CPU never on the reactor (§17).
         let outcome = match self.simulate(request).await {
@@ -213,9 +244,16 @@ mod tests {
     use events::DomainEvent;
 
     use crate::consumer::JobDelivery;
+    use crate::reorg::{NeverOrphaned, SharedOrphanedBlocks};
     use crate::resolver::{JobResolver, ResolveError};
-    use crate::simulator::{SimError, SimulationOutcome, SimulationRequest, Simulator};
+    use crate::simulator::{
+        BlockParams, SimError, SimulationOutcome, SimulationRequest, Simulator,
+    };
     use crate::test_util::{empty_request, sample_job, test_pool, AckRecorder, RecordingEventSink};
+
+    use events::chain::BlockReverted;
+    use events::primitives::BlockRef;
+    use revm::primitives::B256;
 
     /// A resolver that always returns a canned request, or a canned error.
     struct CannedResolver(Result<(), ResolveErrorKind>);
@@ -261,6 +299,7 @@ mod tests {
     ) -> Worker {
         let mut w = Worker::new(
             resolver,
+            Arc::new(NeverOrphaned),
             simulator,
             test_pool(),
             events,
@@ -349,6 +388,58 @@ mod tests {
         assert!(events.events().is_empty(), "neither fault publishes");
     }
 
+    /// A job whose resolved block was orphaned by a reorg is cancelled (§7, §15): the
+    /// worker acks it and publishes nothing, so no incident is created for an orphaned
+    /// block. The generation check runs *after* resolve (the job carries no block).
+    #[tokio::test]
+    async fn a_job_for_an_orphaned_block_is_cancelled_without_simulating() {
+        /// Resolves every job to a scenario stamped with a fixed block hash.
+        struct BlockResolver(B256);
+        #[async_trait]
+        impl JobResolver for BlockResolver {
+            async fn resolve(
+                &self,
+                job: &SimulationJob,
+            ) -> Result<SimulationRequest, ResolveError> {
+                let mut req = empty_request(job);
+                req.block = BlockParams {
+                    number: 100,
+                    hash: self.0,
+                    ..BlockParams::default()
+                };
+                Ok(req)
+            }
+        }
+
+        let hash = B256::repeat_byte(0xaa);
+        let orphaned = SharedOrphanedBlocks::new();
+        orphaned.record(&BlockReverted {
+            block: BlockRef::new(100, hash),
+            replaced_by: B256::repeat_byte(0xbb),
+        });
+
+        let events = Arc::new(RecordingEventSink::default());
+        let mut w = Worker::new(
+            Arc::new(BlockResolver(hash)),
+            orphaned,
+            Arc::new(CannedSimulator(Ok(true))),
+            test_pool(),
+            events.clone(),
+            CancellationToken::new(),
+        );
+        w.publish_backoff = Duration::from_millis(1);
+
+        assert_eq!(
+            w.process(&sample_job()).await,
+            Disposition::Ack,
+            "a reorg-cancelled job is acked (dropped), not dead-lettered"
+        );
+        assert!(
+            events.events().is_empty(),
+            "no result is published for an orphaned block"
+        );
+    }
+
     /// Shutdown interrupting the publish path requeues rather than acking past an
     /// unpublished result — the at-least-once guard.
     #[tokio::test]
@@ -357,6 +448,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut w = Worker::new(
             Arc::new(CannedResolver(Ok(()))),
+            Arc::new(NeverOrphaned),
             Arc::new(CannedSimulator(Ok(true))),
             test_pool(),
             events.clone(),

@@ -14,10 +14,15 @@ workspace = true
 # Swagger (§4 append API).
 events = { workspace = true, features = ["openapi"] }
 telemetry.workspace = true
+# Shared Kafka-backbone seam (§20): the resilient at-least-once consume loop
+# (`run_consumer`/`EventHandler`), so the store's Kafka ingest doesn't re-implement
+# the subscribe/decode/trace/commit mechanics.
+event-bus.workspace = true
 
 # Errors.
 anyhow.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
 
 # Async runtime + HTTP + storage + transport.
 tokio.workspace = true

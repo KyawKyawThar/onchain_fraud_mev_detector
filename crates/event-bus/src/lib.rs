@@ -1,34 +1,41 @@
-//! The shared event-publishing seam (§20) — how every *producer* service ships
-//! domain events onto the Kafka backbone.
+//! The shared Kafka-backbone seam (§20) — the one place every service's produce
+//! *and* consume policy lives, so neither can drift per-service.
 //!
-//! [`EventSink`] is the object-safe seam each producer's logic writes against, so
-//! the interesting parts (the ingestion reorg walk, the detection fan-out) can be
-//! unit-tested against an in-memory sink with no broker. [`KafkaEventSink`] is the
-//! production impl: it routes each envelope to its schema-derived topic
-//! ([`EventEnvelope::topic`]), keys it via [`EventEnvelope::partition_key`] (by
-//! chain for per-chain order, §20 — but the simulation result path by its
-//! incident business key so it dedups per incident, §7), and injects the current
-//! W3C trace context into
-//! the record headers so a downstream consumer continues the same distributed
-//! trace across the broker (§19).
+//! **Produce.** [`EventSink`] is the object-safe seam each producer's logic writes
+//! against, so the interesting parts (the ingestion reorg walk, the detection
+//! fan-out) can be unit-tested against an in-memory sink with no broker.
+//! [`KafkaEventSink`] is the production impl: it routes each envelope to its
+//! schema-derived topic ([`EventEnvelope::topic`]), keys it via
+//! [`EventEnvelope::partition_key`] (by chain for per-chain order, §20 — but the
+//! simulation result path by its incident business key so it dedups per incident,
+//! §7), and injects the current W3C trace context into the record headers so a
+//! downstream consumer continues the same distributed trace across the broker
+//! (§19). Delivery is at-least-once: [`publish_resilient`] retries a transient
+//! broker blip until it succeeds or shutdown, and only gives up on a permanent
+//! (encode) failure that can never succeed.
 //!
-//! Delivery is at-least-once: a send is awaited and a failure surfaces to the
-//! caller. The event store dedupes on `event_id` (§7), so a redelivered envelope
-//! is harmless — but a *dropped* one is a gap in the audit log, so
-//! [`publish_resilient`] retries a transient broker blip until it succeeds or
-//! shutdown, and only gives up on a permanent (encode) failure that can never
-//! succeed.
+//! **Consume.** [`run_consumer`] is the symmetric half: the resilient at-least-once
+//! consume loop every simple stream consumer (the simulation dispatcher, the reorg
+//! consumer, the event-store ingest) was hand-rolling — subscribe, shutdown-aware
+//! receive, decode-or-skip-poison, trace-span continuation, and commit-vs-retry —
+//! now in one tested place. A service supplies only its per-record decision as an
+//! [`EventHandler`] returning a [`Handled`] verdict; the loop owns everything else.
+//! (Detection's consumer is deliberately *not* built on this — it decodes to a
+//! domain command, hands off to a bounded channel, and commits in a separate stage
+//! to preserve per-chain ordering, a genuinely different shape.)
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use events::{EventEnvelope, EventError};
-use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::ClientConfig;
+use rdkafka::{ClientConfig, Message};
 use telemetry::propagation::{self, HeaderCarrier};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// How long a single produce may take before it's reported as failed. The record
 /// is also bounded by librdkafka's own `message.timeout.ms` (set below); this is
@@ -179,9 +186,174 @@ pub async fn publish_resilient(
     }
 }
 
+// ── Consume seam (the symmetric half of EventSink) ───────────────────────────
+
+/// What an [`EventHandler`] decided should happen to a consumed record's offset —
+/// the three outcomes the at-least-once consume policy needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
+    /// Fully handled (stored/published) *or* an un-actionable record deliberately
+    /// skipped — advance the offset either way, so a poison record can't wedge the
+    /// stream.
+    Commit,
+    /// A transient fault (a downstream store/broker blip): leave the offset, back
+    /// off, and let the broker redeliver. The handler must be idempotent, since a
+    /// redelivery re-runs it.
+    Retry,
+    /// Stop the consumer without committing (a graceful shutdown caught mid-work):
+    /// the record is left for redelivery when the service restarts.
+    Stop,
+}
+
+/// One service's per-record decision — the only part of a stream consumer that
+/// varies. Object-safe-friendly (used behind a generic in [`run_consumer`]); the
+/// handler sees a fully-decoded [`EventEnvelope`] (poison is skipped by the loop
+/// before it gets here) and returns a [`Handled`] verdict.
+#[async_trait]
+pub trait EventHandler: Send + Sync {
+    /// Handle one decoded event. `&self` (not `&mut`) because handlers hold their
+    /// collaborators behind `Arc`; concurrency, if any, is the handler's own.
+    async fn handle(&self, envelope: EventEnvelope) -> Handled;
+}
+
+/// Drive `handler` over `topics` until shutdown or a fatal subscribe error — the
+/// resilient, at-least-once consume loop shared by every simple stream consumer.
+///
+/// The loop owns the invariant mechanics so no service re-implements them: it
+/// subscribes to the explicit `topics` (a closed, schema-derived list fails loudly
+/// on drift, unlike a `mev.events.*` regex), prefers a pending shutdown over a ready
+/// message (`biased` select), **skips poison** (a record with no payload or
+/// undecodable bytes is committed-not-handled so it can't wedge the stream), and
+/// continues the producer's distributed trace by adopting the record headers as the
+/// handler span's parent (§19). The per-record [`Handled`] verdict then maps to the
+/// offset action: `Commit` advances it, `Retry` backs off `retry_backoff`
+/// (cancellably) and leaves it for redelivery, `Stop` returns without committing.
+///
+/// `name` labels the span + logs so multiple consumers in one process stay
+/// distinguishable. Manual commit (`enable.auto.commit=false`) on the passed
+/// consumer is what ties the offset to the handler's verdict — the caller builds the
+/// consumer with the group/offset-reset it wants.
+pub async fn run_consumer(
+    consumer: StreamConsumer,
+    topics: &[&str],
+    name: &str,
+    retry_backoff: Duration,
+    handler: impl EventHandler,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    consumer
+        .subscribe(topics)
+        .with_context(|| format!("{name}: subscribing to {topics:?}"))?;
+    tracing::info!(
+        consumer = name,
+        topics = topics.len(),
+        "consumer subscribed"
+    );
+
+    loop {
+        let msg = tokio::select! {
+            // Prefer shutdown so a pending cancel wins over a ready message.
+            biased;
+            () = shutdown.cancelled() => {
+                tracing::info!(consumer = name, "consumer stopping");
+                return Ok(());
+            }
+            received = consumer.recv() => match received {
+                Ok(msg) => msg,
+                Err(err) => {
+                    // Transport-level error (broker blip); log and keep going.
+                    tracing::error!(consumer = name, error = %err, "Kafka receive error");
+                    continue;
+                }
+            },
+        };
+
+        // Poison (no payload / undecodable / future schema version) can never be
+        // handled — commit to skip it so one bad record can't wedge the stream.
+        let Some(envelope) = decode(&msg, name) else {
+            commit(&consumer, &msg, name);
+            continue;
+        };
+
+        // Continue the producer's trace as this record's handling span parent (§19).
+        let span = tracing::info_span!(
+            "consume_record",
+            consumer = name,
+            topic = msg.topic(),
+            partition = msg.partition(),
+            offset = msg.offset(),
+        );
+        propagation::set_parent_from_headers(&span, &header_carrier(&msg));
+
+        match handler.handle(envelope).instrument(span).await {
+            Handled::Commit => commit(&consumer, &msg, name),
+            Handled::Retry => {
+                tracing::warn!(
+                    consumer = name,
+                    "transient fault; leaving offset, backing off"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(retry_backoff) => {}
+                }
+            }
+            Handled::Stop => {
+                tracing::info!(
+                    consumer = name,
+                    "consumer stopping (record left for redelivery)"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Decode one record into an [`EventEnvelope`], or `None` for poison (no payload or
+/// undecodable bytes — `from_json_slice` also rejects future schema versions, §2),
+/// logged so a skipped record is visible.
+fn decode(msg: &BorrowedMessage<'_>, name: &str) -> Option<EventEnvelope> {
+    let Some(payload) = msg.payload() else {
+        tracing::error!(consumer = name, "record has no payload; skipping");
+        return None;
+    };
+    match EventEnvelope::from_json_slice(payload) {
+        Ok(envelope) => Some(envelope),
+        Err(err) => {
+            tracing::error!(consumer = name, error = %err, "undecodable event; skipping");
+            None
+        }
+    }
+}
+
+/// Advance the offset for a handled record; a commit failure is logged, not fatal
+/// (the broker redelivers an uncommitted record).
+fn commit(consumer: &StreamConsumer, msg: &BorrowedMessage<'_>, name: &str) {
+    if let Err(err) = consumer.commit_message(msg, CommitMode::Async) {
+        tracing::error!(consumer = name, error = %err, "offset commit failed");
+    }
+}
+
+/// Lift a record's headers into a [`HeaderCarrier`] (UTF-8 string values only, as
+/// W3C `traceparent`/`tracestate` are), so a consumer can adopt the producer's trace
+/// context (§19). The consume-side counterpart to [`trace_headers`]; shared so every
+/// consumer (including detection's bespoke loop) reconstructs the carrier identically.
+pub fn header_carrier(msg: &BorrowedMessage<'_>) -> HeaderCarrier {
+    let mut map = std::collections::HashMap::new();
+    if let Some(headers) = msg.headers() {
+        for header in headers.iter() {
+            if let Some(value) = header.value {
+                if let Ok(value) = std::str::from_utf8(value) {
+                    map.insert(header.key.to_owned(), value.to_owned());
+                }
+            }
+        }
+    }
+    HeaderCarrier::from_map(map)
+}
+
 /// Serialize the current span's W3C trace context into Kafka record headers, so
 /// the consumer adopts it as the parent span and the trace continues unbroken
-/// across the broker (§19). Mirrors the event-store consumer's `header_carrier`.
+/// across the broker (§19). The produce-side counterpart to [`header_carrier`].
 fn trace_headers() -> OwnedHeaders {
     let mut carrier = HeaderCarrier::new();
     propagation::inject_current_context(&mut carrier);

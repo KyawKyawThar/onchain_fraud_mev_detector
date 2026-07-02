@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use events::primitives::Chain;
+use secrecy::SecretString;
 
 use crate::simulator::{MinProfit, SimLimits};
 
@@ -54,8 +55,13 @@ pub struct WorkerConfig {
 pub struct KafkaConfig {
     /// Comma-separated bootstrap brokers (`localhost:9092`).
     pub brokers: String,
-    /// Consumer-group id — restarts resume from committed offsets.
+    /// Consumer-group id for the dispatcher's `PreliminaryAlertCreated` consumer —
+    /// restarts resume from committed offsets.
     pub group_id: String,
+    /// Consumer-group id for the service-side reorg (retraction) consumer that reacts
+    /// to `BlockReverted` by emitting `IncidentRetracted` (§15). A distinct group so it
+    /// tracks the `BlockReverted` topic independently of the alert stream.
+    pub reorg_group_id: String,
 }
 
 /// How to reach RabbitMQ, plus the names of the `sim.jobs` topology the dispatcher
@@ -82,6 +88,53 @@ pub struct RabbitConfig {
     pub delivery_limit: i64,
 }
 
+/// Configuration for the `simulation-projection` binary (Sprint 6 t5) — the incident/
+/// job persistence consumer. Deliberately **separate** from [`Config`]: the projection
+/// is a Kafka→Postgres/ClickHouse consumer and needs neither RabbitMQ nor the revm
+/// worker tuning, so requiring `RABBITMQ_URL` etc. would be wrong. Each binary reads only
+/// the env it needs (§ the crate's config discipline).
+#[derive(Debug, Clone)]
+pub struct ProjectionConfig {
+    /// Comma-separated Kafka bootstrap brokers — the result-path event source.
+    pub kafka_brokers: String,
+    /// Consumer-group id; restarts resume from committed offsets.
+    pub group_id: String,
+    /// Postgres connection URL (`postgres://…`) for the mutable read model (§14).
+    pub postgres_url: String,
+    /// ClickHouse connection for the append-only analytics projection (§14).
+    pub clickhouse: ClickhouseConfig,
+}
+
+/// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base URL plus
+/// user/password/database set separately, so they are kept apart (mirrors event-store).
+/// The password is [`SecretString`] so `Debug` redacts it and an explicit
+/// `expose_secret()` is required at the use site.
+#[derive(Debug, Clone)]
+pub struct ClickhouseConfig {
+    /// HTTP-interface base URL, e.g. `http://127.0.0.1:8123` (no creds, no db).
+    pub url: String,
+    pub user: String,
+    pub password: SecretString,
+    pub database: String,
+}
+
+impl ProjectionConfig {
+    /// Resolve from the environment, erroring on anything missing (fail fast at boot).
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            kafka_brokers: env("KAFKA_BROKERS")?,
+            group_id: env_or("SIMULATION_PROJECTION_KAFKA_GROUP", "simulation-projection"),
+            postgres_url: env("DATABASE_URL")?,
+            clickhouse: ClickhouseConfig {
+                url: env("CLICKHOUSE_HTTP_URL")?,
+                user: env("CLICKHOUSE_USER")?,
+                password: SecretString::from(env("CLICKHOUSE_PASSWORD")?),
+                database: env("CLICKHOUSE_DB")?,
+            },
+        })
+    }
+}
+
 impl Config {
     /// Resolve config from the process environment, erroring on anything missing or
     /// malformed (fail fast at boot rather than at first alert).
@@ -91,6 +144,7 @@ impl Config {
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
                 group_id: env_or("SIMULATION_KAFKA_GROUP", "simulation"),
+                reorg_group_id: env_or("SIMULATION_REORG_KAFKA_GROUP", "simulation-reorg"),
             },
             rabbitmq: RabbitConfig {
                 url: env("RABBITMQ_URL")?,
