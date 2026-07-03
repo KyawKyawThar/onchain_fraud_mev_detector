@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO attributions (incident_id, entity_id, confidence, evidence, attributed_at)\n             VALUES ($1, $2, $3, $4, $5)\n             ON CONFLICT (incident_id, entity_id) DO UPDATE SET\n                 confidence    = EXCLUDED.confidence,\n                 evidence      = EXCLUDED.evidence,\n                 attributed_at = EXCLUDED.attributed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Float8",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a6cc36679770cbd98f1ca7879f6e2f89ec164e235a012dc7d6202220daa6912"
+}

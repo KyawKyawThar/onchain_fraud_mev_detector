@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE entities\n             SET status = 'absorbed', absorbed_into = $2, version = version + 1,\n                 updated_at = now()\n             WHERE entity_id = $1 AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "823147dcdcb5a0491a38d6ba83873bf84a0b4a14a664516bcea359adb1c0ea12"
+}

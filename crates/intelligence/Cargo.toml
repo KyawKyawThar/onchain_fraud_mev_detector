@@ -1,0 +1,76 @@
+[package]
+name = "intelligence"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Intelligence service (§8) — the moat: labels, entity clustering, attribution,
+# risk scores, sanctions. Sprint 7 t1 builds its *data-store layer* (§14), each
+# store behind an object-safe seam so the consumers landing in t2–t5 are tested
+# against in-memory doubles:
+#
+#   `store`     — Postgres system of record: labels with provenance (conflicting
+#                 labels coexist, §8.1), versioned entities + membership (§8.2),
+#                 attribution records, sanctions lists (§8.5).
+#   `cache`     — the Redis hot-path label/score cache (TTL-backed, evicted on
+#                 update) serving the synchronous screening path (§11).
+#   `adjacency` — the append-only ClickHouse address graph the hop queries walk,
+#                 degree-capped at hub nodes (§8.2 — critical).
+#
+# The Kafka consumer (attribution on IncidentCreated, t4), label seeding (t2),
+# clustering (t3) and the per-entity merge actor (t5) build on these seams.
+
+[[bin]]
+name = "intelligence"
+path = "src/main.rs"
+
+[dependencies]
+events = { workspace = true }
+telemetry = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Postgres (via the shared `db` pool builder + sqlx compile-checked queries) is
+# the mutable, transactional system of record (§14); ClickHouse holds the
+# append-only adjacency graph; Redis is the hot cache. `secrecy` keeps the
+# ClickHouse/Redis credentials out of `Debug`/logs (mirrors event-store);
+# `alloy-primitives` renders `Address` to the stored 0x-hex form.
+db = { workspace = true }
+ch-migrate = { workspace = true }
+sqlx = { workspace = true }
+clickhouse = { workspace = true }
+redis = { workspace = true }
+secrecy = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[features]
+# Exposes `intelligence::test_util` (in-memory store/cache doubles) to this
+# crate's own integration tests and, later, to the t2–t5 consumers' tests.
+test-util = []
+
+[dev-dependencies]
+# Property tests (§18): the address_key encode/decode bijection over the whole
+# address space.
+proptest = { workspace = true }
+# Self-dependency with `test-util` on, so `tests/` sees the in-memory doubles.
+intelligence = { path = ".", features = ["test-util"] }
+# Live-store integration tests (`#[ignore]`): real Postgres, Redis and ClickHouse
+# via throwaway containers, run by `just test-integration`.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = [
+    "postgres",
+    "redis",
+    "clickhouse",
+] }
+
+[lints]
+workspace = true

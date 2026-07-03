@@ -56,7 +56,9 @@ impl BlockRef {
 /// form, so a consumer that needs the variant as a `&'static str` (e.g. a persistence
 /// projection stamping it into a column) gets it derive-driven — guaranteed to stay in
 /// sync with the variants, no hand-rolled match to drift (§2, same pattern as `EventFamily`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr, strum::EnumIter,
+)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -72,7 +74,9 @@ pub enum AlertKind {
 
 /// Coarse incident severity, set when simulation confirms an incident (§7). Carries the
 /// same derive-driven `&'static str` mapping as [`AlertKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr, strum::EnumIter,
+)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]

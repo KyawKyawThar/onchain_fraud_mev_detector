@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT incident_id, entity_id, confidence, evidence, attributed_at\n             FROM attributions WHERE incident_id = $1 ORDER BY entity_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "incident_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attributions",
+            "name": "incident_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "entity_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attributions",
+            "name": "entity_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "confidence",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "attributions",
+            "name": "confidence"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "evidence",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "attributions",
+            "name": "evidence"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "attributed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "attributions",
+            "name": "attributed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0d0a8fd3837628533abc72f4ba976475cdf263dc303fd1dae31c1dc3b4eb3053"
+}

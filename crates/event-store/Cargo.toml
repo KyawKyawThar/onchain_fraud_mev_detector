@@ -14,6 +14,9 @@ workspace = true
 # Swagger (§4 append API).
 events = { workspace = true, features = ["openapi"] }
 telemetry.workspace = true
+# Shared ClickHouse migration runner; this service binds it to its own
+# `schema_migrations` table (see src/migrate.rs).
+ch-migrate = { workspace = true }
 # Shared Kafka-backbone seam (§20): the resilient at-least-once consume loop
 # (`run_consumer`/`EventHandler`), so the store's Kafka ingest doesn't re-implement
 # the subscribe/decode/trace/commit mechanics.

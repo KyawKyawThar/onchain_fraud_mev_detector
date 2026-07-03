@@ -176,7 +176,8 @@ async fn analytics_rows_append_and_aggregate_by_kind() {
         .with_database("default");
 
     // Apply the analytics migration, then append a few immutable rows.
-    simulation::ch_migrate::run(&client)
+    simulation::ch_migrate::MIGRATOR
+        .run(&client)
         .await
         .expect("apply ClickHouse migrations");
     let analytics = ClickhouseAnalytics::new(client.clone());

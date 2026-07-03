@@ -140,6 +140,26 @@ sim-ch-migrate-down:
 sim-ch-migrate-info:
     cargo run -p simulation --bin simulation-projection -- migrate info
 
+# ── ClickHouse migrations (intelligence adjacency graph, §8/§14) ──
+# The intelligence binary owns its own ClickHouse schema (migrations under
+# crates/intelligence/migrations). Same pattern as the two blocks above.
+
+# Apply all pending intelligence-adjacency ClickHouse migrations
+intel-ch-migrate-up:
+    cargo run -p intelligence -- migrate up
+
+# Revert the last one (destructive — drops the address_adjacency table)
+intel-ch-migrate-down:
+    cargo run -p intelligence -- migrate down
+
+# Show intelligence-adjacency ClickHouse migration status
+intel-ch-migrate-info:
+    cargo run -p intelligence -- migrate info
+
+# Probe all three intelligence stores (Postgres schema, Redis, ClickHouse)
+intel-ping:
+    cargo run -p intelligence -- ping
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

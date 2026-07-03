@@ -92,6 +92,7 @@ rayon = { workspace = true }
 # `uuid` maps the `alert_id`/`incident_id` columns; `alloy-primitives` renders `B256`
 # tx/block hashes to hex for the stored rows (non-test code now needs it directly).
 db = { workspace = true }
+ch-migrate = { workspace = true }
 sqlx = { workspace = true }
 clickhouse = { workspace = true }
 secrecy = { workspace = true }
@@ -105,6 +106,8 @@ alloy-primitives = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+# `EnumIter` iteration in the wire-string drift tests (exhaustive over variants).
+strum = { workspace = true }
 # Self-dependency with `test-util` on, so the `tests/` integration crate sees
 # `simulation::test_util` (the in-crate unit tests get it under `cfg(test)`).
 simulation = { path = ".", features = ["test-util"] }

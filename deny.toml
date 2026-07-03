@@ -33,6 +33,10 @@ allow = [
   # (webpki-root-certs) reqwest's rustls TLS pulls in for the ingestion RPC
   # pool (§5). Permissive, no copyleft on our code.
   "CDLA-Permissive-2.0",
+  # Boost Software License — permissive, OSI-approved/FSF-free. Covers
+  # xxhash-rust, the hash the redis client uses for cluster slot mapping (§8
+  # intelligence hot cache).
+  "BSL-1.0",
 ]
 confidence-threshold = 0.8
 # Our own crates are `license = "proprietary"` + `publish = false`; ignore them.
