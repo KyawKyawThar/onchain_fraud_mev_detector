@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE entity_addresses SET entity_id = $1 WHERE entity_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "03df4533f2ef82bdc64808169a17b5364bd7543d8394a5b1c40790530ef7ee0f"
+}

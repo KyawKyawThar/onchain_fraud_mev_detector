@@ -14,6 +14,11 @@ publish = false
 events    = { path = "crates/events" }
 telemetry = { path = "crates/telemetry" }
 db        = { path = "crates/db" }
+# Shared ClickHouse migration runner (§4/§14): one `Migrator` implementation
+# (apply/revert/status + the `migrate` CLI arm, with fail-fast set validation)
+# that event-store, simulation and intelligence each bind to their OWN
+# bookkeeping table + migration set — the runner is shared, the schemas are not.
+ch-migrate = { path = "crates/ch-migrate" }
 # Shared Kafka *producer* seam (§20): the `EventSink` trait + `KafkaEventSink` +
 # the at-least-once `publish_resilient` policy, depended on by every event
 # producer (ingestion, detection, …) so the producer config lives in one place.
@@ -41,6 +46,11 @@ demo-detector     = { path = "crates/demo-detector" }
 # `DomainEvent` and never touches the event store — only its result re-enters the
 # backbone — so it lives here, not in `events`.
 simulation = { path = "crates/simulation" }
+# Intelligence service (§8) — the moat. Sprint 7 t1 builds its data-store layer:
+# Postgres (labels w/ provenance, versioned entities, attribution, sanctions),
+# the Redis hot-path label/score cache, and the ClickHouse address-adjacency
+# graph (§14). The event consumer + clustering land in t2–t5 on top of these seams.
+intelligence = { path = "crates/intelligence" }
 
 # Errors.
 anyhow = "1"
@@ -180,6 +190,19 @@ sqlx = { version = "0.9", default-features = false, features = [
     "chrono",
     "macros",
     "migrate",
+] }
+
+# Redis (§8, §14) — the intelligence service's hot-path label/score cache
+# (TTL-backed, evicted on update) so the synchronous screening path (§11) never
+# touches Postgres. `default-features = false` drops the acl/streams/geospatial/
+# script/num-bigint extras we don't use; re-added are only `tokio-comp` (share the
+# service runtime — it pulls the async `aio` core) and `connection-manager` (a
+# self-reconnecting multiplexed connection, so a Redis blip is a retried command,
+# not a dead service). No TLS subtree for the password-auth'd dev topology
+# (`rediss://` in production would add `tls-rustls` here, mirroring sqlx/alloy).
+redis = { version = "1.3", default-features = false, features = [
+    "tokio-comp",
+    "connection-manager",
 ] }
 
 # Property-based testing (§18, Sprint 4 task 4): generate the *whole value space*

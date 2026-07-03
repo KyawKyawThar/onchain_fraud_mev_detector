@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO labels (label_id, address, kind, value, confidence, source,\n                                 source_detail, created_at, valid_until)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n             ON CONFLICT (label_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Float8",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4b53280fc4278da29177fc70b654cdbbc4f33c9f50ad32b528c897cfaae30e22"
+}

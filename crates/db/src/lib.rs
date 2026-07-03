@@ -46,3 +46,52 @@ pub async fn connect_with(url: &str, max_connections: u32) -> Result<PgPool> {
     tracing::info!(max_connections, "Postgres connection pool ready");
     Ok(pool)
 }
+
+/// Whether a Postgres error is a **permanent** (never-succeeds-on-retry) fault
+/// rather than a transient one — the shared half of every service's
+/// retry-vs-skip decision (`is_transient()` on its typed store error), kept
+/// here so the classification cannot drift between services: the same fault
+/// must not wedge one consumer's stream while another skips it (§4).
+///
+/// Permanent means an our-side bug that fails identically on every retry — a
+/// value that can't be encoded, a column/type the query names that the schema
+/// doesn't have, or a protocol/argument/configuration error. Everything else
+/// (I/O, pool timeouts, a closed pool, a server-side `Database` error) is
+/// transient and retried. A new `sqlx::Error` variant defaults to transient
+/// (retry), the safe choice for at-least-once durability.
+pub fn is_permanent(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Encode(_)
+            | sqlx::Error::Decode(_)
+            | sqlx::Error::ColumnDecode { .. }
+            | sqlx::Error::TypeNotFound { .. }
+            | sqlx::Error::ColumnNotFound(_)
+            | sqlx::Error::ColumnIndexOutOfBounds { .. }
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::InvalidArgument(_)
+            | sqlx::Error::Configuration(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retry/skip contract every service's `is_transient()` leans on:
+    /// I/O/pool/server faults retry; our-side encode/decode/schema bugs don't.
+    #[test]
+    fn classifies_permanent_vs_transient() {
+        assert!(!is_permanent(&sqlx::Error::PoolClosed));
+        assert!(!is_permanent(&sqlx::Error::PoolTimedOut));
+        assert!(!is_permanent(&sqlx::Error::WorkerCrashed));
+
+        assert!(is_permanent(&sqlx::Error::Decode("bad".into())));
+        assert!(is_permanent(&sqlx::Error::Encode("bad".into())));
+        assert!(is_permanent(&sqlx::Error::ColumnNotFound("nope".into())));
+        assert!(is_permanent(&sqlx::Error::TypeNotFound {
+            type_name: "x".into()
+        }));
+        assert!(is_permanent(&sqlx::Error::Protocol("bad".into())));
+    }
+}

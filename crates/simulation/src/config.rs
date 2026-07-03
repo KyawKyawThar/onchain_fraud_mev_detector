@@ -100,7 +100,9 @@ pub struct ProjectionConfig {
     /// Consumer-group id; restarts resume from committed offsets.
     pub group_id: String,
     /// Postgres connection URL (`postgres://…`) for the mutable read model (§14).
-    pub postgres_url: String,
+    /// Secret — the URL embeds the password, so `Debug` redacts it and the use
+    /// site must `expose_secret()` (same treatment as the ClickHouse password).
+    pub postgres_url: SecretString,
     /// ClickHouse connection for the append-only analytics projection (§14).
     pub clickhouse: ClickhouseConfig,
 }
@@ -124,7 +126,7 @@ impl ProjectionConfig {
         Ok(Self {
             kafka_brokers: env("KAFKA_BROKERS")?,
             group_id: env_or("SIMULATION_PROJECTION_KAFKA_GROUP", "simulation-projection"),
-            postgres_url: env("DATABASE_URL")?,
+            postgres_url: SecretString::from(env("DATABASE_URL")?),
             clickhouse: ClickhouseConfig {
                 url: env("CLICKHOUSE_HTTP_URL")?,
                 user: env("CLICKHOUSE_USER")?,

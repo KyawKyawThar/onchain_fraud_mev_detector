@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, list_name, entry, listed_at\n             FROM sanctions WHERE address = $1 ORDER BY list_name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sanctions",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "list_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sanctions",
+            "name": "list_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "entry",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sanctions",
+            "name": "entry"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "listed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sanctions",
+            "name": "listed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "6979951c1a9d57ae3f72ee66e6802f923cd501c565056de68ea82d868fc1e5cd"
+}

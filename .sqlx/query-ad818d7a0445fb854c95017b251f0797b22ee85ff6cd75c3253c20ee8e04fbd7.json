@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO sanctions (address, list_name, entry, listed_at, imported_at)\n               SELECT t.address, t.list_name, t.entry, t.listed_at, now()\n               FROM UNNEST($1::text[], $2::text[], $3::text[], $4::timestamptz[])\n                    AS t(address, list_name, entry, listed_at)\n               ON CONFLICT (address, list_name) DO UPDATE SET\n                   entry       = EXCLUDED.entry,\n                   listed_at   = EXCLUDED.listed_at,\n                   imported_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TimestamptzArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad818d7a0445fb854c95017b251f0797b22ee85ff6cd75c3253c20ee8e04fbd7"
+}

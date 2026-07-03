@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None => serve(cfg, client).await,
-        Some("migrate") => migrate_cli(&client, args.next().as_deref()).await,
+        Some("migrate") => {
+            migrate::MIGRATOR
+                .cli(&client, args.next().as_deref())
+                .await
+        }
         Some("provision-topics") => {
             kafka::ensure_topics(&cfg.kafka).await?;
             println!("✅ provision-topics: Kafka topics ensured");
@@ -54,7 +58,8 @@ async fn main() -> Result<()> {
 /// server together until shutdown.
 async fn serve(cfg: config::Config, client: Client) -> Result<()> {
     // Bring the schema up to date before accepting any writes.
-    migrate::run(&client)
+    migrate::MIGRATOR
+        .run(&client)
         .await
         .context("running ClickHouse migrations")?;
     tracing::info!(
@@ -123,35 +128,6 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
     let consumer_result = consumer_task.await.context("consumer task panicked")?;
     tracing::info!("event-store shut down");
     consumer_result.context("Kafka consumer exited with error")
-}
-
-/// Drive ClickHouse migrations explicitly (`event-store migrate up|down|info`),
-/// then exit. Mirrors the sqlx/Postgres `just migrate-*` recipes.
-async fn migrate_cli(client: &Client, action: Option<&str>) -> Result<()> {
-    match action {
-        Some("up") => {
-            let applied = migrate::run(client).await.context("migrate up")?;
-            if applied.is_empty() {
-                println!("✅ migrate up: already up to date");
-            } else {
-                println!("✅ migrate up: applied {}", applied.join(", "));
-            }
-        }
-        Some("down") => match migrate::revert_last(client).await.context("migrate down")? {
-            Some(version) => println!("⚠️  migrate down: reverted {version}"),
-            None => println!("migrate down: nothing to revert"),
-        },
-        Some("info") => {
-            let statuses = migrate::status(client).await.context("migrate info")?;
-            println!("ClickHouse migrations:");
-            for status in statuses {
-                let mark = if status.applied { "applied" } else { "pending" };
-                println!("  [{mark}] {}", status.version);
-            }
-        }
-        other => bail!("unknown migrate action {other:?}; expected up, down, or info"),
-    }
-    Ok(())
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM — the signals a

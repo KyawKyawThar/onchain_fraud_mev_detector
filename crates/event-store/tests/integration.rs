@@ -128,7 +128,10 @@ async fn append_persists_and_round_trips_every_event() {
         .expect("clickhouse port");
 
     let store = store_for(port);
-    migrate::run(store.client()).await.expect("migrate");
+    migrate::MIGRATOR
+        .run(store.client())
+        .await
+        .expect("migrate");
 
     let mut want = sample_events();
     store.append_batch(&want).await.expect("append");
@@ -159,7 +162,10 @@ async fn query_api_finds_events_by_incident_address_and_window() {
         .expect("clickhouse port");
 
     let store = store_for(port);
-    migrate::run(store.client()).await.expect("migrate");
+    migrate::MIGRATOR
+        .run(store.client())
+        .await
+        .expect("migrate");
 
     let at = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
     let incident = IncidentId(Uuid::from_u128(0x5151));
@@ -397,7 +403,10 @@ async fn event_published_to_kafka_lands_in_store() {
     );
 
     let store = store_for(ch_port);
-    migrate::run(store.client()).await.expect("migrate");
+    migrate::MIGRATOR
+        .run(store.client())
+        .await
+        .expect("migrate");
 
     // Mirror production boot order: provision the topology first, so the topics
     // exist before either the producer sends or the consumer's explicit

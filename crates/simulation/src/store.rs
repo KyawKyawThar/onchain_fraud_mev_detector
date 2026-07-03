@@ -46,7 +46,7 @@ use crate::projection::IncidentRecord;
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     /// A Postgres round-trip failed. Usually transient (connection/pool/server), but an
-    /// encoding/decoding/schema fault ([`is_permanent_pg`]) is a bug that fails identically
+    /// encoding/decoding/schema fault ([`db::is_permanent`]) is a bug that fails identically
     /// on every retry.
     #[error("postgres write failed")]
     Postgres(#[from] sqlx::Error),
@@ -61,34 +61,15 @@ impl PersistError {
     /// Whether retrying the same write could plausibly succeed later. A transient fault
     /// (I/O, pool, server) is redelivered; a permanent one (a programming/encoding/schema
     /// bug that will fail identically every time) is skipped so it can't wedge the stream
-    /// (§4). Same retry-vs-skip contract as [`event-store`'s `StoreError`](../../event-store/src/store.rs).
+    /// (§4). Postgres faults classify through the shared [`db::is_permanent`] so the
+    /// decision can't drift across services; same retry-vs-skip contract as
+    /// [`event-store`'s `StoreError`](../../event-store/src/store.rs).
     pub fn is_transient(&self) -> bool {
         match self {
             PersistError::Clickhouse(_) => true,
-            PersistError::Postgres(err) => !is_permanent_pg(err),
+            PersistError::Postgres(err) => !db::is_permanent(err),
         }
     }
-}
-
-/// Whether a Postgres error is a permanent (never-succeeds-on-retry) fault rather than a
-/// transient one. These are our-side bugs — a value that can't be encoded, a column/type the
-/// query names that the schema doesn't have, or a protocol/argument error — so redelivering
-/// the identical row would loop forever. Everything else (I/O, pool timeouts, a closed pool,
-/// a server-side `Database` error) is transient and retried. A new `sqlx::Error` variant
-/// defaults to transient (retry), the safe choice for at-least-once durability.
-fn is_permanent_pg(err: &sqlx::Error) -> bool {
-    matches!(
-        err,
-        sqlx::Error::Encode(_)
-            | sqlx::Error::Decode(_)
-            | sqlx::Error::ColumnDecode { .. }
-            | sqlx::Error::TypeNotFound { .. }
-            | sqlx::Error::ColumnNotFound(_)
-            | sqlx::Error::ColumnIndexOutOfBounds { .. }
-            | sqlx::Error::Protocol(_)
-            | sqlx::Error::InvalidArgument(_)
-            | sqlx::Error::Configuration(_)
-    )
 }
 
 /// Which point of a job's lifecycle a [`JobUpdate`] records. Derived directly from the
@@ -395,24 +376,14 @@ mod tests {
     /// `#[serde(rename_all)]`) ever drifting apart.
     #[test]
     fn kind_and_severity_strings_match_the_serde_wire_form() {
-        for kind in [
-            AlertKind::Sandwich,
-            AlertKind::Arbitrage,
-            AlertKind::Liquidation,
-            AlertKind::Flashloan,
-            AlertKind::Rugpull,
-            AlertKind::WashTrading,
-            AlertKind::AddressPoisoning,
-        ] {
+        use strum::IntoEnumIterator;
+        // Exhaustive by construction (EnumIter): a newly added variant is
+        // covered automatically instead of silently missing from a hand list.
+        for kind in AlertKind::iter() {
             let wire = serde_json::to_string(&kind).unwrap();
             assert_eq!(wire, format!("\"{}\"", <&str>::from(kind)));
         }
-        for sev in [
-            Severity::Low,
-            Severity::Medium,
-            Severity::High,
-            Severity::Critical,
-        ] {
+        for sev in Severity::iter() {
             let wire = serde_json::to_string(&sev).unwrap();
             assert_eq!(wire, format!("\"{}\"", <&str>::from(sev)));
         }

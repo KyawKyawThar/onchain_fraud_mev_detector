@@ -21,6 +21,7 @@
 use anyhow::{bail, Context, Result};
 use clickhouse::Client;
 use event_bus::PUBLISH_BACKOFF;
+use secrecy::ExposeSecret;
 use simulation::ch_migrate;
 use simulation::config::ProjectionConfig;
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
@@ -44,7 +45,11 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None => run(cfg, client).await,
-        Some("migrate") => migrate_cli(&client, args.next().as_deref()).await,
+        Some("migrate") => {
+            ch_migrate::MIGRATOR
+                .cli(&client, args.next().as_deref())
+                .await
+        }
         Some(other) => bail!(
             "unknown argument {other:?}; expected `migrate up|down|info`, or no args to run the consumer"
         ),
@@ -62,12 +67,13 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     // Bring the analytics schema up to date before writing (Postgres schema is applied by
     // sqlx-cli via `just migrate-*` / the migrate.yml workflow — the same split as the
     // event store: schema is an operational step, distinct from running the service).
-    ch_migrate::run(&client)
+    ch_migrate::MIGRATOR
+        .run(&client)
         .await
         .context("running ClickHouse analytics migrations")?;
 
     // Connect the two stores; a bad URL / unreachable database fails fast here at boot.
-    let pool = db::connect(&cfg.postgres_url)
+    let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
     let store = Arc::new(PgIncidentStore::new(pool));
@@ -96,38 +102,6 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         .context("projection consumer exited with error")?;
 
     tracing::info!("simulation projection consumer shut down");
-    Ok(())
-}
-
-/// Drive the ClickHouse analytics migrations explicitly, then exit. Mirrors event-store's
-/// `migrate` subcommand.
-async fn migrate_cli(client: &Client, action: Option<&str>) -> Result<()> {
-    match action {
-        Some("up") => {
-            let applied = ch_migrate::run(client).await.context("migrate up")?;
-            if applied.is_empty() {
-                println!("✅ migrate up: already up to date");
-            } else {
-                println!("✅ migrate up: applied {}", applied.join(", "));
-            }
-        }
-        Some("down") => match ch_migrate::revert_last(client)
-            .await
-            .context("migrate down")?
-        {
-            Some(version) => println!("⚠️  migrate down: reverted {version}"),
-            None => println!("migrate down: nothing to revert"),
-        },
-        Some("info") => {
-            let statuses = ch_migrate::status(client).await.context("migrate info")?;
-            println!("ClickHouse (simulation analytics) migrations:");
-            for status in statuses {
-                let mark = if status.applied { "applied" } else { "pending" };
-                println!("  [{mark}] {}", status.version);
-            }
-        }
-        other => bail!("unknown migrate action {other:?}; expected up, down, or info"),
-    }
     Ok(())
 }
 

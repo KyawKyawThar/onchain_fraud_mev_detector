@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE labels SET revoked_at = $2, revocation_reason = $3\n             WHERE label_id = $1 AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9b8d752a27172b9a8dae86ed2a5660c62c3e87ca75e3a3541a5ad2e9624ef2e5"
+}
