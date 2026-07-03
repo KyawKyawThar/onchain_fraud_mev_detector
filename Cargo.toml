@@ -68,6 +68,10 @@ strum = { version = "0.27", features = ["derive"] }
 # audit identifier where collision-resistance matters. Pure-Rust, no system
 # deps (keeps the self-contained-image goal). Hex-encoded via alloy's `hex`.
 sha2 = "0.10"
+# RFC-4180 CSV for the §8.1 public label feeds (Etherscan-style tag exports,
+# Sprint 7 t2): name tags legitimately contain commas, so quoted CSV is parsed
+# properly rather than split on ','. Tiny, boring, no optional features.
+csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # alloy is the project's chosen Ethereum stack (§21) — use its type-safe

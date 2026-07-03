@@ -417,6 +417,108 @@ async fn hot_cache_round_trips_expires_and_evicts() {
         None,
         "TTL reaped the entry"
     );
+
+    // evict_many (the pipelined seed-import path) drops every listed address
+    // in one round-trip and leaves others alone.
+    let (a, b, untouched) = (addr(0x41), addr(0x42), addr(0x43));
+    for wallet in [&a, &b, &untouched] {
+        cache
+            .put_score(wallet, &v2)
+            .await
+            .expect("put for evict_many");
+    }
+    cache.evict_many(&[a, b]).await.expect("evict_many");
+    assert_eq!(cache.score(&a, "2.0.0").await.expect("evicted a"), None);
+    assert_eq!(cache.score(&b, "2.0.0").await.expect("evicted b"), None);
+    assert_eq!(
+        cache.score(&untouched, "2.0.0").await.expect("kept"),
+        Some(v2),
+        "evict_many must not touch unlisted addresses"
+    );
+}
+
+/// The batched label insert (`add_labels`, the seed-import path) honours the
+/// same keyed-idempotency contract as `add_label`: a re-imported slice inserts
+/// nothing, a partially-new slice inserts exactly the new rows, an in-slice
+/// duplicate id neither errors nor double-counts — and conflicting claims
+/// coexist (§8.1).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn label_batch_insert_is_keyed_idempotent_and_coexists() {
+    let (store, _pg) = pg_store().await;
+    let wallet = addr(0x51);
+
+    let bot_a = LabelRecord::new(
+        wallet,
+        LabelKind::MevBot,
+        "bot-a",
+        LabelSource::ExternalFeed,
+        "community_mev_list",
+        at(10),
+    );
+    // A later created_at than bot-a: `labels_for` orders by (created_at,
+    // label_id), and the ids here are random v4s — same-instant order would
+    // be nondeterministic.
+    let bot_b = LabelRecord::new(
+        wallet,
+        LabelKind::MevBot,
+        "bot-b",
+        LabelSource::ExternalFeed,
+        "community_mev_list",
+        at(11),
+    );
+
+    let batch = vec![bot_a.clone(), bot_b.clone()];
+    assert_eq!(store.add_labels(&batch).await.expect("first import"), 2);
+    assert_eq!(
+        store.add_labels(&batch).await.expect("re-import"),
+        0,
+        "a re-imported batch is a keyed no-op"
+    );
+
+    // A refreshed feed: one old claim, one new — only the new row lands, and
+    // both values coexist afterwards (stored, not overwritten).
+    let renamed = LabelRecord::new(
+        wallet,
+        LabelKind::MevBot,
+        "bot-a (renamed)",
+        LabelSource::ExternalFeed,
+        "community_mev_list",
+        at(20),
+    );
+    assert_eq!(
+        store
+            .add_labels(&[bot_a.clone(), renamed.clone()])
+            .await
+            .expect("refresh"),
+        1
+    );
+    let values: Vec<String> = store
+        .labels_for(&wallet, at(1_000))
+        .await
+        .expect("read back")
+        .into_iter()
+        .map(|label| label.value)
+        .collect();
+    assert_eq!(values, ["bot-a", "bot-b", "bot-a (renamed)"]);
+
+    // An in-slice duplicate id is tolerated by ON CONFLICT DO NOTHING and
+    // counts once (the parsers dedup, but the store must not depend on it).
+    let dup = LabelRecord::new(
+        addr(0x52),
+        LabelKind::Protocol,
+        "Router",
+        LabelSource::ExternalFeed,
+        "protocol_registry",
+        at(30),
+    );
+    assert_eq!(
+        store
+            .add_labels(&[dup.clone(), dup.clone()])
+            .await
+            .expect("duplicate slice"),
+        1
+    );
 }
 
 #[tokio::test]
