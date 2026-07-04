@@ -226,7 +226,7 @@ pub struct SanctionEntry {
 
 /// The clustering signal an adjacency edge records (§8.2). These are the §8.2
 /// heuristics as *graph facts*: A funded B, A deployed B, A received B's
-/// profit, A interacted with B.
+/// profit, A and B share deployed bytecode, A interacted with B.
 #[derive(
     Debug,
     Clone,
@@ -246,6 +246,10 @@ pub enum EdgeKind {
     Funded,
     Deployed,
     ProfitReceiver,
+    /// Two contract addresses were deployed with identical bytecode — the
+    /// §8.2 "same code hash" heuristic as a graph fact between the two sites
+    /// (recorded by whichever deploy-observing consumer notices the match).
+    SameCodeHash,
     Interacted,
 }
 

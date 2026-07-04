@@ -17,17 +17,20 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clickhouse::Client;
+use events::primitives::Chain;
 use intelligence::adjacency::{build_clickhouse_client, ClickhouseAdjacency};
 use intelligence::cache::RedisHotCache;
 use intelligence::ch_migrate;
+use intelligence::cluster::{cluster_address, ClusterLimits};
 use intelligence::config::Config;
 use intelligence::seed::{Feed, Seeder};
 use intelligence::store::PgIntelligenceStore;
 use secrecy::ExposeSecret;
 use tracing::Instrument;
 
-const USAGE: &str = "expected `migrate up|down|info`, `ping`, or \
-                     `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]` \
+const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
+                     `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, or \
+                     `cluster <chain-id> <address>` \
                      (the intelligence event consumer lands with Sprint 7 t4)";
 
 #[tokio::main]
@@ -46,6 +49,7 @@ async fn main() -> Result<()> {
         }
         Some("ping") => ping(&cfg, client).await,
         Some("seed") => seed(&cfg, args).await,
+        Some("cluster") => cluster(&cfg, client, args).await,
         Some(other) => bail!("unknown argument {other:?}; {USAGE}"),
         None => bail!("{USAGE}"),
     }
@@ -97,6 +101,68 @@ async fn seed(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()
         .await
         .context("applying the parsed feed (safe to re-run: writes are keyed)")?;
     println!("✅ {report}");
+    Ok(())
+}
+
+/// Run one basic-entity-clustering pass (§8.2, Sprint 7 t3) from a seed
+/// address: walk the adjacency graph over the funder/deployer/
+/// profit-receiver/code-hash signal only, degree-capped and hop-bounded, then
+/// apply the resulting component to the Postgres entity store. Safe to re-run
+/// (idempotent) and safe to seed on an unknown or infrastructure address (the
+/// latter simply reports no cluster).
+async fn cluster(
+    cfg: &Config,
+    client: Client,
+    mut args: impl Iterator<Item = String>,
+) -> Result<()> {
+    let Some(chain_id) = args.next() else {
+        bail!("missing chain id; {USAGE}");
+    };
+    let chain = Chain(
+        chain_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("chain id {chain_id:?} is not a u64; {USAGE}"))?,
+    );
+    let Some(raw_address) = args.next() else {
+        bail!("missing address; {USAGE}");
+    };
+    let address = raw_address
+        .parse()
+        .map_err(|_| anyhow::anyhow!("address {raw_address:?} is not 0x-hex; {USAGE}"))?;
+
+    let graph = ClickhouseAdjacency::new(client);
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = PgIntelligenceStore::new(pool);
+
+    let outcome = cluster_address(
+        &graph,
+        &store,
+        chain,
+        &address,
+        "cli:cluster",
+        chrono::Utc::now(),
+        ClusterLimits::default(),
+    )
+    .instrument(tracing::info_span!("cluster_address", %chain, %raw_address))
+    .await
+    .context("clustering the seed address")?;
+
+    match outcome {
+        Some(outcome) => println!(
+            "✅ entity {}: {} newly linked, {} entities absorbed, {} hubs excluded ({:?})",
+            outcome.entity_id,
+            outcome.linked.len(),
+            outcome.absorbed.len(),
+            outcome.hubs.len(),
+            outcome.hubs,
+        ),
+        None => println!(
+            "no cluster formed: {raw_address} is itself an infrastructure endpoint \
+             (degree over the cap at hop 0)"
+        ),
+    }
     Ok(())
 }
 

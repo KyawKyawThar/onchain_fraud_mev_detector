@@ -175,6 +175,14 @@ intel-ping:
 intel-seed feed file detail="":
     cargo run -p intelligence -- seed {{feed}} {{file}} {{detail}}
 
+# ── Entity clustering (§8.2, Sprint 7 t3) ─────────────────────────
+# Cluster the bounded component around one seed address: common funder,
+# deployer, profit-receiver and same-code-hash edges only, degree-capped and
+# hop-bounded (never bridges through a CEX/bridge hub). Idempotent — safe to
+# re-run against an unchanged graph.
+intel-cluster chain address:
+    cargo run -p intelligence -- cluster {{chain}} {{address}}
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

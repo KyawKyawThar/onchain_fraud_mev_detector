@@ -18,7 +18,8 @@ CREATE TABLE address_adjacency
     -- Lowercase 0x-hex addresses (the shared `address_key` rendering).
     src          String,
     dst          String,
-    -- EdgeKind wire string: funded | deployed | profit_receiver | interacted.
+    -- EdgeKind wire string: funded | deployed | profit_receiver |
+    -- same_code_hash | interacted.
     kind         LowCardinality(String),
     -- The tx hash / evidence ref that witnessed the relation (§8.2 — every
     -- cluster edge is justified).

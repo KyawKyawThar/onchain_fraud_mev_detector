@@ -21,7 +21,9 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ClickhouseConfig;
-use crate::model::{address_key, parse_address_key, AddressKeyError, AdjacencyEdge, Neighborhood};
+use crate::model::{
+    address_key, parse_address_key, AddressKeyError, AdjacencyEdge, EdgeKind, Neighborhood,
+};
 
 /// A failure appending to or querying the graph. ClickHouse faults are I/O —
 /// always transient; a malformed stored address is permanent for that row.
@@ -75,6 +77,21 @@ pub trait AdjacencyStore: Send + Sync {
     /// The exact distinct-neighbor count — the hub-ness measure (metrics,
     /// hub-labeling); the walk itself only needs [`Self::neighbors`].
     async fn degree(&self, chain: Chain, address: &AccountAddress) -> Result<u64, GraphError>;
+
+    /// Like [`Self::neighbors`], but restricted to the given edge kinds — the
+    /// entity-clustering walk (§8.2) only trusts a subset of the recorded
+    /// facts (funder/deployer/profit-receiver/code-hash; `Interacted` is too
+    /// weak a signal for identity). The cap is still evaluated against the
+    /// *filtered* count: a CEX hot wallet is a hub through `Funded` edges
+    /// alone, so filtering first and capping second is what keeps it a stop
+    /// signal rather than a bridge.
+    async fn clustering_neighbors(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        kinds: &[EdgeKind],
+        cap: u32,
+    ) -> Result<Neighborhood, GraphError>;
 }
 
 /// One stored edge row. Field order mirrors the `address_adjacency` columns;
@@ -192,6 +209,50 @@ impl AdjacencyStore for ClickhouseAdjacency {
             .fetch_one()
             .await?;
         Ok(degree)
+    }
+
+    async fn clustering_neighbors(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        kinds: &[EdgeKind],
+        cap: u32,
+    ) -> Result<Neighborhood, GraphError> {
+        let key = address_key(address);
+        // `kinds` are our own closed-enum wire strings (never user input), so
+        // baking them into the SQL text is safe — the crate's `?` binding is
+        // reserved for the address/chain values below.
+        let kind_list = kinds
+            .iter()
+            .map(|kind| format!("'{}'", <&str>::from(*kind)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let neighbor_set_sql = format!(
+            "SELECT dst AS neighbor FROM address_adjacency \
+             WHERE chain = ? AND src = ? AND kind IN ({kind_list}) \
+             UNION DISTINCT \
+             SELECT src AS neighbor FROM address_adjacency \
+             WHERE chain = ? AND dst = ? AND kind IN ({kind_list})"
+        );
+        let rows: Vec<String> = self
+            .client
+            .query(&format!(
+                "SELECT neighbor FROM ({neighbor_set_sql}) ORDER BY neighbor LIMIT ?"
+            ))
+            .bind(chain.id())
+            .bind(&key)
+            .bind(chain.id())
+            .bind(&key)
+            .bind(u64::from(cap) + 1)
+            .fetch_all()
+            .await?;
+
+        let capped = rows.len() > cap as usize;
+        rows.into_iter()
+            .take(cap as usize)
+            .map(|raw| Ok(parse_address_key(&raw)?))
+            .collect::<Result<Vec<_>, GraphError>>()
+            .map(|neighbors| Neighborhood { neighbors, capped })
     }
 }
 
