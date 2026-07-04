@@ -407,4 +407,30 @@ impl AdjacencyStore for InMemoryAdjacency {
         }
         Ok(set.len() as u64)
     }
+
+    async fn clustering_neighbors(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        kinds: &[crate::model::EdgeKind],
+        cap: u32,
+    ) -> Result<Neighborhood, GraphError> {
+        let edges = self.edges.lock().expect("graph lock");
+        let mut set = BTreeSet::new();
+        for edge in edges
+            .iter()
+            .filter(|e| e.chain == chain && kinds.contains(&e.kind))
+        {
+            if edge.src == *address {
+                set.insert(edge.dst);
+            } else if edge.dst == *address {
+                set.insert(edge.src);
+            }
+        }
+        let capped = set.len() > cap as usize;
+        Ok(Neighborhood {
+            neighbors: set.into_iter().take(cap as usize).collect(),
+            capped,
+        })
+    }
 }
