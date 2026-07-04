@@ -109,7 +109,23 @@ pub trait HotCache: Send + Sync {
     /// merged). Eviction, not overwrite, so a concurrent reader can never see
     /// a half-updated pair (§8).
     async fn evict(&self, address: &AccountAddress) -> Result<(), CacheError>;
+
+    /// Evict many addresses. The default loops over [`evict`](Self::evict) so
+    /// every double stays correct by construction; [`RedisHotCache`] overrides
+    /// it with pipelined `UNLINK`s — a feed import (§8.1) touches thousands of
+    /// addresses, and one round-trip per address is not a production path.
+    async fn evict_many(&self, addresses: &[AccountAddress]) -> Result<(), CacheError> {
+        for address in addresses {
+            self.evict(address).await?;
+        }
+        Ok(())
+    }
 }
+
+/// How many addresses one eviction pipeline batches: large enough that a feed
+/// import is a handful of round-trips, small enough that a single command
+/// buffer stays modest.
+const EVICT_PIPELINE_CHUNK: usize = 1024;
 
 /// The Redis key holding an address's cached label set.
 fn labels_key(address: &AccountAddress) -> String {
@@ -214,6 +230,19 @@ impl HotCache for RedisHotCache {
         let _: () = conn
             .unlink(&[labels_key(address), scores_key(address)])
             .await?;
+        Ok(())
+    }
+
+    async fn evict_many(&self, addresses: &[AccountAddress]) -> Result<(), CacheError> {
+        let mut conn = self.conn.clone();
+        for chunk in addresses.chunks(EVICT_PIPELINE_CHUNK) {
+            let mut pipe = redis::pipe();
+            for address in chunk {
+                pipe.unlink(&[labels_key(address), scores_key(address)])
+                    .ignore();
+            }
+            let _: () = pipe.query_async(&mut conn).await?;
+        }
         Ok(())
     }
 }

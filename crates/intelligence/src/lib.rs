@@ -18,18 +18,25 @@
 //!   **degree-capped** neighborhoods (§8.2's critical hub-node rule, enforced
 //!   in the seam). Schema owned by [`ch_migrate`], this service's own runner.
 //!
+//! Sprint 7 t2 adds [`seed`] on top: label seeding from the §8.1 public
+//! sources (Etherscan tags, OFAC SDN, community MEV lists, protocol
+//! registries) — pure per-feed parsers plus the [`seed::Seeder`] shell, with
+//! deterministic seeded label ids so a re-import no-ops and a changed claim
+//! coexists as a new row (conflicting labels stored, not overwritten).
+//!
 //! What deliberately does *not* live here: petgraph subgraph analysis is
 //! bounded and in-memory (load a capped neighborhood, analyze, discard — §8);
-//! the Kafka consumer (attribution on `IncidentCreated`, t4), label seeding
-//! (t2), clustering (t3) and the per-entity merge actor (t5) land on top of
-//! these seams. The fast path stays attribution-blind (§6/§8): nothing in
-//! detection reads these stores.
+//! the Kafka consumer (attribution on `IncidentCreated`, t4), clustering (t3)
+//! and the per-entity merge actor (t5) land on top of these seams. The fast
+//! path stays attribution-blind (§6/§8): nothing in detection reads these
+//! stores.
 
 pub mod adjacency;
 pub mod cache;
 pub mod ch_migrate;
 pub mod config;
 pub mod model;
+pub mod seed;
 pub mod store;
 
 #[cfg(any(test, feature = "test-util"))]

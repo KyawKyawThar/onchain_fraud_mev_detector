@@ -160,6 +160,21 @@ intel-ch-migrate-info:
 intel-ping:
     cargo run -p intelligence -- ping
 
+# ── Label seeding from public feeds (§8.1, Sprint 7 t2) ──────────
+# Import a downloaded feed file. Feeds are fetched out-of-band so an import is
+# a reproducible file, not a moving URL. Re-running the same file is a no-op
+# (deterministic seeded label ids); a changed claim lands as a NEW coexisting
+# row — conflicting labels are stored, never overwritten.
+#
+#   feed:   etherscan-tags (CSV address,kind,value)
+#           ofac-sdn       (plain text, one address/line; e.g.
+#                           https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt)
+#           mev-list       (JSON [{"address","name"}])
+#           protocol-registry (JSON [{"address","name","kind"?}])
+#   detail: optional source_detail naming the specific list/registry.
+intel-seed feed file detail="":
+    cargo run -p intelligence -- seed {{feed}} {{file}} {{detail}}
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

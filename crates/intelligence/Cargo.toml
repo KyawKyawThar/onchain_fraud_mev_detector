@@ -52,6 +52,20 @@ redis = { workspace = true }
 secrecy = { workspace = true }
 alloy-primitives = { workspace = true }
 
+# Label seeding from the §8.1 public feeds (t2). `csv` parses the
+# Etherscan-style tag exports (quoted RFC-4180 — name tags contain commas);
+# `sha2` + `uuid` mint the *deterministic* seeded `label_id` (SHA-256 of the
+# claim → UUIDv8) that makes a feed re-import an idempotent no-op while a
+# changed claim lands as a new coexisting row, never an overwrite.
+csv = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+# Import counters for seed batches (§19), through the `metrics` facade — a
+# no-op until the binary installs the exporter (`telemetry::metrics::init`),
+# same stance as detection's per-detector metrics.
+metrics = { workspace = true }
+
 [features]
 # Exposes `intelligence::test_util` (in-memory store/cache doubles) to this
 # crate's own integration tests and, later, to the t2–t5 consumers' tests.
@@ -61,6 +75,9 @@ test-util = []
 # Property tests (§18): the address_key encode/decode bijection over the whole
 # address space.
 proptest = { workspace = true }
+# In-memory recorder so the seed-import metrics test can assert on recorded
+# series without an exporter (mirrors detection).
+metrics-util = { workspace = true }
 # Self-dependency with `test-util` on, so `tests/` sees the in-memory doubles.
 intelligence = { path = ".", features = ["test-util"] }
 # Live-store integration tests (`#[ignore]`): real Postgres, Redis and ClickHouse

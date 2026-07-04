@@ -118,6 +118,27 @@ pub trait LabelStore: Send + Sync {
     /// already stored — a redelivered `LabelAdded` is a no-op.
     async fn add_label(&self, label: &LabelRecord) -> Result<bool, StoreError>;
 
+    /// Insert many keyed labels; returns how many were *new* (the rest were
+    /// already stored — `len - new` is the idempotent-no-op count). The
+    /// default loops over [`add_label`](Self::add_label) so every double stays
+    /// correct by construction; [`PgIntelligenceStore`] overrides it with one
+    /// UNNEST statement — feed imports (§8.1) are OFAC/Etherscan-scale, and
+    /// per-row round-trips are not a production path (same rule as
+    /// [`SanctionsStore::seed_sanctions`]).
+    ///
+    /// Callers should deduplicate by `label_id` first (the seed parsers do):
+    /// an in-slice duplicate is *counted* as already-present, muddying the
+    /// report even though the write itself stays correct.
+    async fn add_labels(&self, labels: &[LabelRecord]) -> Result<u64, StoreError> {
+        let mut inserted = 0;
+        for label in labels {
+            if self.add_label(label).await? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
     /// All labels *active as of the given instant* for an address — created by
     /// then, not expired by then — every conflicting claim, newest last; the
     /// reader ranks by source/confidence. `as_of` is an explicit input (not an
@@ -357,6 +378,60 @@ impl LabelStore for PgIntelligenceStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn add_labels(&self, labels: &[LabelRecord]) -> Result<u64, StoreError> {
+        if labels.is_empty() {
+            return Ok(0);
+        }
+        // One UNNEST statement for the whole batch — same shape and rationale
+        // as `seed_sanctions`. `ON CONFLICT DO NOTHING` (unlike `DO UPDATE`)
+        // tolerates an in-slice duplicate id, so a non-deduped batch is still
+        // correct, just reported coarsely (see the trait doc).
+        let mut label_ids = Vec::with_capacity(labels.len());
+        let mut addresses = Vec::with_capacity(labels.len());
+        let mut kinds = Vec::with_capacity(labels.len());
+        let mut values = Vec::with_capacity(labels.len());
+        let mut confidences = Vec::with_capacity(labels.len());
+        let mut sources = Vec::with_capacity(labels.len());
+        let mut source_details = Vec::with_capacity(labels.len());
+        let mut created_ats = Vec::with_capacity(labels.len());
+        let mut valid_untils: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(labels.len());
+        for label in labels {
+            label_ids.push(label.label_id.0);
+            addresses.push(address_key(&label.address));
+            kinds.push(<&str>::from(label.kind).to_owned());
+            values.push(label.value.clone());
+            confidences.push(label.confidence.get());
+            sources.push(<&str>::from(label.source).to_owned());
+            source_details.push(label.source_detail.clone());
+            created_ats.push(label.created_at);
+            valid_untils.push(label.valid_until);
+        }
+
+        let result = sqlx::query!(
+            r#"INSERT INTO labels (label_id, address, kind, value, confidence, source,
+                                   source_detail, created_at, valid_until)
+               SELECT t.label_id, t.address, t.kind, t.value, t.confidence, t.source,
+                      t.source_detail, t.created_at, t.valid_until
+               FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::text[], $5::float8[],
+                           $6::text[], $7::text[], $8::timestamptz[], $9::timestamptz[])
+                    AS t(label_id, address, kind, value, confidence, source,
+                         source_detail, created_at, valid_until)
+               ON CONFLICT (label_id) DO NOTHING"#,
+            &label_ids,
+            &addresses,
+            &kinds,
+            &values,
+            &confidences,
+            &sources,
+            &source_details,
+            &created_ats,
+            valid_untils.as_slice() as &[Option<DateTime<Utc>>],
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     async fn labels_for(
