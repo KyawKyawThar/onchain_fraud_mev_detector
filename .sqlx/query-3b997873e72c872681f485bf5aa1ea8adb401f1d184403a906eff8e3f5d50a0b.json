@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE entity_merges SET reverted_at = $2 WHERE merge_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3b997873e72c872681f485bf5aa1ea8adb401f1d184403a906eff8e3f5d50a0b"
+}

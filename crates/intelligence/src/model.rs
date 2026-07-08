@@ -8,6 +8,8 @@
 //! [`AlertKind`](events::primitives::AlertKind), so the stored string and the
 //! serde form can never drift apart).
 
+use std::collections::BTreeSet;
+
 use alloy_primitives::Address;
 use chrono::{DateTime, Utc};
 use events::primitives::{AccountAddress, Confidence, EntityId, IncidentId, LabelId};
@@ -200,6 +202,140 @@ pub struct EntityRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Stable identity for one [`MergeLogEntry`] row — the reorg-rollback join
+/// key (§15). Crate-local, unlike `EntityId`/`IncidentId`/`LabelId`: a merge
+/// log entry never crosses the wire (no event carries it, it only ever
+/// travels between [`crate::store::EntityStore::absorb`],
+/// [`crate::store::EntityStore::merges_for_incident`] and
+/// [`crate::store::EntityStore::reverse_merge`]), so it deliberately skips
+/// `Serialize`/`Deserialize` rather than carrying unused wire machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MergeId(pub uuid::Uuid);
+
+impl MergeId {
+    /// Mint a fresh random id.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for MergeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for MergeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One [`crate::store::EntityStore::absorb`] merge, logged so a later
+/// `IncidentRetracted` can find and reverse it (§8.2, §15). `moved_addresses`
+/// is exactly what `absorb` moved from `absorbed_id` to `surviving_id` — the
+/// precise partition [`crate::store::EntityStore::reverse_merge`] hands back
+/// to `split`. `incident_id` is `None` for operator-driven clustering (the
+/// `intelligence cluster` CLI has no incident to name); such merges are never
+/// candidates for reorg rollback (nothing names them for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeLogEntry {
+    pub merge_id: MergeId,
+    pub surviving_id: EntityId,
+    pub absorbed_id: EntityId,
+    pub incident_id: Option<IncidentId>,
+    pub evidence_ref: String,
+    pub moved_addresses: Vec<AccountAddress>,
+    pub merged_at: DateTime<Utc>,
+    /// Set once a reversal has applied this entry — an idempotency guard
+    /// against re-retracting the same incident twice.
+    pub reverted_at: Option<DateTime<Utc>>,
+}
+
+/// Why an [`crate::store::EntityStore::reverse_merge`] attempt can't proceed
+/// (§15). A closed enum rather than a free-text reason — callers (and tests)
+/// match on *which* guard tripped instead of grepping a message; [`Display`](std::fmt::Display)
+/// still gives the human-readable form for logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreversibleReason {
+    /// The survivor is no longer an active entity — it was itself absorbed
+    /// or split since the original merge.
+    SurvivorInactive,
+    /// One or more of the merge's `moved_addresses` no longer belong to the
+    /// survivor — a later merge or split moved them.
+    AddressesMoved,
+    /// The survivor has no members left over once the moved addresses are
+    /// set aside — reversing would leave nothing behind.
+    NoRemainingMembers,
+    /// Defensive: [`plan_reversal`] found a valid split, but the store-level
+    /// `split` rejected it anyway. Should be unreachable given the entity
+    /// lock held since before the membership read — refusing loudly here is
+    /// safer than assuming why it happened.
+    SplitRejected,
+}
+
+impl std::fmt::Display for UnreversibleReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SurvivorInactive => "survivor is no longer an active entity",
+            Self::AddressesMoved => {
+                "one or more merged addresses no longer belong to the survivor \
+                 (a later merge or split moved them)"
+            }
+            Self::NoRemainingMembers => {
+                "the survivor has no members left over — reversing would leave nothing behind"
+            }
+            Self::SplitRejected => {
+                "splitting the survivor to reverse the merge was unexpectedly rejected by the store"
+            }
+        })
+    }
+}
+
+/// What [`plan_reversal`] decided — the pure half of
+/// [`crate::store::EntityStore::reverse_merge`], split out from the I/O (the
+/// entity/membership reads) so it's testable with plain `BTreeSet`s, the same
+/// "find root"/`plan_merge` discipline [`crate::cluster`] uses for the
+/// forward merge decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReversalPlan {
+    /// Split the survivor's current membership into exactly these two
+    /// groups — hand straight to [`crate::store::EntityStore::split`].
+    Split {
+        moved: Vec<AccountAddress>,
+        remaining: Vec<AccountAddress>,
+    },
+    Unreversible(UnreversibleReason),
+}
+
+/// Decide whether/how to reverse a merge, given the survivor's current
+/// activeness and membership plus what the original merge moved. Pure: the
+/// same inputs always yield the same plan, so a redelivered retraction
+/// converges rather than re-litigating the decision.
+pub fn plan_reversal(
+    survivor_active: bool,
+    current_members: &BTreeSet<AccountAddress>,
+    moved_addresses: &BTreeSet<AccountAddress>,
+) -> ReversalPlan {
+    if !survivor_active {
+        return ReversalPlan::Unreversible(UnreversibleReason::SurvivorInactive);
+    }
+    if !moved_addresses.is_subset(current_members) {
+        return ReversalPlan::Unreversible(UnreversibleReason::AddressesMoved);
+    }
+    let remaining: BTreeSet<AccountAddress> = current_members
+        .difference(moved_addresses)
+        .copied()
+        .collect();
+    if remaining.is_empty() {
+        return ReversalPlan::Unreversible(UnreversibleReason::NoRemainingMembers);
+    }
+    ReversalPlan::Split {
+        moved: moved_addresses.iter().copied().collect(),
+        remaining: remaining.into_iter().collect(),
+    }
+}
+
 /// One attribution link: this incident is the work of this entity, with the
 /// evidence that says so (§8). Keyed `(incident_id, entity_id)`, so re-running
 /// attribution on a redelivered `IncidentCreated` is an idempotent upsert.
@@ -381,5 +517,80 @@ mod tests {
         assert_eq!(label.confidence.get(), 0.4);
         assert_eq!(label.valid_until, None);
         assert_eq!(label.created_at, at);
+    }
+
+    // ── plan_reversal: the pure merge-reversal decision ──────────────
+    // No store, no doubles, no `async` — mirrors `cluster::plan_merge`'s tests.
+
+    fn addr(byte: u8) -> AccountAddress {
+        Address::repeat_byte(byte)
+    }
+
+    #[test]
+    fn plan_reversal_splits_moved_addresses_from_the_remainder() {
+        let current = BTreeSet::from([addr(1), addr(2), addr(3)]);
+        let moved = BTreeSet::from([addr(2)]);
+
+        let plan = plan_reversal(true, &current, &moved);
+        assert_eq!(
+            plan,
+            ReversalPlan::Split {
+                moved: vec![addr(2)],
+                remaining: vec![addr(1), addr(3)],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_reversal_is_unreversible_when_survivor_is_inactive() {
+        let current = BTreeSet::from([addr(1), addr(2)]);
+        let moved = BTreeSet::from([addr(2)]);
+
+        assert_eq!(
+            plan_reversal(false, &current, &moved),
+            ReversalPlan::Unreversible(UnreversibleReason::SurvivorInactive)
+        );
+    }
+
+    #[test]
+    fn plan_reversal_is_unreversible_when_a_moved_address_left_the_survivor() {
+        let current = BTreeSet::from([addr(1)]);
+        // addr(2) was moved by the original merge but no longer belongs to
+        // the survivor — a later merge/split touched it.
+        let moved = BTreeSet::from([addr(2)]);
+
+        assert_eq!(
+            plan_reversal(true, &current, &moved),
+            ReversalPlan::Unreversible(UnreversibleReason::AddressesMoved)
+        );
+    }
+
+    #[test]
+    fn plan_reversal_is_unreversible_when_nothing_would_be_left_behind() {
+        let current = BTreeSet::from([addr(1)]);
+        let moved = BTreeSet::from([addr(1)]);
+
+        assert_eq!(
+            plan_reversal(true, &current, &moved),
+            ReversalPlan::Unreversible(UnreversibleReason::NoRemainingMembers)
+        );
+    }
+
+    #[test]
+    fn plan_reversal_is_deterministic_regardless_of_set_construction_order() {
+        let current_a = BTreeSet::from([addr(3), addr(1), addr(2)]);
+        let current_b = BTreeSet::from([addr(1), addr(2), addr(3)]);
+        let moved = BTreeSet::from([addr(1)]);
+
+        assert_eq!(
+            plan_reversal(true, &current_a, &moved),
+            plan_reversal(true, &current_b, &moved)
+        );
+    }
+
+    #[test]
+    fn merge_id_displays_as_its_uuid() {
+        let id = MergeId(uuid::Uuid::from_u128(0xAB));
+        assert_eq!(id.to_string(), "00000000-0000-0000-0000-0000000000ab");
     }
 }

@@ -5,9 +5,10 @@
 //! `(address, model_version)`, invalidated when any input changes, recomputed
 //! by the intelligence service." Every event that can change what
 //! [`risk::score`] sees for some address — a label landing/correcting/
-//! revoking, a sanctions hit, an entity being created/merged/split, or an
-//! attribution update — is consumed here. For every address the change can
-//! affect: the stale hot-cache entry is evicted, the score is recomputed
+//! revoking, a sanctions hit, an entity being created/merged/split, an
+//! attribution update, or an attribution retraction (§15, reorg rollback) —
+//! is consumed here. For every address the change can affect: the stale
+//! hot-cache entry is evicted, the score is recomputed
 //! against the *current* store state (not the event's own payload), the fresh
 //! value replaces it in the cache under `(address, `[`risk::MODEL_VERSION`]`)`,
 //! and `RiskScoreUpdated` is published — so the decision layer's Redis read
@@ -74,6 +75,7 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
     "EntityMerged",
     "EntitySplit",
     "AttributionUpdated",
+    "AttributionRetracted",
 ];
 
 /// Cap on how many addresses one event's fan-out recomputes concurrently
@@ -361,6 +363,10 @@ impl RiskScorer {
                 let addresses = self.addresses_for_entities(e.entity_ids).await?;
                 self.recompute_many(addresses, chain, at).await
             }
+            AttributionRetracted(e) => {
+                let addresses = self.addresses_for_entities(e.entity_ids).await?;
+                self.recompute_many(addresses, chain, at).await
+            }
             other => {
                 tracing::warn!(
                     event = other.event_type(),
@@ -621,7 +627,10 @@ mod tests {
             .create_entity(absorbed, &addr(2), "seed", at(1))
             .await
             .unwrap();
-        h.store.absorb(survivor, absorbed).await.unwrap();
+        h.store
+            .absorb(survivor, absorbed, None, "test", at(1))
+            .await
+            .unwrap();
 
         h.scorer
             .handle(envelope(
@@ -706,6 +715,38 @@ mod tests {
                     incident_id: events::primitives::IncidentId::new(),
                     entity_ids: vec![e1, e2],
                     labels: vec![],
+                }),
+                at(10),
+            ))
+            .await;
+
+        let mut addresses: Vec<_> = h.sink.risk_scores().iter().map(|s| s.address).collect();
+        addresses.sort();
+        assert_eq!(addresses, vec![addr(1), addr(2)]);
+    }
+
+    /// `AttributionRetracted` (§15, reorg rollback) recomputes every current
+    /// member of the named entities — the reverse of `AttributionUpdated`,
+    /// but the same fan-out.
+    #[tokio::test]
+    async fn attribution_retracted_recomputes_every_named_entitys_members() {
+        let h = harness();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        h.store
+            .create_entity(e1, &addr(1), "seed", at(1))
+            .await
+            .unwrap();
+        h.store
+            .create_entity(e2, &addr(2), "seed", at(1))
+            .await
+            .unwrap();
+
+        h.scorer
+            .handle(envelope(
+                DomainEvent::AttributionRetracted(events::intelligence::AttributionRetracted {
+                    incident_id: events::primitives::IncidentId::new(),
+                    entity_ids: vec![e1, e2],
                 }),
                 at(10),
             ))

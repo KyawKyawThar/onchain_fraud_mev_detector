@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE entity_addresses SET entity_id = $1, evidence = $2, linked_at = $3\n                 WHERE address = ANY($4::text[])",
+  "query": "UPDATE entity_addresses SET entity_id = $1, evidence = $2, linked_at = $3\n             WHERE address = ANY($4::text[])",
   "describe": {
     "columns": [],
     "parameters": {
@@ -13,5 +13,5 @@
     },
     "nullable": []
   },
-  "hash": "df324cc4349d1f7525e52de1cf56739d93c9158c4a7b6e220f46b2dbf6547985"
+  "hash": "865018b19f55dc4b6714e826844d1cf2a241bc3c94b50ed98b7e5346914233cd"
 }

@@ -273,7 +273,10 @@ async fn entities_version_on_merge_and_membership_moves_atomically() {
 
     // Merge e2 into e1: both versions bump, membership moves, e2 tombstones.
     assert_eq!(
-        store.absorb(e1, e2).await.expect("merge"),
+        store
+            .absorb(e1, e2, None, "test", at(30))
+            .await
+            .expect("merge"),
         MergeOutcome::Merged {
             survivor_version: 2
         }
@@ -297,15 +300,24 @@ async fn entities_version_on_merge_and_membership_moves_atomically() {
 
     // Merge edge cases: redelivery, merging into a tombstone, self-merge.
     assert_eq!(
-        store.absorb(e1, e2).await.expect("redelivered merge"),
+        store
+            .absorb(e1, e2, None, "test", at(31))
+            .await
+            .expect("redelivered merge"),
         MergeOutcome::AbsorbedInactive
     );
     assert_eq!(
-        store.absorb(e2, e1).await.expect("merge into tombstone"),
+        store
+            .absorb(e2, e1, None, "test", at(32))
+            .await
+            .expect("merge into tombstone"),
         MergeOutcome::SurvivorInactive
     );
     assert_eq!(
-        store.absorb(e1, e1).await.expect("self merge"),
+        store
+            .absorb(e1, e1, None, "test", at(33))
+            .await
+            .expect("self merge"),
         MergeOutcome::SelfMerge
     );
     let survivor = store.entity(e1).await.expect("read").expect("e1");

@@ -33,8 +33,8 @@ use events::chain::{
 };
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
-    AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
-    LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
+    AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
+    LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
@@ -208,6 +208,10 @@ fn sample_events() -> Vec<DomainEvent> {
             entity_ids: vec![entity_id()],
             labels: vec!["mev-bot".into()],
         }),
+        DomainEvent::AttributionRetracted(AttributionRetracted {
+            incident_id: incident_id(),
+            entity_ids: vec![entity_id()],
+        }),
         DomainEvent::RiskScoreUpdated(RiskScoreUpdated {
             address: addr(),
             entity_id: Some(entity_id()),
@@ -332,6 +336,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "AttributionUpdated",
         r#"{"type":"AttributionUpdated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","entity_ids":["00000000-0000-0000-0000-0000000000e1"],"labels":["mev-bot"]}}"#,
+    ),
+    (
+        "AttributionRetracted",
+        r#"{"type":"AttributionRetracted","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","entity_ids":["00000000-0000-0000-0000-0000000000e1"]}}"#,
     ),
     (
         "RiskScoreUpdated",

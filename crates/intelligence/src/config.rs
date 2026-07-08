@@ -38,6 +38,11 @@ pub struct KafkaConfig {
     /// it's an independently deployable/scalable process reading a disjoint
     /// (mostly self-produced) set of topics.
     pub risk_group_id: String,
+    /// Consumer-group id for the reorg-rollback consumer ([`crate::reorg`],
+    /// §15) — its own group since it reads a disjoint topic
+    /// (`IncidentRetracted`) and is independently deployable/scalable, like
+    /// `score`/`attribute`.
+    pub reorg_group_id: String,
 }
 
 /// How to reach Redis and how long cached entries live. The full URL is secret
@@ -83,6 +88,7 @@ impl Config {
                 brokers: env("KAFKA_BROKERS")?,
                 group_id: env_or("INTELLIGENCE_KAFKA_GROUP", "intelligence-attribution"),
                 risk_group_id: env_or("INTELLIGENCE_RISK_KAFKA_GROUP", "intelligence-risk-scoring"),
+                reorg_group_id: env_or("INTELLIGENCE_REORG_KAFKA_GROUP", "intelligence-reorg"),
             },
         })
     }

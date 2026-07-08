@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO entities (entity_id, version, status, created_at)\n             VALUES ($1, 1, 'active', $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d720979ffd0cfb8ecaf431b5fba40145280790b3fdcad5e5fb25fe4cec9ce949"
+}

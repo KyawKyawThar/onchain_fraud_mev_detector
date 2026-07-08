@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE entities SET status = 'split', version = version + 1, updated_at = now()\n         WHERE entity_id = $1 AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c82c83813a8083dc3e618f8031d3f6af71ccc6badfdb7663c75e025ea0fa048a"
+}

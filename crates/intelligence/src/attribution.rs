@@ -494,6 +494,7 @@ impl Attributor {
             chain,
             address,
             &evidence,
+            Some(incident.incident_id),
             at,
             self.cluster_limits,
         )

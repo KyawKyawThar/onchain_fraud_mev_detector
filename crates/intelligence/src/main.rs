@@ -32,8 +32,12 @@
 //!   - `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` —
 //!     reverse an incorrect merge, `group` a comma-separated address list;
 //!     emits `EntitySplit`.
+//!   - `reorg` — drive the t3 reorg-rollback consumer (§15): `IncidentRetracted`
+//!     in (its own Kafka consumer group), attribution withdrawn and eligible
+//!     merges reversed, `AttributionRetracted`/`EntitySplit` out, until a
+//!     shutdown signal — see [`intelligence::reorg`].
 //!
-//! The last three are one-shot operator actions with no Kafka consumer of
+//! The label/entity-split trio above are one-shot operator actions with no Kafka consumer of
 //! their own (nothing else in this service calls `revoke_label`/
 //! `update_label_value`/`split`), so the CLI itself is the event producer —
 //! see [`publish_once`] for why that's a single best-effort publish rather
@@ -54,6 +58,7 @@ use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
 use intelligence::merge_actor::MergeActor;
+use intelligence::reorg::{self, ReorgConsumer};
 use intelligence::risk;
 use intelligence::risk_scorer::{self, RiskScorer};
 use intelligence::seed::{Feed, Seeder};
@@ -65,7 +70,7 @@ use tracing::Instrument;
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
-                     `risk <address>`, `score`, \
+                     `risk <address>`, `score`, `reorg`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -91,6 +96,7 @@ async fn main() -> Result<()> {
         Some("attribute") | None => attribute(&cfg, client).await,
         Some("risk") => address_risk(&cfg, args).await,
         Some("score") => score(&cfg).await,
+        Some("reorg") => reorg_cmd(&cfg).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -220,6 +226,7 @@ async fn cluster(
         chain,
         &address,
         "cli:cluster",
+        None,
         chrono::Utc::now(),
         ClusterLimits::default(),
     )
@@ -262,12 +269,7 @@ async fn address_risk(cfg: &Config, mut args: impl Iterator<Item = String>) -> R
         .await
         .context("connecting to Postgres")?;
     let store = Arc::new(PgIntelligenceStore::new(pool));
-    let stores = StoreSeams {
-        labels: store.clone(),
-        entities: store.clone(),
-        attributions: store.clone(),
-        sanctions: store,
-    };
+    let stores = StoreSeams::single(store);
 
     let as_of = chrono::Utc::now();
     let (entity_id, inputs) = risk_scorer::load_risk_inputs(&stores, &address, as_of)
@@ -358,12 +360,7 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
     });
 
     let attributor = Attributor::new(
-        StoreSeams {
-            labels: store.clone(),
-            entities: store.clone(),
-            attributions: store.clone(),
-            sanctions: store,
-        },
+        StoreSeams::single(store),
         graph,
         cache,
         sink,
@@ -424,17 +421,7 @@ async fn score(cfg: &Config) -> Result<()> {
         }
     });
 
-    let scorer = RiskScorer::new(
-        StoreSeams {
-            labels: store.clone(),
-            entities: store.clone(),
-            attributions: store.clone(),
-            sanctions: store,
-        },
-        cache,
-        sink,
-        shutdown.clone(),
-    );
+    let scorer = RiskScorer::new(StoreSeams::single(store), cache, sink, shutdown.clone());
 
     let consumer = risk_scorer::build_consumer(&cfg.kafka.brokers, &cfg.kafka.risk_group_id)
         .context("building the risk-score Kafka consumer")?;
@@ -444,6 +431,51 @@ async fn score(cfg: &Config) -> Result<()> {
         .context("risk-score consumer exited with error")?;
 
     tracing::info!("intelligence risk-score consumer shut down");
+    Ok(())
+}
+
+/// Run the t3 reorg-rollback consumer (§15): connect the four store seams +
+/// the Kafka event sink, then drain `IncidentRetracted` until shutdown,
+/// withdrawing the retracted incident's attributions and reversing every
+/// merge it caused — publishing `AttributionRetracted`/`EntitySplit` for the
+/// t2 risk-scorer to react to. Its own consumer group
+/// (`cfg.kafka.reorg_group_id`) — an independently deployable process from
+/// `attribute`/`score`, not a ClickHouse/Redis reader, so neither `Client`
+/// nor a hot cache is needed here.
+async fn reorg_cmd(cfg: &Config) -> Result<()> {
+    tracing::info!(
+        group = %cfg.kafka.reorg_group_id,
+        "starting intelligence reorg-rollback consumer"
+    );
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let consumer = ReorgConsumer::new(StoreSeams::single(store), sink, shutdown.clone());
+
+    let kafka_consumer = reorg::build_consumer(&cfg.kafka.brokers, &cfg.kafka.reorg_group_id)
+        .context("building the reorg Kafka consumer")?;
+    consumer
+        .run(kafka_consumer, PUBLISH_BACKOFF, &shutdown)
+        .await
+        .context("reorg consumer exited with error")?;
+
+    tracing::info!("intelligence reorg-rollback consumer shut down");
     Ok(())
 }
 
