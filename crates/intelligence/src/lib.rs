@@ -55,6 +55,14 @@
 //! [`attribution::Attributor`] and the `intelligence cluster` CLI both share
 //! one actor per process. The fast path stays attribution-blind (§6/§8):
 //! nothing in detection reads these stores.
+//!
+//! Sprint 8 t1 adds [`risk`]: the pure risk-scoring kernel (§8.3) — labels,
+//! attributions, sanctions and entity membership in, an explainable,
+//! model-versioned, time-decayed [`events::intelligence::RiskScoreUpdated`]
+//! out. It has no store dependency of its own; wiring it behind the
+//! `(address, model_version)` cache with invalidate-on-input-change and
+//! publishing the result (§8.3, t2) consumes it the same way `cluster`/
+//! `attribution` consume their pure decision helpers.
 
 pub mod adjacency;
 pub mod attribution;
@@ -64,6 +72,7 @@ pub mod cluster;
 pub mod config;
 pub mod merge_actor;
 pub mod model;
+pub mod risk;
 pub mod seed;
 pub mod store;
 
