@@ -97,7 +97,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::AdjacencyStore;
 use crate::cache::{CacheError, HotCache};
-use crate::cluster::{cluster_address, ClusterError, ClusterLimits};
+use crate::cluster::{cluster_address, ClusterError, ClusterLimits, ClusterSeams};
+use crate::merge_actor::MergeActorHandle;
 use crate::model::{AttributionRecord, LabelKind, LabelRecord, LabelSource};
 use crate::seed::seeded_label_id;
 use crate::store::{AttributionStore, EntityStore, LabelStore, SanctionsStore, StoreError};
@@ -323,6 +324,12 @@ pub struct Attributor {
     publish_backoff: Duration,
     cluster_limits: ClusterLimits,
     pending: Mutex<PendingState>,
+    /// Serializes `cluster::cluster_address`'s decide-and-write sequence per
+    /// entity (§17, t5) — shared with every other in-process caller (the
+    /// `intelligence cluster` CLI spawns its own, since it's a separate
+    /// process). See `merge_actor`'s module docs for what this does and
+    /// doesn't cover.
+    merge_actor: MergeActorHandle,
 }
 
 impl Attributor {
@@ -334,6 +341,7 @@ impl Attributor {
         cache: Arc<dyn HotCache>,
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
+        merge_actor: MergeActorHandle,
     ) -> Self {
         Self {
             stores,
@@ -344,6 +352,7 @@ impl Attributor {
             publish_backoff: event_bus::PUBLISH_BACKOFF,
             cluster_limits: ClusterLimits::default(),
             pending: Mutex::new(PendingState::new(DEFAULT_PENDING_CAPACITY)),
+            merge_actor,
         }
     }
 
@@ -490,8 +499,11 @@ impl Attributor {
         // belongs to.
         let evidence = format!("incident:{}", incident.incident_id);
         let Some(outcome) = cluster_address(
-            self.graph.as_ref(),
-            self.stores.entities.as_ref(),
+            ClusterSeams {
+                graph: self.graph.as_ref(),
+                entities: self.stores.entities.as_ref(),
+                merge_actor: &self.merge_actor,
+            },
             chain,
             address,
             &evidence,
@@ -738,6 +750,7 @@ impl EventHandler for Attributor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge_actor::MergeActor;
     use crate::model::{AdjacencyEdge, EdgeKind, SanctionEntry};
     use crate::test_util::{InMemoryAdjacency, InMemoryHotCache, InMemoryIntelligenceStore};
     use alloy_primitives::Address;
@@ -839,6 +852,7 @@ mod tests {
             cache,
             sink.clone(),
             CancellationToken::new(),
+            MergeActor::spawn(),
         );
         Harness {
             attributor,
@@ -986,6 +1000,7 @@ mod tests {
             Arc::new(InMemoryHotCache::new()),
             h.sink.clone(),
             CancellationToken::new(),
+            MergeActor::spawn(),
         );
 
         attributor
@@ -1085,6 +1100,7 @@ mod tests {
             Arc::new(InMemoryHotCache::new()),
             h.sink.clone(),
             CancellationToken::new(),
+            MergeActor::spawn(),
         );
 
         async fn run(attributor: &Attributor, alert_id: AlertId) {
