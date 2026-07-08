@@ -23,9 +23,9 @@ pub struct Config {
     pub kafka: KafkaConfig,
 }
 
-/// How to reach Kafka for the `attribute` consumer (Sprint 7 t4): the
-/// broker list, and the consumer group whose committed offsets a restart
-/// resumes from.
+/// How to reach Kafka for the `attribute` and `score` consumers (Sprint 7 t4,
+/// Sprint 8 t2): the broker list, and each consumer's own group whose
+/// committed offsets a restart resumes from.
 #[derive(Debug, Clone)]
 pub struct KafkaConfig {
     /// Comma-separated bootstrap brokers (`localhost:9092`).
@@ -33,6 +33,11 @@ pub struct KafkaConfig {
     /// Consumer-group id for the `PreliminaryAlertCreated`/`IncidentCreated`
     /// attribution consumer — restarts resume from committed offsets.
     pub group_id: String,
+    /// Consumer-group id for the risk-score cache-invalidation consumer
+    /// ([`crate::risk_scorer`], §8.3) — a separate group from `group_id` since
+    /// it's an independently deployable/scalable process reading a disjoint
+    /// (mostly self-produced) set of topics.
+    pub risk_group_id: String,
 }
 
 /// How to reach Redis and how long cached entries live. The full URL is secret
@@ -77,6 +82,7 @@ impl Config {
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
                 group_id: env_or("INTELLIGENCE_KAFKA_GROUP", "intelligence-attribution"),
+                risk_group_id: env_or("INTELLIGENCE_RISK_KAFKA_GROUP", "intelligence-risk-scoring"),
             },
         })
     }

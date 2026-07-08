@@ -63,6 +63,16 @@
 //! `(address, model_version)` cache with invalidate-on-input-change and
 //! publishing the result (§8.3, t2) consumes it the same way `cluster`/
 //! `attribution` consume their pure decision helpers.
+//!
+//! Sprint 8 t2 adds [`risk_scorer`]: the consumer that closes the loop —
+//! every `LabelAdded`/`LabelUpdated`/`LabelRevoked`/`SanctionHit`/
+//! `EntityCreated`/`EntityMerged`/`EntitySplit`/`AttributionUpdated` this
+//! service (or an operator CLI command) emits is also this consumer's
+//! trigger: it evicts the affected address(es)' hot-cache score entry,
+//! recomputes via [`risk::score`] against current store state, repopulates
+//! the `(address, model_version)` cache slot, and publishes the fresh
+//! `RiskScoreUpdated` — the "scores invalidate and recompute automatically"
+//! rule (§8.2/§8.3) made real.
 
 pub mod adjacency;
 pub mod attribution;
@@ -73,6 +83,7 @@ pub mod config;
 pub mod merge_actor;
 pub mod model;
 pub mod risk;
+pub mod risk_scorer;
 pub mod seed;
 pub mod store;
 

@@ -216,6 +216,37 @@ pub trait EventHandler: Send + Sync {
     async fn handle(&self, envelope: EventEnvelope) -> Handled;
 }
 
+/// Map an error's transient/permanent classification to the offset action every
+/// simple consumer on the backbone shares (§4): a transient fault (a downstream
+/// store/cache/broker blip) is logged and retried, leaving the offset for
+/// redelivery — the handler must be idempotent, since a redelivery re-runs it; a
+/// permanent one (a parse/encoding bug that fails identically on every retry) is
+/// logged and skipped so it can't wedge the stream.
+///
+/// Callers classify their own error type (`err.is_transient()`) and pass the
+/// verdict in; this only owns the shared "log + pick the `Handled` variant" shape,
+/// so every consumer's failure log looks the same and a consumer can't drift on
+/// the retry-vs-skip decision itself. `consumer` names the caller in the log line
+/// (mirrors [`run_consumer`]'s own `name` field) so multiple consumers in one
+/// process stay distinguishable.
+pub fn handled_for(is_transient: bool, err: impl std::fmt::Display, consumer: &str) -> Handled {
+    if is_transient {
+        tracing::warn!(
+            consumer,
+            error = %err,
+            "transient fault; leaving offset to retry"
+        );
+        Handled::Retry
+    } else {
+        tracing::error!(
+            consumer,
+            error = %err,
+            "permanent fault; skipping record so it cannot wedge the stream"
+        );
+        Handled::Commit
+    }
+}
+
 /// Drive `handler` over `topics` until shutdown or a fatal subscribe error — the
 /// resilient, at-least-once consume loop shared by every simple stream consumer.
 ///
@@ -374,6 +405,21 @@ mod tests {
 
     use events::primitives::Chain;
     use events::DomainEvent;
+
+    /// `handled_for` maps the caller's transient/permanent verdict straight to
+    /// the matching `Handled` variant — the one behavior every consumer
+    /// depends on, regardless of what error type or message it passes in.
+    #[test]
+    fn handled_for_maps_transient_to_retry_and_permanent_to_commit() {
+        assert_eq!(
+            handled_for(true, "broker blip", "test-consumer"),
+            Handled::Retry
+        );
+        assert_eq!(
+            handled_for(false, "malformed row", "test-consumer"),
+            Handled::Commit
+        );
+    }
 
     /// A sink that fails transiently `remaining_failures` times, then records —
     /// to prove `publish_resilient` retries over a broker blip.

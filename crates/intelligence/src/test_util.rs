@@ -9,7 +9,7 @@
 //! honour the same contract.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -53,6 +53,19 @@ struct EntityMeta {
 impl InMemoryIntelligenceStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Bundle one shared [`InMemoryIntelligenceStore`] into a [`crate::store::StoreSeams`]
+/// four times — every consumer test (`attribution`, `risk_scorer`) needs all
+/// four seams pointed at the same double, so this is the one place that shape
+/// is assembled.
+pub fn store_seams(store: &Arc<InMemoryIntelligenceStore>) -> crate::store::StoreSeams {
+    crate::store::StoreSeams {
+        labels: store.clone(),
+        entities: store.clone(),
+        attributions: store.clone(),
+        sanctions: store.clone(),
     }
 }
 
