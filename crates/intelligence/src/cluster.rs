@@ -227,7 +227,7 @@ async fn read_owners(
 
 /// The three collaborators one [`cluster_address`] pass needs — bundled to
 /// stay under clippy's argument-count gate without collapsing the
-/// object-safe seam split (mirrors [`crate::attribution::StoreSeams`]).
+/// object-safe seam split (mirrors [`crate::store::StoreSeams`]).
 pub struct ClusterSeams<'a> {
     pub graph: &'a dyn AdjacencyStore,
     pub entities: &'a dyn EntityStore,

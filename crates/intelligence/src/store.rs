@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -309,6 +310,25 @@ pub trait SanctionsStore: Send + Sync {
         &self,
         address: &AccountAddress,
     ) -> Result<Vec<SanctionEntry>, StoreError>;
+}
+
+/// The four Postgres-backed seams a pass needs, bundled so a consumer's
+/// constructor doesn't take an unreadable wall of `Arc<dyn Trait>` parameters.
+/// In production all four are the same [`PgIntelligenceStore`] (§14), cloned;
+/// kept as separate trait objects (not one fat trait) because each is
+/// independently object-safe and tested against its own in-memory double.
+/// Shared by the [`attribution`](crate::attribution)'s `IncidentCreated`
+/// consumer and the [`risk_scorer`](crate::risk_scorer)'s cache-invalidation
+/// consumer (§8.3) — both need every store the risk kernel and the
+/// association flywheel read from. `Clone` is cheap (every field is an
+/// `Arc<dyn Trait>` bump) — the risk-scoring consumer clones its seams into
+/// each bounded-concurrency recompute task.
+#[derive(Clone)]
+pub struct StoreSeams {
+    pub labels: Arc<dyn LabelStore>,
+    pub entities: Arc<dyn EntityStore>,
+    pub attributions: Arc<dyn AttributionStore>,
+    pub sanctions: Arc<dyn SanctionsStore>,
 }
 
 /// Postgres-backed implementation of all four seams. Cheap to clone (the pool

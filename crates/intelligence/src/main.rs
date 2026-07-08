@@ -19,6 +19,12 @@
 //!   - `risk <address>` — compute and print one address's risk score (§8.3,
 //!     Sprint 8 t1): read-only, no event published (that lands with the t2
 //!     cache/invalidation consumer this pure kernel plugs into).
+//!   - `score` — drive the t2 risk-score cache-invalidation consumer (§8.3):
+//!     `LabelAdded`/`LabelUpdated`/`LabelRevoked`/`SanctionHit`/
+//!     `EntityCreated`/`EntityMerged`/`EntitySplit`/`AttributionUpdated` in
+//!     (its own Kafka consumer group, independent of `attribute`'s), the
+//!     `(address, model_version)` cache invalidated + recomputed and
+//!     `RiskScoreUpdated` out, until a shutdown signal.
 //!   - `label-update <chain-id> <label-id> <new-value>` — operator correction
 //!     of a label's display value in place; emits `LabelUpdated`.
 //!   - `label-revoke <chain-id> <label-id> <reason...>` — soft-revoke a label;
@@ -42,17 +48,16 @@ use events::intelligence::{EntitySplit, LabelRevoked, LabelUpdated};
 use events::primitives::{Chain, EntityId, LabelId};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::adjacency::{build_clickhouse_client, ClickhouseAdjacency};
-use intelligence::attribution::{build_consumer, Attributor, StoreSeams};
+use intelligence::attribution::{build_consumer, Attributor};
 use intelligence::cache::{HotCache, RedisHotCache};
 use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
 use intelligence::merge_actor::MergeActor;
-use intelligence::risk::{self, RiskInputs};
+use intelligence::risk;
+use intelligence::risk_scorer::{self, RiskScorer};
 use intelligence::seed::{Feed, Seeder};
-use intelligence::store::{
-    AttributionStore, EntityStore, LabelStore, PgIntelligenceStore, SanctionsStore, SplitOutcome,
-};
+use intelligence::store::{EntityStore, LabelStore, PgIntelligenceStore, SplitOutcome, StoreSeams};
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -60,7 +65,7 @@ use tracing::Instrument;
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
-                     `risk <address>`, \
+                     `risk <address>`, `score`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         Some("cluster") => cluster(&cfg, client, args).await,
         Some("attribute") | None => attribute(&cfg, client).await,
         Some("risk") => address_risk(&cfg, args).await,
+        Some("score") => score(&cfg).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -255,38 +261,18 @@ async fn address_risk(cfg: &Config, mut args: impl Iterator<Item = String>) -> R
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
-    let store = PgIntelligenceStore::new(pool);
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+    let stores = StoreSeams {
+        labels: store.clone(),
+        entities: store.clone(),
+        attributions: store.clone(),
+        sanctions: store,
+    };
 
     let as_of = chrono::Utc::now();
-    let labels = store
-        .labels_for(&address, as_of)
+    let (entity_id, inputs) = risk_scorer::load_risk_inputs(&stores, &address, as_of)
         .await
-        .context("loading labels")?;
-    let sanctions = store
-        .sanction_matches(&address)
-        .await
-        .context("loading sanctions")?;
-    let entity_id = store
-        .entity_for_address(&address)
-        .await
-        .context("resolving entity")?;
-    let (entity, attributions) = match entity_id {
-        Some(id) => (
-            store.entity(id).await.context("loading entity")?,
-            store
-                .attributions_for_entity(id)
-                .await
-                .context("loading attributions")?,
-        ),
-        None => (None, Vec::new()),
-    };
-
-    let inputs = RiskInputs {
-        labels,
-        attributions,
-        sanctions,
-        entity,
-    };
+        .context("loading risk inputs")?;
     let result = risk::score(address, entity_id, &inputs, as_of);
 
     println!(
@@ -396,6 +382,68 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
         .context("attribution consumer exited with error")?;
 
     tracing::info!("intelligence attribution consumer shut down");
+    Ok(())
+}
+
+/// Run the t2 risk-score cache-invalidation consumer (§8.3): connect the four
+/// store seams + the Redis hot cache + the Kafka event sink, then drain
+/// `LabelAdded`/`LabelUpdated`/`LabelRevoked`/`SanctionHit`/`EntityCreated`/
+/// `EntityMerged`/`EntitySplit`/`AttributionUpdated` until shutdown,
+/// invalidating and recomputing the `(address, model_version)` cache entry and
+/// publishing `RiskScoreUpdated` for every address each event touches. Its own
+/// consumer group (`cfg.kafka.risk_group_id`) — an independently deployable
+/// process from `attribute`, not a ClickHouse-adjacency reader, so no `Client`
+/// is needed here.
+async fn score(cfg: &Config) -> Result<()> {
+    tracing::info!(
+        group = %cfg.kafka.risk_group_id,
+        "starting intelligence risk-score consumer"
+    );
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+
+    let cache = Arc::new(
+        RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+            .await
+            .context("connecting to Redis")?,
+    );
+
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let scorer = RiskScorer::new(
+        StoreSeams {
+            labels: store.clone(),
+            entities: store.clone(),
+            attributions: store.clone(),
+            sanctions: store,
+        },
+        cache,
+        sink,
+        shutdown.clone(),
+    );
+
+    let consumer = risk_scorer::build_consumer(&cfg.kafka.brokers, &cfg.kafka.risk_group_id)
+        .context("building the risk-score Kafka consumer")?;
+    scorer
+        .run(consumer, PUBLISH_BACKOFF, &shutdown)
+        .await
+        .context("risk-score consumer exited with error")?;
+
+    tracing::info!("intelligence risk-score consumer shut down");
     Ok(())
 }
 

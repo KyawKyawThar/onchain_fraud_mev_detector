@@ -193,6 +193,19 @@ intel-seed feed file detail="":
 intel-cluster chain address:
     cargo run -p intelligence -- cluster {{chain}} {{address}}
 
+# Print one address's current risk score (§8.3, Sprint 8 t1) — read-only.
+intel-risk address:
+    cargo run -p intelligence -- risk {{address}}
+
+# ── Risk-score cache invalidation (§8.3, Sprint 8 t2) ─────────────
+# Long-running consumer: on any label/entity/sanctions/attribution change,
+# evicts and recomputes the affected address(es)' `(address, model_version)`
+# cache entry and publishes `RiskScoreUpdated`. Its own Kafka consumer group
+# (INTELLIGENCE_RISK_KAFKA_GROUP) — deploy/scale independently of the default
+# `cargo run -p intelligence` attribution consumer.
+intel-score:
+    cargo run -p intelligence -- score
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

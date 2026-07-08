@@ -101,7 +101,7 @@ use crate::cluster::{cluster_address, ClusterError, ClusterLimits, ClusterSeams}
 use crate::merge_actor::MergeActorHandle;
 use crate::model::{AttributionRecord, LabelKind, LabelRecord, LabelSource};
 use crate::seed::seeded_label_id;
-use crate::store::{AttributionStore, EntityStore, LabelStore, SanctionsStore, StoreError};
+use crate::store::{StoreError, StoreSeams};
 
 /// Label kinds that mark an address as a *directly known* bad actor — the
 /// association flywheel's trigger (§8.1/§8.6). `SanctionedEntity` is included
@@ -298,19 +298,6 @@ impl AttributionError {
             AttributionError::Cache(err) => err.is_transient(),
         }
     }
-}
-
-/// The four Postgres-backed seams a pass needs, bundled so `Attributor::new`
-/// doesn't take an unreadable wall of `Arc<dyn Trait>` parameters. In
-/// production all four are the same [`crate::store::PgIntelligenceStore`]
-/// (§14), cloned; kept as separate trait objects (not one fat trait) because
-/// each is independently object-safe and tested against its own in-memory
-/// double.
-pub struct StoreSeams {
-    pub labels: Arc<dyn LabelStore>,
-    pub entities: Arc<dyn EntityStore>,
-    pub attributions: Arc<dyn AttributionStore>,
-    pub sanctions: Arc<dyn SanctionsStore>,
 }
 
 /// The attribution consumer: every store/graph seam this pass touches, plus
@@ -669,24 +656,8 @@ impl Attributor {
         match self.attribute(incident, addresses, chain, at).await {
             Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
             Ok(()) => Handled::Commit,
-            Err(err) => handled_for(err),
+            Err(err) => event_bus::handled_for(err.is_transient(), err, "attribution"),
         }
-    }
-}
-
-/// Map an [`AttributionError`] to the offset action (§4), the same
-/// transient-retries/permanent-skips discipline every consumer on the
-/// backbone shares.
-fn handled_for(err: AttributionError) -> Handled {
-    if err.is_transient() {
-        tracing::warn!(error = %err, "attribution failed (transient); leaving offset to retry");
-        Handled::Retry
-    } else {
-        tracing::error!(
-            error = %err,
-            "attribution failed permanently; skipping incident so it cannot wedge the stream"
-        );
-        Handled::Commit
     }
 }
 
@@ -752,7 +723,10 @@ mod tests {
     use super::*;
     use crate::merge_actor::MergeActor;
     use crate::model::{AdjacencyEdge, EdgeKind, SanctionEntry};
-    use crate::test_util::{InMemoryAdjacency, InMemoryHotCache, InMemoryIntelligenceStore};
+    use crate::store::{AttributionStore, EntityStore, LabelStore, SanctionsStore};
+    use crate::test_util::{
+        store_seams, InMemoryAdjacency, InMemoryHotCache, InMemoryIntelligenceStore,
+    };
     use alloy_primitives::Address;
     use events::detection::PreliminaryAlertCreated;
     use events::primitives::{AlertKind, DetectorRef, Severity};
@@ -823,16 +797,6 @@ mod tests {
 
     fn envelope(payload: DomainEvent, at: DateTime<Utc>) -> EventEnvelope {
         EventEnvelope::with_metadata(Uuid::new_v4(), at, Chain::ETHEREUM, payload)
-    }
-
-    /// The one store double satisfies all four seams — bundle it four times.
-    fn store_seams(store: &Arc<InMemoryIntelligenceStore>) -> StoreSeams {
-        StoreSeams {
-            labels: store.clone(),
-            entities: store.clone(),
-            attributions: store.clone(),
-            sanctions: store.clone(),
-        }
     }
 
     struct Harness {
