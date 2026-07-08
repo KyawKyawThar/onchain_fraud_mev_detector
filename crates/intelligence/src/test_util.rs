@@ -23,7 +23,7 @@ use crate::model::{
 };
 use crate::store::{
     AttributionStore, CreateOutcome, EntityStore, LabelStore, LinkOutcome, MergeOutcome,
-    SanctionsStore, StoreError,
+    SanctionsStore, SplitOutcome, StoreError,
 };
 
 /// In-memory implementation of all four Postgres seams.
@@ -98,6 +98,32 @@ impl LabelStore for InMemoryIntelligenceStore {
         }
         Ok(state.revoked.insert(label_id))
     }
+
+    async fn label(&self, label_id: LabelId) -> Result<Option<LabelRecord>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state
+            .labels
+            .iter()
+            .find(|l| l.label_id == label_id)
+            .cloned())
+    }
+
+    async fn update_label_value(
+        &self,
+        label_id: LabelId,
+        new_value: &str,
+    ) -> Result<Option<LabelRecord>, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        if state.revoked.contains(&label_id) {
+            return Ok(None);
+        }
+        let Some(label) = state.labels.iter_mut().find(|l| l.label_id == label_id) else {
+            return Ok(None);
+        };
+        let before = label.clone();
+        label.value = new_value.to_owned();
+        Ok(Some(before))
+    }
 }
 
 #[async_trait]
@@ -137,6 +163,10 @@ impl EntityStore for InMemoryIntelligenceStore {
         _at: DateTime<Utc>,
     ) -> Result<LinkOutcome, StoreError> {
         let mut state = self.inner.lock().expect("store lock");
+        match state.entities.get(&entity_id) {
+            Some(meta) if meta.status == EntityStatus::Active => {}
+            _ => return Ok(LinkOutcome::TargetInactive),
+        }
         match state.memberships.get(address) {
             Some(owner) if *owner == entity_id => Ok(LinkOutcome::AlreadyMember),
             Some(owner) => Ok(LinkOutcome::OwnedBy(*owner)),
@@ -211,6 +241,66 @@ impl EntityStore for InMemoryIntelligenceStore {
         Ok(MergeOutcome::Merged {
             survivor_version: survivor_meta.version,
         })
+    }
+
+    async fn split(
+        &self,
+        entity_id: EntityId,
+        groups: &[Vec<AccountAddress>],
+        _evidence: &str,
+        at: DateTime<Utc>,
+    ) -> Result<SplitOutcome, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        match state.entities.get(&entity_id) {
+            Some(meta) if meta.status == EntityStatus::Active => {}
+            _ => return Ok(SplitOutcome::NotActive),
+        }
+
+        let current: BTreeSet<AccountAddress> = state
+            .memberships
+            .iter()
+            .filter(|(_, owner)| **owner == entity_id)
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        let mut proposed: BTreeSet<AccountAddress> = BTreeSet::new();
+        for group in groups {
+            if group.is_empty() {
+                return Ok(SplitOutcome::Invalid);
+            }
+            for address in group {
+                if !proposed.insert(*address) {
+                    return Ok(SplitOutcome::Invalid);
+                }
+            }
+        }
+        if proposed != current {
+            return Ok(SplitOutcome::Invalid);
+        }
+
+        let meta = state.entities.get_mut(&entity_id).expect("checked above");
+        meta.status = EntityStatus::Split;
+        meta.version += 1;
+
+        let mut new_ids = Vec::with_capacity(groups.len());
+        for group in groups {
+            let new_id = EntityId::new();
+            state.entities.insert(
+                new_id,
+                EntityMeta {
+                    version: 1,
+                    status: EntityStatus::Active,
+                    absorbed_into: None,
+                    created_at: at,
+                },
+            );
+            for address in group {
+                state.memberships.insert(*address, new_id);
+            }
+            new_ids.push(new_id);
+        }
+
+        Ok(SplitOutcome::Split { new_ids })
     }
 }
 

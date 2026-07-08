@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT entity_id FROM entities WHERE entity_id = ANY($1::uuid[])\n         ORDER BY entity_id FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entity_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "entities",
+            "name": "entity_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7d68bc32f96aa7b47aff0fa7fecdb0c037a57d9bd18ec336d6ddde222644ccce"
+}

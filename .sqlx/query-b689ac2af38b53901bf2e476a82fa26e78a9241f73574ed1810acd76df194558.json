@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT label_id, address, kind, value, confidence, source, source_detail,\n                    created_at, valid_until\n             FROM labels WHERE label_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "label_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "label_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "value",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "value"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "confidence",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "confidence"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "source_detail",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "source_detail"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "valid_until",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "labels",
+            "name": "valid_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "b689ac2af38b53901bf2e476a82fa26e78a9241f73574ed1810acd76df194558"
+}

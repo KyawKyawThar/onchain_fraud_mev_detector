@@ -31,12 +31,27 @@
 //! exceeds the cap, then applies the resulting component to the entity store
 //! idempotently.
 //!
-//! What deliberately does *not* live here yet: the Kafka consumer
-//! (attribution on `IncidentCreated`, t4) and the per-entity merge actor (t5)
-//! land on top of these seams. The fast path stays attribution-blind
-//! (§6/§8): nothing in detection reads these stores.
+//! Sprint 7 t4 adds [`attribution`]: the Kafka consumer that attributes a
+//! confirmed `IncidentCreated` to one or more entities, running the t2
+//! (labels) and t3 (clustering) seams together and emitting every domain
+//! event this pass discovers (`SanctionHit`, `EntityCreated`/`EntityMerged`,
+//! `LabelAdded`, `AttributionUpdated`). The remaining three intelligence
+//! events — `LabelUpdated`, `LabelRevoked`, `EntitySplit` — are *operator*
+//! actions rather than incident-triggered ones: [`store::LabelStore::update_label_value`]/
+//! [`revoke_label`](store::LabelStore::revoke_label) and
+//! [`store::EntityStore::split`] are the store primitives, driven by the
+//! `intelligence label-update|label-revoke|entity-split` CLI subcommands
+//! (`main.rs`), which publish the corresponding event themselves (no consumer
+//! of their own exists to do it).
+//!
+//! What deliberately does *not* live here yet: the per-entity merge actor
+//! (t5), which serializes concurrent merges per entity — [`cluster::cluster_address`]
+//! and [`attribution::Attributor`] both call [`store::EntityStore::absorb`]
+//! directly today. The fast path stays attribution-blind (§6/§8): nothing in
+//! detection reads these stores.
 
 pub mod adjacency;
+pub mod attribution;
 pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;

@@ -160,6 +160,8 @@ impl LabelRecord {
 
 /// An entity's lifecycle (§8.2). An absorbed entity is a tombstone pointing at
 /// its survivor — never deleted, so historical attributions stay resolvable.
+/// A split entity is likewise a tombstone, but with no single successor — its
+/// former members now belong to the fresh entities the split created.
 #[derive(
     Debug,
     Clone,
@@ -177,6 +179,9 @@ impl LabelRecord {
 pub enum EntityStatus {
     Active,
     Absorbed,
+    /// Split back apart (§8.2) — an operator's reversal of an earlier,
+    /// incorrect merge. Never re-activated.
+    Split,
 }
 
 /// A wallet cluster (§8.2), versioned: `version` increments on every

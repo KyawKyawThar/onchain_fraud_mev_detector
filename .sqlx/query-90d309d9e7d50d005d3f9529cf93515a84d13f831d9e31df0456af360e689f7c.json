@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address FROM entity_addresses WHERE entity_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entity_addresses",
+            "name": "address"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "90d309d9e7d50d005d3f9529cf93515a84d13f831d9e31df0456af360e689f7c"
+}

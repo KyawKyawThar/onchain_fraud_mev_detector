@@ -13,6 +13,7 @@
 //! primary key) holds at every instant. Serializing merges *per entity* is the
 //! t5 actor's job — this store only guarantees each merge is atomic.
 
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -94,6 +95,13 @@ pub enum LinkOutcome {
     /// Owned by another entity: the membership invariant blocked the link. The
     /// caller decides whether that means "merge these entities" (t3/t5).
     OwnedBy(EntityId),
+    /// `entity_id` is missing, absorbed, or split — linking into a tombstone
+    /// would strand the address on a dead entity, so nothing is written. A
+    /// caller that looked up `entity_id` before a concurrent merge/split can
+    /// hit this even outside a race window; it should re-resolve the address's
+    /// (possibly new) entity and retry, the same way `MergeOutcome::SurvivorInactive`
+    /// signals the caller to re-resolve.
+    TargetInactive,
 }
 
 /// What an [`EntityStore::absorb`] merge did.
@@ -110,8 +118,28 @@ pub enum MergeOutcome {
     SelfMerge,
 }
 
-/// Wallet labels with provenance (§8.1). Conflicting labels coexist; the only
-/// mutation ever applied to a label row is revocation (soft, audited).
+/// What an [`EntityStore::split`] pass did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitOutcome {
+    /// The original entity was tombstoned `Split` and one fresh entity
+    /// created per group, membership moved to match.
+    Split { new_ids: Vec<EntityId> },
+    /// `entity_id` is missing or not active — an idempotent no-op (it was
+    /// already split, absorbed, or never existed).
+    NotActive,
+    /// `groups` doesn't exactly partition the entity's *current* membership —
+    /// a missing address, an extra one, or a duplicate across groups.
+    /// Rejected; nothing written.
+    Invalid,
+}
+
+/// Wallet labels with provenance (§8.1). Conflicting *claims* always coexist
+/// as separate rows — never overwritten by [`add_label`](Self::add_label) —
+/// but an existing row does permit two narrow, audited mutations:
+/// [`revoke_label`](Self::revoke_label) (soft withdrawal) and
+/// [`update_label_value`](Self::update_label_value) (an operator correcting
+/// the same claim's display value in place, e.g. a typo'd tag name — distinct
+/// from a *new* claim, which always mints a new coexisting row).
 #[async_trait]
 pub trait LabelStore: Send + Sync {
     /// Insert a label, keyed by its `label_id`. Returns `false` when the id is
@@ -161,6 +189,27 @@ pub trait LabelStore: Send + Sync {
         reason: &str,
         at: DateTime<Utc>,
     ) -> Result<bool, StoreError>;
+
+    /// One label by its id, regardless of revocation/expiry — the identity
+    /// read an admin action needs before mutating a specific row (e.g.
+    /// resolving the address a `label_id` belongs to before revoking it).
+    /// `None` if no such label was ever stored.
+    async fn label(&self, label_id: LabelId) -> Result<Option<LabelRecord>, StoreError>;
+
+    /// Correct an existing label's `value` in place — the one narrow mutation
+    /// besides revocation §8.1 permits on an already-stored row. This is
+    /// deliberately *not* how a new conflicting claim is recorded (that's
+    /// always [`add_label`](Self::add_label), minting a new coexisting row);
+    /// it is for an operator fixing the *same* claim's display text without
+    /// changing its identity or provenance. Returns the label as it stood
+    /// before the correction — `None` if the id doesn't exist or is already
+    /// revoked (a revoked row is frozen; rewriting a dead claim would corrupt
+    /// the audit trail, not correct it).
+    async fn update_label_value(
+        &self,
+        label_id: LabelId,
+        new_value: &str,
+    ) -> Result<Option<LabelRecord>, StoreError>;
 }
 
 /// Versioned entities + membership (§8.2).
@@ -202,6 +251,23 @@ pub trait EntityStore: Send + Sync {
         surviving: EntityId,
         absorbed: EntityId,
     ) -> Result<MergeOutcome, StoreError>;
+
+    /// Split `entity_id` back apart — the converse of [`absorb`](Self::absorb),
+    /// an operator's reversal of an earlier, incorrect merge. `groups` must
+    /// exactly partition the entity's *current* membership (every member in
+    /// exactly one group, no outsiders); each group becomes a fresh entity,
+    /// seeded/linked with the same `evidence`/`at` semantics as
+    /// [`create_entity`](Self::create_entity)/[`link_address`](Self::link_address).
+    /// One transaction: the original is tombstoned `Split` and every member's
+    /// membership row is moved to its group's new entity atomically, so the
+    /// one-entity-per-address invariant never lapses mid-split.
+    async fn split(
+        &self,
+        entity_id: EntityId,
+        groups: &[Vec<AccountAddress>],
+        evidence: &str,
+        at: DateTime<Utc>,
+    ) -> Result<SplitOutcome, StoreError>;
 }
 
 /// Attribution records (§8): the mutable incident→entity overlay.
@@ -474,6 +540,94 @@ impl LabelStore for PgIntelligenceStore {
         .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    async fn label(&self, label_id: LabelId) -> Result<Option<LabelRecord>, StoreError> {
+        let Some(row) = sqlx::query_as!(
+            LabelRow,
+            "SELECT label_id, address, kind, value, confidence, source, source_detail,
+                    created_at, valid_until
+             FROM labels WHERE label_id = $1",
+            label_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(row.try_into()?))
+    }
+
+    async fn update_label_value(
+        &self,
+        label_id: LabelId,
+        new_value: &str,
+    ) -> Result<Option<LabelRecord>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Read-then-write inside one transaction so the returned "before"
+        // value is exactly what the UPDATE below replaces, even under
+        // concurrent correction attempts.
+        let Some(before) = sqlx::query_as!(
+            LabelRow,
+            "SELECT label_id, address, kind, value, confidence, source, source_detail,
+                    created_at, valid_until
+             FROM labels WHERE label_id = $1 AND revoked_at IS NULL
+             FOR UPDATE",
+            label_id.0,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        sqlx::query!(
+            "UPDATE labels SET value = $2 WHERE label_id = $1",
+            label_id.0,
+            new_value,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(before.try_into()?))
+    }
+}
+
+/// Lock the given entity rows for the rest of the transaction, in ascending
+/// `entity_id` order — the deadlock-safe protocol every membership-mutating
+/// method (`link_address`, `absorb`, `split`) uses to serialize against each
+/// other *per entity*.
+///
+/// Without this, two concurrent writers can race a read-then-write window:
+/// e.g. `split` reads an entity's current membership, then a concurrent
+/// `link_address` adds a new address to that same entity before `split`
+/// tombstones it — the new address is left pointing at a tombstoned entity,
+/// a dangling membership row. Locking the entity row up front (before any
+/// membership read) closes that window: the second transaction simply blocks
+/// until the first commits, then sees the post-commit truth.
+///
+/// Always lock in one fixed order (ascending `Uuid`) regardless of the
+/// caller's argument order — `absorb(a, b)` running concurrently with
+/// `absorb(b, a)` (or `split`/`link_address` on the same pair) must acquire
+/// the same two locks in the same order, or Postgres detects a deadlock and
+/// aborts one side. Sorting here is what makes every call site deadlock-safe
+/// without each one having to reason about lock order itself.
+async fn lock_entities(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entity_ids: &[EntityId],
+) -> Result<(), StoreError> {
+    let mut ids: Vec<Uuid> = entity_ids.iter().map(|id| id.0).collect();
+    ids.sort();
+    ids.dedup();
+    sqlx::query!(
+        "SELECT entity_id FROM entities WHERE entity_id = ANY($1::uuid[])
+         ORDER BY entity_id FOR UPDATE",
+        &ids,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -535,6 +689,26 @@ impl EntityStore for PgIntelligenceStore {
         evidence: &str,
         at: DateTime<Utc>,
     ) -> Result<LinkOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // Serialize against a concurrent `absorb`/`split` of this same entity —
+        // see `lock_entities`'s docs for the race this closes.
+        lock_entities(&mut tx, &[entity_id]).await?;
+
+        // Refuse to link into a tombstone — not just the concurrent case (the
+        // lock above), but a caller that resolved `entity_id` before an
+        // already-committed merge/split too. Either way, linking here would
+        // strand the address on a dead entity.
+        let is_active = sqlx::query!(
+            "SELECT 1 AS one FROM entities WHERE entity_id = $1 AND status = 'active'",
+            entity_id.0,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !is_active {
+            return Ok(LinkOutcome::TargetInactive);
+        }
+
         let linked = sqlx::query!(
             "INSERT INTO entity_addresses (address, entity_id, evidence, linked_at)
              VALUES ($1, $2, $3, $4)
@@ -544,9 +718,10 @@ impl EntityStore for PgIntelligenceStore {
             evidence,
             at,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if linked.rows_affected() == 1 {
+            tx.commit().await?;
             return Ok(LinkOutcome::Linked);
         }
 
@@ -554,8 +729,9 @@ impl EntityStore for PgIntelligenceStore {
             "SELECT entity_id FROM entity_addresses WHERE address = $1",
             address_key(address),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         if owner.entity_id == entity_id.0 {
             Ok(LinkOutcome::AlreadyMember)
         } else {
@@ -621,6 +797,10 @@ impl EntityStore for PgIntelligenceStore {
             return Ok(MergeOutcome::SelfMerge);
         }
         let mut tx = self.pool.begin().await?;
+        // Serialize against a concurrent `link_address`/`absorb`/`split` on
+        // either entity — locked in a fixed order so a concurrent `absorb`
+        // running the opposite direction can't deadlock against this one.
+        lock_entities(&mut tx, &[surviving, absorbed]).await?;
 
         // Tombstone the absorbed entity first; the guard on `status = 'active'`
         // makes a redelivered merge a detectable no-op.
@@ -668,6 +848,106 @@ impl EntityStore for PgIntelligenceStore {
         let survivor_version = u64::try_from(survivor.version)
             .map_err(|_| StoreError::malformed(format!("entity version {}", survivor.version)))?;
         Ok(MergeOutcome::Merged { survivor_version })
+    }
+
+    async fn split(
+        &self,
+        entity_id: EntityId,
+        groups: &[Vec<AccountAddress>],
+        evidence: &str,
+        at: DateTime<Utc>,
+    ) -> Result<SplitOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // Serialize against a concurrent `link_address`/`absorb`/`split` on
+        // this entity — locked *before* reading membership below, which is
+        // what closes the read-then-write race: without this, a concurrent
+        // `link_address` could add a member between the membership read and
+        // the tombstone write, leaving it pointing at a tombstoned entity.
+        lock_entities(&mut tx, &[entity_id]).await?;
+
+        let is_active = sqlx::query!(
+            "SELECT 1 AS one FROM entities WHERE entity_id = $1 AND status = 'active'",
+            entity_id.0,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !is_active {
+            return Ok(SplitOutcome::NotActive);
+        }
+
+        // `groups` must exactly partition the entity's *current* membership —
+        // validated before any write, so an invalid request touches nothing.
+        // Safe from a TOCTOU race now: the lock above holds until commit.
+        let current: BTreeSet<String> = sqlx::query!(
+            "SELECT address FROM entity_addresses WHERE entity_id = $1",
+            entity_id.0,
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row.address)
+        .collect();
+
+        let mut proposed: BTreeSet<String> = BTreeSet::new();
+        for group in groups {
+            if group.is_empty() {
+                return Ok(SplitOutcome::Invalid);
+            }
+            for address in group {
+                if !proposed.insert(address_key(address)) {
+                    // A duplicate address, within one group or across two.
+                    return Ok(SplitOutcome::Invalid);
+                }
+            }
+        }
+        if proposed != current {
+            return Ok(SplitOutcome::Invalid);
+        }
+
+        // Tombstone the original — guarded by `status = 'active'` again so a
+        // concurrent split/absorb since the check above can't double-split.
+        let tombstoned = sqlx::query!(
+            "UPDATE entities SET status = 'split', version = version + 1, updated_at = now()
+             WHERE entity_id = $1 AND status = 'active'",
+            entity_id.0,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if tombstoned.rows_affected() == 0 {
+            return Ok(SplitOutcome::NotActive);
+        }
+
+        // One fresh entity per group, membership moved to match.
+        let mut new_ids = Vec::with_capacity(groups.len());
+        for group in groups {
+            let new_id = EntityId::new();
+            sqlx::query!(
+                "INSERT INTO entities (entity_id, version, status, created_at)
+                 VALUES ($1, 1, 'active', $2)",
+                new_id.0,
+                at,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            let addresses: Vec<String> = group.iter().map(address_key).collect();
+            sqlx::query!(
+                "UPDATE entity_addresses SET entity_id = $1, evidence = $2, linked_at = $3
+                 WHERE address = ANY($4::text[])",
+                new_id.0,
+                evidence,
+                at,
+                &addresses,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            new_ids.push(new_id);
+        }
+
+        tx.commit().await?;
+        Ok(SplitOutcome::Split { new_ids })
     }
 }
 
@@ -811,5 +1091,278 @@ mod tests {
         // Address parsing is model::parse_address_key, folded in as Malformed.
         let err: StoreError = parse_address_key("0xnothex").unwrap_err().into();
         assert!(!err.is_transient());
+    }
+
+    // ── `label`/`update_label_value`/`split`, over the in-memory double ──
+    // These three are pure CRUD (no cluster.rs-style pure-decision module of
+    // their own), so their contract is pinned here against `test_util`'s
+    // double — the real Postgres semantics are proven by the `#[ignore]`
+    // integration tests in `tests/stores.rs`.
+
+    use crate::model::{LabelKind, LabelSource};
+    use crate::test_util::InMemoryIntelligenceStore;
+    use alloy_primitives::Address;
+
+    fn addr(byte: u8) -> AccountAddress {
+        Address::repeat_byte(byte)
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn label_finds_a_stored_row_regardless_of_revocation_and_none_for_unknown() {
+        let store = InMemoryIntelligenceStore::new();
+        let label = LabelRecord::new(
+            addr(1),
+            LabelKind::CexWallet,
+            "Binance 14",
+            LabelSource::Manual,
+            "operator",
+            at(1),
+        );
+        store.add_label(&label).await.unwrap();
+
+        assert_eq!(
+            store.label(label.label_id).await.unwrap(),
+            Some(label.clone())
+        );
+        assert_eq!(store.label(LabelId::new()).await.unwrap(), None);
+
+        store
+            .revoke_label(label.label_id, "wrong", at(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.label(label.label_id).await.unwrap(),
+            Some(label),
+            "label() ignores revocation — it's the identity read, not the active-set read"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_label_value_corrects_in_place_and_reports_the_old_value() {
+        let store = InMemoryIntelligenceStore::new();
+        let label = LabelRecord::new(
+            addr(1),
+            LabelKind::CexWallet,
+            "Binance 14 (typo)",
+            LabelSource::Manual,
+            "operator",
+            at(1),
+        );
+        store.add_label(&label).await.unwrap();
+
+        let before = store
+            .update_label_value(label.label_id, "Binance 14")
+            .await
+            .unwrap()
+            .expect("label exists");
+        assert_eq!(before.value, "Binance 14 (typo)");
+
+        let labels = store.labels_for(&addr(1), at(1_000)).await.unwrap();
+        assert_eq!(
+            labels.len(),
+            1,
+            "corrected in place, not a new coexisting row"
+        );
+        assert_eq!(labels[0].value, "Binance 14");
+        assert_eq!(labels[0].label_id, label.label_id, "identity is unchanged");
+    }
+
+    #[tokio::test]
+    async fn update_label_value_refuses_a_revoked_or_unknown_label() {
+        let store = InMemoryIntelligenceStore::new();
+        let label = LabelRecord::new(
+            addr(1),
+            LabelKind::CexWallet,
+            "Binance 14",
+            LabelSource::Manual,
+            "operator",
+            at(1),
+        );
+        store.add_label(&label).await.unwrap();
+        store
+            .revoke_label(label.label_id, "wrong", at(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .update_label_value(label.label_id, "new value")
+                .await
+                .unwrap(),
+            None,
+            "a revoked row is frozen — correcting it would corrupt the audit trail"
+        );
+        assert_eq!(
+            store
+                .update_label_value(LabelId::new(), "new value")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn split_partitions_membership_into_fresh_entities() {
+        let store = InMemoryIntelligenceStore::new();
+        let entity_id = EntityId::new();
+        store
+            .create_entity(entity_id, &addr(1), "seed", at(1))
+            .await
+            .unwrap();
+        store
+            .link_address(entity_id, &addr(2), "cluster", at(1))
+            .await
+            .unwrap();
+        store
+            .link_address(entity_id, &addr(3), "cluster", at(1))
+            .await
+            .unwrap();
+
+        let groups = vec![vec![addr(1), addr(2)], vec![addr(3)]];
+        let SplitOutcome::Split { new_ids } = store
+            .split(entity_id, &groups, "operator:kkt", at(10))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a successful split");
+        };
+        assert_eq!(new_ids.len(), 2);
+        assert_ne!(new_ids[0], new_ids[1]);
+
+        // The original is tombstoned and owns nothing.
+        assert_eq!(
+            store.entity(entity_id).await.unwrap().unwrap().status,
+            EntityStatus::Split
+        );
+        assert_eq!(
+            store.entity_for_address(&addr(1)).await.unwrap(),
+            Some(new_ids[0])
+        );
+        assert_eq!(
+            store.entity_for_address(&addr(2)).await.unwrap(),
+            Some(new_ids[0])
+        );
+        assert_eq!(
+            store.entity_for_address(&addr(3)).await.unwrap(),
+            Some(new_ids[1])
+        );
+
+        // Re-running the same split against the now-tombstoned original is a
+        // no-op, not a second split — idempotent under redelivery/retry.
+        assert_eq!(
+            store
+                .split(entity_id, &groups, "operator:kkt", at(20))
+                .await
+                .unwrap(),
+            SplitOutcome::NotActive
+        );
+
+        // A caller that resolved `entity_id` before the split (e.g. a stale
+        // cluster-walk result) must not be able to strand a new member on the
+        // now-dead entity.
+        assert_eq!(
+            store
+                .link_address(entity_id, &addr(4), "late cluster signal", at(30))
+                .await
+                .unwrap(),
+            LinkOutcome::TargetInactive
+        );
+    }
+
+    #[tokio::test]
+    async fn link_address_refuses_an_absorbed_target_too() {
+        let store = InMemoryIntelligenceStore::new();
+        let (survivor, absorbed) = (EntityId::new(), EntityId::new());
+        store
+            .create_entity(survivor, &addr(1), "seed", at(1))
+            .await
+            .unwrap();
+        store
+            .create_entity(absorbed, &addr(2), "seed", at(1))
+            .await
+            .unwrap();
+        store.absorb(survivor, absorbed).await.unwrap();
+
+        assert_eq!(
+            store
+                .link_address(absorbed, &addr(3), "stale target", at(10))
+                .await
+                .unwrap(),
+            LinkOutcome::TargetInactive,
+            "absorbed is a tombstone now — linking into it would strand addr(3)"
+        );
+        // The survivor is still a perfectly valid target.
+        assert_eq!(
+            store
+                .link_address(survivor, &addr(3), "correct target", at(10))
+                .await
+                .unwrap(),
+            LinkOutcome::Linked
+        );
+    }
+
+    #[tokio::test]
+    async fn split_rejects_a_partition_that_does_not_match_current_membership() {
+        let store = InMemoryIntelligenceStore::new();
+        let entity_id = EntityId::new();
+        store
+            .create_entity(entity_id, &addr(1), "seed", at(1))
+            .await
+            .unwrap();
+        store
+            .link_address(entity_id, &addr(2), "cluster", at(1))
+            .await
+            .unwrap();
+
+        // Missing addr(2).
+        assert_eq!(
+            store
+                .split(entity_id, &[vec![addr(1)]], "op", at(10))
+                .await
+                .unwrap(),
+            SplitOutcome::Invalid
+        );
+        // An outsider that never belonged to this entity.
+        assert_eq!(
+            store
+                .split(entity_id, &[vec![addr(1), addr(2), addr(9)]], "op", at(10))
+                .await
+                .unwrap(),
+            SplitOutcome::Invalid
+        );
+        // The same address in two groups.
+        assert_eq!(
+            store
+                .split(
+                    entity_id,
+                    &[vec![addr(1), addr(2)], vec![addr(2)]],
+                    "op",
+                    at(10)
+                )
+                .await
+                .unwrap(),
+            SplitOutcome::Invalid
+        );
+        // Membership must be intact after every rejected attempt.
+        assert_eq!(
+            store.entity(entity_id).await.unwrap().unwrap().status,
+            EntityStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn split_on_a_missing_or_already_split_entity_is_not_active() {
+        let store = InMemoryIntelligenceStore::new();
+        assert_eq!(
+            store
+                .split(EntityId::new(), &[vec![addr(1)]], "op", at(10))
+                .await
+                .unwrap(),
+            SplitOutcome::NotActive
+        );
     }
 }
