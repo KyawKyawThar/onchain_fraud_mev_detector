@@ -16,6 +16,9 @@
 //!   - `attribute` (default; also the no-arg run) — drive the t4 attribution
 //!     consumer: `PreliminaryAlertCreated` + `IncidentCreated` in, entities/
 //!     labels/attribution/sanctions events out, until a shutdown signal.
+//!   - `risk <address>` — compute and print one address's risk score (§8.3,
+//!     Sprint 8 t1): read-only, no event published (that lands with the t2
+//!     cache/invalidation consumer this pure kernel plugs into).
 //!   - `label-update <chain-id> <label-id> <new-value>` — operator correction
 //!     of a label's display value in place; emits `LabelUpdated`.
 //!   - `label-revoke <chain-id> <label-id> <reason...>` — soft-revoke a label;
@@ -45,8 +48,11 @@ use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
 use intelligence::merge_actor::MergeActor;
+use intelligence::risk::{self, RiskInputs};
 use intelligence::seed::{Feed, Seeder};
-use intelligence::store::{EntityStore, LabelStore, PgIntelligenceStore, SplitOutcome};
+use intelligence::store::{
+    AttributionStore, EntityStore, LabelStore, PgIntelligenceStore, SanctionsStore, SplitOutcome,
+};
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -54,6 +60,7 @@ use tracing::Instrument;
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
+                     `risk <address>`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -77,6 +84,7 @@ async fn main() -> Result<()> {
         Some("seed") => seed(&cfg, args).await,
         Some("cluster") => cluster(&cfg, client, args).await,
         Some("attribute") | None => attribute(&cfg, client).await,
+        Some("risk") => address_risk(&cfg, args).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -226,6 +234,75 @@ async fn cluster(
             "no cluster formed: {raw_address} is itself an infrastructure endpoint \
              (degree over the cap at hop 0)"
         ),
+    }
+    Ok(())
+}
+
+/// Compute and print one address's risk score (§8.3, Sprint 8 t1): read the
+/// four store seams directly, hand the fetched rows to the pure
+/// [`risk::score`] kernel, and print the same explainable breakdown the
+/// architecture doc's worked example shows. Read-only — no `RiskScoreUpdated`
+/// is published here; that lands with the t2 cache/invalidation consumer this
+/// kernel plugs into.
+async fn address_risk(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let Some(raw_address) = args.next() else {
+        bail!("missing address; {USAGE}");
+    };
+    let address = raw_address
+        .parse()
+        .map_err(|_| anyhow::anyhow!("address {raw_address:?} is not 0x-hex; {USAGE}"))?;
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = PgIntelligenceStore::new(pool);
+
+    let as_of = chrono::Utc::now();
+    let labels = store
+        .labels_for(&address, as_of)
+        .await
+        .context("loading labels")?;
+    let sanctions = store
+        .sanction_matches(&address)
+        .await
+        .context("loading sanctions")?;
+    let entity_id = store
+        .entity_for_address(&address)
+        .await
+        .context("resolving entity")?;
+    let (entity, attributions) = match entity_id {
+        Some(id) => (
+            store.entity(id).await.context("loading entity")?,
+            store
+                .attributions_for_entity(id)
+                .await
+                .context("loading attributions")?,
+        ),
+        None => (None, Vec::new()),
+    };
+
+    let inputs = RiskInputs {
+        labels,
+        attributions,
+        sanctions,
+        entity,
+    };
+    let result = risk::score(address, entity_id, &inputs, as_of);
+
+    println!(
+        "Score: {} / 100   Confidence: {:.2}   (model {})",
+        result.score,
+        result.confidence.get(),
+        result.model_version
+    );
+    if result.factors.is_empty() {
+        println!("(no risk signal on record for this address)");
+    }
+    for factor in &result.factors {
+        println!(
+            "{:+.0}  {}  [{}]",
+            factor.delta, factor.name, factor.evidence_ref
+        );
     }
     Ok(())
 }
