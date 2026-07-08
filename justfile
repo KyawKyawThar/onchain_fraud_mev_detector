@@ -17,6 +17,16 @@ export DATABASE_URL := env_var_or_default("DATABASE_URL",
     env_var_or_default("POSTGRES_PORT", "5432") + "/" +
     env_var_or_default("POSTGRES_DB", "detector") + "?sslmode=disable")
 
+# Every `sqlx::query!`/`query_as!` verifies against the committed `.sqlx/`
+# cache instead of a live Postgres connection — build/lint/test never need a
+# running database, and can't silently break because someone's shell has a
+# stale/unreachable DATABASE_URL exported. `cargo sqlx prepare` (the one
+# recipe that *must* hit a live database to regenerate the cache) ignores
+# this var for its own purpose, so it isn't affected. Override per-invocation
+# with `SQLX_OFFLINE=false just <recipe>` if you deliberately want live
+# verification.
+export SQLX_OFFLINE := env_var_or_default("SQLX_OFFLINE", "true")
+
 # Show available recipes (default).
 _default:
     @just --list

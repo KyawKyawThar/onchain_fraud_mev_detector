@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE labels SET value = $2 WHERE label_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e1fddff151c841e0fe5c8c1db3e4a4b68f05b2e6fb81d86c21184e79e1797fee"
+}

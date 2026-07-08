@@ -75,6 +75,17 @@ pub enum ClusterError {
     Store(#[from] StoreError),
 }
 
+impl ClusterError {
+    /// Whether retrying the same pass could plausibly succeed — the shared
+    /// retry/skip contract every store/graph error carries.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ClusterError::Graph(err) => err.is_transient(),
+            ClusterError::Store(err) => err.is_transient(),
+        }
+    }
+}
+
 /// What one [`cluster_address`] pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterOutcome {
@@ -89,6 +100,12 @@ pub struct ClusterOutcome {
     /// because their cluster-relevant degree exceeded the cap (§8.2) —
     /// infrastructure endpoints, not members.
     pub hubs: Vec<AccountAddress>,
+    /// The address `entity_id` was freshly seeded from, if this pass *created*
+    /// a new entity (`None` when the component already had an owner, or a
+    /// concurrent writer raced the create — see [`CreateOutcome::SeedOwnedBy`]).
+    /// The `IncidentCreated` attribution consumer (t4) uses this to know
+    /// whether to emit `EntityCreated`.
+    pub created_seed: Option<AccountAddress>,
 }
 
 /// A bounded, in-memory view of the graph around one seed (§8: "load 3-hop
@@ -217,23 +234,24 @@ pub async fn cluster_address(
         }
     }
 
-    let (survivor, to_absorb) = match plan_merge(&owners, &subgraph.members) {
-        MergePlan::UseExisting { survivor, absorb } => (survivor, absorb),
+    let (survivor, to_absorb, created_seed) = match plan_merge(&owners, &subgraph.members) {
+        MergePlan::UseExisting { survivor, absorb } => (survivor, absorb, None),
         MergePlan::CreateNew { seed: seed_addr } => {
             let new_id = EntityId::new();
-            let survivor = match entities
+            let (survivor, created_seed) = match entities
                 .create_entity(new_id, &seed_addr, evidence, at)
                 .await?
             {
-                CreateOutcome::Created => new_id,
+                CreateOutcome::Created => (new_id, Some(seed_addr)),
                 CreateOutcome::AlreadyExists => {
                     unreachable!("freshly minted EntityId can't already exist")
                 }
                 // Raced with a concurrent writer since the `owners` read
-                // above; adopt whoever won instead of erroring the pass out.
-                CreateOutcome::SeedOwnedBy(owner) => owner,
+                // above; adopt whoever won instead of erroring the pass out —
+                // that writer's pass is the one that "created" it.
+                CreateOutcome::SeedOwnedBy(owner) => (owner, None),
             };
-            (survivor, Vec::new())
+            (survivor, Vec::new(), created_seed)
         }
     };
 
@@ -267,6 +285,7 @@ pub async fn cluster_address(
         linked,
         absorbed,
         hubs,
+        created_seed,
     }))
 }
 
@@ -385,6 +404,11 @@ mod tests {
         .expect("a cluster forms");
 
         assert!(outcome.hubs.is_empty());
+        assert_eq!(
+            outcome.created_seed,
+            Some(addr(1)),
+            "no member owned an entity yet, so this pass created one, seeded at the lowest address"
+        );
         let entity = store.entity(outcome.entity_id).await.unwrap().unwrap();
         let mut members = entity.addresses.clone();
         members.sort();
@@ -529,6 +553,10 @@ mod tests {
         let absorbed_id = if survivor == e1 { e2 } else { e1 };
         assert_eq!(outcome.entity_id, survivor);
         assert_eq!(outcome.absorbed, vec![absorbed_id]);
+        assert_eq!(
+            outcome.created_seed, None,
+            "both members already owned an entity — this pass merged, it didn't create"
+        );
 
         let entity = store.entity(survivor).await.unwrap().unwrap();
         let mut members = entity.addresses.clone();
@@ -559,6 +587,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(!first.linked.is_empty());
+        assert_eq!(first.created_seed, Some(addr(1)));
 
         let second = cluster_address(
             &graph,
@@ -575,5 +604,9 @@ mod tests {
         assert_eq!(second.entity_id, first.entity_id);
         assert!(second.linked.is_empty());
         assert!(second.absorbed.is_empty());
+        assert_eq!(
+            second.created_seed, None,
+            "a re-run finds the entity already owned — it must not report a fresh create"
+        );
     }
 }
