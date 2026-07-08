@@ -32,6 +32,7 @@ use chrono::{DateTime, Utc};
 use events::primitives::{AccountAddress, Chain, EntityId};
 
 use crate::adjacency::{AdjacencyStore, GraphError};
+use crate::merge_actor::{EntityGuard, MergeActorError, MergeActorHandle};
 use crate::model::EdgeKind;
 use crate::store::{CreateOutcome, EntityStore, LinkOutcome, MergeOutcome, StoreError};
 
@@ -73,15 +74,21 @@ pub enum ClusterError {
     Graph(#[from] GraphError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    MergeActor(#[from] MergeActorError),
 }
 
 impl ClusterError {
     /// Whether retrying the same pass could plausibly succeed — the shared
-    /// retry/skip contract every store/graph error carries.
+    /// retry/skip contract every store/graph error carries. A gone merge
+    /// actor means the coordinator task died with the process (or is mid
+    /// shutdown); a redelivered pass against a freshly booted process gets a
+    /// fresh actor, so it's transient like the rest.
     pub fn is_transient(&self) -> bool {
         match self {
             ClusterError::Graph(err) => err.is_transient(),
             ClusterError::Store(err) => err.is_transient(),
+            ClusterError::MergeActor(_) => true,
         }
     }
 }
@@ -201,6 +208,32 @@ fn plan_merge(
     }
 }
 
+/// Which existing entity, if any, already owns each member — a live snapshot
+/// at call time. On its own this can go stale by the time a caller acts on
+/// it; [`cluster_address`]'s converge-then-lock loop is what closes that
+/// window, not this helper.
+async fn read_owners(
+    entities: &dyn EntityStore,
+    members: &BTreeSet<AccountAddress>,
+) -> Result<HashMap<AccountAddress, EntityId>, ClusterError> {
+    let mut owners = HashMap::new();
+    for member in members {
+        if let Some(owner) = entities.entity_for_address(member).await? {
+            owners.insert(*member, owner);
+        }
+    }
+    Ok(owners)
+}
+
+/// The three collaborators one [`cluster_address`] pass needs — bundled to
+/// stay under clippy's argument-count gate without collapsing the
+/// object-safe seam split (mirrors [`crate::attribution::StoreSeams`]).
+pub struct ClusterSeams<'a> {
+    pub graph: &'a dyn AdjacencyStore,
+    pub entities: &'a dyn EntityStore,
+    pub merge_actor: &'a MergeActorHandle,
+}
+
 /// Cluster the bounded component around `seed` and apply it to the
 /// [`EntityStore`] (§8.2). Returns `Ok(None)` when the seed itself is an
 /// infrastructure endpoint (capped at hop 0) — there is no cluster to form,
@@ -212,27 +245,49 @@ fn plan_merge(
 /// already owned by the same survivor entity, and returns an outcome with
 /// empty `linked`/`absorbed`.
 pub async fn cluster_address(
-    graph: &dyn AdjacencyStore,
-    entities: &dyn EntityStore,
+    seams: ClusterSeams<'_>,
     chain: Chain,
     seed: &AccountAddress,
     evidence: &str,
     at: DateTime<Utc>,
     limits: ClusterLimits,
 ) -> Result<Option<ClusterOutcome>, ClusterError> {
+    let ClusterSeams {
+        graph,
+        entities,
+        merge_actor,
+    } = seams;
     let subgraph = bounded_component(graph, chain, *seed, limits).await?;
     let hubs: Vec<AccountAddress> = subgraph.hubs.into_iter().collect();
     if subgraph.members.is_empty() {
         return Ok(None);
     }
 
-    // Which existing entity, if any, already owns each member.
-    let mut owners: HashMap<AccountAddress, EntityId> = HashMap::new();
-    for member in &subgraph.members {
-        if let Some(owner) = entities.entity_for_address(member).await? {
-            owners.insert(*member, owner);
+    // Hold every entity id this pass reads as an owner for the rest of this
+    // function (§17, the t5 merge actor) — without this, a concurrent
+    // in-process pass could tombstone one of them between this read and the
+    // writes below, and we'd either silently drop a link
+    // (`LinkOutcome::TargetInactive`, only the `Linked` arm does anything
+    // below) or hand the caller a since-absorbed entity id. Converges by
+    // re-reading owners after each lock: if the locked set turns out stale
+    // (a concurrent pass changed ownership before we got here), the newly
+    // discovered id(s) fold into `needed` and we retry.
+    let mut guard: Option<EntityGuard> = None;
+    let owners = loop {
+        let owners = read_owners(entities, &subgraph.members).await?;
+        let needed: HashSet<EntityId> = owners.values().copied().collect();
+        if guard.as_ref().is_some_and(|g| g.matches(&needed)) {
+            break owners;
         }
-    }
+        // Drop whatever we're currently holding *before* requesting the new
+        // set — a stale guard can share an id with `needed` (that id didn't
+        // change), and a plain reassignment would only drop the old value
+        // after the new `lock` call resolves, i.e. after we've already
+        // asked to acquire an id we still hold ourselves. Self-deadlock.
+        drop(guard.take());
+        guard = Some(merge_actor.lock(needed).await?);
+    };
+    let _guard = guard; // held until this function returns.
 
     let (survivor, to_absorb, created_seed) = match plan_merge(&owners, &subgraph.members) {
         MergePlan::UseExisting { survivor, absorb } => (survivor, absorb, None),
@@ -292,13 +347,28 @@ pub async fn cluster_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AdjacencyEdge;
+    use crate::merge_actor::MergeActor;
+    use crate::model::{AdjacencyEdge, EntityRecord, EntityStatus};
+    use crate::store::SplitOutcome;
     use crate::test_util::{InMemoryAdjacency, InMemoryIntelligenceStore};
     use alloy_primitives::Address;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     fn addr(byte: u8) -> AccountAddress {
         Address::repeat_byte(byte)
+    }
+
+    /// A fresh actor for a test that doesn't care about sharing one across
+    /// calls — every production caller shares a single per-process handle
+    /// ([`crate::attribution::Attributor`], the `cluster` CLI subcommand),
+    /// but most of these tests only exercise one `cluster_address` call at a
+    /// time, so a throwaway per-test actor keeps the signature simple.
+    fn actor() -> MergeActorHandle {
+        MergeActor::spawn()
     }
 
     // ── plan_merge: the pure decision, tested with plain values ──────
@@ -380,6 +450,7 @@ mod tests {
     async fn common_funder_clusters_into_one_entity() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         let funder = addr(0xF0);
         graph
             .append(&[
@@ -391,8 +462,11 @@ mod tests {
             .unwrap();
 
         let outcome = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -421,6 +495,7 @@ mod tests {
     async fn hub_funder_does_not_bridge_unrelated_addresses() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         let hub = addr(0xAA);
         let limits = ClusterLimits {
             degree_cap: 3,
@@ -433,8 +508,11 @@ mod tests {
         graph.append(&edges).await.unwrap();
 
         let outcome = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -451,8 +529,11 @@ mod tests {
 
         // addr(2) independently clusters into its OWN entity, not addr(1)'s.
         let other = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(2),
             "test",
@@ -470,6 +551,7 @@ mod tests {
     async fn seed_that_is_itself_a_hub_forms_no_cluster() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         let hub = addr(0xAA);
         let limits = ClusterLimits {
             degree_cap: 2,
@@ -480,9 +562,20 @@ mod tests {
             .collect();
         graph.append(&edges).await.unwrap();
 
-        let outcome = cluster_address(&graph, &store, Chain::ETHEREUM, &hub, "test", at(1), limits)
-            .await
-            .unwrap();
+        let outcome = cluster_address(
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
+            Chain::ETHEREUM,
+            &hub,
+            "test",
+            at(1),
+            limits,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, None);
     }
 
@@ -491,14 +584,18 @@ mod tests {
     async fn interacted_edges_do_not_cluster() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         graph
             .append(&[edge(addr(1), addr(2), EdgeKind::Interacted)])
             .await
             .unwrap();
 
         let outcome = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -518,6 +615,7 @@ mod tests {
     async fn merges_pre_existing_entities_in_the_component() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         graph
             .append(&[edge(addr(1), addr(2), EdgeKind::Deployed)])
             .await
@@ -537,8 +635,11 @@ mod tests {
             .unwrap();
 
         let outcome = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -569,14 +670,18 @@ mod tests {
     async fn re_running_a_cluster_pass_is_idempotent() {
         let graph = InMemoryAdjacency::new();
         let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
         graph
             .append(&[edge(addr(0xF0), addr(1), EdgeKind::Funded)])
             .await
             .unwrap();
 
         let first = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -590,8 +695,11 @@ mod tests {
         assert_eq!(first.created_seed, Some(addr(1)));
 
         let second = cluster_address(
-            &graph,
-            &store,
+            ClusterSeams {
+                graph: &graph,
+                entities: &store,
+                merge_actor: &merge_actor,
+            },
             Chain::ETHEREUM,
             &addr(1),
             "test",
@@ -608,5 +716,214 @@ mod tests {
             second.created_seed, None,
             "a re-run finds the entity already owned — it must not report a fresh create"
         );
+    }
+
+    // ── merge actor (§17, t5): the race it closes ─────────────────────
+
+    /// Delegates every [`EntityStore`] call straight through to `inner`,
+    /// except that the *first* `entity_for_address` call for `pause_at`
+    /// notifies `paused` and then blocks on `resume` before returning — lets
+    /// a test drive a second `cluster_address` pass to completion while this
+    /// one is parked mid owners-read, deterministically reproducing the race
+    /// the merge actor exists to close.
+    struct PausingStore<'a> {
+        inner: &'a InMemoryIntelligenceStore,
+        pause_at: AccountAddress,
+        fired: AtomicBool,
+        paused: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl EntityStore for PausingStore<'_> {
+        async fn create_entity(
+            &self,
+            entity_id: EntityId,
+            seed: &AccountAddress,
+            evidence: &str,
+            at: DateTime<Utc>,
+        ) -> Result<CreateOutcome, StoreError> {
+            self.inner
+                .create_entity(entity_id, seed, evidence, at)
+                .await
+        }
+
+        async fn link_address(
+            &self,
+            entity_id: EntityId,
+            address: &AccountAddress,
+            evidence: &str,
+            at: DateTime<Utc>,
+        ) -> Result<LinkOutcome, StoreError> {
+            self.inner
+                .link_address(entity_id, address, evidence, at)
+                .await
+        }
+
+        async fn entity(&self, entity_id: EntityId) -> Result<Option<EntityRecord>, StoreError> {
+            self.inner.entity(entity_id).await
+        }
+
+        async fn entity_for_address(
+            &self,
+            address: &AccountAddress,
+        ) -> Result<Option<EntityId>, StoreError> {
+            let result = self.inner.entity_for_address(address).await;
+            if *address == self.pause_at && !self.fired.swap(true, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.resume.notified().await;
+            }
+            result
+        }
+
+        async fn absorb(
+            &self,
+            surviving: EntityId,
+            absorbed: EntityId,
+        ) -> Result<MergeOutcome, StoreError> {
+            self.inner.absorb(surviving, absorbed).await
+        }
+
+        async fn split(
+            &self,
+            entity_id: EntityId,
+            groups: &[Vec<AccountAddress>],
+            evidence: &str,
+            at: DateTime<Utc>,
+        ) -> Result<SplitOutcome, StoreError> {
+            self.inner.split(entity_id, groups, evidence, at).await
+        }
+    }
+
+    /// The regression this whole module exists for: two overlapping-but-not-
+    /// identical components discovered concurrently must never leave a pass
+    /// reporting a since-tombstoned entity id.
+    ///
+    /// Setup: `e1` owns A, `e2` owns B, `e3` owns C, with `Funded` edges
+    /// A–B and B–C (so with `max_hops: 1`, a pass seeded at A sees only
+    /// {A, B} and a pass seeded at C sees only {B, C} — they overlap at B
+    /// without being the same component). Pass 2 (seeded at C) is paused via
+    /// `PausingStore` right after it reads B's *stale* owner (`e2`, before
+    /// pass 1 runs); pass 1 (seeded at A) then runs to completion via the
+    /// same actor, merging `e2` into `e1` (`e1 < e2` by construction) —
+    /// tombstoning the very entity pass 2's stale read named. Without the
+    /// actor's converge-then-lock loop, pass 2 would go on to compute
+    /// `survivor = e2` from its stale read, hit `MergeOutcome::SurvivorInactive`
+    /// on the absorb and `LinkOutcome::TargetInactive` on the link, and hand
+    /// its caller a dead entity id. With it, pass 2 re-reads under lock,
+    /// discovers `e2` is gone, and converges onto the same live entity as
+    /// pass 1.
+    #[tokio::test]
+    async fn concurrent_passes_on_overlapping_components_never_surface_a_tombstoned_entity() {
+        let graph = InMemoryAdjacency::new();
+        let store = InMemoryIntelligenceStore::new();
+        let merge_actor = actor();
+        let limits = ClusterLimits {
+            degree_cap: 25,
+            max_hops: 1,
+        };
+
+        let e1 = EntityId(Uuid::from_u128(1));
+        let e2 = EntityId(Uuid::from_u128(2));
+        let e3 = EntityId(Uuid::from_u128(3));
+        store
+            .create_entity(e1, &addr(1), "prior", at(1))
+            .await
+            .unwrap();
+        store
+            .create_entity(e2, &addr(2), "prior", at(1))
+            .await
+            .unwrap();
+        store
+            .create_entity(e3, &addr(3), "prior", at(1))
+            .await
+            .unwrap();
+        graph
+            .append(&[
+                edge(addr(1), addr(2), EdgeKind::Funded),
+                edge(addr(2), addr(3), EdgeKind::Funded),
+            ])
+            .await
+            .unwrap();
+
+        let paused = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let pausing = PausingStore {
+            inner: &store,
+            pause_at: addr(2),
+            fired: AtomicBool::new(false),
+            paused: paused.clone(),
+            resume: resume.clone(),
+        };
+
+        let seed2 = addr(3);
+        let pass2 = cluster_address(
+            ClusterSeams {
+                graph: &graph,
+                entities: &pausing,
+                merge_actor: &merge_actor,
+            },
+            Chain::ETHEREUM,
+            &seed2,
+            "pass2",
+            at(200),
+            limits,
+        );
+        let seed1 = addr(1);
+        let controller = async {
+            paused.notified().await;
+            let outcome1 = cluster_address(
+                ClusterSeams {
+                    graph: &graph,
+                    entities: &store,
+                    merge_actor: &merge_actor,
+                },
+                Chain::ETHEREUM,
+                &seed1,
+                "pass1",
+                at(100),
+                limits,
+            )
+            .await
+            .unwrap()
+            .expect("pass1 forms a cluster");
+            resume.notify_one();
+            outcome1
+        };
+
+        let (pass2_result, outcome1) =
+            tokio::time::timeout(Duration::from_secs(5), join_both(pass2, controller))
+                .await
+                .expect("both passes must complete without deadlocking");
+        let outcome2 = pass2_result.unwrap().expect("pass2 forms a cluster");
+
+        // The crux: pass2 must never report an entity that's since been
+        // tombstoned, even though its owners-read raced pass1's absorb.
+        let reported = store.entity(outcome2.entity_id).await.unwrap().unwrap();
+        assert_eq!(
+            reported.status,
+            EntityStatus::Active,
+            "pass2 must not surface a since-absorbed entity id"
+        );
+
+        // Every address in the shared component converges onto one live entity.
+        let owner1 = store.entity_for_address(&addr(1)).await.unwrap().unwrap();
+        let owner2 = store.entity_for_address(&addr(2)).await.unwrap().unwrap();
+        let owner3 = store.entity_for_address(&addr(3)).await.unwrap().unwrap();
+        assert_eq!(owner1, owner2);
+        assert_eq!(owner2, owner3);
+        assert_eq!(outcome1.entity_id, owner1);
+        assert_eq!(outcome2.entity_id, owner1);
+    }
+
+    /// `tokio::join!` resolves inline rather than returning a `Future`, so it
+    /// can't be passed to `tokio::time::timeout` directly — this wraps it in
+    /// one so the test fails fast with a clear panic instead of hanging if
+    /// the actor ever deadlocks.
+    async fn join_both<A, B>(
+        a: impl std::future::Future<Output = A>,
+        b: impl std::future::Future<Output = B>,
+    ) -> (A, B) {
+        tokio::join!(a, b)
     }
 }

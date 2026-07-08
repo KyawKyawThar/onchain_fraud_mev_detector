@@ -10,8 +10,10 @@
 //! [`EntityStore::absorb`]: a merge moves membership, tombstones the absorbed
 //! entity and bumps the survivor's `version` atomically, so the
 //! "address belongs to at most one entity" invariant (the `entity_addresses`
-//! primary key) holds at every instant. Serializing merges *per entity* is the
-//! t5 actor's job — this store only guarantees each merge is atomic.
+//! primary key) holds at every instant. Serializing the *sequence* of calls a
+//! merge pass makes (read owners, decide, then several of these primitives)
+//! is [`crate::merge_actor`]'s job — this store only guarantees each
+//! individual call is atomic.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -244,8 +246,11 @@ pub trait EntityStore: Send + Sync {
 
     /// Merge `absorbed` into `surviving` in one transaction: move membership,
     /// tombstone the absorbed entity (status + `absorbed_into`), bump **both**
-    /// versions (§8.2: version increments on merge). Atomic, but *not*
-    /// serialized across concurrent merges — that is the t5 actor's job.
+    /// versions (§8.2: version increments on merge). Atomic, and safe against
+    /// a *concurrent call to this same method* (row-locked via
+    /// `lock_entities`) — but a caller that reads owners, decides a plan, and
+    /// only *then* calls this needs [`crate::merge_actor`] to hold that whole
+    /// sequence together; this method alone can't do that for it.
     async fn absorb(
         &self,
         surviving: EntityId,

@@ -44,11 +44,17 @@
 //! (`main.rs`), which publish the corresponding event themselves (no consumer
 //! of their own exists to do it).
 //!
-//! What deliberately does *not* live here yet: the per-entity merge actor
-//! (t5), which serializes concurrent merges per entity — [`cluster::cluster_address`]
-//! and [`attribution::Attributor`] both call [`store::EntityStore::absorb`]
-//! directly today. The fast path stays attribution-blind (§6/§8): nothing in
-//! detection reads these stores.
+//! Sprint 7 t5 adds [`merge_actor`]: the per-entity merge actor that closes
+//! the one gap left in t3/t4 — [`cluster::cluster_address`]'s owners-read →
+//! plan → `create_entity`/`absorb`/`link_address` sequence is now held
+//! together by a per-process [`merge_actor::MergeActorHandle`] lock (over
+//! every entity id the pass has read as an owner) instead of racing other
+//! in-process passes between those calls. Each individual store write was
+//! already atomic and entity-locked at the Postgres layer (`store.rs`'s
+//! `lock_entities`); the actor protects the *sequence*, not the primitive.
+//! [`attribution::Attributor`] and the `intelligence cluster` CLI both share
+//! one actor per process. The fast path stays attribution-blind (§6/§8):
+//! nothing in detection reads these stores.
 
 pub mod adjacency;
 pub mod attribution;
@@ -56,6 +62,7 @@ pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
+pub mod merge_actor;
 pub mod model;
 pub mod seed;
 pub mod store;

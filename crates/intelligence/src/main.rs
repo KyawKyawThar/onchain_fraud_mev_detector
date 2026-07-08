@@ -42,8 +42,9 @@ use intelligence::adjacency::{build_clickhouse_client, ClickhouseAdjacency};
 use intelligence::attribution::{build_consumer, Attributor, StoreSeams};
 use intelligence::cache::{HotCache, RedisHotCache};
 use intelligence::ch_migrate;
-use intelligence::cluster::{cluster_address, ClusterLimits};
+use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
+use intelligence::merge_actor::MergeActor;
 use intelligence::seed::{Feed, Seeder};
 use intelligence::store::{EntityStore, LabelStore, PgIntelligenceStore, SplitOutcome};
 use secrecy::ExposeSecret;
@@ -190,10 +191,18 @@ async fn cluster(
         .await
         .context("connecting to Postgres")?;
     let store = PgIntelligenceStore::new(pool);
+    // A one-shot process gets its own actor — nothing else shares this
+    // invocation's mailbox, so there's no contention to serialize against
+    // (see `merge_actor`'s module docs on the cross-process limit this
+    // implies if this CLI ever races the `attribute` consumer).
+    let merge_actor = MergeActor::spawn();
 
     let outcome = cluster_address(
-        &graph,
-        &store,
+        ClusterSeams {
+            graph: &graph,
+            entities: &store,
+            merge_actor: &merge_actor,
+        },
         chain,
         &address,
         "cli:cluster",
@@ -296,6 +305,10 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
         cache,
         sink,
         shutdown.clone(),
+        // One actor for the process's life, serializing every cluster pass
+        // this consumer runs against every other (§17, t5) — see
+        // `merge_actor`'s module docs.
+        MergeActor::spawn(),
     );
 
     let consumer = build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)
