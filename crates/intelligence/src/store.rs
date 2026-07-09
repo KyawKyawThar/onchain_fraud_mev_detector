@@ -27,8 +27,9 @@ use sqlx::PgPool;
 use sqlx::types::Uuid;
 
 use crate::model::{
-    address_key, parse_address_key, AddressKeyError, AttributionRecord, EntityRecord, EntityStatus,
-    LabelRecord, SanctionEntry,
+    address_key, parse_address_key, plan_reversal, AddressKeyError, AttributionRecord,
+    EntityRecord, EntityStatus, LabelRecord, MergeId, MergeLogEntry, ReversalPlan, SanctionEntry,
+    UnreversibleReason,
 };
 
 /// A failure reading or writing the Postgres store. Carries the retry/skip
@@ -134,6 +135,32 @@ pub enum SplitOutcome {
     /// a missing address, an extra one, or a duplicate across groups.
     /// Rejected; nothing written.
     Invalid,
+}
+
+/// What an [`EntityStore::reverse_merge`] attempt did (§15 reorg rollback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReversalOutcome {
+    /// The merge was reversed: `split_id` re-owns exactly the addresses the
+    /// original merge moved, `continuing_id` re-owns everything else the
+    /// survivor currently has. Both are *fresh* entity ids — mirroring
+    /// [`EntityStore::split`], the survivor itself tombstones `Split` rather
+    /// than one side reusing its id.
+    Reversed {
+        split_id: EntityId,
+        continuing_id: EntityId,
+    },
+    /// This merge was already reversed (or never existed) — an idempotent
+    /// no-op on a redelivered `IncidentRetracted`.
+    AlreadyReverted,
+    /// The survivor's membership has moved on since this merge (a later
+    /// merge/split touched one of `moved_addresses`, or the survivor itself
+    /// is no longer active) — reversing would either strand addresses or
+    /// silently undo unrelated history, so this merge is left alone. A
+    /// documented, honest limitation (mirrors `simulation::reorg`'s
+    /// `EmptyIncidentIndex` stub): the merge stays logged, unreverted, for an
+    /// operator to resolve by hand. See [`crate::model::plan_reversal`] for
+    /// the decision and [`crate::model::UnreversibleReason`] for why.
+    Unreversible(crate::model::UnreversibleReason),
 }
 
 /// Wallet labels with provenance (§8.1). Conflicting *claims* always coexist
@@ -247,15 +274,23 @@ pub trait EntityStore: Send + Sync {
 
     /// Merge `absorbed` into `surviving` in one transaction: move membership,
     /// tombstone the absorbed entity (status + `absorbed_into`), bump **both**
-    /// versions (§8.2: version increments on merge). Atomic, and safe against
-    /// a *concurrent call to this same method* (row-locked via
-    /// `lock_entities`) — but a caller that reads owners, decides a plan, and
-    /// only *then* calls this needs [`crate::merge_actor`] to hold that whole
-    /// sequence together; this method alone can't do that for it.
+    /// versions (§8.2: version increments on merge), and append an
+    /// [`crate::model::MergeLogEntry`] recording exactly which addresses moved
+    /// (§15 — the reorg-rollback join). `incident_id` names the incident whose
+    /// attribution-driven clustering caused this merge, if any (`None` for
+    /// operator-driven clustering, which is never a reorg-rollback candidate).
+    /// Atomic, and safe against a *concurrent call to this same method*
+    /// (row-locked via `lock_entities`) — but a caller that reads owners,
+    /// decides a plan, and only *then* calls this needs
+    /// [`crate::merge_actor`] to hold that whole sequence together; this
+    /// method alone can't do that for it.
     async fn absorb(
         &self,
         surviving: EntityId,
         absorbed: EntityId,
+        incident_id: Option<IncidentId>,
+        evidence_ref: &str,
+        at: DateTime<Utc>,
     ) -> Result<MergeOutcome, StoreError>;
 
     /// Split `entity_id` back apart — the converse of [`absorb`](Self::absorb),
@@ -274,6 +309,31 @@ pub trait EntityStore: Send + Sync {
         evidence: &str,
         at: DateTime<Utc>,
     ) -> Result<SplitOutcome, StoreError>;
+
+    /// Every unreverted [`MergeLogEntry`](crate::model::MergeLogEntry) caused
+    /// by `incident_id` — the block→incident→merge join a reorg rollback
+    /// walks (§15). `Ok(vec![])` means this incident caused no merges (or
+    /// they're already reversed).
+    async fn merges_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<crate::model::MergeLogEntry>, StoreError>;
+
+    /// Reverse one logged merge (§15): split the survivor back into exactly
+    /// the addresses the merge moved and everything else it currently owns —
+    /// the converse of [`absorb`](Self::absorb), built on the same
+    /// exact-partition guarantee [`split`](Self::split) already provides. `at`
+    /// is the *reversal's* instant (the retraction's event-time), stamped on
+    /// the two fresh entities this creates — not the original merge's time,
+    /// which would backdate them. Idempotent
+    /// ([`ReversalOutcome::AlreadyReverted`] on a redelivered retraction) and
+    /// safe against intervening history ([`ReversalOutcome::Unreversible`]
+    /// when the survivor's membership has moved on since).
+    async fn reverse_merge(
+        &self,
+        merge_id: MergeId,
+        at: DateTime<Utc>,
+    ) -> Result<ReversalOutcome, StoreError>;
 }
 
 /// Attribution records (§8): the mutable incident→entity overlay.
@@ -295,6 +355,17 @@ pub trait AttributionStore: Send + Sync {
         &self,
         entity_id: EntityId,
     ) -> Result<Vec<AttributionRecord>, StoreError>;
+
+    /// Remove every attribution link `incident_id` carries — the reversal of
+    /// [`record_attribution`](Self::record_attribution) for every entity this
+    /// incident was linked to (§15, `IncidentRetracted`). Returns the entity
+    /// ids that were attributed, so the caller can recompute their risk
+    /// scores; `Ok(vec![])` on a redelivered retraction (already removed) is
+    /// the idempotent no-op.
+    async fn retract_attributions_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<EntityId>, StoreError>;
 }
 
 /// Sanctions lists (§8.5). The exact-address match behind the immediate
@@ -329,6 +400,27 @@ pub struct StoreSeams {
     pub entities: Arc<dyn EntityStore>,
     pub attributions: Arc<dyn AttributionStore>,
     pub sanctions: Arc<dyn SanctionsStore>,
+}
+
+impl StoreSeams {
+    /// Bundle one store that implements all four seams into a [`StoreSeams`]
+    /// — the shape every production binary needs (one [`PgIntelligenceStore`]
+    /// pool backs all four tables) and the shape
+    /// [`crate::test_util::store_seams`] builds for the in-memory double.
+    /// Generic over `S` rather than hard-coding `PgIntelligenceStore` so both
+    /// assemble through this one constructor instead of each hand-copying the
+    /// same four-field literal.
+    pub fn single<S>(store: Arc<S>) -> Self
+    where
+        S: LabelStore + EntityStore + AttributionStore + SanctionsStore + 'static,
+    {
+        Self {
+            labels: store.clone(),
+            entities: store.clone(),
+            attributions: store.clone(),
+            sanctions: store,
+        }
+    }
 }
 
 /// Postgres-backed implementation of all four seams. Cheap to clone (the pool
@@ -411,6 +503,39 @@ impl TryFrom<AttributionRow> for AttributionRecord {
             confidence: parse_confidence(row.confidence)?,
             evidence: row.evidence,
             attributed_at: row.attributed_at,
+        })
+    }
+}
+
+/// An `entity_merges` row as stored.
+struct MergeRow {
+    merge_id: Uuid,
+    surviving_id: Uuid,
+    absorbed_id: Uuid,
+    incident_id: Option<Uuid>,
+    evidence_ref: String,
+    moved_addresses: Vec<String>,
+    merged_at: DateTime<Utc>,
+    reverted_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<MergeRow> for MergeLogEntry {
+    type Error = StoreError;
+
+    fn try_from(row: MergeRow) -> Result<Self, StoreError> {
+        Ok(MergeLogEntry {
+            merge_id: MergeId(row.merge_id),
+            surviving_id: EntityId(row.surviving_id),
+            absorbed_id: EntityId(row.absorbed_id),
+            incident_id: row.incident_id.map(IncidentId),
+            evidence_ref: row.evidence_ref,
+            moved_addresses: row
+                .moved_addresses
+                .iter()
+                .map(|raw| Ok(parse_address_key(raw)?))
+                .collect::<Result<_, StoreError>>()?,
+            merged_at: row.merged_at,
+            reverted_at: row.reverted_at,
         })
     }
 }
@@ -817,6 +942,9 @@ impl EntityStore for PgIntelligenceStore {
         &self,
         surviving: EntityId,
         absorbed: EntityId,
+        incident_id: Option<IncidentId>,
+        evidence_ref: &str,
+        at: DateTime<Utc>,
     ) -> Result<MergeOutcome, StoreError> {
         if surviving == absorbed {
             return Ok(MergeOutcome::SelfMerge);
@@ -826,6 +954,19 @@ impl EntityStore for PgIntelligenceStore {
         // either entity — locked in a fixed order so a concurrent `absorb`
         // running the opposite direction can't deadlock against this one.
         lock_entities(&mut tx, &[surviving, absorbed]).await?;
+
+        // Capture exactly which addresses are about to move — the merge log
+        // (§15) needs this precise partition before the UPDATE below moves
+        // them, so a later reversal can hand it straight to `split`.
+        let moved_addresses: Vec<String> = sqlx::query!(
+            "SELECT address FROM entity_addresses WHERE entity_id = $1",
+            absorbed.0,
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row.address)
+        .collect();
 
         // Tombstone the absorbed entity first; the guard on `status = 'active'`
         // makes a redelivered merge a detectable no-op.
@@ -869,6 +1010,23 @@ impl EntityStore for PgIntelligenceStore {
         .execute(&mut *tx)
         .await?;
 
+        // Log the merge (§15) — the durable record a later `IncidentRetracted`
+        // reverses via `reverse_merge`.
+        sqlx::query!(
+            "INSERT INTO entity_merges (merge_id, surviving_id, absorbed_id, incident_id,
+                                         evidence_ref, moved_addresses, merged_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            MergeId::new().0,
+            surviving.0,
+            absorbed.0,
+            incident_id.map(|id| id.0),
+            evidence_ref,
+            &moved_addresses,
+            at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         let survivor_version = u64::try_from(survivor.version)
             .map_err(|_| StoreError::malformed(format!("entity version {}", survivor.version)))?;
@@ -883,97 +1041,224 @@ impl EntityStore for PgIntelligenceStore {
         at: DateTime<Utc>,
     ) -> Result<SplitOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let outcome = split_within_tx(&mut tx, entity_id, groups, evidence, at).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    async fn merges_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<MergeLogEntry>, StoreError> {
+        let rows = sqlx::query_as!(
+            MergeRow,
+            "SELECT merge_id, surviving_id, absorbed_id, incident_id, evidence_ref,
+                    moved_addresses, merged_at, reverted_at
+             FROM entity_merges
+             WHERE incident_id = $1 AND reverted_at IS NULL
+             ORDER BY merged_at",
+            incident_id.0,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn reverse_merge(
+        &self,
+        merge_id: MergeId,
+        at: DateTime<Utc>,
+    ) -> Result<ReversalOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the merge row first so a concurrent redelivery of the same
+        // retraction can't both pass the `reverted_at IS NULL` check.
+        let Some(merge_row) = sqlx::query_as!(
+            MergeRow,
+            "SELECT merge_id, surviving_id, absorbed_id, incident_id, evidence_ref,
+                    moved_addresses, merged_at, reverted_at
+             FROM entity_merges WHERE merge_id = $1 FOR UPDATE",
+            merge_id.0,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(ReversalOutcome::AlreadyReverted);
+        };
+        if merge_row.reverted_at.is_some() {
+            return Ok(ReversalOutcome::AlreadyReverted);
+        }
+        let surviving = EntityId(merge_row.surviving_id);
+        let moved: BTreeSet<AccountAddress> = merge_row
+            .moved_addresses
+            .iter()
+            .map(|raw| parse_address_key(raw))
+            .collect::<Result<_, _>>()?;
+
         // Serialize against a concurrent `link_address`/`absorb`/`split` on
-        // this entity — locked *before* reading membership below, which is
-        // what closes the read-then-write race: without this, a concurrent
-        // `link_address` could add a member between the membership read and
-        // the tombstone write, leaving it pointing at a tombstoned entity.
-        lock_entities(&mut tx, &[entity_id]).await?;
+        // the survivor before reading its current membership below.
+        lock_entities(&mut tx, &[surviving]).await?;
 
         let is_active = sqlx::query!(
             "SELECT 1 AS one FROM entities WHERE entity_id = $1 AND status = 'active'",
-            entity_id.0,
+            surviving.0,
         )
         .fetch_optional(&mut *tx)
         .await?
         .is_some();
-        if !is_active {
-            return Ok(SplitOutcome::NotActive);
-        }
 
-        // `groups` must exactly partition the entity's *current* membership —
-        // validated before any write, so an invalid request touches nothing.
-        // Safe from a TOCTOU race now: the lock above holds until commit.
-        let current: BTreeSet<String> = sqlx::query!(
+        let current: BTreeSet<AccountAddress> = sqlx::query!(
             "SELECT address FROM entity_addresses WHERE entity_id = $1",
-            entity_id.0,
+            surviving.0,
         )
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
-        .map(|row| row.address)
-        .collect();
+        .map(|row| parse_address_key(&row.address))
+        .collect::<Result<_, _>>()?;
 
-        let mut proposed: BTreeSet<String> = BTreeSet::new();
-        for group in groups {
-            if group.is_empty() {
-                return Ok(SplitOutcome::Invalid);
-            }
-            for address in group {
-                if !proposed.insert(address_key(address)) {
-                    // A duplicate address, within one group or across two.
-                    return Ok(SplitOutcome::Invalid);
-                }
-            }
-        }
-        if proposed != current {
-            return Ok(SplitOutcome::Invalid);
-        }
+        let (moved_group, remaining_group) = match plan_reversal(is_active, &current, &moved) {
+            ReversalPlan::Unreversible(reason) => return Ok(ReversalOutcome::Unreversible(reason)),
+            ReversalPlan::Split { moved, remaining } => (moved, remaining),
+        };
+        let groups = [moved_group, remaining_group];
 
-        // Tombstone the original — guarded by `status = 'active'` again so a
-        // concurrent split/absorb since the check above can't double-split.
-        let tombstoned = sqlx::query!(
-            "UPDATE entities SET status = 'split', version = version + 1, updated_at = now()
-             WHERE entity_id = $1 AND status = 'active'",
-            entity_id.0,
+        let evidence = format!("reorg:reverse_merge:{merge_id}");
+        let outcome = split_within_tx(&mut tx, surviving, &groups, &evidence, at).await?;
+        let SplitOutcome::Split { new_ids } = outcome else {
+            // The lock above holds since before the membership read, so the
+            // guards `plan_reversal` just applied can't have changed
+            // underneath us — this is defensive, not an expected path.
+            return Ok(ReversalOutcome::Unreversible(
+                UnreversibleReason::SplitRejected,
+            ));
+        };
+        let [split_id, continuing_id] = new_ids[..] else {
+            unreachable!("split_within_tx was called with exactly two groups");
+        };
+
+        sqlx::query!(
+            "UPDATE entity_merges SET reverted_at = $2 WHERE merge_id = $1",
+            merge_id.0,
+            at,
         )
         .execute(&mut *tx)
         .await?;
-        if tombstoned.rows_affected() == 0 {
-            return Ok(SplitOutcome::NotActive);
-        }
-
-        // One fresh entity per group, membership moved to match.
-        let mut new_ids = Vec::with_capacity(groups.len());
-        for group in groups {
-            let new_id = EntityId::new();
-            sqlx::query!(
-                "INSERT INTO entities (entity_id, version, status, created_at)
-                 VALUES ($1, 1, 'active', $2)",
-                new_id.0,
-                at,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            let addresses: Vec<String> = group.iter().map(address_key).collect();
-            sqlx::query!(
-                "UPDATE entity_addresses SET entity_id = $1, evidence = $2, linked_at = $3
-                 WHERE address = ANY($4::text[])",
-                new_id.0,
-                evidence,
-                at,
-                &addresses,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            new_ids.push(new_id);
-        }
 
         tx.commit().await?;
-        Ok(SplitOutcome::Split { new_ids })
+        Ok(ReversalOutcome::Reversed {
+            split_id,
+            continuing_id,
+        })
     }
+}
+
+/// The guts of [`EntityStore::split`], scoped to an already-open transaction
+/// so [`PgIntelligenceStore::reverse_merge`] can share it: lock the entity,
+/// validate `groups` exactly partitions its current membership, tombstone it
+/// `Split`, and create one fresh entity per group. Locks `entity_id` itself
+/// (via `lock_entities`) before reading its membership — safe to call from a
+/// caller that has already locked it too (`reverse_merge` locks the survivor
+/// before its own membership read, then calls this; re-locking an
+/// already-held row in the same transaction is a no-op). Does **not**
+/// commit — the caller decides when the surrounding transaction (which may
+/// also touch the merge log) is done.
+async fn split_within_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entity_id: EntityId,
+    groups: &[Vec<AccountAddress>],
+    evidence: &str,
+    at: DateTime<Utc>,
+) -> Result<SplitOutcome, StoreError> {
+    // Serialize against a concurrent `link_address`/`absorb`/`split` on this
+    // entity — locked *before* reading membership below, which is what closes
+    // the read-then-write race: without this, a concurrent `link_address`
+    // could add a member between the membership read and the tombstone
+    // write, leaving it pointing at a tombstoned entity.
+    lock_entities(tx, &[entity_id]).await?;
+
+    let is_active = sqlx::query!(
+        "SELECT 1 AS one FROM entities WHERE entity_id = $1 AND status = 'active'",
+        entity_id.0,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if !is_active {
+        return Ok(SplitOutcome::NotActive);
+    }
+
+    // `groups` must exactly partition the entity's *current* membership —
+    // validated before any write, so an invalid request touches nothing.
+    // Safe from a TOCTOU race now: the caller's lock holds until commit.
+    let current: BTreeSet<String> = sqlx::query!(
+        "SELECT address FROM entity_addresses WHERE entity_id = $1",
+        entity_id.0,
+    )
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|row| row.address)
+    .collect();
+
+    let mut proposed: BTreeSet<String> = BTreeSet::new();
+    for group in groups {
+        if group.is_empty() {
+            return Ok(SplitOutcome::Invalid);
+        }
+        for address in group {
+            if !proposed.insert(address_key(address)) {
+                // A duplicate address, within one group or across two.
+                return Ok(SplitOutcome::Invalid);
+            }
+        }
+    }
+    if proposed != current {
+        return Ok(SplitOutcome::Invalid);
+    }
+
+    // Tombstone the original — guarded by `status = 'active'` again so a
+    // concurrent split/absorb since the check above can't double-split.
+    let tombstoned = sqlx::query!(
+        "UPDATE entities SET status = 'split', version = version + 1, updated_at = now()
+         WHERE entity_id = $1 AND status = 'active'",
+        entity_id.0,
+    )
+    .execute(&mut **tx)
+    .await?;
+    if tombstoned.rows_affected() == 0 {
+        return Ok(SplitOutcome::NotActive);
+    }
+
+    // One fresh entity per group, membership moved to match.
+    let mut new_ids = Vec::with_capacity(groups.len());
+    for group in groups {
+        let new_id = EntityId::new();
+        sqlx::query!(
+            "INSERT INTO entities (entity_id, version, status, created_at)
+             VALUES ($1, 1, 'active', $2)",
+            new_id.0,
+            at,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        let addresses: Vec<String> = group.iter().map(address_key).collect();
+        sqlx::query!(
+            "UPDATE entity_addresses SET entity_id = $1, evidence = $2, linked_at = $3
+             WHERE address = ANY($4::text[])",
+            new_id.0,
+            evidence,
+            at,
+            &addresses,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        new_ids.push(new_id);
+    }
+
+    Ok(SplitOutcome::Split { new_ids })
 }
 
 #[async_trait]
@@ -1025,6 +1310,22 @@ impl AttributionStore for PgIntelligenceStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn retract_attributions_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<EntityId>, StoreError> {
+        let rows = sqlx::query!(
+            "DELETE FROM attributions WHERE incident_id = $1 RETURNING entity_id",
+            incident_id.0,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EntityId(row.entity_id))
+            .collect())
     }
 }
 
@@ -1310,7 +1611,10 @@ mod tests {
             .create_entity(absorbed, &addr(2), "seed", at(1))
             .await
             .unwrap();
-        store.absorb(survivor, absorbed).await.unwrap();
+        store
+            .absorb(survivor, absorbed, None, "test", at(1))
+            .await
+            .unwrap();
 
         assert_eq!(
             store

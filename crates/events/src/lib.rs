@@ -164,6 +164,7 @@ pub enum DomainEvent {
     EntityMerged(intelligence::EntityMerged),
     EntitySplit(intelligence::EntitySplit),
     AttributionUpdated(intelligence::AttributionUpdated),
+    AttributionRetracted(intelligence::AttributionRetracted),
     RiskScoreUpdated(intelligence::RiskScoreUpdated),
     SanctionHit(intelligence::SanctionHit),
 
@@ -237,6 +238,7 @@ impl DomainEvent {
             | EntityMerged(_)
             | EntitySplit(_)
             | AttributionUpdated(_)
+            | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
@@ -261,6 +263,7 @@ impl DomainEvent {
             IncidentRetracted(e) => Some(e.incident_id),
             IncidentFinalized(e) => Some(e.incident_id),
             AttributionUpdated(e) => Some(e.incident_id),
+            AttributionRetracted(e) => Some(e.incident_id),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -330,6 +333,7 @@ impl DomainEvent {
             | EntityMerged(_)
             | EntitySplit(_)
             | AttributionUpdated(_)
+            | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
             | RuleCreated(_)
@@ -370,6 +374,7 @@ impl DomainEvent {
             | IncidentRetracted(_)
             | IncidentFinalized(_)
             | AttributionUpdated(_)
+            | AttributionRetracted(_)
             | EntityMerged(_)
             | EntitySplit(_)
             | RuleCreated(_)

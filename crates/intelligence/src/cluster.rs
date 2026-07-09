@@ -29,7 +29,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, Chain, EntityId};
+use events::primitives::{AccountAddress, Chain, EntityId, IncidentId};
 
 use crate::adjacency::{AdjacencyStore, GraphError};
 use crate::merge_actor::{EntityGuard, MergeActorError, MergeActorHandle};
@@ -249,6 +249,7 @@ pub async fn cluster_address(
     chain: Chain,
     seed: &AccountAddress,
     evidence: &str,
+    incident_id: Option<IncidentId>,
     at: DateTime<Utc>,
     limits: ClusterLimits,
 ) -> Result<Option<ClusterOutcome>, ClusterError> {
@@ -312,7 +313,10 @@ pub async fn cluster_address(
 
     let mut absorbed = Vec::new();
     for other in to_absorb {
-        if let MergeOutcome::Merged { .. } = entities.absorb(survivor, other).await? {
+        if let MergeOutcome::Merged { .. } = entities
+            .absorb(survivor, other, incident_id, evidence, at)
+            .await?
+        {
             absorbed.push(other);
         }
         // `AbsorbedInactive`/`SurvivorInactive` mean a concurrent pass already
@@ -470,6 +474,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(100),
             ClusterLimits::default(),
         )
@@ -516,6 +521,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(100),
             limits,
         )
@@ -537,6 +543,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(2),
             "test",
+            None,
             at(100),
             limits,
         )
@@ -571,6 +578,7 @@ mod tests {
             Chain::ETHEREUM,
             &hub,
             "test",
+            None,
             at(1),
             limits,
         )
@@ -599,6 +607,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(1),
             ClusterLimits::default(),
         )
@@ -643,6 +652,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(100),
             ClusterLimits::default(),
         )
@@ -685,6 +695,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(1),
             ClusterLimits::default(),
         )
@@ -703,6 +714,7 @@ mod tests {
             Chain::ETHEREUM,
             &addr(1),
             "test",
+            None,
             at(2),
             ClusterLimits::default(),
         )
@@ -780,8 +792,13 @@ mod tests {
             &self,
             surviving: EntityId,
             absorbed: EntityId,
+            incident_id: Option<IncidentId>,
+            evidence_ref: &str,
+            at: DateTime<Utc>,
         ) -> Result<MergeOutcome, StoreError> {
-            self.inner.absorb(surviving, absorbed).await
+            self.inner
+                .absorb(surviving, absorbed, incident_id, evidence_ref, at)
+                .await
         }
 
         async fn split(
@@ -792,6 +809,21 @@ mod tests {
             at: DateTime<Utc>,
         ) -> Result<SplitOutcome, StoreError> {
             self.inner.split(entity_id, groups, evidence, at).await
+        }
+
+        async fn merges_for_incident(
+            &self,
+            incident_id: IncidentId,
+        ) -> Result<Vec<crate::model::MergeLogEntry>, StoreError> {
+            self.inner.merges_for_incident(incident_id).await
+        }
+
+        async fn reverse_merge(
+            &self,
+            merge_id: crate::model::MergeId,
+            at: DateTime<Utc>,
+        ) -> Result<crate::store::ReversalOutcome, StoreError> {
+            self.inner.reverse_merge(merge_id, at).await
         }
     }
 
@@ -866,6 +898,7 @@ mod tests {
             Chain::ETHEREUM,
             &seed2,
             "pass2",
+            None,
             at(200),
             limits,
         );
@@ -881,6 +914,7 @@ mod tests {
                 Chain::ETHEREUM,
                 &seed1,
                 "pass1",
+                None,
                 at(100),
                 limits,
             )

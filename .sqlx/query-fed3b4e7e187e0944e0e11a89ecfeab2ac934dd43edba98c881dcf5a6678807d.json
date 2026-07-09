@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO entity_merges (merge_id, surviving_id, absorbed_id, incident_id,\n                                         evidence_ref, moved_addresses, merged_at)\n             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fed3b4e7e187e0944e0e11a89ecfeab2ac934dd43edba98c881dcf5a6678807d"
+}

@@ -18,12 +18,12 @@ use events::primitives::{AccountAddress, Chain, EntityId, IncidentId, LabelId};
 use crate::adjacency::{AdjacencyStore, GraphError};
 use crate::cache::{CacheError, CachedScore, HotCache};
 use crate::model::{
-    AdjacencyEdge, AttributionRecord, EntityRecord, EntityStatus, LabelRecord, Neighborhood,
-    SanctionEntry,
+    plan_reversal, AdjacencyEdge, AttributionRecord, EntityRecord, EntityStatus, LabelRecord,
+    MergeId, MergeLogEntry, Neighborhood, ReversalPlan, SanctionEntry,
 };
 use crate::store::{
     AttributionStore, CreateOutcome, EntityStore, LabelStore, LinkOutcome, MergeOutcome,
-    SanctionsStore, SplitOutcome, StoreError,
+    ReversalOutcome, SanctionsStore, SplitOutcome, StoreError,
 };
 
 /// In-memory implementation of all four Postgres seams.
@@ -41,6 +41,9 @@ struct StoreState {
     memberships: HashMap<AccountAddress, EntityId>,
     attributions: HashMap<(IncidentId, EntityId), AttributionRecord>,
     sanctions: HashMap<(AccountAddress, String), SanctionEntry>,
+    /// The merge log (§15) — one entry per `absorb` call, mirroring the
+    /// `entity_merges` table.
+    merges: Vec<MergeLogEntry>,
 }
 
 struct EntityMeta {
@@ -57,16 +60,11 @@ impl InMemoryIntelligenceStore {
 }
 
 /// Bundle one shared [`InMemoryIntelligenceStore`] into a [`crate::store::StoreSeams`]
-/// four times — every consumer test (`attribution`, `risk_scorer`) needs all
-/// four seams pointed at the same double, so this is the one place that shape
-/// is assembled.
+/// — every consumer test (`attribution`, `risk_scorer`, `reorg`) needs all
+/// four seams pointed at the same double; [`crate::store::StoreSeams::single`]
+/// is the one place that assembly happens, shared with production wiring.
 pub fn store_seams(store: &Arc<InMemoryIntelligenceStore>) -> crate::store::StoreSeams {
-    crate::store::StoreSeams {
-        labels: store.clone(),
-        entities: store.clone(),
-        attributions: store.clone(),
-        sanctions: store.clone(),
-    }
+    crate::store::StoreSeams::single(store.clone())
 }
 
 #[async_trait]
@@ -224,6 +222,9 @@ impl EntityStore for InMemoryIntelligenceStore {
         &self,
         surviving: EntityId,
         absorbed: EntityId,
+        incident_id: Option<IncidentId>,
+        evidence_ref: &str,
+        at: DateTime<Utc>,
     ) -> Result<MergeOutcome, StoreError> {
         if surviving == absorbed {
             return Ok(MergeOutcome::SelfMerge);
@@ -238,6 +239,16 @@ impl EntityStore for InMemoryIntelligenceStore {
             _ => return Ok(MergeOutcome::SurvivorInactive),
         }
 
+        // Capture exactly which addresses are about to move, for the merge
+        // log — mirrors the Postgres impl reading this before the UPDATE.
+        let mut moved_addresses: Vec<AccountAddress> = state
+            .memberships
+            .iter()
+            .filter(|(_, owner)| **owner == absorbed)
+            .map(|(addr, _)| *addr)
+            .collect();
+        moved_addresses.sort();
+
         let absorbed_meta = state.entities.get_mut(&absorbed).expect("checked above");
         absorbed_meta.status = EntityStatus::Absorbed;
         absorbed_meta.absorbed_into = Some(surviving);
@@ -251,9 +262,20 @@ impl EntityStore for InMemoryIntelligenceStore {
 
         let survivor_meta = state.entities.get_mut(&surviving).expect("checked above");
         survivor_meta.version += 1;
-        Ok(MergeOutcome::Merged {
-            survivor_version: survivor_meta.version,
-        })
+        let survivor_version = survivor_meta.version;
+
+        state.merges.push(MergeLogEntry {
+            merge_id: MergeId::new(),
+            surviving_id: surviving,
+            absorbed_id: absorbed,
+            incident_id,
+            evidence_ref: evidence_ref.to_owned(),
+            moved_addresses,
+            merged_at: at,
+            reverted_at: None,
+        });
+
+        Ok(MergeOutcome::Merged { survivor_version })
     }
 
     async fn split(
@@ -264,57 +286,138 @@ impl EntityStore for InMemoryIntelligenceStore {
         at: DateTime<Utc>,
     ) -> Result<SplitOutcome, StoreError> {
         let mut state = self.inner.lock().expect("store lock");
-        match state.entities.get(&entity_id) {
-            Some(meta) if meta.status == EntityStatus::Active => {}
-            _ => return Ok(SplitOutcome::NotActive),
-        }
+        Ok(split_locked(&mut state, entity_id, groups, at))
+    }
 
+    async fn merges_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<MergeLogEntry>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state
+            .merges
+            .iter()
+            .filter(|m| m.incident_id == Some(incident_id) && m.reverted_at.is_none())
+            .cloned()
+            .collect())
+    }
+
+    async fn reverse_merge(
+        &self,
+        merge_id: MergeId,
+        at: DateTime<Utc>,
+    ) -> Result<ReversalOutcome, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let Some(index) = state.merges.iter().position(|m| m.merge_id == merge_id) else {
+            return Ok(ReversalOutcome::AlreadyReverted);
+        };
+        if state.merges[index].reverted_at.is_some() {
+            return Ok(ReversalOutcome::AlreadyReverted);
+        }
+        let surviving = state.merges[index].surviving_id;
+        let moved: BTreeSet<AccountAddress> = state.merges[index]
+            .moved_addresses
+            .iter()
+            .copied()
+            .collect();
+
+        let is_active = matches!(
+            state.entities.get(&surviving),
+            Some(meta) if meta.status == EntityStatus::Active
+        );
         let current: BTreeSet<AccountAddress> = state
             .memberships
             .iter()
-            .filter(|(_, owner)| **owner == entity_id)
+            .filter(|(_, owner)| **owner == surviving)
             .map(|(addr, _)| *addr)
             .collect();
 
-        let mut proposed: BTreeSet<AccountAddress> = BTreeSet::new();
-        for group in groups {
-            if group.is_empty() {
-                return Ok(SplitOutcome::Invalid);
-            }
-            for address in group {
-                if !proposed.insert(*address) {
-                    return Ok(SplitOutcome::Invalid);
-                }
-            }
-        }
-        if proposed != current {
-            return Ok(SplitOutcome::Invalid);
-        }
+        let (moved_group, remaining_group) = match plan_reversal(is_active, &current, &moved) {
+            ReversalPlan::Unreversible(reason) => return Ok(ReversalOutcome::Unreversible(reason)),
+            ReversalPlan::Split { moved, remaining } => (moved, remaining),
+        };
+        let groups = [moved_group, remaining_group];
 
-        let meta = state.entities.get_mut(&entity_id).expect("checked above");
-        meta.status = EntityStatus::Split;
-        meta.version += 1;
+        let outcome = split_locked(&mut state, surviving, &groups, at);
+        let SplitOutcome::Split { new_ids } = outcome else {
+            // `plan_reversal` just confirmed this partition is valid against
+            // the membership read above — this is defensive, not expected.
+            return Ok(ReversalOutcome::Unreversible(
+                crate::model::UnreversibleReason::SplitRejected,
+            ));
+        };
+        let [split_id, continuing_id] = new_ids[..] else {
+            unreachable!("split_locked was called with exactly two groups");
+        };
 
-        let mut new_ids = Vec::with_capacity(groups.len());
-        for group in groups {
-            let new_id = EntityId::new();
-            state.entities.insert(
-                new_id,
-                EntityMeta {
-                    version: 1,
-                    status: EntityStatus::Active,
-                    absorbed_into: None,
-                    created_at: at,
-                },
-            );
-            for address in group {
-                state.memberships.insert(*address, new_id);
-            }
-            new_ids.push(new_id);
-        }
+        state.merges[index].reverted_at = Some(at);
 
-        Ok(SplitOutcome::Split { new_ids })
+        Ok(ReversalOutcome::Reversed {
+            split_id,
+            continuing_id,
+        })
     }
+}
+
+/// The guts of [`EntityStore::split`], operating on an already-locked
+/// [`StoreState`] so [`InMemoryIntelligenceStore::reverse_merge`] can share it
+/// — mirrors the Postgres double's `split_within_tx`.
+fn split_locked(
+    state: &mut StoreState,
+    entity_id: EntityId,
+    groups: &[Vec<AccountAddress>],
+    at: DateTime<Utc>,
+) -> SplitOutcome {
+    match state.entities.get(&entity_id) {
+        Some(meta) if meta.status == EntityStatus::Active => {}
+        _ => return SplitOutcome::NotActive,
+    }
+
+    let current: BTreeSet<AccountAddress> = state
+        .memberships
+        .iter()
+        .filter(|(_, owner)| **owner == entity_id)
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    let mut proposed: BTreeSet<AccountAddress> = BTreeSet::new();
+    for group in groups {
+        if group.is_empty() {
+            return SplitOutcome::Invalid;
+        }
+        for address in group {
+            if !proposed.insert(*address) {
+                return SplitOutcome::Invalid;
+            }
+        }
+    }
+    if proposed != current {
+        return SplitOutcome::Invalid;
+    }
+
+    let meta = state.entities.get_mut(&entity_id).expect("checked above");
+    meta.status = EntityStatus::Split;
+    meta.version += 1;
+
+    let mut new_ids = Vec::with_capacity(groups.len());
+    for group in groups {
+        let new_id = EntityId::new();
+        state.entities.insert(
+            new_id,
+            EntityMeta {
+                version: 1,
+                status: EntityStatus::Active,
+                absorbed_into: None,
+                created_at: at,
+            },
+        );
+        for address in group {
+            state.memberships.insert(*address, new_id);
+        }
+        new_ids.push(new_id);
+    }
+
+    SplitOutcome::Split { new_ids }
 }
 
 #[async_trait]
@@ -352,6 +455,23 @@ impl AttributionStore for InMemoryIntelligenceStore {
             .filter(|a| a.entity_id == entity_id)
             .cloned()
             .collect())
+    }
+
+    async fn retract_attributions_for_incident(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<Vec<EntityId>, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let entity_ids: Vec<EntityId> = state
+            .attributions
+            .keys()
+            .filter(|(inc, _)| *inc == incident_id)
+            .map(|(_, entity_id)| *entity_id)
+            .collect();
+        for entity_id in &entity_ids {
+            state.attributions.remove(&(incident_id, *entity_id));
+        }
+        Ok(entity_ids)
     }
 }
 

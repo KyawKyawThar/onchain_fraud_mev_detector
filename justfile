@@ -206,6 +206,15 @@ intel-risk address:
 intel-score:
     cargo run -p intelligence -- score
 
+# ── Reorg rollback (§15, Sprint 8 t3) ─────────────────────────────
+# Long-running consumer: on `IncidentRetracted`, withdraws the incident's
+# attributions and reverses any merge it caused, publishing
+# `AttributionRetracted`/`EntitySplit` for `intel-score` to recompute off. Its
+# own Kafka consumer group (INTELLIGENCE_REORG_KAFKA_GROUP) — deploy/scale
+# independently of `attribute`/`score`.
+intel-reorg:
+    cargo run -p intelligence -- reorg
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

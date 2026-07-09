@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT merge_id, surviving_id, absorbed_id, incident_id, evidence_ref,\n                    moved_addresses, merged_at, reverted_at\n             FROM entity_merges WHERE merge_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "merge_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "merge_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "surviving_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "surviving_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "absorbed_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "absorbed_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "incident_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "incident_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "evidence_ref",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "evidence_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "moved_addresses",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "moved_addresses"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "merged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "merged_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "reverted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "entity_merges",
+            "name": "reverted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "19eeb94cae882caf94088861d630b1f30b039d0f118a11c58c6f2e328a8148b8"
+}

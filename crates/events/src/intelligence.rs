@@ -79,6 +79,19 @@ pub struct AttributionUpdated {
     pub labels: Vec<String>,
 }
 
+/// An incident's attribution to one or more entities was withdrawn — the
+/// reverse of [`AttributionUpdated`], emitted when `IncidentRetracted` (§7,
+/// §15) undoes entity linkage on reorg. `entity_ids` names every entity that
+/// lost this incident's attribution, so downstream risk-score recompute
+/// (§8.3) can react the same way it reacts to `AttributionUpdated` — the
+/// factors this incident contributed are gone, not just added-to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AttributionRetracted {
+    pub incident_id: IncidentId,
+    pub entity_ids: Vec<EntityId>,
+}
+
 /// A single factor contributing to a risk score, with the evidence that backs
 /// it. The aggregate score is only as auditable as its factors (§8.3, §23).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

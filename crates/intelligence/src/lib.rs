@@ -73,6 +73,19 @@
 //! the `(address, model_version)` cache slot, and publishes the fresh
 //! `RiskScoreUpdated` — the "scores invalidate and recompute automatically"
 //! rule (§8.2/§8.3) made real.
+//!
+//! Sprint 8 t3 adds [`reorg`]: rolling back scores/merges on reorg (§15).
+//! None of this crate's stores carry a block number, so it keys off
+//! `IncidentRetracted` — the event a reorg already produces once
+//! simulation's block→incident join withdraws an incident — rather than
+//! `BlockReverted` directly. It withdraws the retracted incident's
+//! `attributions` (publishing `AttributionRetracted`, a new event t2's
+//! `risk_scorer` reacts to exactly like `AttributionUpdated`) and reverses
+//! every merge that incident caused, via the merge log [`EntityStore::absorb`](store::EntityStore::absorb)
+//! now writes and [`EntityStore::reverse_merge`](store::EntityStore::reverse_merge)
+//! reads back — splitting the survivor apart again (publishing
+//! `EntitySplit`, which `risk_scorer` also already consumes). A merge whose
+//! survivor has moved on since is left logged, not silently undone.
 
 pub mod adjacency;
 pub mod attribution;
@@ -82,6 +95,7 @@ pub mod cluster;
 pub mod config;
 pub mod merge_actor;
 pub mod model;
+pub mod reorg;
 pub mod risk;
 pub mod risk_scorer;
 pub mod seed;
