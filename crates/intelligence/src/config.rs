@@ -3,14 +3,16 @@
 //! `event-store`). Everything downstream takes an explicit [`Config`] so the
 //! rest of the service stays pure and testable.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use secrecy::SecretString;
 
 /// All runtime configuration for the intelligence service (§8, §14): the three
 /// data stores (Postgres system of record, Redis hot cache, ClickHouse
-/// adjacency graph) plus the t4 attribution consumer's Kafka settings.
+/// adjacency graph) plus the t4 attribution consumer's Kafka settings and the
+/// `grpc` subcommand's bind address (§11).
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Postgres connection URL (`postgres://…`) for labels/entities/
@@ -21,6 +23,9 @@ pub struct Config {
     pub redis: RedisConfig,
     pub clickhouse: ClickhouseConfig,
     pub kafka: KafkaConfig,
+    /// Address the `IntelligenceRead` gRPC server (`grpc` subcommand) binds
+    /// to — read only by that run mode.
+    pub grpc_addr: SocketAddr,
 }
 
 /// How to reach Kafka for the `attribute` and `score` consumers (Sprint 7 t4,
@@ -72,6 +77,14 @@ impl Config {
     /// Resolve from the environment, erroring on anything missing or malformed
     /// (fail fast at boot rather than at the first event).
     pub fn from_env() -> Result<Self> {
+        let grpc_addr = format!(
+            "{}:{}",
+            env("INTELLIGENCE_GRPC_HOST")?,
+            env("INTELLIGENCE_GRPC_PORT")?
+        )
+        .parse()
+        .context("INTELLIGENCE_GRPC_HOST:INTELLIGENCE_GRPC_PORT is not a valid socket address")?;
+
         Ok(Self {
             postgres_url: SecretString::from(env("DATABASE_URL")?),
             redis: RedisConfig {
@@ -90,6 +103,7 @@ impl Config {
                 risk_group_id: env_or("INTELLIGENCE_RISK_KAFKA_GROUP", "intelligence-risk-scoring"),
                 reorg_group_id: env_or("INTELLIGENCE_REORG_KAFKA_GROUP", "intelligence-reorg"),
             },
+            grpc_addr,
         })
     }
 }

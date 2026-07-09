@@ -1,0 +1,56 @@
+// The intelligence service's read contract (§8, §11): the two synchronous
+// screening lookups the public API service (and any other in-network caller)
+// needs — an address's current risk score and its active labels. Nothing here
+// is a command; every RPC is read-only, mirroring the store/cache seams behind
+// it (`crate::store`, `crate::cache`) — this is a wire-level view onto them, not
+// a second source of truth.
+syntax = "proto3";
+
+package intelligence.v1;
+
+service IntelligenceRead {
+  // Current risk score for an address (§8.3). Serves from the hot cache when
+  // present; computes live (and repopulates the cache) on a miss.
+  rpc GetRiskScore(RiskScoreRequest) returns (RiskScoreReply);
+
+  // An address's active labels (§8.1), most-authoritative-first. Same
+  // cache-aside behavior as GetRiskScore.
+  rpc GetLabels(LabelsRequest) returns (LabelsReply);
+}
+
+message RiskScoreRequest {
+  // 0x-prefixed hex address, any case.
+  string address = 1;
+}
+
+message RiskScoreReply {
+  // 0-100, "how risky".
+  uint32 score = 1;
+  // 0-1, "how sure" — never conflated with `score` (§8.3).
+  double confidence = 2;
+  string model_version = 3;
+  // Unix milliseconds.
+  int64 computed_at_unix_millis = 4;
+}
+
+message LabelsRequest {
+  string address = 1;
+}
+
+message Label {
+  string label_id = 1;
+  string kind = 2;
+  string value = 3;
+  double confidence = 4;
+  string source = 5;
+  string source_detail = 6;
+  // Unix milliseconds.
+  int64 created_at_unix_millis = 7;
+  // Unix milliseconds; absent (0 + present=false handled via optional) when the
+  // label has no expiry.
+  optional int64 valid_until_unix_millis = 8;
+}
+
+message LabelsReply {
+  repeated Label labels = 1;
+}

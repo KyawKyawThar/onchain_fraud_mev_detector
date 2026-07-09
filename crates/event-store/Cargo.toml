@@ -21,6 +21,8 @@ ch-migrate = { workspace = true }
 # (`run_consumer`/`EventHandler`), so the store's Kafka ingest doesn't re-implement
 # the subscribe/decode/trace/commit mechanics.
 event-bus.workspace = true
+# Shared HTTP handler-error type (§11) — see crates/api-error.
+api-error.workspace = true
 
 # Errors.
 anyhow.workspace = true

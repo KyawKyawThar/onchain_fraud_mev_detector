@@ -99,6 +99,14 @@ secrecy = { workspace = true }
 uuid = { workspace = true }
 alloy-primitives = { workspace = true }
 
+# `simulation-projection`'s internal read surface (§11 `GET /v1/incidents` —
+# fronted by the public API service, exactly like event-store's read routes).
+# axum + tower-http mirror event-store's own internal HTTP stack; api-error is
+# the shared handler-error type (see crates/api-error).
+axum = { workspace = true }
+tower-http = { workspace = true }
+api-error = { workspace = true }
+
 [features]
 # Exposes `simulation::test_util` (recording sinks, canned scenarios + ack handle).
 # Enabled for this crate's own integration tests via the self dev-dependency below,

@@ -61,6 +61,13 @@ redis = { workspace = true }
 secrecy = { workspace = true }
 alloy-primitives = { workspace = true }
 
+# gRPC read surface (§11): the `IntelligenceRead` service (`grpc <address>`
+# subcommand) — the risk/labels lookups the public API service calls instead of
+# reaching Postgres/Redis directly.
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
 # Label seeding from the §8.1 public feeds (t2). `csv` parses the
 # Etherscan-style tag exports (quoted RFC-4180 — name tags contain commas);
 # `sha2` + `uuid` mint the *deterministic* seeded `label_id` (SHA-256 of the
@@ -97,6 +104,12 @@ testcontainers-modules = { workspace = true, features = [
     "redis",
     "clickhouse",
 ] }
+
+[build-dependencies]
+# Codegen for `proto/intelligence.proto` (see `build.rs`); `protoc-bin-vendored`
+# supplies `PROTOC` so no system `protobuf-compiler` package is required.
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [lints]
 workspace = true

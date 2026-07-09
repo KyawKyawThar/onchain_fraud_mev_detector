@@ -260,6 +260,12 @@ mod tests {
             self.jobs.lock().unwrap().push(job.clone());
             Ok(())
         }
+        async fn list_incidents(
+            &self,
+            _filters: &crate::store::IncidentFilters,
+        ) -> Result<crate::store::IncidentPage, PersistError> {
+            unimplemented!("RecordingStore only records writes for these tests")
+        }
     }
 
     #[derive(Default)]

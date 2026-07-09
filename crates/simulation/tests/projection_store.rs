@@ -20,10 +20,10 @@ use events::primitives::{AlertId, AlertKind, Chain, IncidentId, Severity};
 use events::simulation::{IncidentCreated, SimulationCompleted};
 use events::{DomainEvent, EventEnvelope};
 use revm::primitives::B256;
-use simulation::projection::IncidentProjection;
+use simulation::projection::{IncidentProjection, IncidentStatus};
 use simulation::store::{
-    AnalyticsRow, ClickhouseAnalytics, IncidentAnalytics, IncidentStore, JobState, JobUpdate,
-    PgIncidentStore,
+    AnalyticsRow, ClickhouseAnalytics, IncidentAnalytics, IncidentFilters, IncidentStore, JobState,
+    JobUpdate, PgIncidentStore,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
@@ -221,4 +221,106 @@ async fn analytics_rows_append_and_aggregate_by_kind() {
     assert_eq!(kind, "sandwich");
     assert_eq!(n, 3);
     assert_eq!(total_profit, 21.0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn list_incidents_filters_by_status_and_paginates() {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("start Postgres container");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("Postgres port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let pool = db::connect(&url).await.expect("connect");
+    sqlx::migrate!("../db/migrations")
+        .run(&pool)
+        .await
+        .expect("apply migrations");
+    let store = PgIncidentStore::new(pool);
+
+    // Two confirmed incidents, written oldest-first, plus one unconfirmed
+    // (SimulationCompleted with confirmed = false, no IncidentCreated) — the
+    // §11 audit outcome that never becomes a live incident.
+    let mut confirmed_alerts = Vec::new();
+    for (secs, profit) in [(10, 5.0), (20, 9.0)] {
+        let alert = AlertId::new();
+        let incident = IncidentId::new();
+        let mut proj = IncidentProjection::new();
+        proj.apply(&env(completed(alert, profit), at(secs)));
+        proj.apply(&env(created(alert, incident), at(secs + 1)));
+        store
+            .upsert_incident(proj.record(&alert).expect("folded row"))
+            .await
+            .expect("upsert confirmed");
+        confirmed_alerts.push(alert);
+    }
+
+    let unconfirmed_alert = AlertId::new();
+    let mut proj = IncidentProjection::new();
+    proj.apply(&env(
+        DomainEvent::SimulationCompleted(SimulationCompleted {
+            alert_id: unconfirmed_alert,
+            profit: 0.0,
+            victim_loss: 0.0,
+            confirmed: false,
+        }),
+        at(30),
+    ));
+    store
+        .upsert_incident(proj.record(&unconfirmed_alert).expect("folded row"))
+        .await
+        .expect("upsert unconfirmed");
+
+    // Unfiltered: all three, newest-updated (i.e. most-recently-written) first.
+    let page = store
+        .list_incidents(&IncidentFilters::default())
+        .await
+        .expect("list all");
+    assert_eq!(page.incidents.len(), 3);
+    assert_eq!(page.incidents[0].alert_id, unconfirmed_alert);
+    assert!(page.next_cursor.is_none());
+
+    // Status filter: only the two confirmed rows.
+    let page = store
+        .list_incidents(&IncidentFilters {
+            status: Some(IncidentStatus::Confirmed),
+            ..Default::default()
+        })
+        .await
+        .expect("list confirmed");
+    assert_eq!(page.incidents.len(), 2);
+    assert!(page
+        .incidents
+        .iter()
+        .all(|record| confirmed_alerts.contains(&record.alert_id)));
+
+    // Pagination: a page of 1 reports a cursor; following it exhausts the rest.
+    let first_page = store
+        .list_incidents(&IncidentFilters {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .expect("first page");
+    assert_eq!(first_page.incidents.len(), 1);
+    let cursor = first_page.next_cursor.expect("more rows follow");
+
+    let second_page = store
+        .list_incidents(&IncidentFilters {
+            limit: Some(1),
+            cursor: Some(cursor),
+            ..Default::default()
+        })
+        .await
+        .expect("second page");
+    assert_eq!(second_page.incidents.len(), 1);
+    assert_ne!(
+        first_page.incidents[0].alert_id,
+        second_page.incidents[0].alert_id
+    );
 }

@@ -5,11 +5,55 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The public §11 API service — the JWT-gated front door: `GET /v1/address/{addr}/risk`
+# and `/labels` (gRPC into `intelligence`), `GET /v1/audit/incident/{id}` (proxies
+# event-store's existing internal read endpoint) and `GET /v1/incidents` (proxies
+# simulation-projection's). Owns end-user auth so the internal services it fronts
+# don't have to (see event-store's `http.rs` module docs).
+
 [lints]
 workspace = true
 
 [dependencies]
-events.workspace = true
-telemetry.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
+events = { workspace = true }
+telemetry = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Shared HTTP handler-error type (§11) — see crates/api-error.
+api-error = { workspace = true }
+
+# HTTP server. axum + tower-http mirror event-store's own stack; utoipa/-swagger-ui/
+# -axum give this public surface the same OpenAPI/Swagger docs event-store's append
+# API has.
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "timeout"] }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+utoipa-axum = { workspace = true }
+
+# gRPC client into `intelligence`'s `IntelligenceRead` service (§11) — reuses the
+# generated `pb` client stub straight from that crate rather than recompiling the
+# proto here, so the two can never drift.
+tonic = { workspace = true }
+intelligence = { workspace = true }
+
+# Outbound HTTP client to event-store's and simulation-projection's existing
+# internal read endpoints (§11).
+reqwest = { workspace = true }
+
+# JWT bearer verification (no issuance — see `src/auth.rs`).
+jsonwebtoken = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+# Mint tokens in the JWT middleware tests.
+jsonwebtoken = { workspace = true }
+# Drive the router directly (`ServiceExt::oneshot`) without binding a listener.
+tower = { workspace = true }
