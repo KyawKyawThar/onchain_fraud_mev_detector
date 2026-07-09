@@ -6164,6 +6164,7 @@ dependencies = [
  "futures-util",
  "intelligence",
  "jsonwebtoken",
+ "metrics",
  "rdkafka",
  "reqwest",
  "secrecy",
@@ -6181,6 +6182,7 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "utoipa-swagger-ui",
+ "uuid",
 ]
 
 [[package]]

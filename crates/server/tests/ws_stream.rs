@@ -40,7 +40,9 @@ fn jwt_config() -> JwtConfig {
 
 fn valid_bearer() -> String {
     let claims = Claims {
-        sub: "test-caller".to_owned(),
+        // `sub` must be a customer UUID — auth resolves it into the
+        // `CustomerId` usage metering bills against (§13).
+        sub: "00000000-0000-0000-0000-0000000000c0".to_owned(),
         exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         iss: TEST_ISSUER.to_owned(),
     };
@@ -58,6 +60,9 @@ fn valid_bearer() -> String {
 /// `crate::stream::run` would feed from Kafka in production).
 async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage>) {
     let (alerts_tx, _) = tokio::sync::broadcast::channel(16);
+    // Metering sink for this test: the receiver is dropped, so records are
+    // discarded — `src/http.rs`'s tests cover what gets metered.
+    let (usage, _) = server::usage::UsageRecorder::channel(16);
 
     let state = AppState {
         intelligence: IntelligenceClient::connect_lazy("http://127.0.0.1:50051".to_owned())
@@ -67,6 +72,7 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
         simulation_url: "http://127.0.0.1:8082".to_owned(),
         jwt: jwt_config(),
         alerts: alerts_tx.clone(),
+        usage,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")

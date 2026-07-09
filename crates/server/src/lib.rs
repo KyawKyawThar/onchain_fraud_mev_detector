@@ -4,7 +4,9 @@
 //! the gRPC channel into `intelligence`'s `IntelligenceRead` service,
 //! [`upstream`] proxies event-store's/simulation-projection's existing
 //! internal read endpoints, [`stream`] is the Kafka consumer feeding
-//! `WS /v1/stream`'s alert lifecycle, and [`http`] assembles the whole router.
+//! `WS /v1/stream`'s alert lifecycle, [`usage`] meters every authenticated
+//! call as a `UsageRecorded` event (§13), and [`http`] assembles the whole
+//! router.
 //!
 //! Keeping this in a library (mirrors `event-store`) is what lets the router/
 //! auth tests exercise the real types without a running process.
@@ -15,3 +17,4 @@ pub mod http;
 pub mod intelligence_client;
 pub mod stream;
 pub mod upstream;
+pub mod usage;
