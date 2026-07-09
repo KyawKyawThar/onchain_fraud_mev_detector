@@ -137,6 +137,21 @@ impl IncidentStatus {
             IncidentStatus::Retracted => "retracted",
         }
     }
+
+    /// The inverse of [`as_str`](Self::as_str) — parses a persisted/query-string
+    /// status back into the enum. Used both to reconstruct a row read back from
+    /// Postgres ([`crate::store::PgIncidentStore::list_incidents`]) and to parse
+    /// the `GET /v1/incidents?status=` filter ([`crate::http`]), so the two can
+    /// never disagree on the wire strings.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "unconfirmed" => Some(IncidentStatus::Unconfirmed),
+            "confirmed" => Some(IncidentStatus::Confirmed),
+            "finalized" => Some(IncidentStatus::Finalized),
+            "retracted" => Some(IncidentStatus::Retracted),
+            _ => None,
+        }
+    }
 }
 
 /// One incident's read-model row — the join of every result-path event that references
@@ -181,6 +196,44 @@ pub struct IncidentRecord {
 }
 
 impl IncidentRecord {
+    /// Reconstruct a row read back from storage (`crate::store::PgIncidentStore::list_incidents`,
+    /// §11 `GET /v1/incidents`) — the inverse of what `upsert_incident` persists. Takes the
+    /// hidden watermarks directly rather than via [`Self::figures_at`]/[`Self::retracted_at`]/
+    /// [`Self::finalized_at`] since those are for *reading an existing in-memory record*, not
+    /// building a fresh one from column values.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_stored(
+        alert_id: AlertId,
+        incident_id: Option<IncidentId>,
+        status: IncidentStatus,
+        kind: Option<AlertKind>,
+        severity: Option<Severity>,
+        profit: f64,
+        victim_loss: f64,
+        txs: Vec<B256>,
+        retraction_reason: Option<String>,
+        finalized_block: Option<B256>,
+        figures_at: DateTime<Utc>,
+        retracted_at: Option<DateTime<Utc>>,
+        finalized_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            alert_id,
+            incident_id,
+            status,
+            kind,
+            severity,
+            profit,
+            victim_loss,
+            txs,
+            retraction_reason,
+            finalized_block,
+            figures_at,
+            retracted_at,
+            finalized_at,
+        }
+    }
+
     /// Event-time of the result that last set the monetary figures — the
     /// last-writer-wins watermark the store persists so a re-projection can't let a
     /// stale event overwrite newer numbers. Read by [`crate::store`].

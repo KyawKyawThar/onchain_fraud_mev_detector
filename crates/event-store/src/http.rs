@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use api_error::ApiError;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -163,9 +164,9 @@ struct AppendResponse {
 async fn append(
     State(state): State<AppState>,
     Json(envelopes): Json<Vec<EventEnvelope>>,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     if envelopes.len() > MAX_BATCH_LEN {
-        return Err(AppError::payload_too_large(format!(
+        return Err(ApiError::payload_too_large(format!(
             "batch of {} exceeds the maximum of {MAX_BATCH_LEN} events",
             envelopes.len()
         )));
@@ -174,14 +175,14 @@ async fn append(
     // Reject anything written under a schema version this build can't read,
     // before touching storage (§2 versioning).
     for envelope in &envelopes {
-        envelope.ensure_supported().map_err(AppError::bad_request)?;
+        envelope.ensure_supported().map_err(ApiError::bad_request)?;
     }
 
     state
         .store
         .append_batch(&envelopes)
         .await
-        .map_err(AppError::internal)?;
+        .map_err(ApiError::internal)?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -202,8 +203,8 @@ async fn append(
         (status = 500, description = "ClickHouse unreachable"),
     ),
 )]
-async fn healthz(State(state): State<AppState>) -> Result<&'static str, AppError> {
-    state.store.ping().await.map_err(AppError::internal)?;
+async fn healthz(State(state): State<AppState>) -> Result<&'static str, ApiError> {
+    state.store.ping().await.map_err(ApiError::internal)?;
     Ok("ok")
 }
 
@@ -231,12 +232,12 @@ struct FilterParams {
 impl FilterParams {
     /// Convert to domain [`Filters`], parsing the opaque cursor token. A
     /// malformed cursor is the caller's fault — surfaced as a 400.
-    fn into_filters(self) -> Result<Filters, AppError> {
+    fn into_filters(self) -> Result<Filters, ApiError> {
         let cursor = self
             .cursor
             .map(|token| {
                 Cursor::parse(&token)
-                    .ok_or_else(|| AppError::bad_request(format!("invalid cursor `{token}`")))
+                    .ok_or_else(|| ApiError::bad_request(format!("invalid cursor `{token}`")))
             })
             .transpose()?;
         Ok(Filters {
@@ -286,12 +287,12 @@ async fn audit_incident(
     State(state): State<AppState>,
     Path(incident_id): Path<uuid::Uuid>,
     Query(params): Query<FilterParams>,
-) -> Result<Json<EventPageResponse>, AppError> {
+) -> Result<Json<EventPageResponse>, ApiError> {
     let page = state
         .store
         .audit_incident(IncidentId(incident_id), &params.into_filters()?)
         .await
-        .map_err(AppError::from_query)?;
+        .map_err(map_query_error)?;
     Ok(Json(page.into()))
 }
 
@@ -315,15 +316,15 @@ async fn events_by_address(
     State(state): State<AppState>,
     Path(address): Path<String>,
     Query(params): Query<FilterParams>,
-) -> Result<Json<EventPageResponse>, AppError> {
+) -> Result<Json<EventPageResponse>, ApiError> {
     let address: AccountAddress = address
         .parse()
-        .map_err(|_| AppError::bad_request(format!("invalid address `{address}`")))?;
+        .map_err(|_| ApiError::bad_request(format!("invalid address `{address}`")))?;
     let page = state
         .store
         .events_by_address(address, &params.into_filters()?)
         .await
-        .map_err(AppError::from_query)?;
+        .map_err(map_query_error)?;
     Ok(Json(page.into()))
 }
 
@@ -346,12 +347,12 @@ async fn events_by_address(
 async fn replay(
     State(state): State<AppState>,
     Query(params): Query<FilterParams>,
-) -> Result<Json<EventPageResponse>, AppError> {
+) -> Result<Json<EventPageResponse>, ApiError> {
     let page = state
         .store
         .replay(&params.into_filters()?)
         .await
-        .map_err(AppError::from_query)?;
+        .map_err(map_query_error)?;
     Ok(Json(page.into()))
 }
 
@@ -379,61 +380,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// A handler error carrying the HTTP status to return. The message is logged and
-/// returned as a plain-text body (this is an internal API; no need for a
-/// structured error envelope yet).
-struct AppError {
-    status: StatusCode,
-    message: String,
-}
-
-impl AppError {
-    /// 500 — an unexpected failure (storage down, serialization bug).
-    fn internal(err: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: err.to_string(),
-        }
-    }
-
-    /// 400 — the request itself is bad (e.g. an unsupported schema version).
-    fn bad_request(err: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: err.to_string(),
-        }
-    }
-
-    /// Map a read-path failure to a status: an unbounded replay is the caller's
-    /// mistake (400); a storage failure is ours (500).
-    fn from_query(err: QueryError) -> Self {
-        match err {
-            QueryError::UnboundedReplay => Self::bad_request(QueryError::UnboundedReplay),
-            QueryError::Store(inner) => Self::internal(inner),
-        }
-    }
-
-    /// 413 — the batch is larger than the service accepts.
-    fn payload_too_large(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        if self.status.is_server_error() {
-            // Log the detail, but never return internal error text (which can
-            // carry storage URLs / SQL) to the caller.
-            tracing::error!(status = %self.status, error = %self.message, "append request failed");
-            (self.status, "internal server error").into_response()
-        } else {
-            // 4xx is the caller's own fault — the detail helps them fix it.
-            tracing::warn!(status = %self.status, error = %self.message, "append request rejected");
-            (self.status, self.message).into_response()
-        }
+/// Map a read-path failure to the shared [`ApiError`]: an unbounded replay is
+/// the caller's mistake (400); a storage failure is ours (500).
+fn map_query_error(err: QueryError) -> ApiError {
+    match err {
+        QueryError::UnboundedReplay => ApiError::bad_request(QueryError::UnboundedReplay),
+        QueryError::Store(inner) => ApiError::internal(inner),
     }
 }
 

@@ -3,6 +3,8 @@
 //! `event-store`). Everything downstream takes an explicit [`Config`] so the rest
 //! of the service stays pure and testable.
 
+use std::net::SocketAddr;
+
 use anyhow::{Context, Result};
 use events::primitives::Chain;
 use secrecy::SecretString;
@@ -105,6 +107,8 @@ pub struct ProjectionConfig {
     pub postgres_url: SecretString,
     /// ClickHouse connection for the append-only analytics projection (§14).
     pub clickhouse: ClickhouseConfig,
+    /// Address the internal `GET /v1/incidents` read API (§11) binds to.
+    pub http_addr: SocketAddr,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base URL plus
@@ -123,6 +127,16 @@ pub struct ClickhouseConfig {
 impl ProjectionConfig {
     /// Resolve from the environment, erroring on anything missing (fail fast at boot).
     pub fn from_env() -> Result<Self> {
+        let http_addr = format!(
+            "{}:{}",
+            env("SIMULATION_PROJECTION_HTTP_HOST")?,
+            env("SIMULATION_PROJECTION_HTTP_PORT")?
+        )
+        .parse()
+        .context(
+            "SIMULATION_PROJECTION_HTTP_HOST:SIMULATION_PROJECTION_HTTP_PORT is not a valid socket address",
+        )?;
+
         Ok(Self {
             kafka_brokers: env("KAFKA_BROKERS")?,
             group_id: env_or("SIMULATION_PROJECTION_KAFKA_GROUP", "simulation-projection"),
@@ -133,6 +147,7 @@ impl ProjectionConfig {
                 password: SecretString::from(env("CLICKHOUSE_PASSWORD")?),
                 database: env("CLICKHOUSE_DB")?,
             },
+            http_addr,
         })
     }
 }

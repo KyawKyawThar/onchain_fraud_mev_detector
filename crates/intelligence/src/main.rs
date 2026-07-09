@@ -57,7 +57,9 @@ use intelligence::cache::{HotCache, RedisHotCache};
 use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
+use intelligence::grpc::IntelligenceReadService;
 use intelligence::merge_actor::MergeActor;
+use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
 use intelligence::reorg::{self, ReorgConsumer};
 use intelligence::risk;
 use intelligence::risk_scorer::{self, RiskScorer};
@@ -70,7 +72,7 @@ use tracing::Instrument;
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
-                     `risk <address>`, `score`, `reorg`, \
+                     `risk <address>`, `score`, `reorg`, `grpc`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
         Some("risk") => address_risk(&cfg, args).await,
         Some("score") => score(&cfg).await,
         Some("reorg") => reorg_cmd(&cfg).await,
+        Some("grpc") => grpc_serve(&cfg).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -476,6 +479,45 @@ async fn reorg_cmd(cfg: &Config) -> Result<()> {
         .context("reorg consumer exited with error")?;
 
     tracing::info!("intelligence reorg-rollback consumer shut down");
+    Ok(())
+}
+
+/// Run the `IntelligenceRead` gRPC server (§11): connect the four store seams
+/// and the Redis hot cache, then serve `GetRiskScore`/`GetLabels` until
+/// shutdown. Independently deployable from `attribute`/`score`/`reorg` — pure
+/// reads, no Kafka consumer group of its own.
+async fn grpc_serve(cfg: &Config) -> Result<()> {
+    tracing::info!(addr = %cfg.grpc_addr, "starting intelligence gRPC server");
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+
+    let cache = Arc::new(
+        RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+            .await
+            .context("connecting to Redis")?,
+    );
+
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let service = IntelligenceReadService::new(StoreSeams::single(store), cache);
+    tonic::transport::Server::builder()
+        .add_service(IntelligenceReadServer::new(service))
+        .serve_with_shutdown(cfg.grpc_addr, shutdown.cancelled())
+        .await
+        .context("gRPC server error")?;
+
+    tracing::info!("intelligence gRPC server shut down");
     Ok(())
 }
 

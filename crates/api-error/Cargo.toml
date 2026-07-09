@@ -1,0 +1,19 @@
+[package]
+name = "api-error"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The shared HTTP error seam (§11): one `ApiError` type every internal/public HTTP
+# surface in the workspace (event-store, simulation-projection, the public API
+# service) converts its domain errors into, instead of each hand-rolling the same
+# status+message+logging shape. See src/lib.rs.
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

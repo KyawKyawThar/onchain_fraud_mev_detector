@@ -29,15 +29,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use events::primitives::{AlertId, Chain};
+use events::primitives::{AlertId, Chain, IncidentId};
 use events::{DomainEvent, EventEnvelope};
+use revm::primitives::B256;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::config::ClickhouseConfig;
-use crate::projection::IncidentRecord;
+use crate::projection::{IncidentRecord, IncidentStatus};
 
 /// A failure writing to (or probing) one of the stores. The variant — and, for Postgres,
 /// the specific `sqlx` error — decides whether retrying the *same* write could ever succeed,
@@ -123,6 +124,73 @@ impl JobUpdate {
     }
 }
 
+/// Hard ceiling on one [`IncidentStore::list_incidents`] page — a guard against an
+/// unbounded scan. Mirrors [`event-store`'s `MAX_LIMIT`](../../event-store/src/query.rs).
+pub const MAX_INCIDENTS_LIMIT: u64 = 1_000;
+/// Default page size when a caller doesn't ask for one.
+pub const DEFAULT_INCIDENTS_LIMIT: u64 = 100;
+
+/// A keyset cursor into the `(updated_at, alert_id)` sort order `list_incidents` walks
+/// newest-first: the position to resume *after*. Opaque to HTTP callers (see
+/// [`crate::http`]'s token encoding) but a plain struct here — the store only ever
+/// receives one back verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncidentCursor {
+    pub updated_at: DateTime<Utc>,
+    pub alert_id: Uuid,
+}
+
+impl IncidentCursor {
+    /// Encode as `<unix_millis>:<alert_id>` — mirrors
+    /// [`event-store`'s `Cursor::token`](../../event-store/src/query.rs).
+    pub fn token(&self) -> String {
+        format!("{}:{}", self.updated_at.timestamp_millis(), self.alert_id)
+    }
+
+    /// Parse a token from [`Self::token`]. `None` on any malformation (the caller
+    /// maps that to a 400).
+    pub fn parse(token: &str) -> Option<Self> {
+        let (millis, alert_id) = token.split_once(':')?;
+        Some(Self {
+            updated_at: DateTime::<Utc>::from_timestamp_millis(millis.parse().ok()?)?,
+            alert_id: alert_id.parse().ok()?,
+        })
+    }
+}
+
+/// Optional narrowing for [`IncidentStore::list_incidents`] (§11 `/v1/incidents`). An
+/// unset field is simply not constrained; `cursor`/`limit` drive pagination and never
+/// count as narrowing.
+#[derive(Debug, Default, Clone)]
+pub struct IncidentFilters {
+    pub status: Option<IncidentStatus>,
+    /// Resume after this point in the sort order (keyset pagination).
+    pub cursor: Option<IncidentCursor>,
+    /// Max rows for this page; clamped to `[1, MAX_INCIDENTS_LIMIT]`, defaulting to
+    /// [`DEFAULT_INCIDENTS_LIMIT`].
+    pub limit: Option<u64>,
+}
+
+impl IncidentFilters {
+    /// The effective page size: the caller's `limit` clamped to
+    /// `[1, MAX_INCIDENTS_LIMIT]`, or [`DEFAULT_INCIDENTS_LIMIT`] when unset.
+    fn effective_limit(&self) -> u64 {
+        self.limit
+            .unwrap_or(DEFAULT_INCIDENTS_LIMIT)
+            .clamp(1, MAX_INCIDENTS_LIMIT)
+    }
+}
+
+/// One page of [`IncidentStore::list_incidents`] results plus where to resume.
+#[derive(Debug)]
+pub struct IncidentPage {
+    /// Rows, most-recently-updated first.
+    pub incidents: Vec<IncidentRecord>,
+    /// Set iff this page was full and more rows may follow. `None` means the listing
+    /// is exhausted, so a caller can always tell a complete result from a truncated one.
+    pub next_cursor: Option<IncidentCursor>,
+}
+
 /// The mutable Postgres records (§14): in-flight jobs + the confirmed-incident read model.
 /// Object-safe so the consumer holds a `dyn IncidentStore` and swaps [`PgIncidentStore`]
 /// for a test double.
@@ -136,6 +204,11 @@ pub trait IncidentStore: Send + Sync {
     /// Record an in-flight job's lifecycle transition. Idempotent and monotonic in SQL
     /// (a `completed` job can't regress; a first-seen timestamp is preserved).
     async fn record_job(&self, job: &JobUpdate) -> Result<(), PersistError>;
+
+    /// List confirmed-incident rows, newest-updated first (§11 `GET /v1/incidents` —
+    /// [`crate::http`]), optionally narrowed by status and paginated by `filters`.
+    async fn list_incidents(&self, filters: &IncidentFilters)
+        -> Result<IncidentPage, PersistError>;
 }
 
 /// The append-only ClickHouse analytics firehose (§14). Object-safe for the same reason.
@@ -155,6 +228,15 @@ impl PgIncidentStore {
     /// Wrap a connection pool (see [`db::connect`]) as the incident store.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Liveness probe: a trivial query that proves Postgres is reachable — used by
+    /// [`crate::http`]'s `/healthz`, mirroring [`ClickhouseAnalytics::ping`].
+    pub async fn ping(&self) -> Result<(), PersistError> {
+        sqlx::query!("SELECT 1 AS one")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -245,6 +327,118 @@ impl IncidentStore for PgIncidentStore {
         .await?;
         Ok(())
     }
+
+    async fn list_incidents(
+        &self,
+        filters: &IncidentFilters,
+    ) -> Result<IncidentPage, PersistError> {
+        let status = filters.status.map(IncidentStatus::as_str);
+        let cursor_updated_at = filters.cursor.map(|c| c.updated_at);
+        let cursor_alert_id = filters.cursor.map(|c| c.alert_id);
+        let limit = filters.effective_limit();
+        // Fetch one row past `limit` so we can tell whether another page exists
+        // without a second round-trip (mirrors event-store's `run_paged`).
+        let fetch_limit = (limit + 1) as i64;
+
+        let mut rows = sqlx::query!(
+            "SELECT alert_id, incident_id, status, kind, severity, profit, victim_loss,
+                    txs, retraction_reason, finalized_block, figures_at, retracted_at,
+                    finalized_at, updated_at
+             FROM incidents
+             WHERE ($1::text IS NULL OR status = $1)
+               AND ($2::timestamptz IS NULL OR $3::uuid IS NULL
+                    OR (updated_at, alert_id) < ($2, $3))
+             ORDER BY updated_at DESC, alert_id DESC
+             LIMIT $4",
+            status,
+            cursor_updated_at,
+            cursor_alert_id,
+            fetch_limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() as u64 > limit;
+        if has_more {
+            rows.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            rows.last().map(|row| IncidentCursor {
+                updated_at: row.updated_at,
+                alert_id: row.alert_id,
+            })
+        } else {
+            None
+        };
+
+        let incidents = rows
+            .into_iter()
+            .map(|row| {
+                let status = IncidentStatus::parse(&row.status).ok_or_else(|| {
+                    PersistError::Postgres(sqlx::Error::ColumnDecode {
+                        index: "status".to_owned(),
+                        source: format!("unrecognized incident status {:?}", row.status).into(),
+                    })
+                })?;
+                let kind = row.kind.as_deref().map(parse_wire_enum).transpose()?;
+                let severity = row.severity.as_deref().map(parse_wire_enum).transpose()?;
+                let txs = row
+                    .txs
+                    .iter()
+                    .map(|tx| parse_hex_column("txs", tx))
+                    .collect::<Result<Vec<B256>, PersistError>>()?;
+                let finalized_block = row
+                    .finalized_block
+                    .as_deref()
+                    .map(|raw| parse_hex_column("finalized_block", raw))
+                    .transpose()?;
+
+                Ok(IncidentRecord::from_stored(
+                    AlertId(row.alert_id),
+                    row.incident_id.map(IncidentId),
+                    status,
+                    kind,
+                    severity,
+                    row.profit,
+                    row.victim_loss,
+                    txs,
+                    row.retraction_reason,
+                    finalized_block,
+                    row.figures_at,
+                    row.retracted_at,
+                    row.finalized_at,
+                ))
+            })
+            .collect::<Result<Vec<_>, PersistError>>()?;
+
+        Ok(IncidentPage {
+            incidents,
+            next_cursor,
+        })
+    }
+}
+
+/// Parse a snake_case wire string (e.g. `"sandwich"`) back into a derive-driven
+/// `Serialize`/`Deserialize` enum like [`AlertKind`]/[`Severity`], reusing their
+/// existing `serde(rename_all = "snake_case")` mapping rather than hand-rolling a
+/// second one that could drift.
+fn parse_wire_enum<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, PersistError> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned())).map_err(|err| {
+        PersistError::Postgres(sqlx::Error::ColumnDecode {
+            index: "kind/severity".to_owned(),
+            source: format!("unrecognized value {raw:?}: {err}").into(),
+        })
+    })
+}
+
+/// Parse a stored `0x`-hex column value back into a fixed-size hash.
+fn parse_hex_column(column: &'static str, raw: &str) -> Result<B256, PersistError> {
+    raw.parse().map_err(|err| {
+        PersistError::Postgres(sqlx::Error::ColumnDecode {
+            index: column.to_owned(),
+            source: format!("{raw:?} is not 0x-hex: {err}").into(),
+        })
+    })
 }
 
 /// ClickHouse-backed [`IncidentAnalytics`]. Cheap to clone (the client is `Arc`-cheap).

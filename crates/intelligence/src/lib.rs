@@ -86,6 +86,14 @@
 //! reads back — splitting the survivor apart again (publishing
 //! `EntitySplit`, which `risk_scorer` also already consumes). A merge whose
 //! survivor has moved on since is left logged, not silently undone.
+//!
+//! Sprint 8 t4 adds [`grpc`] and [`pb`] (generated from
+//! `proto/intelligence.proto`): the crate's first gRPC surface, the
+//! `IntelligenceRead` service the public API service (§11) calls for an
+//! address's risk score and labels — cache-aside over the same
+//! [`cache::HotCache`] and [`risk_scorer::load_risk_inputs`]/[`risk::score`]
+//! seams the `score` consumer and `risk` CLI subcommand already use, so this
+//! surface can't drift from how those already compute the same answer.
 
 pub mod adjacency;
 pub mod attribution;
@@ -93,8 +101,10 @@ pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
+pub mod grpc;
 pub mod merge_actor;
 pub mod model;
+pub mod pb;
 pub mod reorg;
 pub mod risk;
 pub mod risk_scorer;

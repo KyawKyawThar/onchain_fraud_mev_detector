@@ -23,6 +23,11 @@ ch-migrate = { path = "crates/ch-migrate" }
 # the at-least-once `publish_resilient` policy, depended on by every event
 # producer (ingestion, detection, …) so the producer config lives in one place.
 event-bus = { path = "crates/event-bus" }
+# Shared HTTP handler-error seam (§11): the `ApiError` type every internal/public
+# HTTP surface (event-store, simulation-projection, the public API service)
+# converts into, instead of each hand-rolling the same status+message+logging
+# shape (see crates/api-error/src/lib.rs).
+api-error = { path = "crates/api-error" }
 # Detection seam (§6): `detector-api` is the thin, stable contract every detector
 # builds against — the `DetectorPlugin` trait + `DetectionCtx`/enrichment, and
 # nothing of the service's internals. The `detection` service crate re-exports it
@@ -168,6 +173,9 @@ rdkafka = { version = "0.39", features = ["tokio"] }
 # secrecy    — keep passwords/tokens out of `Debug`/logs; explicit `expose_secret()`.
 # subtle     — audited constant-time comparison for the bearer token.
 tower-http = { version = "0.7", features = ["trace", "timeout"] }
+# `ServiceExt::oneshot` drives a router directly in tests (the `server` crate's
+# JWT-middleware tests) without binding a real listener.
+tower = { version = "0.5", features = ["util"] }
 tokio-util = "0.7"
 # `StreamExt::next` for draining lapin's `Consumer` stream in the simulation worker
 # pool (§7) — tokio-native, so no second futures ecosystem is pulled in.
@@ -234,6 +242,35 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 # route and its OpenAPI path from one `#[utoipa::path]` annotation, so the served
 # routes and the spec can't drift (no hand-maintained `paths(...)` list).
 utoipa-axum = "0.2"
+
+# gRPC (§11/§8): `intelligence`'s first gRPC surface — a read-only
+# `IntelligenceRead` service the public API service calls for risk scores/labels,
+# instead of that hot Postgres/Redis path being reached over HTTP-JSON. `tonic` is
+# the async gRPC runtime (server in `intelligence`, client-only in `server`);
+# `tonic-prost`/`prost` are the message codec. Build-time codegen
+# (`tonic-prost-build` + `protoc-bin-vendored`) lives only in `intelligence`'s
+# `build.rs` — vendoring the `protoc` binary means no system `protobuf-compiler`
+# package is needed in CI or the Docker build, the same "self-contained image"
+# stance as the rdkafka/rustls choices above.
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+# JWT verification (§11): the public API service validates a caller-presented
+# bearer JWT (`JWT_SECRET`/`JWT_ISSUER`) before serving any read endpoint. No
+# issuance/login flow yet — no user/tenant store exists — so only the `Validation`
+# half of this crate is used. `aws_lc_rs` picks the same crypto backend `reqwest`'s
+# `rustls` feature already pulls in below, rather than adding a second (RustCrypto)
+# backend just for HMAC.
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+# Outbound HTTP client (§11): the public API service proxies to event-store's and
+# simulation-projection's existing internal read endpoints. `rustls-tls` keeps the
+# self-contained-image stance (no system OpenSSL); `json` for the page-shaped
+# response bodies.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 
 # Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"

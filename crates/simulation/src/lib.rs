@@ -77,6 +77,7 @@ pub mod command;
 pub mod config;
 pub mod consumer;
 pub mod dispatcher;
+pub mod http;
 pub mod projection;
 pub mod projection_consumer;
 pub mod queue;

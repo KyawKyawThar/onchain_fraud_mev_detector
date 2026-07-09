@@ -24,6 +24,7 @@ use event_bus::PUBLISH_BACKOFF;
 use secrecy::ExposeSecret;
 use simulation::ch_migrate;
 use simulation::config::ProjectionConfig;
+use simulation::http;
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
 use simulation::store::{build_clickhouse_client, ClickhouseAnalytics, PgIncidentStore};
 use std::sync::Arc;
@@ -76,7 +77,8 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
-    let store = Arc::new(PgIncidentStore::new(pool));
+    let pg_store = PgIncidentStore::new(pool);
+    let store = Arc::new(pg_store.clone());
     let analytics = ClickhouseAnalytics::new(client);
     analytics
         .ping()
@@ -94,15 +96,47 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         }
     });
 
+    // ── Kafka result-path projection (background task) ───────────────
+    // A fatal consumer error cancels the token too, so the HTTP server drains
+    // rather than serving reads against a process that stopped ingesting
+    // (mirrors event-store's `serve()`).
     let consumer = build_consumer(&cfg.kafka_brokers, &cfg.group_id)
         .context("building the result-path Kafka consumer")?;
-    ProjectionConsumer::new(store, analytics)
-        .run(consumer, PUBLISH_BACKOFF, &shutdown)
-        .await
-        .context("projection consumer exited with error")?;
+    let consumer_task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let result = ProjectionConsumer::new(store, analytics)
+                .run(consumer, PUBLISH_BACKOFF, &shutdown)
+                .await;
+            if let Err(ref err) = result {
+                tracing::error!(error = %err, "projection consumer failed; initiating shutdown");
+                shutdown.cancel();
+            }
+            result
+        }
+    });
 
+    // ── Internal read API (§11 `/v1/incidents`) ───────────────────────
+    let http_state = http::AppState {
+        store: Arc::new(pg_store.clone()),
+        pg: pg_store,
+    };
+    let listener = tokio::net::TcpListener::bind(cfg.http_addr)
+        .await
+        .with_context(|| format!("binding HTTP listener on {}", cfg.http_addr))?;
+    tracing::info!(addr = %cfg.http_addr, "simulation-projection HTTP API listening");
+
+    axum::serve(listener, http::router(http_state))
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        })
+        .await
+        .context("HTTP server error")?;
+
+    let consumer_result = consumer_task.await.context("consumer task panicked")?;
     tracing::info!("simulation projection consumer shut down");
-    Ok(())
+    consumer_result.context("projection consumer exited with error")
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM.
