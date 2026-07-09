@@ -45,6 +45,17 @@ reqwest = { workspace = true }
 # JWT bearer verification (no issuance — see `src/auth.rs`).
 jsonwebtoken = { workspace = true }
 
+# `WS /v1/stream` (§11): the shared Kafka-backbone consume seam (`run_consumer`/
+# `EventHandler`, same as event-store's ingest) feeds the provisional/confirmed/
+# retracted alert lifecycle into a broadcast channel every WS connection
+# subscribes to. `futures-util` splits the axum `WebSocket` into concurrent
+# send/receive halves (see `src/http.rs`).
+event-bus = { workspace = true }
+rdkafka = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+alloy-primitives = { workspace = true }
+
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 secrecy = { workspace = true }
@@ -57,3 +68,6 @@ chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 # Drive the router directly (`ServiceExt::oneshot`) without binding a listener.
 tower = { workspace = true }
+# Drive a real client connection against a bound listener for the `/v1/stream`
+# lifecycle test — `ServiceExt::oneshot` can't exercise a WS upgrade.
+tokio-tungstenite = { workspace = true }

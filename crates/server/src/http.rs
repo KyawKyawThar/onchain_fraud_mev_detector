@@ -1,7 +1,9 @@
 //! The public §11 API service: `GET /v1/address/{addr}/risk` and `/labels`
 //! (gRPC into `intelligence`), `GET /v1/audit/incident/{id}` (proxies
-//! event-store) and `GET /v1/incidents` (proxies simulation-projection),
-//! behind [`crate::auth::require_jwt`]. `/healthz` is the only open route.
+//! event-store), `GET /v1/incidents` (proxies simulation-projection), and
+//! `WS /v1/stream` (the provisional/confirmed/retracted alert lifecycle,
+//! fed by [`crate::stream`]) — all behind [`crate::auth::require_jwt`].
+//! `/healthz` is the only open route.
 //!
 //! Follows event-store's `http.rs` shape: one [`OpenApiRouter`] assembled from
 //! `#[utoipa::path]`-annotated handlers so the served routes and the Swagger
@@ -16,10 +18,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use axum::{Json, Router};
 use events::primitives::AccountAddress;
 use intelligence::model::address_key;
 use serde::Serialize;
+use tokio::sync::broadcast;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
@@ -30,6 +34,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
 use crate::intelligence_client::IntelligenceClient;
+use crate::stream::{self, WsMessage};
 use crate::upstream;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,7 +44,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     info(
         title = "api-service",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Public read API (§11): address risk/labels, incident audit trail and listing",
+        description = "Public read API (§11): address risk/labels, incident audit trail and listing. \
+            Also serves `WS /v1/stream` (not representable in OpenAPI): the live alert lifecycle — \
+            `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
+            every other `/v1` route.",
     ),
     components(schemas(RiskResponse, LabelResponse, LabelsResponse)),
     modifiers(&SecurityAddon),
@@ -69,6 +77,9 @@ pub struct AppState {
     pub event_store_url: String,
     pub simulation_url: String,
     pub jwt: JwtConfig,
+    /// Fan-out for `WS /v1/stream` (§11): [`crate::stream::run`] feeds this
+    /// from Kafka; each WS connection holds its own `subscribe()`d receiver.
+    pub alerts: broadcast::Sender<WsMessage>,
 }
 
 fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
@@ -76,11 +87,17 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     // the router's own state type — so `require_jwt` (which only needs
     // `JwtConfig`) can be layered with just that slice of `AppState`, no adapter
     // function required to bridge the two.
+    //
+    // `/v1/stream` is a plain `.route` (not `routes!`) because it's a WS
+    // upgrade, not a `#[utoipa::path]`-describable JSON handler — utoipa has no
+    // WebSocket support, so it's documented in prose (the module doc + the
+    // OpenAPI `description` below) rather than in the generated spec.
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
+        .route("/v1/stream", get(stream::stream_ws))
         .route_layer(middleware::from_fn_with_state(
             state.jwt.clone(),
             require_jwt,
@@ -311,6 +328,7 @@ mod tests {
                 secret: SecretString::from("test-secret"),
                 issuer: "mev".to_owned(),
             },
+            alerts: tokio::sync::broadcast::channel(16).0,
         }
     }
 

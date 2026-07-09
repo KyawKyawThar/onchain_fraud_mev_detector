@@ -164,7 +164,10 @@ revm = { version = "41", default-features = false, features = [
 #   requires curl headers and broke CI. Production SASL_SSL: add the `ssl`/`sasl`
 #   features here + the matching system libs in CI/Dockerfile when that lands.
 #   `tokio` enables the async StreamConsumer.
-axum = "0.8"
+# The `ws` feature turns on `axum::extract::ws` — the public API service's
+# `WS /v1/stream` (§11), which fans out the provisional/confirmed/retracted
+# alert lifecycle to connected clients.
+axum = { version = "0.8", features = ["ws"] }
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 rdkafka = { version = "0.39", features = ["tokio"] }
 # Production hardening for the network service:
@@ -271,6 +274,19 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 # self-contained-image stance (no system OpenSSL); `json` for the page-shaped
 # response bodies.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+
+# `WS /v1/stream` (§11): the public API service's own Kafka consumer, built on
+# the shared `event-bus::run_consumer` loop (same as event-store's ingest),
+# fans `PreliminaryAlertCreated`/`IncidentCreated`/`IncidentRetracted` out to
+# connected WebSocket clients as `provisional_alert`/`alert_confirmed`/
+# `alert_retracted`. `futures-util` is already pulled in transitively by axum's
+# `ws` feature; naming it explicitly is what lets the handler `.split()` a
+# `WebSocket` into its send/receive halves and drive them concurrently in one
+# `tokio::select!`. `tokio-tungstenite` is dev-only — it drives a real client
+# connection in the lifecycle test, pinned to the same version axum's `ws`
+# feature itself depends on so only one copy resolves.
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
 
 # Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"
