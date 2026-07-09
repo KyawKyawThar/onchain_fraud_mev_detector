@@ -409,7 +409,6 @@ mod tests {
     use events::intelligence::{
         EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked, SanctionHit,
     };
-    use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
     fn addr(byte: u8) -> AccountAddress {
@@ -424,27 +423,21 @@ mod tests {
         EventEnvelope::with_metadata(Uuid::new_v4(), at, Chain::ETHEREUM, payload)
     }
 
-    #[derive(Default)]
-    struct RecordingSink {
-        events: StdMutex<Vec<DomainEvent>>,
+    use event_bus::test_util::RecordingSink;
+
+    /// The `RiskScoreUpdated`s among the recorded events — a thin, crate-local
+    /// projection over the shared [`RecordingSink`], which only owns generic
+    /// recording; domain filters stay with the tests that need them.
+    trait RiskScoresExt {
+        fn risk_scores(&self) -> Vec<events::intelligence::RiskScoreUpdated>;
     }
 
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), event_bus::PublishError> {
-            self.events.lock().unwrap().push(envelope.payload);
-            Ok(())
-        }
-    }
-
-    impl RecordingSink {
+    impl RiskScoresExt for RecordingSink {
         fn risk_scores(&self) -> Vec<events::intelligence::RiskScoreUpdated> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
+            self.events()
+                .into_iter()
                 .filter_map(|e| match e {
-                    DomainEvent::RiskScoreUpdated(r) => Some(r.clone()),
+                    DomainEvent::RiskScoreUpdated(r) => Some(r),
                     _ => None,
                 })
                 .collect()

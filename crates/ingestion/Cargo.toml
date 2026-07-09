@@ -35,6 +35,9 @@ alloy-transport = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+# Shared recording `EventSink` for the pipeline's emit tests (the `FlakySink`
+# retry double stays local — it has a single user, so nothing to dedup).
+event-bus = { workspace = true, features = ["test-util"] }
 # A hermetic in-process JSON-RPC server (no network, no external node) to prove
 # failover + circuit breaking deterministically in tests/failover.rs.
 axum = { workspace = true }

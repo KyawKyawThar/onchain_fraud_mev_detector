@@ -108,10 +108,12 @@ tower-http = { workspace = true }
 api-error = { workspace = true }
 
 [features]
-# Exposes `simulation::test_util` (recording sinks, canned scenarios + ack handle).
-# Enabled for this crate's own integration tests via the self dev-dependency below,
-# so `tests/` and the in-crate unit tests share one set of doubles.
-test-util = []
+# Exposes `simulation::test_util` (canned scenarios + ack handle, plus the
+# recording sink re-exported from event-bus). Enabled for this crate's own
+# integration tests via the self dev-dependency below, so `tests/` and the
+# in-crate unit tests share one set of doubles. Forwards to event-bus's own
+# test-util so the re-exported `RecordingEventSink` resolves in both.
+test-util = ["event-bus/test-util"]
 
 [dev-dependencies]
 # `EnumIter` iteration in the wire-string drift tests (exhaustive over variants).

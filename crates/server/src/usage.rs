@@ -226,24 +226,9 @@ async fn publish_one(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use event_bus::test_util::RecordingSink;
     use event_bus::PublishError;
-    use std::sync::Mutex;
     use std::time::Instant;
-
-    /// Captures published envelopes — same double every producer test in this
-    /// workspace uses.
-    #[derive(Default)]
-    struct RecordingSink {
-        published: Mutex<Vec<EventEnvelope>>,
-    }
-
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
-            self.published.lock().unwrap().push(envelope);
-            Ok(())
-        }
-    }
 
     /// A sink whose publish never resolves — models a broker that hangs at
     /// shutdown, to prove the flush is bounded rather than open-ended.
@@ -271,7 +256,7 @@ mod tests {
 
         run(sink.clone(), rx, Duration::from_millis(1), shutdown).await;
 
-        let published = sink.published.lock().unwrap();
+        let published = sink.envelopes();
         assert_eq!(published.len(), 1);
         let envelope = &published[0];
         assert_eq!(envelope.event_type(), "UsageRecorded");
@@ -313,7 +298,7 @@ mod tests {
         run(sink.clone(), rx, Duration::from_millis(1), shutdown).await;
 
         assert_eq!(
-            sink.published.lock().unwrap().len(),
+            sink.len(),
             1,
             "a queued event must be flushed on shutdown, not lost"
         );

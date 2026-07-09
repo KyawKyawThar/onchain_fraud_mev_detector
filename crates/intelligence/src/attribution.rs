@@ -731,7 +731,6 @@ mod tests {
     use alloy_primitives::Address;
     use events::detection::PreliminaryAlertCreated;
     use events::primitives::{AlertKind, DetectorRef, Severity};
-    use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
     fn addr(byte: u8) -> AccountAddress {
@@ -742,29 +741,7 @@ mod tests {
         DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
     }
 
-    /// In-memory [`EventSink`] recording every emitted event, for assertions.
-    #[derive(Default)]
-    struct RecordingSink {
-        events: StdMutex<Vec<DomainEvent>>,
-    }
-
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), event_bus::PublishError> {
-            self.events.lock().unwrap().push(envelope.payload);
-            Ok(())
-        }
-    }
-
-    impl RecordingSink {
-        fn events(&self) -> Vec<DomainEvent> {
-            self.events.lock().unwrap().clone()
-        }
-
-        fn count(&self, matches: impl Fn(&DomainEvent) -> bool) -> usize {
-            self.events().iter().filter(|e| matches(e)).count()
-        }
-    }
+    use event_bus::test_util::RecordingSink;
 
     fn preliminary_alert(
         alert_id: AlertId,

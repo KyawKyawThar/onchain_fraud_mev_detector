@@ -70,6 +70,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Shared recording `EventSink` for the usage-publisher tests (§13).
+event-bus = { workspace = true, features = ["test-util"] }
 # Mint tokens in the JWT middleware tests.
 jsonwebtoken = { workspace = true }
 # Drive the router directly (`ServiceExt::oneshot`) without binding a listener.

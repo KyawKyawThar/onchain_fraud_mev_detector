@@ -7,10 +7,15 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use event_bus::{EventSink, PublishError};
 use events::primitives::{AlertId, AlertKind, Chain, Confidence, DetectorRef};
-use events::{DomainEvent, EventEnvelope};
 use revm::primitives::Address;
+
+/// The shared recording [`EventSink`](event_bus::EventSink), re-exported under
+/// this crate's historical name so the worker/dispatcher/reorg tests keep using
+/// `RecordingEventSink` while the double itself lives in `event-bus` (one copy
+/// for the whole workspace). Its `events()` returns the published payloads, as
+/// before.
+pub use event_bus::test_util::RecordingSink as RecordingEventSink;
 
 use crate::command::{Priority, SimulationJob};
 use crate::consumer::{DeliveryAck, Disposition};
@@ -70,27 +75,6 @@ pub struct EmptyScenarioResolver;
 impl JobResolver for EmptyScenarioResolver {
     async fn resolve(&self, job: &SimulationJob) -> Result<SimulationRequest, ResolveError> {
         Ok(empty_request(job))
-    }
-}
-
-/// An [`EventSink`] that records every published event for assertions.
-#[derive(Default)]
-pub struct RecordingEventSink {
-    events: Mutex<Vec<DomainEvent>>,
-}
-
-impl RecordingEventSink {
-    /// A snapshot of the events published so far.
-    pub fn events(&self) -> Vec<DomainEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl EventSink for RecordingEventSink {
-    async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
-        self.events.lock().unwrap().push(envelope.payload);
-        Ok(())
     }
 }
 
