@@ -361,11 +361,8 @@ pub async fn run_committer(consumer: Arc<StreamConsumer>, mut done: mpsc::Receiv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    use async_trait::async_trait;
     use chrono::Utc;
-    use event_bus::PublishError;
 
     use detector_api::test_util::{MockCrossBlockDetector, MockDetector};
     use detector_api::{Evidence, SemVer};
@@ -376,29 +373,20 @@ mod tests {
 
     use alloy_primitives::B256;
 
-    /// An in-memory [`EventSink`] recording every published payload, so tests assert
-    /// on the emitted lifecycle without a broker.
-    #[derive(Default)]
-    struct RecordingSink {
-        events: Mutex<Vec<DomainEvent>>,
+    use event_bus::test_util::RecordingSink;
+
+    /// The emitted event *type names*, in order — a crate-local projection over
+    /// the shared [`RecordingSink`] (which owns only generic recording).
+    trait EventTypesExt {
+        fn types(&self) -> Vec<String>;
     }
 
-    impl RecordingSink {
+    impl EventTypesExt for RecordingSink {
         fn types(&self) -> Vec<String> {
-            self.events
-                .lock()
-                .unwrap()
+            self.events()
                 .iter()
                 .map(|e| e.event_type().to_owned())
                 .collect()
-        }
-    }
-
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
-            self.events.lock().unwrap().push(envelope.payload);
-            Ok(())
         }
     }
 

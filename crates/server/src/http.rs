@@ -36,6 +36,7 @@ use crate::config::JwtConfig;
 use crate::intelligence_client::IntelligenceClient;
 use crate::stream::{self, WsMessage};
 use crate::upstream;
+use crate::usage::{self, UsageRecorder};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -80,6 +81,10 @@ pub struct AppState {
     /// Fan-out for `WS /v1/stream` (§11): [`crate::stream::run`] feeds this
     /// from Kafka; each WS connection holds its own `subscribe()`d receiver.
     pub alerts: broadcast::Sender<WsMessage>,
+    /// §13 metering: every authenticated `/v1` call records an
+    /// `api_call_made` here; [`crate::usage::run`] publishes the queue as
+    /// `UsageRecorded` events.
+    pub usage: UsageRecorder,
 }
 
 fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
@@ -92,12 +97,20 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     // upgrade, not a `#[utoipa::path]`-describable JSON handler — utoipa has no
     // WebSocket support, so it's documented in prose (the module doc + the
     // OpenAPI `description` below) rather than in the generated spec.
+    // Layer order: `route_layer` wraps what's already there, so the JWT gate
+    // (added last, outermost) runs first and inserts the `CustomerId`
+    // extension the usage layer reads — an unauthenticated request is
+    // rejected before it can be metered (§13).
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
         .route("/v1/stream", get(stream::stream_ws))
+        .route_layer(middleware::from_fn_with_state(
+            state.usage.clone(),
+            usage::record_usage,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.jwt.clone(),
             require_jwt,
@@ -313,12 +326,17 @@ mod tests {
     use super::{build_router, AppState};
     use crate::config::JwtConfig;
     use crate::intelligence_client::IntelligenceClient;
+    use crate::usage::UsageRecorder;
+    use events::system::UsageRecorded;
     use secrecy::SecretString;
+    use tokio::sync::mpsc;
 
     /// A throwaway state — `connect_lazy` does no I/O (the channel dials on
     /// first RPC), so the router/spec can be built with no live intelligence.
-    fn test_state() -> AppState {
-        AppState {
+    /// Returns the usage receiver so tests can observe what got metered.
+    fn test_state() -> (AppState, mpsc::Receiver<UsageRecorded>) {
+        let (usage, usage_rx) = UsageRecorder::channel(16);
+        let state = AppState {
             intelligence: IntelligenceClient::connect_lazy("http://127.0.0.1:50051".to_owned())
                 .expect("lazy channel never fails to construct"),
             http_client: reqwest::Client::new(),
@@ -329,7 +347,9 @@ mod tests {
                 issuer: "mev".to_owned(),
             },
             alerts: tokio::sync::broadcast::channel(16).0,
-        }
+            usage,
+        };
+        (state, usage_rx)
     }
 
     #[tokio::test]
@@ -337,7 +357,8 @@ mod tests {
         // The spec is built by the *router* from the handler annotations — the same
         // spec that ships at `/api-docs/openapi.json` — so this guards against
         // route/doc drift, not just against a missing derive.
-        let (_router, api) = build_router(test_state());
+        let (state, _usage_rx) = test_state();
+        let (_router, api) = build_router(state);
         let spec = serde_json::to_value(&api).expect("serialize spec");
 
         for name in ["RiskResponse", "LabelResponse", "LabelsResponse"] {
@@ -361,5 +382,76 @@ mod tests {
                 "OpenAPI paths missing `{method} {path}`"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_v1_calls_are_metered_and_everything_else_is_not() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use secrecy::ExposeSecret;
+        use tower::ServiceExt;
+
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let (state, mut usage_rx) = test_state();
+        let bearer = {
+            let claims = crate::auth::Claims {
+                sub: customer.to_owned(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                iss: state.jwt.issuer.clone(),
+            };
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(state.jwt.secret.expose_secret().as_bytes()),
+            )
+            .expect("mint test token");
+            format!("Bearer {token}")
+        };
+        let router = super::router(state);
+
+        // Open route: never metered.
+        let response = router
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(usage_rx.try_recv().is_err(), "/healthz must not be metered");
+
+        // Unauthenticated /v1 call: rejected before the meter.
+        let response = router
+            .clone()
+            .oneshot(Request::get("/v1/incidents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            usage_rx.try_recv().is_err(),
+            "a 401 must not be metered (§13 — no billable identity)"
+        );
+
+        // Authenticated /v1 call: metered against the token's customer even
+        // though the upstream is unreachable here (502) — "ApiCallMade" is
+        // the call, not its outcome.
+        let response = router
+            .oneshot(
+                Request::get("/v1/incidents")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let usage = usage_rx.try_recv().expect("the call must be metered");
+        assert_eq!(usage.customer_id.to_string(), customer);
+        assert_eq!(
+            usage.event_type,
+            events::system::UsageEventType::ApiCallMade.as_wire_str()
+        );
+        assert_eq!(usage.quantity, 1);
+        assert!(usage_rx.try_recv().is_err(), "exactly one event per call");
     }
 }

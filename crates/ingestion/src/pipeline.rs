@@ -371,40 +371,29 @@ mod tests {
 
     // ── Effectful-pipeline tests (driver + fakes) ─────────────────────
 
-    /// An in-memory [`EventSink`] that records every published payload, so tests
-    /// assert on the emitted lifecycle (types, order, fields) without a broker.
-    #[derive(Default)]
-    struct RecordingSink {
-        events: Mutex<Vec<DomainEvent>>,
+    use event_bus::test_util::RecordingSink;
+
+    /// Crate-local projections of the recorded lifecycle over the shared
+    /// [`RecordingSink`] (`clear` is a shared method): the emitted event *type
+    /// names*, and each event paired with the block it carries — for asserting
+    /// order and per-block grouping without a broker.
+    trait LifecycleExt {
+        fn types(&self) -> Vec<String>;
+        fn blocks(&self) -> Vec<(String, BlockRef)>;
     }
 
-    impl RecordingSink {
+    impl LifecycleExt for RecordingSink {
         fn types(&self) -> Vec<String> {
-            self.events
-                .lock()
-                .unwrap()
+            self.events()
                 .iter()
                 .map(|e| e.event_type().to_owned())
                 .collect()
         }
         fn blocks(&self) -> Vec<(String, BlockRef)> {
-            self.events
-                .lock()
-                .unwrap()
+            self.events()
                 .iter()
                 .map(|e| (e.event_type().to_owned(), block_ref_of(e)))
                 .collect()
-        }
-        fn clear(&self) {
-            self.events.lock().unwrap().clear();
-        }
-    }
-
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
-            self.events.lock().unwrap().push(envelope.payload);
-            Ok(())
         }
     }
 

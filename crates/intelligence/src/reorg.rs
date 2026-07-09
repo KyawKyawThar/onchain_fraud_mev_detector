@@ -293,7 +293,6 @@ mod tests {
     use crate::test_util::{store_seams, InMemoryIntelligenceStore};
     use alloy_primitives::Address;
     use events::primitives::{AccountAddress, Confidence, EntityId, IncidentId};
-    use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
     fn addr(byte: u8) -> AccountAddress {
@@ -308,24 +307,7 @@ mod tests {
         EventEnvelope::with_metadata(Uuid::new_v4(), at, Chain::ETHEREUM, payload)
     }
 
-    #[derive(Default)]
-    struct RecordingSink {
-        events: StdMutex<Vec<DomainEvent>>,
-    }
-
-    #[async_trait]
-    impl EventSink for RecordingSink {
-        async fn publish(&self, envelope: EventEnvelope) -> Result<(), event_bus::PublishError> {
-            self.events.lock().unwrap().push(envelope.payload);
-            Ok(())
-        }
-    }
-
-    impl RecordingSink {
-        fn events(&self) -> Vec<DomainEvent> {
-            self.events.lock().unwrap().clone()
-        }
-    }
+    use event_bus::test_util::RecordingSink;
 
     struct Harness {
         consumer: ReorgConsumer,

@@ -11,15 +11,19 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use events::primitives::CustomerId;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::config::JwtConfig;
 
-/// The claims this service expects. `sub` is the caller identity (unused
-/// beyond being logged/validated as present — there's no user store to look
-/// it up against yet); `exp`/`iss` are enforced by [`jsonwebtoken::decode`].
+/// The claims this service expects. `sub` is the billing customer's UUID
+/// ([`CustomerId`], §13) — every authenticated call is metered against it
+/// (see `usage.rs`), so a token whose `sub` isn't a UUID is rejected outright:
+/// an unmeterable call on a metered product is an invalid credential, not a
+/// free one. `exp`/`iss` are enforced by [`jsonwebtoken::decode`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -29,8 +33,10 @@ pub struct Claims {
 
 /// Middleware: require a valid bearer JWT or reject with 401. Mirrors the
 /// shape of event-store's `require_write_token`, just JWT instead of a static
-/// shared secret.
-pub async fn require_jwt(State(jwt): State<JwtConfig>, req: Request, next: Next) -> Response {
+/// shared secret. On success, inserts the token's [`CustomerId`] as a request
+/// extension so downstream layers (usage metering, `usage.rs`) know who
+/// called without re-parsing the token.
+pub async fn require_jwt(State(jwt): State<JwtConfig>, mut req: Request, next: Next) -> Response {
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -46,7 +52,17 @@ pub async fn require_jwt(State(jwt): State<JwtConfig>, req: Request, next: Next)
 
     let key = DecodingKey::from_secret(jwt.secret.expose_secret().as_bytes());
     match decode::<Claims>(token, &key, &validation) {
-        Ok(_) => next.run(req).await,
+        Ok(data) => {
+            let Ok(customer) = Uuid::parse_str(&data.claims.sub) else {
+                tracing::warn!(
+                    sub = %data.claims.sub,
+                    "bearer token rejected: sub is not a customer UUID (unmeterable, §13)"
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            req.extensions_mut().insert(CustomerId(customer));
+            next.run(req).await
+        }
         Err(err) => {
             tracing::warn!(error = %err, "bearer token rejected");
             StatusCode::UNAUTHORIZED.into_response()
@@ -82,9 +98,25 @@ mod tests {
         .unwrap()
     }
 
+    /// A `sub` the middleware accepts: [`CustomerId`]s are UUIDs (§13).
+    const CUSTOMER_SUB: &str = "00000000-0000-0000-0000-0000000000c0";
+
     fn app(jwt: JwtConfig) -> Router {
+        // The handler proves the middleware inserted the CustomerId extension
+        // (what usage metering reads) — a missing extension is a 500, not 200.
         Router::new()
-            .route("/protected", get(|| async { "ok" }))
+            .route(
+                "/protected",
+                get(|req: HttpRequest<Body>| async move {
+                    match req.extensions().get::<CustomerId>() {
+                        Some(customer) => {
+                            assert_eq!(customer.to_string(), CUSTOMER_SUB);
+                            StatusCode::OK
+                        }
+                        None => StatusCode::INTERNAL_SERVER_ERROR,
+                    }
+                }),
+            )
             .route_layer(middleware::from_fn_with_state(jwt, require_jwt))
     }
 
@@ -113,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn valid_token_is_accepted() {
         let claims = Claims {
-            sub: "caller".to_owned(),
+            sub: CUSTOMER_SUB.to_owned(),
             exp: future_exp(),
             iss: "mev".to_owned(),
         };
@@ -136,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn expired_token_is_rejected() {
         let claims = Claims {
-            sub: "caller".to_owned(),
+            sub: CUSTOMER_SUB.to_owned(),
             exp: past_exp(),
             iss: "mev".to_owned(),
         };
@@ -159,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_issuer_is_rejected() {
         let claims = Claims {
-            sub: "caller".to_owned(),
+            sub: CUSTOMER_SUB.to_owned(),
             exp: future_exp(),
             iss: "someone-else".to_owned(),
         };
@@ -182,13 +214,38 @@ mod tests {
     #[tokio::test]
     async fn wrong_secret_is_rejected() {
         let claims = Claims {
-            sub: "caller".to_owned(),
+            sub: CUSTOMER_SUB.to_owned(),
             exp: future_exp(),
             iss: "mev".to_owned(),
         };
         let bearer = token(&claims, "not-the-real-secret");
 
         let response = app(jwt_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn non_uuid_sub_is_rejected() {
+        // Correctly signed, unexpired, right issuer — but the sub can't name a
+        // CustomerId, so the call would be unmeterable (§13). Rejected.
+        let claims = Claims {
+            sub: "not-a-customer-uuid".to_owned(),
+            exp: future_exp(),
+            iss: "mev".to_owned(),
+        };
+        let jwt = jwt_config();
+        let bearer = token(&claims, jwt.secret.expose_secret());
+
+        let response = app(jwt)
             .oneshot(
                 HttpRequest::builder()
                     .uri("/protected")

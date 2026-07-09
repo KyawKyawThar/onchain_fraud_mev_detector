@@ -88,6 +88,9 @@ metrics = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+# Shared recording `EventSink` for the producer-consumer tests (risk_scorer,
+# reorg, attribution) instead of a per-module copy.
+event-bus = { workspace = true, features = ["test-util"] }
 # Property tests (§18): the address_key encode/decode bijection over the whole
 # address space.
 proptest = { workspace = true }

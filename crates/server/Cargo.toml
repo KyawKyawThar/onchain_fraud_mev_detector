@@ -59,11 +59,19 @@ alloy-primitives = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 secrecy = { workspace = true }
+# Parse the JWT `sub` claim into a `CustomerId` for §13 usage metering.
+uuid = { workspace = true }
+# §13/§19 usage counters (`usage_events_recorded_total`/`_dropped_total`) through
+# the `metrics` facade; the binary exports them via `telemetry::metrics`. A no-op
+# until the exporter installs the global recorder.
+metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Shared recording `EventSink` for the usage-publisher tests (§13).
+event-bus = { workspace = true, features = ["test-util"] }
 # Mint tokens in the JWT middleware tests.
 jsonwebtoken = { workspace = true }
 # Drive the router directly (`ServiceExt::oneshot`) without binding a listener.

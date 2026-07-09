@@ -12,6 +12,9 @@ use secrecy::SecretString;
 /// is unset (§11).
 const DEFAULT_ALERT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Usage-metering queue capacity when `USAGE_CHANNEL_CAPACITY` is unset (§13).
+const DEFAULT_USAGE_CHANNEL_CAPACITY: usize = 1024;
+
 /// All runtime configuration for the public §11 API service: where to bind,
 /// where to reach the three internal services it fronts, and the JWT
 /// verification settings that gate every `/v1` route.
@@ -35,12 +38,23 @@ pub struct Config {
     /// dropping the backlog, not the connection). Defaults to
     /// [`DEFAULT_ALERT_CHANNEL_CAPACITY`].
     pub alert_channel_capacity: usize,
+    /// Capacity of the usage-metering queue between the request path and the
+    /// `UsageRecorded` Kafka publisher (§13, see `src/usage.rs`) — how many
+    /// events may await publish (e.g. during a broker outage) before further
+    /// ones are dropped with a `warn` rather than stalling customer calls.
+    /// Defaults to [`DEFAULT_USAGE_CHANNEL_CAPACITY`].
+    pub usage_channel_capacity: usize,
+    /// Address the Prometheus `/metrics` endpoint binds to (§19). Exposes this
+    /// service's counters — including `usage_events_recorded_total` /
+    /// `usage_events_dropped_total` (§13, `src/usage.rs`), which ops alerts on.
+    /// Defaults to `0.0.0.0:9100` (per-service, overridden per container).
+    pub metrics_addr: SocketAddr,
 }
 
-/// How to reach Kafka for the `WS /v1/stream` consumer (§11) — it subscribes to
-/// the three lifecycle topics (`PreliminaryAlertCreated`/`IncidentCreated`/
-/// `IncidentRetracted`) that event-store's `ensure_topics` already provisions,
-/// so this service only ever reads.
+/// How to reach Kafka: the `WS /v1/stream` consumer (§11) subscribes to the
+/// three lifecycle topics, and the usage publisher (§13, `src/usage.rs`)
+/// produces `UsageRecorded`. Both topics are provisioned by event-store's
+/// `ensure_topics`, so this service never creates topology.
 #[derive(Debug, Clone)]
 pub struct KafkaConfig {
     /// Comma-separated bootstrap brokers (`localhost:9092`).
@@ -89,19 +103,31 @@ impl Config {
                 brokers: env("KAFKA_BROKERS")?,
                 group_id: env("SERVER_KAFKA_GROUP")?,
             },
-            alert_channel_capacity: alert_channel_capacity()?,
+            alert_channel_capacity: channel_capacity(
+                "WS_ALERT_CHANNEL_CAPACITY",
+                DEFAULT_ALERT_CHANNEL_CAPACITY,
+            )?,
+            usage_channel_capacity: channel_capacity(
+                "USAGE_CHANNEL_CAPACITY",
+                DEFAULT_USAGE_CHANNEL_CAPACITY,
+            )?,
+            metrics_addr: env_parse(
+                "SERVER_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9100)),
+            )?,
         })
     }
 }
 
-/// Resolve and validate `WS_ALERT_CHANNEL_CAPACITY`. A non-positive value
-/// would panic inside `tokio::sync::broadcast::channel`; catching it here
-/// keeps the "fail fast with a clear message at boot" contract the rest of
-/// this module holds, same as event-store's Kafka topology validation.
-fn alert_channel_capacity() -> Result<usize> {
-    let capacity = env_parse("WS_ALERT_CHANNEL_CAPACITY", DEFAULT_ALERT_CHANNEL_CAPACITY)?;
+/// Resolve and validate a channel-capacity env var. A non-positive value
+/// would panic inside `tokio::sync::broadcast::channel`/`mpsc::channel`;
+/// catching it here keeps the "fail fast with a clear message at boot"
+/// contract the rest of this module holds, same as event-store's Kafka
+/// topology validation.
+fn channel_capacity(key: &str, default: usize) -> Result<usize> {
+    let capacity = env_parse(key, default)?;
     if capacity < 1 {
-        bail!("WS_ALERT_CHANNEL_CAPACITY must be >= 1, got {capacity}");
+        bail!("{key} must be >= 1, got {capacity}");
     }
     Ok(capacity)
 }

@@ -24,6 +24,12 @@
 //! domain command, hands off to a bounded channel, and commits in a separate stage
 //! to preserve per-chain ordering, a genuinely different shape.)
 
+/// Shared test doubles (the recording [`EventSink`]) behind the `test-util`
+/// feature — the producer-seam counterpart to `detector-api::test_util`, so
+/// every producer crate's tests share one double instead of copying it.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};

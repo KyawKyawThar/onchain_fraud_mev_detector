@@ -6,17 +6,22 @@
 //!
 //! Boot: observability, resolve config, build the outbound clients (a lazy
 //! gRPC channel to intelligence, a `reqwest::Client` for the two HTTP
-//! proxies, a broadcast channel + Kafka consumer for the WS stream), then
+//! proxies, a broadcast channel + Kafka consumer for the WS stream, and a
+//! Kafka producer publishing every metered call as `UsageRecorded`, §13), then
 //! serve until a shutdown signal — the same `CancellationToken` +
 //! graceful-drain shape every other service in this workspace uses. A fatal
 //! consumer error cancels the token too (mirrors event-store), so the whole
 //! service stops rather than silently running HTTP-only with a dead stream.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
+use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
 use server::config::Config;
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
 use server::stream;
+use server::usage::{self, UsageRecorder};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -24,6 +29,10 @@ async fn main() -> Result<()> {
     // Hold the guard for the lifetime of `main` so spans flush on exit (§19).
     let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("server"))?;
     let cfg = Config::from_env()?;
+
+    // Inside the Tokio runtime: the exporter spawns its `/metrics` listener here.
+    // Serves this service's §13 usage counters (and future service metrics, §19).
+    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
 
     tracing::info!(schema_version = events::SCHEMA_VERSION, "server starting");
 
@@ -33,6 +42,7 @@ async fn main() -> Result<()> {
         .build()
         .context("building the outbound HTTP client")?;
     let (alerts_tx, _) = tokio::sync::broadcast::channel(cfg.alert_channel_capacity);
+    let (usage_recorder, usage_rx) = UsageRecorder::channel(cfg.usage_channel_capacity);
 
     let state = AppState {
         intelligence,
@@ -41,6 +51,7 @@ async fn main() -> Result<()> {
         simulation_url: cfg.simulation_url.clone(),
         jwt: cfg.jwt.clone(),
         alerts: alerts_tx.clone(),
+        usage: usage_recorder,
     };
 
     let shutdown = CancellationToken::new();
@@ -52,6 +63,20 @@ async fn main() -> Result<()> {
             shutdown.cancel();
         }
     });
+
+    // ── UsageRecorded publisher (§13, background task) ─────────────────
+    // The one place this service *produces* onto the backbone; the topic is
+    // provisioned by event-store's `ensure_topics` like every other.
+    let usage_sink: Arc<dyn EventSink> = Arc::new(
+        KafkaEventSink::new(&cfg.kafka.brokers)
+            .context("building the Kafka producer for usage metering")?,
+    );
+    let usage_task = tokio::spawn(usage::run(
+        usage_sink,
+        usage_rx,
+        PUBLISH_BACKOFF,
+        shutdown.clone(),
+    ));
 
     // ── WS /v1/stream ingest (background task) ────────────────────────
     let stream_consumer =
@@ -81,8 +106,9 @@ async fn main() -> Result<()> {
         .await
         .context("HTTP server error")?;
 
-    // The server has drained — wait for the stream consumer to finish and
+    // The server has drained — wait for the background tasks to finish and
     // surface a fatal error as a non-zero exit.
+    usage_task.await.context("usage publisher task panicked")?;
     let stream_result = stream_task
         .await
         .context("/v1/stream consumer task panicked")?;

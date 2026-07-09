@@ -85,6 +85,8 @@ demo = ["dep:demo-detector"]
 # `MockDetector`/`dummy_evidence` for the registry/model tests — the seam's test
 # doubles now live in `detector-api` behind its `test-util` feature.
 detector-api = { workspace = true, features = ["test-util"] }
+# Shared recording `EventSink` for the scheduler's emit tests.
+event-bus = { workspace = true, features = ["test-util"] }
 # In-memory recorder so the metrics tests can assert on recorded series (runs,
 # hits, latency) under a scoped recorder — no global install, no scrape.
 metrics-util = { workspace = true }
