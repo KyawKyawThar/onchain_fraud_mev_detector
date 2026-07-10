@@ -72,6 +72,53 @@ pub enum AlertKind {
     AddressPoisoning,
 }
 
+/// What a label claims about an address (§8.1) — the platform's shared label
+/// vocabulary. A closed enum — a new kind is a compile error at every `match` —
+/// with the snake_case wire/storage string derive-driven (same pairing as
+/// [`AlertKind`]).
+///
+/// Lives here (not in the intelligence service that mints labels) because it is
+/// cross-service vocabulary: the rule engine's §9 conditions (`EntityLabel`,
+/// `InteractedWith`) name label kinds in customer-defined rules, and validating
+/// those against the closed set must use the *same* enum intelligence stores —
+/// two copies would drift. The label *provenance* enum (`LabelSource`) stays in
+/// `intelligence::model`: which class a claim came from is that service's
+/// internal concern.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    // Ord so label kinds can key ordered collections (e.g. the rule engine's
+    // enrichment sets) with deterministic iteration.
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LabelKind {
+    CexWallet,
+    MevBot,
+    KnownScammer,
+    Bridge,
+    Protocol,
+    Deployer,
+    MixerUser,
+    SanctionedEntity,
+    /// Derived by association: clusters with a known scammer (§8.1), at reduced
+    /// confidence.
+    ScammerAssociate,
+    BuilderAddress,
+}
+
 /// Coarse incident severity, set when simulation confirms an incident (§7). Carries the
 /// same derive-driven `&'static str` mapping as [`AlertKind`].
 #[derive(

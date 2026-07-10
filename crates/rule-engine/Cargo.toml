@@ -1,0 +1,64 @@
+[package]
+name = "rule-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Rule engine service (§9) — customer-defined alerting on top of the
+# intelligence graph, the enterprise pricing tier. Sprint 9 t1 builds the
+# foundation the rest of the sprint stacks on:
+#
+#   `model` — the `Rule`/`Condition`/`LogicOp`/`TemporalConstraint`/`Action`
+#             document a customer authors (validated at the parse boundary,
+#             §9's closed condition vocabulary).
+#   `store` — the Postgres rule-definition store behind the `RuleStore` seam,
+#             customer-isolated by construction: every read/write is keyed by
+#             `owner`, so no query can cross customers.
+#
+# The rule compiler (t2), temporal state machines (t3) and the Kafka consumer +
+# `POST /v1/rules` surface (t4) consume these seams; like intelligence, they are
+# tested against the in-memory double behind the `test-util` feature.
+
+[dependencies]
+events = { workspace = true }
+
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+# Postgres system of record for rule definitions (§14: rule-engine owns its
+# tables; the shared `db` crate supplies only the pool + fault classification).
+db = { workspace = true }
+sqlx = { workspace = true }
+
+# Exact decimal thresholds in `Condition::TransferAmount` — never f64.
+rust_decimal = { workspace = true }
+# Validate `Action::WebhookAlert` URLs once, at the parse boundary, so the t5
+# delivery path never sees an unparseable target.
+url = { workspace = true }
+# `Condition` fields carry the event schema's `Address` type.
+alloy-primitives = { workspace = true }
+
+[features]
+# Exposes `rule_engine::test_util` (the in-memory `RuleStore` double) to this
+# crate's own integration tests and the t2–t5 consumers' tests.
+test-util = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Self-dependency with `test-util` on, so `tests/` sees the in-memory double.
+rule-engine = { path = ".", features = ["test-util"] }
+# Live-store integration tests (`#[ignore]`): real Postgres via a throwaway
+# container, run by `just test-integration` — proves `PgRuleStore` honours the
+# same contract the double does.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres"] }
+
+[lints]
+workspace = true
