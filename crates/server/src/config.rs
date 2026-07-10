@@ -28,6 +28,9 @@ pub struct Config {
     pub simulation_url: String,
     /// `http://host:port` of intelligence's `IntelligenceRead` gRPC server.
     pub intelligence_grpc_addr: String,
+    /// Postgres — `POST /v1/rules` writes the customer's rule definitions
+    /// through the rule-engine crate's `PgRuleStore` (§9/§14).
+    pub database_url: SecretString,
     pub jwt: JwtConfig,
     /// Kafka settings for the `/v1/stream` WebSocket's consumer (§11).
     pub kafka: KafkaConfig,
@@ -95,6 +98,7 @@ impl Config {
             event_store_url: env("EVENT_STORE_URL")?,
             simulation_url: env("SIMULATION_URL")?,
             intelligence_grpc_addr: env("INTELLIGENCE_GRPC_ADDR")?,
+            database_url: SecretString::from(env("DATABASE_URL")?),
             jwt: JwtConfig {
                 secret: SecretString::from(env("JWT_SECRET")?),
                 issuer: env("JWT_ISSUER")?,

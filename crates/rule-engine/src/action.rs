@@ -68,3 +68,26 @@ impl DeliveryError {
 pub trait ActionSink: Send + Sync {
     async fn deliver(&self, alert: &RuleAlert, action: &Action) -> Result<(), DeliveryError>;
 }
+
+/// The t4 placeholder [`ActionSink`]: logs each would-be delivery and
+/// succeeds. Real delivery (the webhook adapter with retry/backoff and
+/// receipts, §12) is Sprint 9 t5 — it replaces this type in the binary's
+/// wiring and touches nothing else, which is the point of the seam. Until
+/// then the §2 `RuleAlertCreated` event (published regardless of the sink)
+/// is the observable output.
+pub struct LoggingActionSink;
+
+#[async_trait]
+impl ActionSink for LoggingActionSink {
+    async fn deliver(&self, alert: &RuleAlert, action: &Action) -> Result<(), DeliveryError> {
+        tracing::info!(
+            rule_id = %alert.rule_id,
+            owner = %alert.owner,
+            address = %alert.address,
+            ?action,
+            "rule alert (delivery lands in t5): {}",
+            alert.explanation
+        );
+        Ok(())
+    }
+}

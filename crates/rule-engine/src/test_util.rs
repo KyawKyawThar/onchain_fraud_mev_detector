@@ -24,9 +24,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use events::primitives::{CustomerId, RuleId};
+use events::primitives::{AccountAddress, Confidence, CustomerId, EntityId, LabelKind, RuleId};
 
 use crate::action::{ActionSink, DeliveryError, RuleAlert};
+use crate::compile::EnrichmentNeeds;
+use crate::ctx::Enrichment;
+use crate::enrich::{EnrichError, EnrichmentSource};
 use crate::model::{Action, Condition, LogicOp, Rule, TemporalConstraint};
 use crate::state_store::{StateKey, StateStoreError, TemporalStateStore};
 use crate::store::{CreateRuleOutcome, RuleStore, StoreError};
@@ -251,6 +254,115 @@ impl TemporalStateStore for InMemoryTemporalStore {
         self.maybe_fault()?;
         let inner = self.inner.lock().expect("state lock");
         Ok(inner.keys().copied().collect())
+    }
+}
+
+// ── In-memory enrichment source ──────────────────────────────────
+
+/// In-memory implementation of the [`EnrichmentSource`] seam (t4): tests seed
+/// per-address [`Enrichment`] snapshots and per-entity member lists, and can
+/// inject transient faults to exercise the consumer's retry-not-drop path.
+/// Deliberately ignores [`EnrichmentNeeds`] and returns the full seeded
+/// snapshot — the *production* adapter owns need-scoping; matchers only read
+/// the fields their condition tests either way.
+#[derive(Default)]
+pub struct InMemoryEnrichment {
+    snapshots: Mutex<HashMap<AccountAddress, Enrichment>>,
+    members: Mutex<HashMap<EntityId, Vec<AccountAddress>>>,
+    transient_faults: AtomicUsize,
+}
+
+impl InMemoryEnrichment {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make the next `n` calls (either method) fail transiently.
+    pub fn inject_transient_faults(&self, n: usize) {
+        self.transient_faults.store(n, Ordering::SeqCst);
+    }
+
+    /// Replace the whole snapshot for an address.
+    pub fn set_enrichment(&self, address: AccountAddress, enrichment: Enrichment) {
+        self.snapshots
+            .lock()
+            .expect("enrichment lock")
+            .insert(address, enrichment);
+    }
+
+    /// Seed the address's sanctions-list memberships.
+    pub fn set_sanctions(&self, address: AccountAddress, lists: &[&str]) {
+        let mut snapshots = self.snapshots.lock().expect("enrichment lock");
+        snapshots.entry(address).or_default().sanction_lists =
+            lists.iter().map(|list| (*list).to_owned()).collect();
+    }
+
+    /// Seed the address's current risk score.
+    pub fn set_risk_score(&self, address: AccountAddress, score: u8) {
+        let mut snapshots = self.snapshots.lock().expect("enrichment lock");
+        snapshots.entry(address).or_default().risk_score = Some(score);
+    }
+
+    /// Seed the address's entity labels (kind + read-time confidence).
+    pub fn set_entity_labels(&self, address: AccountAddress, labels: &[(LabelKind, f64)]) {
+        let mut snapshots = self.snapshots.lock().expect("enrichment lock");
+        snapshots.entry(address).or_default().entity_labels = labels
+            .iter()
+            .map(|(kind, confidence)| (*kind, Confidence::new(*confidence)))
+            .collect();
+    }
+
+    /// Seed an entity's member list (the `EntityMerged` fan-out).
+    pub fn set_members(&self, entity_id: EntityId, members: Vec<AccountAddress>) {
+        self.members
+            .lock()
+            .expect("members lock")
+            .insert(entity_id, members);
+    }
+
+    fn maybe_fault(&self) -> Result<(), EnrichError> {
+        let taken = self
+            .transient_faults
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if taken {
+            return Err(EnrichError::transient("injected fault"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EnrichmentSource for InMemoryEnrichment {
+    async fn enrichment(
+        &self,
+        address: &AccountAddress,
+        _counterparty: Option<&AccountAddress>,
+        _needs: &EnrichmentNeeds,
+        _as_of: DateTime<Utc>,
+    ) -> Result<Enrichment, EnrichError> {
+        self.maybe_fault()?;
+        Ok(self
+            .snapshots
+            .lock()
+            .expect("enrichment lock")
+            .get(address)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn entity_members(
+        &self,
+        entity_id: EntityId,
+    ) -> Result<Vec<AccountAddress>, EnrichError> {
+        self.maybe_fault()?;
+        Ok(self
+            .members
+            .lock()
+            .expect("members lock")
+            .get(&entity_id)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

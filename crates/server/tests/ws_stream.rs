@@ -73,6 +73,10 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
         jwt: jwt_config(),
         alerts: alerts_tx.clone(),
         usage,
+        // This file exercises the WS transport only; rules/events get inert
+        // doubles (`src/http.rs`'s tests cover `POST /v1/rules`).
+        rules: std::sync::Arc::new(rule_engine::test_util::InMemoryRuleStore::new()),
+        events: std::sync::Arc::new(event_bus::test_util::RecordingSink::default()),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")

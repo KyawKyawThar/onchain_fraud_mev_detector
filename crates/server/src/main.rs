@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
+use rule_engine::store::PgRuleStore;
+use secrecy::ExposeSecret;
 use server::config::Config;
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
@@ -44,6 +46,23 @@ async fn main() -> Result<()> {
     let (alerts_tx, _) = tokio::sync::broadcast::channel(cfg.alert_channel_capacity);
     let (usage_recorder, usage_rx) = UsageRecorder::channel(cfg.usage_channel_capacity);
 
+    // ── Rule store (§9, Sprint 9 t4) ───────────────────────────────────
+    // `POST /v1/rules` writes through the rule-engine crate's customer-
+    // isolated store; probe it at boot so a missing migration fails here.
+    let pg_pool = db::connect(cfg.database_url.expose_secret())
+        .await
+        .context("connecting Postgres for the rule store")?;
+    let rule_store = PgRuleStore::new(pg_pool);
+    rule_store
+        .ping()
+        .await
+        .context("rules schema not reachable — run `just migrate-up`?")?;
+
+    // The one Kafka producer this service holds: usage metering (§13) and the
+    // `RuleCreated` announcement (§9) share it.
+    let sink: Arc<dyn EventSink> =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka producer")?);
+
     let state = AppState {
         intelligence,
         http_client,
@@ -52,6 +71,8 @@ async fn main() -> Result<()> {
         jwt: cfg.jwt.clone(),
         alerts: alerts_tx.clone(),
         usage: usage_recorder,
+        rules: Arc::new(rule_store),
+        events: sink.clone(),
     };
 
     let shutdown = CancellationToken::new();
@@ -65,14 +86,10 @@ async fn main() -> Result<()> {
     });
 
     // ── UsageRecorded publisher (§13, background task) ─────────────────
-    // The one place this service *produces* onto the backbone; the topic is
-    // provisioned by event-store's `ensure_topics` like every other.
-    let usage_sink: Arc<dyn EventSink> = Arc::new(
-        KafkaEventSink::new(&cfg.kafka.brokers)
-            .context("building the Kafka producer for usage metering")?,
-    );
+    // The topic is provisioned by event-store's `ensure_topics` like every
+    // other.
     let usage_task = tokio::spawn(usage::run(
-        usage_sink,
+        sink,
         usage_rx,
         PUBLISH_BACKOFF,
         shutdown.clone(),
