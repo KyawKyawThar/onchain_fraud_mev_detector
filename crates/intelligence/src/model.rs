@@ -39,38 +39,12 @@ pub fn parse_address_key(raw: &str) -> Result<AccountAddress, AddressKeyError> {
     })
 }
 
-/// What a label claims about an address (§8.1). A closed enum — a new kind is a
-/// compile error at every `match` — with the snake_case wire/storage string
-/// derive-driven.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    strum::IntoStaticStr,
-    strum::EnumString,
-    strum::EnumIter,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum LabelKind {
-    CexWallet,
-    MevBot,
-    KnownScammer,
-    Bridge,
-    Protocol,
-    Deployer,
-    MixerUser,
-    SanctionedEntity,
-    /// Derived by association: clusters with a known scammer (§8.1), at reduced
-    /// confidence.
-    ScammerAssociate,
-    BuilderAddress,
-}
+// What a label claims about an address (§8.1). Defined in `events::primitives`
+// since Sprint 9 — the rule engine's §9 conditions name label kinds too, and
+// the closed vocabulary must be one enum, not two drifting copies. Re-exported
+// here so every existing `crate::model::LabelKind` call site (and the stored
+// wire strings) is unchanged.
+pub use events::primitives::LabelKind;
 
 /// Where a label came from — the provenance *class* (§8.1). The specific origin
 /// within the class (which feed, which heuristic, which operator) travels in

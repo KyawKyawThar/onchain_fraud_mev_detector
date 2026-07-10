@@ -56,6 +56,11 @@ simulation = { path = "crates/simulation" }
 # the Redis hot-path label/score cache, and the ClickHouse address-adjacency
 # graph (§14). The event consumer + clustering land in t2–t5 on top of these seams.
 intelligence = { path = "crates/intelligence" }
+# Rule engine service (§9) — the commercial unlock. Sprint 9 t1 builds the
+# `Rule`/`Condition`/`LogicOp`/`Action` model and the customer-isolated Postgres
+# rule-definition store; the compiler/temporal state machine/consumer land in
+# t2–t5 on top of the `RuleStore` seam.
+rule-engine = { path = "crates/rule-engine" }
 
 # Errors.
 anyhow = "1"
@@ -78,6 +83,11 @@ sha2 = "0.10"
 # properly rather than split on ','. Tiny, boring, no optional features.
 csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Exact decimal thresholds for the §9 rule model (`TransferAmount { gt, lt }`).
+# Money/amount comparisons must not go through f64 (the serde_json f64
+# round-trip flake is a documented gotcha here); rust_decimal's default serde
+# form is a *string*, so a stored rule round-trips its thresholds exactly.
+rust_decimal = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # alloy is the project's chosen Ethereum stack (§21) — use its type-safe
 # Address/B256/U256 in the event schema rather than stringly-typed hashes.
@@ -205,6 +215,10 @@ sqlx = { version = "0.9", default-features = false, features = [
     "chrono",
     "macros",
     "migrate",
+    # JSONB columns: the §9 rule store persists `conditions`/`temporal`/`actions`
+    # as JSONB (a rule definition is a document, not a join target), bound as
+    # `serde_json::Value` in the compile-checked queries.
+    "json",
 ] }
 
 # Redis (§8, §14) — the intelligence service's hot-path label/score cache

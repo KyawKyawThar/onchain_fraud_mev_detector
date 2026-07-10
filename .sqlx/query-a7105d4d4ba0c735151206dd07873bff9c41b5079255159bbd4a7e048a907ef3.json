@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE rules SET deleted_at = $3, updated_at = $3\n             WHERE rule_id = $1 AND owner = $2 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a7105d4d4ba0c735151206dd07873bff9c41b5079255159bbd4a7e048a907ef3"
+}
