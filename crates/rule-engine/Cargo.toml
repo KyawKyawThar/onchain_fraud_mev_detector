@@ -53,6 +53,26 @@ url = { workspace = true }
 # `Condition` fields carry the event schema's `Address` type.
 alloy-primitives = { workspace = true }
 
+# The t4 Kafka consumer: the shared consume/produce seams (`run_consumer`,
+# `EventSink`/`publish_resilient`) — never raw rdkafka in the logic; rdkafka
+# itself only to build the `StreamConsumer` the seam drives.
+event-bus = { workspace = true }
+rdkafka = { workspace = true }
+anyhow = { workspace = true }
+
+# The production `EnrichmentSource` adapter reads the intelligence stores/hot
+# cache through that crate's own seams (`labels_for`, `sanction_matches`,
+# cache-aside risk) — the same reads its gRPC service serves, so the rule
+# engine and a screening call can never disagree about an address.
+intelligence = { workspace = true }
+
+# Service binary plumbing (src/main.rs): tracing/metrics boot + env config.
+telemetry = { workspace = true }
+secrecy = { workspace = true }
+# §19 counters (`rule_set_refresh_total`, `rule_fires_total`) through the
+# `metrics` facade — a no-op until the binary's exporter installs the recorder.
+metrics = { workspace = true }
+
 [features]
 # Exposes `rule_engine::test_util` (the in-memory `RuleStore` double) to this
 # crate's own integration tests and the t2–t5 consumers' tests.
@@ -62,6 +82,8 @@ test-util = []
 tokio = { workspace = true }
 # Self-dependency with `test-util` on, so `tests/` sees the in-memory double.
 rule-engine = { path = ".", features = ["test-util"] }
+# The recording `EventSink` the consumer tests assert emissions against.
+event-bus = { workspace = true, features = ["test-util"] }
 # Live-store integration tests (`#[ignore]`): real Postgres/Redis via throwaway
 # containers, run by `just test-integration` — proves `PgRuleStore` and
 # `RedisTemporalStore` honour the same contracts the doubles do.

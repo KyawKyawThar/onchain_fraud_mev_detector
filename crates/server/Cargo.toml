@@ -45,6 +45,12 @@ reqwest = { workspace = true }
 # JWT bearer verification (no issuance — see `src/auth.rs`).
 jsonwebtoken = { workspace = true }
 
+# `POST /v1/rules` (§9/§11, Sprint 9 t4): the rule model + customer-isolated
+# `RuleStore` seam come from the rule-engine crate (the wire form IS the
+# stored form — no translation layer here); `db` supplies the Postgres pool.
+rule-engine = { workspace = true }
+db = { workspace = true }
+
 # `WS /v1/stream` (§11): the shared Kafka-backbone consume seam (`run_consumer`/
 # `EventHandler`, same as event-store's ingest) feeds the provisional/confirmed/
 # retracted alert lifecycle into a broadcast channel every WS connection
@@ -72,6 +78,8 @@ chrono = { workspace = true }
 [dev-dependencies]
 # Shared recording `EventSink` for the usage-publisher tests (§13).
 event-bus = { workspace = true, features = ["test-util"] }
+# The in-memory `RuleStore` double for the `POST /v1/rules` handler tests.
+rule-engine = { workspace = true, features = ["test-util"] }
 # Mint tokens in the JWT middleware tests.
 jsonwebtoken = { workspace = true }
 # Drive the router directly (`ServiceExt::oneshot`) without binding a listener.

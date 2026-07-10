@@ -28,15 +28,24 @@
 //!   raises [`action::RuleAlert`]s and hands actions to the sink; the webhook
 //!   adapter lands in t5.
 //!
-//! Evaluation flow (the t4 consumer's loop): consume event → build
-//! `EventCtx` (prefetch per `EnrichmentNeeds`) → `set.evaluate(ctx)` for
-//! instant rules + `TemporalPool::step(ctx)` for temporal ones (fires come
-//! back on the pool's channel; `BlockReverted` → `TemporalPool::rewind`) →
-//! for each fire, `RuleAlert` → `ActionSink::deliver` per action.
+//! * [`enrich`] — the t4 enrichment seam ([`enrich::EnrichmentSource`]):
+//!   where the consumer fetches "what intelligence currently says" per the
+//!   compiled set's prefetch plan; production reads the intelligence stores
+//!   the same way its own gRPC read service does.
+//! * [`consumer`] — the t4 Kafka consumer ([`consumer::EngineConsumer`]):
+//!   consume event → build `EventCtx` (prefetch per `EnrichmentNeeds`) →
+//!   `set.evaluate(ctx)` for instant rules + `TemporalPool::step(ctx)` for
+//!   temporal ones → for each fire, publish `RuleTriggered`/`RuleAlertCreated`
+//!   (§2) and hand actions to the [`action::ActionSink`]; offsets commit only
+//!   after the pool's flush barrier. (`BlockReverted` →
+//!   `TemporalPool::rewind` lands with t5.)
 
 pub mod action;
 pub mod compile;
+pub mod config;
+pub mod consumer;
 pub mod ctx;
+pub mod enrich;
 pub mod model;
 pub mod state_store;
 pub mod store;
