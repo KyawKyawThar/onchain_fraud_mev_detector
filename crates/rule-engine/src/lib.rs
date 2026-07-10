@@ -17,28 +17,36 @@
 //!   also emits the [`compile::EnrichmentNeeds`] prefetch plan; refresh is a
 //!   snapshot swap through [`compile::RuleSetHandle`].
 //! * [`temporal`] — the pure per-`(rule_id, address)` state machine
-//!   (t3's functional core): `step` and the §15 `rewind` are pure transitions;
-//!   the Redis persistence/partitioning shell lands in t3.
+//!   (t3's functional core): `step` and the §15 `rewind` are pure transitions.
+//! * [`state_store`] + [`worker`] — t3's imperative shell around that core:
+//!   [`state_store::TemporalStateStore`] persists in-flight windows to Redis
+//!   (TTL-bounded, keyed by rule + address — expiry ≡ window close), and
+//!   [`worker::TemporalPool`] partitions events by address over N worker
+//!   tasks so **one worker owns all state for an address** (§17) — which is
+//!   what makes the lock-free `load → step → save` sound.
 //! * [`action`] — the delivery seam ([`action::ActionSink`]): evaluation
 //!   raises [`action::RuleAlert`]s and hands actions to the sink; the webhook
 //!   adapter lands in t5.
 //!
 //! Evaluation flow (the t4 consumer's loop): consume event → build
 //! `EventCtx` (prefetch per `EnrichmentNeeds`) → `set.evaluate(ctx)` for
-//! instant rules + `temporal::step` per temporal rule (state from Redis) →
+//! instant rules + `TemporalPool::step(ctx)` for temporal ones (fires come
+//! back on the pool's channel; `BlockReverted` → `TemporalPool::rewind`) →
 //! for each fire, `RuleAlert` → `ActionSink::deliver` per action.
 
 pub mod action;
 pub mod compile;
 pub mod ctx;
 pub mod model;
+pub mod state_store;
 pub mod store;
 pub mod temporal;
+pub mod worker;
 
 /// Doubles + builders ([`test_util::InMemoryRuleStore`],
-/// [`test_util::RecordingActionSink`], [`test_util::RuleBuilder`]) for
-/// consumer tests — compiled only with the `test-util` feature (mirrors
-/// `intelligence`).
+/// [`test_util::InMemoryTemporalStore`], [`test_util::RecordingActionSink`],
+/// [`test_util::RuleBuilder`]) for consumer tests — compiled only with the
+/// `test-util` feature (mirrors `intelligence`).
 #[cfg(feature = "test-util")]
 pub mod test_util;
 

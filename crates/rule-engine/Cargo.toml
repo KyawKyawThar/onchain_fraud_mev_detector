@@ -37,6 +37,14 @@ tracing = { workspace = true }
 db = { workspace = true }
 sqlx = { workspace = true }
 
+# Temporal window state (t3): Redis is the TTL-bounded store for in-flight
+# `Sequence`/`Frequency` windows (key expiry ≡ window close, §9); tokio for the
+# per-partition worker tasks + bounded mailboxes (§17); tokio-util for the
+# shutdown token, the same shape as `event-bus::run_consumer`.
+redis = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
 # Exact decimal thresholds in `Condition::TransferAmount` — never f64.
 rust_decimal = { workspace = true }
 # Validate `Action::WebhookAlert` URLs once, at the parse boundary, so the t5
@@ -54,11 +62,11 @@ test-util = []
 tokio = { workspace = true }
 # Self-dependency with `test-util` on, so `tests/` sees the in-memory double.
 rule-engine = { path = ".", features = ["test-util"] }
-# Live-store integration tests (`#[ignore]`): real Postgres via a throwaway
-# container, run by `just test-integration` — proves `PgRuleStore` honours the
-# same contract the double does.
+# Live-store integration tests (`#[ignore]`): real Postgres/Redis via throwaway
+# containers, run by `just test-integration` — proves `PgRuleStore` and
+# `RedisTemporalStore` honour the same contracts the doubles do.
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["postgres"] }
+testcontainers-modules = { workspace = true, features = ["postgres", "redis"] }
 
 [lints]
 workspace = true
