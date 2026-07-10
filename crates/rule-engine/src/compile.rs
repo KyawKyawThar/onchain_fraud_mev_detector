@@ -86,6 +86,17 @@ pub enum CompiledTemporal {
     },
 }
 
+impl CompiledTemporal {
+    /// The clause's window length in blocks — what the t3 shell sizes each
+    /// Redis key's TTL from ([`crate::state_store::TtlPolicy`]).
+    pub fn within_blocks(&self) -> u64 {
+        match self {
+            CompiledTemporal::Sequence { within_blocks, .. }
+            | CompiledTemporal::Frequency { within_blocks, .. } => *within_blocks,
+        }
+    }
+}
+
 impl CompiledRule {
     /// Evaluate an instant (non-temporal) rule against one event. Temporal
     /// rules return `false` here — their matching is stateful and lives in

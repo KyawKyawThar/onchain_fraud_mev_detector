@@ -8,13 +8,19 @@
 //!   isolation contract — soft delete, validation before insert). A test that
 //!   passes here means the consumer logic is right; the `#[ignore]` integration
 //!   tests prove the real store honours the same contract.
+//! * [`InMemoryTemporalStore`] — the [`TemporalStateStore`] double for the t3
+//!   shell: a map plus recorded TTLs (asserted on, never enforced — tests own
+//!   the clock) and injectable transient faults for the retry path.
 //! * [`RecordingActionSink`] — the [`ActionSink`] double: records every
 //!   delivery instead of speaking HTTP, so evaluation tests assert on *what
 //!   would have been sent*.
 //! * [`RuleBuilder`] — the one place tests construct [`Rule`]s, so fixture
 //!   noise doesn't spread and a model-field addition is a one-file change.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -22,7 +28,9 @@ use events::primitives::{CustomerId, RuleId};
 
 use crate::action::{ActionSink, DeliveryError, RuleAlert};
 use crate::model::{Action, Condition, LogicOp, Rule, TemporalConstraint};
+use crate::state_store::{StateKey, StateStoreError, TemporalStateStore};
 use crate::store::{CreateRuleOutcome, RuleStore, StoreError};
+use crate::temporal::TemporalState;
 
 /// In-memory implementation of the [`RuleStore`] seam.
 #[derive(Default)]
@@ -138,6 +146,111 @@ impl RuleStore for InMemoryRuleStore {
             .collect();
         live.sort_by_key(|stored| (stored.created_at, stored.rule.id.0));
         Ok(live.into_iter().map(|stored| stored.rule.clone()).collect())
+    }
+}
+
+// ── In-memory temporal-state store ───────────────────────────────
+
+/// In-memory implementation of the [`TemporalStateStore`] seam. TTLs are
+/// *recorded* (so tests assert the shell computed the right bound) but never
+/// enforced — expiry-as-window-close is the pure core's block arithmetic,
+/// not something a test should race a clock for.
+#[derive(Default)]
+pub struct InMemoryTemporalStore {
+    inner: Mutex<HashMap<StateKey, (TemporalState, Duration)>>,
+    /// Remaining injected transient faults: while non-zero, every operation
+    /// consumes one and fails transiently — exercising the worker's
+    /// retry-not-drop policy.
+    transient_faults: AtomicUsize,
+    /// How many times `load` was called (including faulted attempts) — what
+    /// the worker-cache tests observe to prove hot keys stop hitting the
+    /// store.
+    loads: AtomicUsize,
+}
+
+impl InMemoryTemporalStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make the next `n` operations (any kind) fail with a transient error.
+    pub fn inject_transient_faults(&self, n: usize) {
+        self.transient_faults.store(n, Ordering::SeqCst);
+    }
+
+    /// The persisted machine for `key`, bypassing fault injection — for
+    /// assertions.
+    pub fn state(&self, key: &StateKey) -> Option<TemporalState> {
+        let inner = self.inner.lock().expect("state lock");
+        inner.get(key).map(|(state, _)| state.clone())
+    }
+
+    /// The TTL recorded with the last save of `key` — for assertions.
+    pub fn ttl(&self, key: &StateKey) -> Option<Duration> {
+        let inner = self.inner.lock().expect("state lock");
+        inner.get(key).map(|(_, ttl)| *ttl)
+    }
+
+    /// How many machines are in flight.
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("state lock").len()
+    }
+
+    /// Total `load` calls so far (faulted attempts included).
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Consume one injected fault, if any are pending.
+    fn maybe_fault(&self) -> Result<(), StateStoreError> {
+        let taken = self
+            .transient_faults
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if taken {
+            return Err(StateStoreError::Redis(redis::RedisError::from(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected fault"),
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TemporalStateStore for InMemoryTemporalStore {
+    async fn load(&self, key: &StateKey) -> Result<Option<TemporalState>, StateStoreError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.maybe_fault()?;
+        Ok(self.state(key))
+    }
+
+    async fn save(
+        &self,
+        key: &StateKey,
+        state: &TemporalState,
+        ttl: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.maybe_fault()?;
+        let mut inner = self.inner.lock().expect("state lock");
+        inner.insert(*key, (state.clone(), ttl));
+        Ok(())
+    }
+
+    async fn clear(&self, key: &StateKey) -> Result<(), StateStoreError> {
+        self.maybe_fault()?;
+        let mut inner = self.inner.lock().expect("state lock");
+        inner.remove(key);
+        Ok(())
+    }
+
+    async fn in_flight_keys(&self) -> Result<Vec<StateKey>, StateStoreError> {
+        self.maybe_fault()?;
+        let inner = self.inner.lock().expect("state lock");
+        Ok(inner.keys().copied().collect())
     }
 }
 
