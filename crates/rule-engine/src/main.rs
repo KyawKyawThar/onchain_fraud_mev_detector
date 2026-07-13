@@ -14,8 +14,9 @@
 //!   - `ping` — connect and probe Postgres (rules schema) + Redis, so a
 //!     misconfigured deployment fails fast and visibly.
 //!
-//! Action delivery goes through the [`ActionSink`] seam; until the t5 webhook
-//! adapter lands, [`LoggingActionSink`] logs each would-be delivery (the §2
+//! Action delivery goes through the `ActionSink` seam; production is
+//! [`WebhookActionSink`] (t5) — webhook actions POST to the customer's
+//! endpoint with bounded retry, the §12 channels log until Sprint 10 (the §2
 //! events are published regardless — they are the durable output).
 
 use std::sync::Arc;
@@ -25,7 +26,6 @@ use anyhow::{bail, Context, Result};
 use event_bus::KafkaEventSink;
 use intelligence::cache::RedisHotCache;
 use intelligence::store::{PgIntelligenceStore, StoreSeams};
-use rule_engine::action::LoggingActionSink;
 use rule_engine::compile::{CompiledRuleSet, RuleSetHandle};
 use rule_engine::config::Config;
 use rule_engine::consumer::{
@@ -34,6 +34,7 @@ use rule_engine::consumer::{
 use rule_engine::enrich::IntelligenceEnrichment;
 use rule_engine::state_store::RedisTemporalStore;
 use rule_engine::store::{PgRuleStore, RuleStore};
+use rule_engine::webhook::WebhookActionSink;
 use rule_engine::worker::{PoolConfig, TemporalPool};
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
@@ -129,11 +130,11 @@ async fn run(cfg: &Config) -> Result<()> {
     // ── Emission + temporal pool + fire drain ──────────────────────
     let sink =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka producer")?);
-    let emitter = Arc::new(FireEmitter::new(
-        sink,
-        Arc::new(LoggingActionSink),
-        shutdown.clone(),
-    ));
+    let actions = Arc::new(
+        WebhookActionSink::new(cfg.webhook, shutdown.clone())
+            .context("building the webhook delivery client")?,
+    );
+    let emitter = Arc::new(FireEmitter::new(sink, actions, shutdown.clone()));
 
     let (fires_tx, fires_rx) = mpsc::channel(cfg.fires_capacity);
     let pool = TemporalPool::spawn(

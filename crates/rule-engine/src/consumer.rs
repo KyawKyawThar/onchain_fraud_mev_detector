@@ -19,6 +19,12 @@
 //!   block height, but every temporal window and `NewAddress` check measures
 //!   in blocks. The consumer keeps a per-chain **block watermark** from the
 //!   canonical chain stream and stamps it onto each [`EventCtx`].
+//! * **`BlockReverted`** — the §15 rewind trigger (t5): a reorged block's
+//!   events must stop counting as temporal-window progress, so each revert
+//!   becomes one [`TemporalPool::rewind`] (flush → scan → per-key unwind →
+//!   flush; a deeper reorg delivers one event per reverted block, each
+//!   rewound in turn). The watermark deliberately does **not** rewind — it is
+//!   monotonic (see the handler arm) — only window *progress* unwinds.
 //! * **`RuleCreated`** — the refresh trigger: a rule created through
 //!   `POST /v1/rules` re-loads and recompiles the enabled set (snapshot swap,
 //!   [`refresh_rules`]) the moment its event lands, instead of waiting for the
@@ -32,9 +38,13 @@
 //! instant rules (emission is `publish_resilient`, at-least-once), then
 //! `pool.step` each ctx and **commit only after `pool.flush()`** — the t3
 //! checkpoint barrier, so a crash can never lose an acknowledged window.
-//! Redelivery may therefore re-emit a fire or re-step a machine: the same
-//! at-least-once stance the rest of the backbone takes (consumers tolerate a
-//! redelivered fact; the producer doesn't suppress it).
+//! Redelivery may therefore re-emit a fire or re-step a machine — but a
+//! re-emitted fire carries the **same, deterministically derived `alert_id`**
+//! (`Fire::alert_id`'s hash of the fire's identity), so every downstream
+//! consumer of the at-least-once stream (the customer's webhook endpoint
+//! first of all) has a dedup key instead of uncorrelatable duplicates. The
+//! same stance the rest of the backbone takes, sharpened: tolerate the
+//! redelivered fact *and* make it recognizable.
 //!
 //! Temporal fires are drained by a **separate task** ([`drain_fires`]) — a
 //! full fires channel plus a flush from the same task deadlocks (see
@@ -63,8 +73,10 @@ use events::rule_engine::{RuleAlertCreated, RuleTriggered};
 use events::simulation::IncidentCreated;
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::action::{ActionSink, RuleAlert};
 use crate::compile::{CompiledRule, CompiledRuleSet, RuleSetHandle};
@@ -77,7 +89,7 @@ use crate::worker::{TemporalFire, TemporalPool};
 const CONSUMER: &str = "rule-engine";
 
 /// The event types this consumer subscribes to — the five §9 inputs plus the
-/// three supporting streams the module docs justify. An explicit, closed list
+/// four supporting streams the module docs justify. An explicit, closed list
 /// (not a topic regex) so a renamed event fails loudly, the same discipline as
 /// every consumer on the backbone.
 const CONSUMED_EVENT_TYPES: &[&str] = &[
@@ -88,6 +100,7 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
     "SanctionHit",
     "PreliminaryAlertCreated",
     "BlockCanonicalized",
+    "BlockReverted",
     "RuleCreated",
 ];
 
@@ -187,6 +200,12 @@ enum FireKind {
     Instant {
         /// The triggering event type (`"SanctionHit"`, …).
         trigger: &'static str,
+        /// The triggering event's envelope id — the instant half of the
+        /// deterministic [`Fire::alert_id`] preimage. For a buffered incident
+        /// this is the *incident's* envelope id (stored with it in
+        /// [`PendingIncident`]), never the alert envelope that replayed it —
+        /// cross-topic arrival order must not change the identity.
+        trigger_id: Uuid,
     },
     /// A temporal window completed ([`TemporalFire`]).
     Temporal {
@@ -199,7 +218,7 @@ impl FireKind {
     /// The `trigger` label carried in `RuleTriggered.context` and logs.
     fn label(&self) -> &'static str {
         match self {
-            FireKind::Instant { trigger } => trigger,
+            FireKind::Instant { trigger, .. } => trigger,
             FireKind::Temporal { .. } => "temporal_window",
         }
     }
@@ -235,7 +254,12 @@ struct Fire {
 }
 
 impl Fire {
-    fn instant(rule: &CompiledRule, ctx: &EventCtx, trigger: &'static str) -> Self {
+    fn instant(
+        rule: &CompiledRule,
+        ctx: &EventCtx,
+        trigger: &'static str,
+        trigger_id: Uuid,
+    ) -> Self {
         Self {
             rule_id: rule.id,
             owner: rule.owner,
@@ -243,7 +267,10 @@ impl Fire {
             actions: rule.actions.clone(),
             address: ctx.address,
             block: ctx.block,
-            kind: FireKind::Instant { trigger },
+            kind: FireKind::Instant {
+                trigger,
+                trigger_id,
+            },
         }
     }
 
@@ -261,10 +288,51 @@ impl Fire {
         }
     }
 
+    /// The alert's identity, derived — not minted — so the same logical fire
+    /// always maps to the same id (the seeded-label discipline, `seed.rs`):
+    /// a redelivered Kafka record re-emits the *same* `alert_id`, which is
+    /// what lets the customer's webhook endpoint (and any store keyed on
+    /// alert id) deduplicate an at-least-once stream. Instant fires key on
+    /// `(rule, address, triggering event)`; temporal fires on
+    /// `(rule, address, evidence window)` — identical evidence within one
+    /// block is deliberately the *same* alert, which is dedup, not loss.
+    ///
+    /// **The preimage recipe is a customer-facing contract** (the id rides
+    /// the webhook payload): every field is fixed-width (uuid 16, address 20,
+    /// block 8) with a one-byte kind discriminator, so the encoding is
+    /// unambiguous without length prefixes. The golden test below pins the
+    /// exact bytes; bump the `.v1` domain tag only with a migration story.
+    fn alert_id(&self) -> AlertId {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mevwatch.rule-alert.v1");
+        hasher.update(self.rule_id.0.as_bytes());
+        hasher.update(self.address.as_slice());
+        match &self.kind {
+            FireKind::Instant { trigger_id, .. } => {
+                hasher.update([0u8]);
+                hasher.update(trigger_id.as_bytes());
+            }
+            FireKind::Temporal { matched_blocks } => {
+                hasher.update([1u8]);
+                for block in matched_blocks {
+                    hasher.update(block.to_be_bytes());
+                }
+            }
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        // Stamp RFC 9562 version 8 ("custom") + variant bits so the id stays
+        // a well-formed UUID next to the random v4s minted elsewhere.
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        AlertId(Uuid::from_bytes(bytes))
+    }
+
     /// The customer-readable account `RuleAlertCreated` carries.
     fn explanation(&self) -> String {
         match &self.kind {
-            FireKind::Instant { trigger } => format!(
+            FireKind::Instant { trigger, .. } => format!(
                 "rule {:?} matched on {trigger} for {:#x} at block {}",
                 self.rule_name, self.address, self.block
             ),
@@ -279,7 +347,7 @@ impl Fire {
     /// one entry per matched block, or the single triggering event type.
     fn matched_events(&self) -> Vec<String> {
         match &self.kind {
-            FireKind::Instant { trigger } => vec![(*trigger).to_owned()],
+            FireKind::Instant { trigger, .. } => vec![(*trigger).to_owned()],
             FireKind::Temporal { matched_blocks } => matched_blocks
                 .iter()
                 .map(|block| format!("block:{block}"))
@@ -318,13 +386,15 @@ impl FireEmitter {
         self
     }
 
-    /// RuleTriggered → RuleAlertCreated → one delivery per action. A fresh
-    /// `alert_id` is minted per fire (a redelivered record re-fires under a
-    /// new id — the documented at-least-once stance). Delivery failures are
-    /// logged, not retried here: retry/receipts are the t5 adapter's policy,
-    /// behind the [`ActionSink`] seam.
+    /// RuleTriggered → RuleAlertCreated → one delivery per action. The
+    /// `alert_id` is *derived* from the fire's identity ([`Fire::alert_id`]),
+    /// so a redelivered record re-emits the same alert under the same id —
+    /// at-least-once with a dedup key, instead of duplicates the customer
+    /// can't correlate. Delivery failures are logged, not retried here:
+    /// retry/receipts are the t5 adapter's policy, behind the [`ActionSink`]
+    /// seam.
     async fn emit(&self, chain: Chain, fire: Fire) {
-        let alert_id = AlertId::new();
+        let alert_id = fire.alert_id();
         let explanation = fire.explanation();
         metrics::counter!(RULE_FIRES_TOTAL, "kind" => fire.kind.metric_label()).increment(1);
 
@@ -469,11 +539,15 @@ struct AlertFacts {
 }
 
 /// An incident buffered until its alert's facts arrive, with the envelope
-/// metadata its eventual evaluation needs.
+/// metadata its eventual evaluation needs — including the incident's own
+/// envelope id, so a fire's identity ([`Fire::alert_id`]) is the same whether
+/// the incident was evaluated directly or replayed after buffering
+/// (cross-topic arrival order must not re-mint alert ids).
 struct PendingIncident {
     incident: IncidentCreated,
     chain: Chain,
     at: DateTime<Utc>,
+    event_id: Uuid,
 }
 
 /// The cross-topic state one consumer instance buffers, behind one lock. The
@@ -509,6 +583,7 @@ impl PendingState {
         incident: IncidentCreated,
         chain: Chain,
         at: DateTime<Utc>,
+        event_id: Uuid,
     ) -> Option<(IncidentCreated, AlertFacts)> {
         match self.alerts.get(&incident.alert_id) {
             Some(facts) => Some((incident, facts.clone())),
@@ -519,6 +594,7 @@ impl PendingState {
                         incident,
                         chain,
                         at,
+                        event_id,
                     },
                 );
                 None
@@ -543,6 +619,12 @@ enum EngineError {
     /// next boot.
     #[error("the temporal pool is shutting down")]
     Stopped,
+    /// The §15 rewind's in-flight scan failed and was not applied (the pool
+    /// retries transient faults internally, so what surfaces here is
+    /// permanent). At-least-once redelivery of the `BlockReverted` is the
+    /// retry path either way.
+    #[error("rewinding temporal windows failed")]
+    Rewind(#[source] crate::state_store::StateStoreError),
 }
 
 impl EngineError {
@@ -554,6 +636,16 @@ impl EngineError {
             EngineError::Enrich(err) => err.is_transient(),
             EngineError::Store(err) => err.is_transient(),
             EngineError::Stopped => false,
+            EngineError::Rewind(err) => err.is_transient(),
+        }
+    }
+}
+
+impl From<crate::worker::PoolError> for EngineError {
+    fn from(err: crate::worker::PoolError) -> Self {
+        match err {
+            crate::worker::PoolError::Closed => EngineError::Stopped,
+            crate::worker::PoolError::Scan(err) => EngineError::Rewind(err),
         }
     }
 }
@@ -654,6 +746,7 @@ impl EngineConsumer {
         chain: Chain,
         at: DateTime<Utc>,
         trigger: &'static str,
+        trigger_id: Uuid,
     ) -> Result<(), EngineError> {
         let set = self.rules.load();
         if set.is_empty() || subjects.is_empty() {
@@ -684,7 +777,7 @@ impl EngineConsumer {
         for ctx in &ctxs {
             for rule in set.evaluate(ctx) {
                 self.emitter
-                    .emit(chain, Fire::instant(rule, ctx, trigger))
+                    .emit(chain, Fire::instant(rule, ctx, trigger, trigger_id))
                     .await;
             }
         }
@@ -707,12 +800,15 @@ impl EngineConsumer {
 
     /// One incident, with the addresses/confidence its provisional alert
     /// carried: an [`EventFacts::Incident`] ctx per distinct address.
+    /// `trigger_id` is the incident's own envelope id, whichever topic's
+    /// arrival triggered the evaluation (see [`PendingIncident`]).
     async fn evaluate_incident(
         &self,
         incident: &IncidentCreated,
         facts: &AlertFacts,
         chain: Chain,
         at: DateTime<Utc>,
+        trigger_id: Uuid,
     ) -> Result<(), EngineError> {
         let unique: std::collections::BTreeSet<AccountAddress> =
             facts.addresses.iter().copied().collect();
@@ -728,7 +824,8 @@ impl EngineConsumer {
                 )
             })
             .collect();
-        self.evaluate(subjects, chain, at, "IncidentCreated").await
+        self.evaluate(subjects, chain, at, "IncidentCreated", trigger_id)
+            .await
     }
 
     /// Intelligence state changed for `addresses`: a [`EventFacts::StateChanged`]
@@ -740,13 +837,15 @@ impl EngineConsumer {
         chain: Chain,
         at: DateTime<Utc>,
         trigger: &'static str,
+        trigger_id: Uuid,
     ) -> Result<(), EngineError> {
         let unique: std::collections::BTreeSet<AccountAddress> = addresses.into_iter().collect();
         let subjects = unique
             .into_iter()
             .map(|address| (address, EventFacts::StateChanged))
             .collect();
-        self.evaluate(subjects, chain, at, trigger).await
+        self.evaluate(subjects, chain, at, trigger, trigger_id)
+            .await
     }
 
     /// `EntityMerged` fans the state change out to the surviving entity's
@@ -756,9 +855,10 @@ impl EngineConsumer {
         surviving_id: events::primitives::EntityId,
         chain: Chain,
         at: DateTime<Utc>,
+        trigger_id: Uuid,
     ) -> Result<(), EngineError> {
         let members = self.enrichment.entity_members(surviving_id).await?;
-        self.evaluate_state_change(members, chain, at, "EntityMerged")
+        self.evaluate_state_change(members, chain, at, "EntityMerged", trigger_id)
             .await
     }
 }
@@ -768,6 +868,7 @@ impl EventHandler for EngineConsumer {
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
         let at = envelope.occurred_at;
         let chain = envelope.chain;
+        let event_id = envelope.event_id;
         match envelope.payload {
             DomainEvent::BlockCanonicalized(block) => {
                 let mut watermarks = self.watermarks.lock().expect("watermark lock");
@@ -778,6 +879,22 @@ impl EventHandler for EngineConsumer {
                 // could re-open a closed window).
                 *entry = (*entry).max(block.block.number);
                 Handled::Commit
+            }
+
+            DomainEvent::BlockReverted(reverted) => {
+                // §15: unwind every in-flight window's progress from this
+                // block. The watermark stays put — it is the monotonic block
+                // clock (see the arm above); only window *progress* rewinds.
+                tracing::info!(
+                    block = reverted.block.number,
+                    "block reverted; rewinding in-flight temporal windows"
+                );
+                let result = self
+                    .pool
+                    .rewind(reverted.block.number)
+                    .await
+                    .map_err(EngineError::from);
+                self.verdict(result)
             }
 
             DomainEvent::RuleCreated(created) => {
@@ -799,7 +916,13 @@ impl EventHandler for EngineConsumer {
                 match ready {
                     Some(pending) => {
                         let result = self
-                            .evaluate_incident(&pending.incident, &facts, pending.chain, pending.at)
+                            .evaluate_incident(
+                                &pending.incident,
+                                &facts,
+                                pending.chain,
+                                pending.at,
+                                pending.event_id,
+                            )
                             .await;
                         self.verdict(result)
                     }
@@ -812,10 +935,12 @@ impl EventHandler for EngineConsumer {
                     .pending
                     .lock()
                     .expect("pending lock")
-                    .facts_or_buffer(incident, chain, at);
+                    .facts_or_buffer(incident, chain, at, event_id);
                 match ready {
                     Some((incident, facts)) => {
-                        let result = self.evaluate_incident(&incident, &facts, chain, at).await;
+                        let result = self
+                            .evaluate_incident(&incident, &facts, chain, at, event_id)
+                            .await;
                         self.verdict(result)
                     }
                     // Buffered until its alert arrives — nothing to evaluate.
@@ -825,26 +950,32 @@ impl EventHandler for EngineConsumer {
 
             DomainEvent::RiskScoreUpdated(update) => {
                 let result = self
-                    .evaluate_state_change(vec![update.address], chain, at, "RiskScoreUpdated")
+                    .evaluate_state_change(
+                        vec![update.address],
+                        chain,
+                        at,
+                        "RiskScoreUpdated",
+                        event_id,
+                    )
                     .await;
                 self.verdict(result)
             }
             DomainEvent::LabelAdded(label) => {
                 let result = self
-                    .evaluate_state_change(vec![label.address], chain, at, "LabelAdded")
+                    .evaluate_state_change(vec![label.address], chain, at, "LabelAdded", event_id)
                     .await;
                 self.verdict(result)
             }
             DomainEvent::SanctionHit(hit) => {
                 let result = self
-                    .evaluate_state_change(vec![hit.address], chain, at, "SanctionHit")
+                    .evaluate_state_change(vec![hit.address], chain, at, "SanctionHit", event_id)
                     .await;
                 self.verdict(result)
             }
 
             DomainEvent::EntityMerged(merged) => {
                 let result = self
-                    .evaluate_entity_merged(merged.surviving_id, chain, at)
+                    .evaluate_entity_merged(merged.surviving_id, chain, at, event_id)
                     .await;
                 self.verdict(result)
             }
@@ -871,7 +1002,7 @@ mod tests {
     };
     use crate::worker::PoolConfig;
     use event_bus::test_util::RecordingSink;
-    use events::chain::BlockCanonicalized;
+    use events::chain::{BlockCanonicalized, BlockReverted};
     use events::detection::PreliminaryAlertCreated;
     use events::intelligence::{EntityMerged, RiskScoreUpdated, SanctionHit};
     use events::primitives::{
@@ -914,6 +1045,13 @@ mod tests {
     fn block_canonicalized(number: u64) -> DomainEvent {
         DomainEvent::BlockCanonicalized(BlockCanonicalized {
             block: BlockRef::new(number, Default::default()),
+        })
+    }
+
+    fn block_reverted(number: u64) -> DomainEvent {
+        DomainEvent::BlockReverted(BlockReverted {
+            block: BlockRef::new(number, Default::default()),
+            replaced_by: Default::default(),
         })
     }
 
@@ -1212,6 +1350,139 @@ mod tests {
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].0.owner, owner);
         assert_eq!(deliveries[0].0.matched_blocks, vec![100, 150]);
+    }
+
+    /// §15 end-to-end through the consumer: a `BlockReverted` unwinds the
+    /// progress that block contributed to an in-flight window, so the rule
+    /// fires only once two *surviving* hits complete it.
+    #[tokio::test]
+    async fn block_reverted_rewinds_in_flight_temporal_windows() {
+        let owner = CustomerId::new();
+        let risky = Condition::RiskScore {
+            gt: Some(80),
+            lt: None,
+        };
+        let rule = RuleBuilder::new(owner)
+            .name("Repeatedly risky")
+            .condition(risky.clone())
+            .temporal(TemporalConstraint::Frequency {
+                condition: Box::new(risky),
+                count: 2,
+                within_blocks: 100,
+            })
+            .build();
+        let h = harness(vec![rule]).await;
+        h.enrichment.set_risk_score(addr(0x07), 95);
+
+        // One hit at block 100: a window is in flight.
+        h.consumer.handle(envelope(block_canonicalized(100))).await;
+        h.consumer.handle(envelope(risk_updated(addr(0x07)))).await;
+        assert_eq!(h.temporal_store.len(), 1, "window in flight");
+
+        // Block 100 reverts: its hit never happened — the machine unwinds to
+        // idle and its key is gone from the store.
+        let verdict = h.consumer.handle(envelope(block_reverted(100))).await;
+        assert_eq!(verdict, Handled::Commit);
+        assert!(h.temporal_store.is_empty(), "rewound to idle");
+
+        // A single post-revert hit must NOT complete the window (the reverted
+        // hit no longer counts)…
+        h.consumer.handle(envelope(block_canonicalized(150))).await;
+        h.consumer.handle(envelope(risk_updated(addr(0x07)))).await;
+        assert_eq!(h.sink.count(is_alert_created), 0, "one surviving hit only");
+
+        // …but a second one does — the machine still works after the rewind.
+        h.consumer.handle(envelope(block_canonicalized(160))).await;
+        h.consumer.handle(envelope(risk_updated(addr(0x07)))).await;
+        let sink = h.sink.clone();
+        wait_for(move || sink.count(is_alert_created) == 1).await;
+        let deliveries = h.actions.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].0.matched_blocks,
+            vec![150, 160],
+            "the evidence window is post-revert only"
+        );
+    }
+
+    /// The alert-id preimage is a customer-facing contract (`Fire::alert_id`)
+    /// — pin the exact ids so a well-meaning refactor of the recipe fails CI
+    /// instead of silently re-minting every alert identity.
+    #[test]
+    fn alert_id_preimage_is_pinned() {
+        fn fixed_fire() -> Fire {
+            Fire {
+                rule_id: events::primitives::RuleId(Uuid::from_u128(2)),
+                owner: CustomerId(Uuid::from_u128(3)),
+                rule_name: "r".into(),
+                actions: vec![],
+                address: AccountAddress::repeat_byte(0xAB),
+                block: 100,
+                kind: FireKind::Instant {
+                    trigger: "SanctionHit",
+                    trigger_id: Uuid::from_u128(1),
+                },
+            }
+        }
+        let instant = fixed_fire();
+        let temporal = Fire {
+            kind: FireKind::Temporal {
+                matched_blocks: vec![100, 150],
+            },
+            ..fixed_fire()
+        };
+
+        for (fire, expected) in [
+            (&instant, "257845b6-cbac-8187-8228-79095b66071a"),
+            (&temporal, "d8fa2bbf-7828-827c-81fe-72d0a88d71d5"),
+        ] {
+            let id = fire.alert_id();
+            assert_eq!(id.0.get_version_num(), 8, "well-formed UUIDv8");
+            assert_eq!(id.to_string(), expected);
+            assert_eq!(fire.alert_id(), id, "pure: same fire, same id");
+        }
+    }
+
+    /// The dedup contract end-to-end: a redelivered record (same envelope
+    /// `event_id`) re-emits the *same* alert id; a distinct triggering event
+    /// mints a distinct one.
+    #[tokio::test]
+    async fn redelivered_records_reuse_the_same_alert_id() {
+        let h = harness(vec![sanction_rule(CustomerId::new())]).await;
+        h.enrichment.set_sanctions(addr(0x05), &["ofac_sdn"]);
+
+        let first = EventEnvelope::with_metadata(
+            Uuid::from_u128(0xE1),
+            at(1_000),
+            Chain::ETHEREUM,
+            sanction_hit(addr(0x05)),
+        );
+        h.consumer.handle(first.clone()).await;
+        h.consumer.handle(first).await; // at-least-once redelivery
+        h.consumer
+            .handle(EventEnvelope::with_metadata(
+                Uuid::from_u128(0xE2),
+                at(1_001),
+                Chain::ETHEREUM,
+                sanction_hit(addr(0x05)),
+            ))
+            .await;
+
+        let ids: Vec<AlertId> = h
+            .sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::RuleAlertCreated(a) => Some(a.alert_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            ids[0], ids[1],
+            "redelivery is recognizable, not a new alert"
+        );
+        assert_ne!(ids[1], ids[2], "a distinct event is a distinct alert");
     }
 
     /// `refresh_rules` reports what it did — a swapped set is

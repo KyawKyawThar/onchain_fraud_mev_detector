@@ -1,9 +1,8 @@
-//! The action-delivery seam (§9, toward Sprint 9 t5) — mirrors
-//! `event-bus::EventSink`: the evaluation path raises a [`RuleAlert`] and
-//! hands each of the rule's [`Action`]s to a [`ActionSink`], never speaking
-//! HTTP/SMTP/Slack itself. The webhook adapter (retry/backoff, delivery
-//! receipts — t5/§12) implements this trait; tests use the recording double
-//! in [`crate::test_util`].
+//! The action-delivery seam (§9) — mirrors `event-bus::EventSink`: the
+//! evaluation path raises a [`RuleAlert`] and hands each of the rule's
+//! [`Action`]s to a [`ActionSink`], never speaking HTTP/SMTP/Slack itself.
+//! Production is the webhook adapter ([`crate::webhook::WebhookActionSink`],
+//! t5); tests use the recording double in [`crate::test_util`].
 //!
 //! Keeping delivery behind a seam is what lets t4's consumer be tested
 //! end-to-end (event in → alert out) with zero network, and lets the real
@@ -67,27 +66,4 @@ impl DeliveryError {
 #[async_trait]
 pub trait ActionSink: Send + Sync {
     async fn deliver(&self, alert: &RuleAlert, action: &Action) -> Result<(), DeliveryError>;
-}
-
-/// The t4 placeholder [`ActionSink`]: logs each would-be delivery and
-/// succeeds. Real delivery (the webhook adapter with retry/backoff and
-/// receipts, §12) is Sprint 9 t5 — it replaces this type in the binary's
-/// wiring and touches nothing else, which is the point of the seam. Until
-/// then the §2 `RuleAlertCreated` event (published regardless of the sink)
-/// is the observable output.
-pub struct LoggingActionSink;
-
-#[async_trait]
-impl ActionSink for LoggingActionSink {
-    async fn deliver(&self, alert: &RuleAlert, action: &Action) -> Result<(), DeliveryError> {
-        tracing::info!(
-            rule_id = %alert.rule_id,
-            owner = %alert.owner,
-            address = %alert.address,
-            ?action,
-            "rule alert (delivery lands in t5): {}",
-            alert.explanation
-        );
-        Ok(())
-    }
 }
