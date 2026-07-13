@@ -189,6 +189,27 @@ impl Evidence {
         self.detail = detail;
         self
     }
+
+    /// Construct a finding whose `detail` is a typed, serialisable payload — the
+    /// one-call form every detector uses instead of hand-rolling
+    /// `Evidence::new(...).with_detail(serde_json::to_value(&d).expect(...))`.
+    ///
+    /// The `expect` encodes an **invariant, not a runtime error**: a detector's
+    /// `*Detail` structs are plain data (addresses, integers, options) that always
+    /// serialise, so a failure here is a programmer bug (a non-serialisable field
+    /// slipped in), surfaced loudly at its source rather than silently swallowed.
+    /// Centralising it means that contract lives in one place across the whole
+    /// detector fleet.
+    pub fn from_detail<T: Serialize + ?Sized>(
+        kind: AlertKind,
+        txs: Vec<B256>,
+        confidence: Confidence,
+        detail: &T,
+    ) -> Self {
+        let detail = serde_json::to_value(detail)
+            .expect("detector detail is plain data and always serialises");
+        Self::new(kind, txs, confidence).with_detail(detail)
+    }
 }
 
 /// The compile-time plugin every detector implements (§6).

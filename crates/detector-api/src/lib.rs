@@ -25,6 +25,7 @@
 //!
 //! [`detection`]: https://docs.rs/detection
 
+pub mod bps;
 pub mod cross_block;
 pub mod ctx;
 pub mod enrichment;
@@ -35,6 +36,7 @@ pub mod plugin;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+pub use bps::Bps;
 pub use cross_block::CrossBlockDetector;
 pub use ctx::{BlockBundle, DetectionCtx};
 pub use enrichment::{

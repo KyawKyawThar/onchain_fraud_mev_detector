@@ -19,8 +19,7 @@ use chrono::Utc;
 use detection::config::Config;
 use detection::emit::DetectionPlan;
 use detection::model::{ConfigHash, ModelCard, ModelRegistry};
-use detection::registry::{register_builtins, Registry};
-use detection::reorg::CrossBlockStates;
+use detection::registry::{register_builtins, register_cross_block_builtins, Registry};
 use detection::scheduler::{
     build_consumer, run_committer, run_consumer, BlockEvent, Offsets, Scheduler,
 };
@@ -51,15 +50,18 @@ async fn run(cfg: Config) -> Result<()> {
     let plan = DetectionPlan::link(&registry, &models)
         .context("linking the detector roster to its model cards")?;
 
+    // The cross-block roster (wash-trading is the first `Scope::CrossBlock`
+    // detector, §22 Sprint 10 t1). Each slot is paired with its resolved
+    // `DetectorRef` here, the same link-time discipline as the `Block` plan; the
+    // roster is empty in a build that links no cross-block detector feature.
+    let cross_block = register_cross_block_builtins(&FeatureFlags::all_enabled());
+
     tracing::info!(
         chain = cfg.chain.id(),
         detectors = plan.len(),
+        cross_block_detectors = cross_block.len(),
         "starting detection service"
     );
-
-    // No `Scope::CrossBlock` detector is registered yet (both built-ins are
-    // `Scope::Block`), so the cross-block roster is empty until the first one lands.
-    let cross_block = CrossBlockStates::new();
 
     let consumer = Arc::new(
         build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)
@@ -112,10 +114,9 @@ async fn run(cfg: Config) -> Result<()> {
 fn catalogue(registry: &Registry) -> ModelRegistry {
     let mut builder = ModelRegistry::builder();
     for plugin in registry.detectors() {
-        let seed = format!("{}-{}", plugin.id(), plugin.version());
         builder.record(ModelCard::for_plugin(
             plugin.as_ref(),
-            ConfigHash::of_bytes(seed.as_bytes()),
+            ConfigHash::boot_placeholder(plugin.id(), plugin.version()),
             Utc::now(),
         ));
     }

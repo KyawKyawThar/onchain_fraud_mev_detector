@@ -79,7 +79,9 @@ pub use model::{
     ConfigHash, LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder,
     ModelRegistryError, Performance,
 };
-pub use registry::{register_builtins, Registry, RegistryBuilder, RegistryError};
+pub use registry::{
+    register_builtins, register_cross_block_builtins, Registry, RegistryBuilder, RegistryError,
+};
 pub use reorg::{
     apply_reverts, CrossBlockSlot, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind,
 };

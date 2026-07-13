@@ -64,6 +64,14 @@ sha2 = { workspace = true }
 # `detector-api` (not this crate), there's no dependency cycle.
 sandwich-detector = { workspace = true, optional = true }
 arb-detector = { workspace = true, optional = true }
+# Phase-3 detectors (§22, Sprint 10 t1). `washtrading` is the first
+# `Scope::CrossBlock` detector — wired through `register_cross_block_builtins` into
+# the `CrossBlockStates` roster rather than the `Block` `register_builtins`.
+flashloan-detector = { workspace = true, optional = true }
+liquidation-detector = { workspace = true, optional = true }
+rugpull-detector = { workspace = true, optional = true }
+washtrading-detector = { workspace = true, optional = true }
+poisoning-detector = { workspace = true, optional = true }
 # Dev/test-only synthetic detector behind the `demo` feature (§19) — see below.
 demo-detector = { workspace = true, optional = true }
 
@@ -74,7 +82,22 @@ default = []
 # none, leaving the choice to the composing binary.
 sandwich = ["dep:sandwich-detector"]
 arb = ["dep:arb-detector"]
-detectors = ["sandwich", "arb"]
+flashloan = ["dep:flashloan-detector"]
+liquidation = ["dep:liquidation-detector"]
+rugpull = ["dep:rugpull-detector"]
+washtrading = ["dep:washtrading-detector"]
+poisoning = ["dep:poisoning-detector"]
+# The full open-source Phase-2 + Phase-3 roster (§22). A binary turns this on (or a
+# superset including closed detectors) at build time; the library default links none.
+detectors = [
+    "sandwich",
+    "arb",
+    "flashloan",
+    "liquidation",
+    "rugpull",
+    "washtrading",
+    "poisoning",
+]
 # Link the synthetic `demo` detector (§19): fires on a deterministic schedule
 # regardless of tx content, so the per-detector metrics (hit rate/findings/
 # latency) and the emit path can be exercised end-to-end while the live source is

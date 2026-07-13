@@ -198,7 +198,7 @@ impl ArbDetector {
         debug_assert!(!profit_amount.is_zero());
 
         let profit_usd = ctx.enrichment().usd_value(profit_token, profit_amount);
-        if profit_usd.is_some_and(|usd| usd < self.config.min_profit_usd.get()) {
+        if self.config.min_profit_usd.excludes(profit_usd) {
             return None;
         }
 
@@ -212,10 +212,12 @@ impl ArbDetector {
             pools: tx.swaps.iter().map(|s| s.pool).collect(),
             hops,
         };
-        let detail =
-            serde_json::to_value(&detail).expect("ArbDetail is plain data and always serializes");
-
-        Some(Evidence::new(AlertKind::Arbitrage, vec![tx.hash], confidence).with_detail(detail))
+        Some(Evidence::from_detail(
+            AlertKind::Arbitrage,
+            vec![tx.hash],
+            confidence,
+            &detail,
+        ))
     }
 }
 

@@ -1,0 +1,27 @@
+[package]
+name = "washtrading-detector"
+version = "1.0.0"        # mirrors the detector's `SemVer` build version (§6, §22).
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Wash-trading detector — `wash-trading-v1.0` (§6, §22 Phase 3). The first
+# `Scope::CrossBlock` detector: it implements `detector_api::CrossBlockDetector`,
+# accumulating a trailing window of a trader's swaps so the detection service can
+# reorg-version its state through `CrossBlockState` (§15). Attribution-blind — it
+# reads a `DetectionCtx` (facts + enrichment, **no labels**) and returns
+# behaviour-only `Evidence`. Depends only on the `detector-api` seam.
+
+[dependencies]
+detector-api = { workspace = true }
+events = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+detector-api = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

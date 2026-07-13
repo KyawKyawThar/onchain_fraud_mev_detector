@@ -2282,10 +2282,14 @@ dependencies = [
  "detector-api",
  "event-bus",
  "events",
+ "flashloan-detector",
+ "liquidation-detector",
  "metrics",
  "metrics-util",
+ "poisoning-detector",
  "rayon",
  "rdkafka",
+ "rugpull-detector",
  "sandwich-detector",
  "serde",
  "serde_json",
@@ -2295,6 +2299,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "washtrading-detector",
 ]
 
 [[package]]
@@ -2710,6 +2715,17 @@ name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
+
+[[package]]
+name = "flashloan-detector"
+version = "2.1.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "flate2"
@@ -3846,6 +3862,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "liquidation-detector"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4615,6 +4642,17 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "poisoning-detector"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "polling"
@@ -5629,6 +5667,17 @@ checksum = "bb919243f34364b6bd2fc10ef797edbfa75f33c252e7998527479c6d6b47e1ec"
 dependencies = [
  "bytes",
  "rustc-hex",
+]
+
+[[package]]
+name = "rugpull-detector"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7735,6 +7784,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
+]
+
+[[package]]
+name = "washtrading-detector"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

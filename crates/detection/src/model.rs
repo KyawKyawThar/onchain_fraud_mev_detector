@@ -71,6 +71,20 @@ impl ConfigHash {
         Self(Sha256::digest(bytes).into())
     }
 
+    /// The **boot-placeholder** config hash for a detector, derived from its
+    /// `(id, version)` identity alone.
+    ///
+    /// Detectors don't yet expose their serialised config for a real
+    /// [`of`](Self::of), so until per-detector config hashing lands (Sprint 10 t4)
+    /// the boot path stamps this stable, identity-seeded stand-in. Both the `Block`
+    /// catalogue (`main::catalogue`) and the cross-block roster
+    /// ([`register_cross_block_builtins`](crate::registry::register_cross_block_builtins))
+    /// route through *this one function* so the placeholder can't drift between the
+    /// two paths — a detector's emitted triple is the same however it was linked.
+    pub fn boot_placeholder(id: DetectorId, version: SemVer) -> Self {
+        Self::of_bytes(format!("{id}-{version}").as_bytes())
+    }
+
     /// The raw 32-byte digest.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0

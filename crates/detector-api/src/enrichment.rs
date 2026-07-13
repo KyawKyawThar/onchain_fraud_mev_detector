@@ -77,6 +77,19 @@ impl UsdPrice {
     pub fn get(self) -> f64 {
         self.0
     }
+
+    /// Does a *known* USD `value` fall strictly below this threshold — i.e. should a
+    /// dust gate reject it?
+    ///
+    /// The load-bearing subtlety, encoded once here so every detector's gate reads
+    /// the same: an **unpriced** amount (`None`) is *not* excluded. The detectors
+    /// deliberately report a structurally-unambiguous finding whose profit/notional
+    /// couldn't be valued (at reduced confidence) rather than dropping it, so a
+    /// missing price must never behave like "below the threshold". A gate is thus
+    /// `if self.min_x_usd.excludes(value_usd) { skip }`.
+    pub fn excludes(self, value: Option<f64>) -> bool {
+        value.is_some_and(|v| v < self.0)
+    }
 }
 
 impl TryFrom<f64> for UsdPrice {
