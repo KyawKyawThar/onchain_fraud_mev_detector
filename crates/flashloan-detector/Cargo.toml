@@ -1,0 +1,28 @@
+[package]
+name = "flashloan-detector"
+version = "2.1.0"        # mirrors the detector's `SemVer` build version (§6, §22).
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Flash-loan detector — `flashloan-v2.1` (§6, §22 Phase 3). An independent detector
+# crate implementing `detector_api::DetectorPlugin`, attribution-blind: it reads a
+# `DetectionCtx` (on-chain facts + enrichment, **no labels**) and returns
+# behaviour-only `Evidence`. It depends on the small `detector-api` seam, never on
+# the `detection` service crate, so there's no dependency cycle and the crate can
+# be tested/open-sourced in isolation (§6).
+
+[dependencies]
+detector-api = { workspace = true }
+events = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+# Shared fixtures (`CtxBuilder`, `addr`/`b256`/`transfer`) for the detector tests.
+detector-api = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -247,7 +247,7 @@ impl SandwichDetector {
                 }
 
                 let profit_usd = ctx.enrichment().usd_value(base_token, profit);
-                if profit_usd.is_some_and(|usd| usd < self.config.min_profit_usd.get()) {
+                if self.config.min_profit_usd.excludes(profit_usd) {
                     continue;
                 }
 
@@ -301,10 +301,7 @@ fn build_evidence(
         profit_base: profit,
         profit_usd,
     };
-    let detail =
-        serde_json::to_value(&detail).expect("SandwichDetail is plain data and always serializes");
-
-    Evidence::new(AlertKind::Sandwich, txs, confidence).with_detail(detail)
+    Evidence::from_detail(AlertKind::Sandwich, txs, confidence, &detail)
 }
 
 #[cfg(test)]

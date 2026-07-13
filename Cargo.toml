@@ -40,6 +40,15 @@ detector-api     = { path = "crates/detector-api" }
 detection        = { path = "crates/detection" }
 sandwich-detector = { path = "crates/sandwich-detector" }
 arb-detector      = { path = "crates/arb-detector" }
+# Phase-3 detectors (§22, Sprint 10 t1) — same seam as sandwich/arb: each depends
+# only on `detector-api` and is wired into `detection` as an optional dep behind a
+# feature. `washtrading-detector` is the first `Scope::CrossBlock` writer (folds a
+# trailing window into `CrossBlockState`), the rest are pure `Scope::Block`.
+flashloan-detector    = { path = "crates/flashloan-detector" }
+liquidation-detector  = { path = "crates/liquidation-detector" }
+rugpull-detector      = { path = "crates/rugpull-detector" }
+washtrading-detector  = { path = "crates/washtrading-detector" }
+poisoning-detector    = { path = "crates/poisoning-detector" }
 # Dev/test-only synthetic detector (§19): fires on a fixed schedule regardless of
 # tx content, so the per-detector metrics + emit path can be demoed while the live
 # source is header-only. Linked only behind detection's `demo` feature.

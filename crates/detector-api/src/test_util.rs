@@ -14,7 +14,9 @@ use alloy_primitives::{Address, B256, U256};
 
 use crate::cross_block::CrossBlockDetector;
 use crate::ctx::{BlockBundle, DetectionCtx};
-use crate::enrichment::{EnrichmentBuilder, PoolState, Swap, TokenMeta, TxActions, UsdPrice};
+use crate::enrichment::{
+    EnrichmentBuilder, PoolState, Swap, TokenMeta, TokenTransfer, TxActions, UsdPrice,
+};
 use crate::plugin::{DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer};
 use events::primitives::{AlertKind, BlockRef, Chain, Confidence};
 
@@ -198,6 +200,18 @@ pub fn swap(
     }
 }
 
+/// A [`TokenTransfer`] with a `u128` raw-base-unit amount — the transfer analogue
+/// of [`swap`], so the transfer-based detectors (flashloan, liquidation, rugpull,
+/// poisoning) declare a decoded `Transfer` log without the `U256::from` noise.
+pub fn transfer(token: Address, from: Address, to: Address, amount: u128) -> TokenTransfer {
+    TokenTransfer {
+        token,
+        from,
+        to,
+        amount: U256::from(amount),
+    }
+}
+
 /// Fluent builder for a [`DetectionCtx`]: declare priced tokens, pools, and the
 /// per-tx swaps, then [`build`](Self::build). Defaults to Ethereum block 1; the
 /// enrichment is assembled in one place so a detector test reads as a scenario,
@@ -282,6 +296,27 @@ impl CtxBuilder {
         self.order.push(hash);
         self.enrichment
             .add_tx(TxActions::new(hash, from, None).with_swaps(swaps));
+        self
+    }
+
+    /// Append a transaction (in block order) carrying decoded `transfers` and no
+    /// swaps — the shape the transfer-based detectors (flashloan, liquidation,
+    /// rugpull, poisoning) pattern-match on.
+    #[must_use]
+    pub fn transfer_tx(mut self, hash: B256, from: Address, transfers: Vec<TokenTransfer>) -> Self {
+        self.order.push(hash);
+        self.enrichment
+            .add_tx(TxActions::new(hash, from, None).with_transfers(transfers));
+        self
+    }
+
+    /// Append a fully-specified transaction (its own `hash`, sender, swaps *and*
+    /// transfers) in block order — the escape hatch for a detector whose scenario
+    /// needs both halves of a tx's decoded actions at once.
+    #[must_use]
+    pub fn tx_actions(mut self, tx: TxActions) -> Self {
+        self.order.push(tx.hash);
+        self.enrichment.add_tx(tx);
         self
     }
 
