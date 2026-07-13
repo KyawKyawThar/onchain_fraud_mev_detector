@@ -24,9 +24,11 @@
 //!   [`worker::TemporalPool`] partitions events by address over N worker
 //!   tasks so **one worker owns all state for an address** (§17) — which is
 //!   what makes the lock-free `load → step → save` sound.
-//! * [`action`] — the delivery seam ([`action::ActionSink`]): evaluation
-//!   raises [`action::RuleAlert`]s and hands actions to the sink; the webhook
-//!   adapter lands in t5.
+//! * [`action`] + [`webhook`] — the delivery seam ([`action::ActionSink`]):
+//!   evaluation raises [`action::RuleAlert`]s and hands actions to the sink;
+//!   production is [`webhook::WebhookActionSink`] (t5), which POSTs webhook
+//!   actions to the customer's endpoint with bounded retry and logs the §12
+//!   channels.
 //!
 //! * [`enrich`] — the t4 enrichment seam ([`enrich::EnrichmentSource`]):
 //!   where the consumer fetches "what intelligence currently says" per the
@@ -37,8 +39,8 @@
 //!   `set.evaluate(ctx)` for instant rules + `TemporalPool::step(ctx)` for
 //!   temporal ones → for each fire, publish `RuleTriggered`/`RuleAlertCreated`
 //!   (§2) and hand actions to the [`action::ActionSink`]; offsets commit only
-//!   after the pool's flush barrier. (`BlockReverted` →
-//!   `TemporalPool::rewind` lands with t5.)
+//!   after the pool's flush barrier. A `BlockReverted` becomes a
+//!   [`worker::TemporalPool::rewind`] — the §15 in-flight-window unwind (t5).
 
 pub mod action;
 pub mod compile;
@@ -50,6 +52,7 @@ pub mod model;
 pub mod state_store;
 pub mod store;
 pub mod temporal;
+pub mod webhook;
 pub mod worker;
 
 /// Doubles + builders ([`test_util::InMemoryRuleStore`],

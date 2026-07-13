@@ -9,6 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use secrecy::SecretString;
 
+use crate::webhook::WebhookConfig;
+
 /// How often the periodic backstop refresh reloads the enabled rule set when
 /// `RULE_REFRESH_SECS` is unset. `RuleCreated` events refresh immediately;
 /// this catches disable/delete, which have no events of their own yet.
@@ -37,6 +39,8 @@ pub struct Config {
     pub fires_capacity: usize,
     /// Intelligence hot-cache TTL for scores this service repopulates.
     pub cache_ttl: Duration,
+    /// Webhook delivery policy (t5): per-attempt timeout, bounded retries.
+    pub webhook: WebhookConfig,
     /// Address the Prometheus `/metrics` endpoint binds to (§19).
     pub metrics_addr: SocketAddr,
 }
@@ -71,6 +75,20 @@ impl Config {
                 "INTEL_CACHE_TTL_SECS",
                 DEFAULT_CACHE_TTL_SECS,
             )?),
+            webhook: {
+                let defaults = WebhookConfig::default();
+                WebhookConfig {
+                    timeout: Duration::from_secs(env_parse(
+                        "RULE_WEBHOOK_TIMEOUT_SECS",
+                        defaults.timeout.as_secs(),
+                    )?),
+                    attempts: env_parse("RULE_WEBHOOK_ATTEMPTS", defaults.attempts)?.max(1),
+                    retry_backoff: Duration::from_millis(env_parse(
+                        "RULE_WEBHOOK_RETRY_BACKOFF_MS",
+                        u64::try_from(defaults.retry_backoff.as_millis()).unwrap_or(500),
+                    )?),
+                }
+            },
             metrics_addr: env_parse(
                 "RULE_ENGINE_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9107)),

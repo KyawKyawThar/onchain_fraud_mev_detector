@@ -66,6 +66,14 @@ anyhow = { workspace = true }
 # engine and a screening call can never disagree about an address.
 intelligence = { workspace = true }
 
+# t5 webhook delivery: the production `ActionSink` POSTs alerts to
+# customer-controlled endpoints (workspace-pinned rustls build, no native TLS).
+reqwest = { workspace = true }
+# Deterministic alert ids: a fire's identity is hashed (SHA-256 → UUIDv8, the
+# seeded-label recipe in `intelligence::seed`) so an at-least-once redelivery
+# re-emits the *same* alert id — the customer's webhook dedup key.
+sha2 = { workspace = true }
+
 # Service binary plumbing (src/main.rs): tracing/metrics boot + env config.
 telemetry = { workspace = true }
 secrecy = { workspace = true }
@@ -84,6 +92,9 @@ tokio = { workspace = true }
 rule-engine = { path = ".", features = ["test-util"] }
 # The recording `EventSink` the consumer tests assert emissions against.
 event-bus = { workspace = true, features = ["test-util"] }
+# Throwaway loopback HTTP endpoint the webhook-delivery tests point the sink
+# at — real requests, zero external network.
+axum = { workspace = true }
 # Live-store integration tests (`#[ignore]`): real Postgres/Redis via throwaway
 # containers, run by `just test-integration` — proves `PgRuleStore` and
 # `RedisTemporalStore` honour the same contracts the doubles do.
