@@ -2,7 +2,6 @@
 **/*.rs.bk
 .env
 onchain_mev_detector_v2_microservices_rev2.md
-production_readiness.md
 sprint_plan.md
 mevwatch_dev_onboarding.md
 plans
