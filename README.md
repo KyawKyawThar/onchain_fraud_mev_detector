@@ -15,6 +15,10 @@ live dashboard, and a configurable alert rule engine.
 
 ---
 
+<!--
+Demo section — re-enable once the video and screenshots exist.
+The image files go in docs/ (live-monitor.png, intelligence.png, rule-engine.png).
+
 ## Demo
 
 > *Full demo video — architecture walkthrough, live incident detection,
@@ -29,6 +33,7 @@ Screenshots:
 | ![Live Monitor](./docs/live-monitor.png) | ![Intelligence](./docs/intelligence.png) | ![Rules](./docs/rule-engine.png) |
 
 ---
+-->
 
 ## What makes this different
 
@@ -255,19 +260,33 @@ data).
 
 ## Repository structure
 
-```
-mevwatch/
-├── README.md
-├── ARCHITECTURE.md      full system design and rationale
-├── ONBOARDING.md        domain knowledge guide for new contributors
-└── docs/
-    ├── live-monitor.png
-    ├── intelligence.png
-    ├── entity-graph.png
-    └── rule-engine.png
-```
+One Cargo workspace; each service is a crate that ships as an independent
+binary/container.
 
-Source code is not public. Contact for access or collaboration.
+```
+├── ARCHITECTURE.md              full system design and rationale
+├── production_readiness.md      MVP → GA: hardening epics with exit gates
+├── crates/
+│   ├── events/                  locked domain-event schema + versioned envelope
+│   ├── event-bus/               Kafka produce/consume seams (EventSink, run_consumer)
+│   ├── event-store/             immutable audit log service (ClickHouse)
+│   ├── ingestion/               reorg-aware block assembly, chain events
+│   ├── detection/               fast-path detector scheduler (< 1s)
+│   ├── sandwich-detector/       │
+│   ├── arb-detector/            ├─ detector plugin crates
+│   ├── demo-detector/           │
+│   ├── detector-api/            the DetectorPlugin seam detector crates implement
+│   ├── simulation/              slow-path revm confirmation (RabbitMQ workers)
+│   ├── intelligence/            labels · entities · attribution · risk scores
+│   ├── rule-engine/             customer rules: compiler, temporal windows, webhooks
+│   ├── server/                  public API: REST · WebSocket · JWT · usage metering
+│   ├── db/ · ch-migrate/        shared Postgres pool + ClickHouse migration runner
+│   ├── telemetry/               tracing + metrics boot, W3C trace propagation
+│   └── api-error/               shared API error vocabulary
+├── deploy/                      docker-compose infra (Kafka, ClickHouse, Postgres, …)
+├── docs/                        engineering conventions
+└── justfile                     `just check` reproduces the CI gate locally
+```
 
 ---
 
