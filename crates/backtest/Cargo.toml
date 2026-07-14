@@ -1,0 +1,30 @@
+[package]
+name = "backtest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Backtest harness (§18, Sprint 10 t2) — replays labeled ground-truth fixtures
+# through the pure detection core (`DetectionPlan::detection_events` +
+# `CrossBlockStates`), no Kafka, and reports each detector's precision/recall.
+# Links the full open-source roster (`detection`'s `detectors` feature) so every
+# built-in detector is scored, and depends on `detector-api`'s `test-util`
+# feature for the same `CtxBuilder` fixture-building helpers the detectors' own
+# regression tests use — a fixture here is built the same way, just replayed
+# through the whole roster instead of one detector in isolation.
+
+[[bin]]
+name = "backtest"
+path = "src/main.rs"
+
+[dependencies]
+detection = { workspace = true, features = ["detectors"] }
+detector-api = { workspace = true, features = ["test-util"] }
+events = { workspace = true }
+alloy-primitives = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

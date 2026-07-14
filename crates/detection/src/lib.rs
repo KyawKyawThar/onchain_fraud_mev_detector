@@ -12,6 +12,10 @@
 //!
 //! This crate is the **service side**:
 //!
+//! - [`boot`] — **shared boot-time linking**: [`boot::link_builtin_roster`], the
+//!   one function every binary (the live service, the backtest harness) calls
+//!   to turn `FeatureFlags` into a linked [`DetectionPlan`], so a second caller
+//!   can't silently derive a different roster than the live service boots.
 //! - [`registry`] — **compile-time** detector registration: [`registry::Registry`]
 //!   is the live roster, [`registry::register_builtins`] the single greppable
 //!   place the linked detectors are named, each behind a Cargo feature (§6: no
@@ -52,6 +56,7 @@
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
+pub mod boot;
 pub mod config;
 pub mod emit;
 pub mod flags;
@@ -71,6 +76,7 @@ pub use detector_api::{
     SemVerParseError, Swap, TokenMeta, TokenTransfer, TxActions, UsdPrice,
 };
 
+pub use boot::link_builtin_roster;
 pub use emit::{
     detector_triggered, implicated_addresses, preliminary_alert, DetectionPlan, UnlinkedDetector,
 };
