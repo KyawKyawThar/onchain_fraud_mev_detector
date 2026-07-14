@@ -1,0 +1,30 @@
+{
+  "address-poisoning": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "arb": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "flashloan": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "liquidation": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "rugpull": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "sandwich": {
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "wash-trading": {
+    "precision": 1.0,
+    "recall": 1.0
+  }
+}

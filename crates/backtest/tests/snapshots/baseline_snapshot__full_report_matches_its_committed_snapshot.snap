@@ -1,0 +1,30 @@
+---
+source: crates/backtest/tests/baseline_snapshot.rs
+expression: report.to_string()
+---
+backtest: 8 fixtures replayed
+
+sandwich: frontrun-victim-backrun bracket on a WETH/TKN pool
+  caught      block 100 sandwich Sandwich
+arb: two-hop closed-cycle WETH -> USDC -> WETH
+  caught      block 200 arb Arbitrage
+flashloan: 100 WETH borrowed and repaid with a fee in one tx
+  caught      block 300 flashloan Flashloan
+liquidation: 8% bonus seizure of WETH collateral for USDC debt
+  caught      block 400 liquidation Liquidation
+rugpull: 90% of a pool's TKN reserve drained in one tx
+  caught      block 500 rugpull Rugpull
+wash-trading: buy/sell/buy/sell round trip on one pool over 4 blocks
+  caught      block 603 wash-trading WashTrading
+address-poisoning: zero-value bait from an 8-nibble lookalike
+  caught      block 700 address-poisoning AddressPoisoning
+clean: one ordinary swap and one plain transfer, no incident
+
+per-detector precision / recall:
+  address-poisoning    precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  arb                  precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  flashloan            precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  liquidation          precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  rugpull              precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  sandwich             precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+  wash-trading         precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)

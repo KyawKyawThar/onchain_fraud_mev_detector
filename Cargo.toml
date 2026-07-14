@@ -92,6 +92,15 @@ sha2 = "0.10"
 # properly rather than split on ','. Tiny, boring, no optional features.
 csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# CLI arg parsing (§21) — first pulled in by the `backtest` binary, whose
+# hand-matched `std::env::args()` outgrew a single flag.
+clap = { version = "4", features = ["derive"] }
+# Snapshot/golden-file testing: a committed `.snap` fails loudly (with a
+# reviewable diff) on *any* change to the value under test, `cargo insta`
+# accepts intentional ones. Complements, not replaces, a directional
+# regress-below-baseline gate (§18) — it also catches an *improvement* nobody
+# reviewed, which such a gate deliberately lets pass.
+insta = "1"
 # Exact decimal thresholds for the §9 rule model (`TransferAmount { gt, lt }`).
 # Money/amount comparisons must not go through f64 (the serde_json f64
 # round-trip flake is a documented gotcha here); rust_decimal's default serde

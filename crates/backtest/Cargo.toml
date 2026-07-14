@@ -25,6 +25,15 @@ events = { workspace = true }
 alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+# Snapshot test for the full report (see tests/baseline_snapshot.rs) — a
+# dev-review signal alongside, not instead of, the baseline.rs merge gate.
+insta = { workspace = true }
 
 [lints]
 workspace = true

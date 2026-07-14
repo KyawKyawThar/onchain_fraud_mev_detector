@@ -51,6 +51,22 @@ jobs:
       - name: cargo build (locked)
         run: cargo build --workspace --all-features --locked
 
+  # ── Backtest gate: precision/recall must not regress (§18) ───────
+  backtest:
+    name: Backtest P/R gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Replay fixtures, compare to committed baseline
+        run: cargo run -p backtest --all-features --locked
+        # Fails the PR if any detector's measured precision/recall drops
+        # below crates/backtest/baseline.json. An intentional change to a
+        # detector's numbers updates the baseline in the same PR via
+        # `just backtest-update-baseline` (reviewed like any other diff).
+
   # ── Coverage → Codecov ───────────────────────────────────────────
   coverage:
     name: Coverage
