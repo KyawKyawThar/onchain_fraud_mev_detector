@@ -21,17 +21,18 @@
 //! [`fixtures`] is the ground truth itself — one known-incident scenario per
 //! built-in detector, plus a clean block, built with the same [`CtxBuilder`]
 //! helper the detectors' own regression tests use; [`scoring`] replays a
-//! fixture and rolls the outcomes up into per-detector precision/recall.
+//! fixture and rolls the outcomes up into per-detector precision/recall;
+//! [`baseline`] compares that roll-up against the committed reference numbers
+//! and is the CI gate (§18, Sprint 10 t3).
 //!
 //! # Scope
 //!
-//! This crate reports the numbers; it doesn't yet gate anything on them or
-//! write them back into a `ModelCard` — wiring the report into a CI baseline
-//! diff and filling `ModelCard::Performance` are the separate Sprint 10 t3/t4
-//! follow-ups (§18) this harness's [`Report`] is built to feed.
+//! Filling `ModelCard::Performance` from these results is the separate
+//! Sprint 10 t4 follow-up (§18).
 //!
 //! [`CtxBuilder`]: detector_api::test_util::CtxBuilder
 
+pub mod baseline;
 pub mod fixture;
 pub mod fixtures;
 pub mod scoring;

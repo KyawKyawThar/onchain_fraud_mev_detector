@@ -336,6 +336,25 @@ test:
 test-integration:
     cargo nextest run --workspace --run-ignored all --no-tests=pass
 
+# ── Backtest / precision-recall gate (§18) ────────────────────────
+
+# Replay the ground-truth fixtures and fail if any detector regressed below
+# its committed baseline (crates/backtest/baseline.json) — the CI merge gate.
+backtest:
+    cargo run -p backtest --all-features --locked
+
+# Overwrite the committed baseline with this run's numbers — the deliberate
+# step a detector/config change that intentionally moves precision/recall
+# takes before it can merge.
+backtest-update-baseline:
+    cargo run -p backtest --all-features --locked -- --update-baseline
+
+# Accept a changed full-report snapshot (tests/baseline_snapshot.rs) after
+# reviewing the diff `cargo test` printed — the dev-review counterpart to
+# backtest-update-baseline, using only the `insta` crate (no extra install).
+backtest-accept-snapshot:
+    INSTA_UPDATE=always cargo test -p backtest --all-features --test baseline_snapshot
+
 # ── Security / supply chain ──────────────────────────────────────
 
 # Check for vulnerable dependencies (cargo-audit)
@@ -348,7 +367,7 @@ deny:
 
 # Full pre-push check (mirrors CI)
 
-check: fmt-check lint test build
+check: fmt-check lint test build backtest
     @echo "════════════════════════════════════════"
     @echo "  ✅ All checks passed — safe to push"
     @echo "════════════════════════════════════════"
