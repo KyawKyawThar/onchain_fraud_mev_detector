@@ -15,11 +15,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use detection::boot::link_builtin_roster;
 use detection::config::Config;
-use detection::emit::DetectionPlan;
-use detection::model::{ConfigHash, ModelCard, ModelRegistry};
-use detection::registry::{register_builtins, register_cross_block_builtins, Registry};
+use detection::registry::register_cross_block_builtins;
 use detection::scheduler::{
     build_consumer, run_committer, run_consumer, BlockEvent, Offsets, Scheduler,
 };
@@ -45,16 +43,16 @@ async fn run(cfg: Config) -> Result<()> {
     // Roster (compile-time + runtime flags) paired with its model cards once at
     // boot — `link` fails fast if any live detector is uncatalogued, so the hot
     // path never has to fabricate a config_hash (the link-or-fail discipline).
-    let registry = register_builtins(&FeatureFlags::all_enabled());
-    let models = catalogue(&registry);
-    let plan = DetectionPlan::link(&registry, &models)
-        .context("linking the detector roster to its model cards")?;
+    // Shared with the backtest harness via `detection::boot` — see its docs.
+    let flags = FeatureFlags::all_enabled();
+    let plan =
+        link_builtin_roster(&flags).context("linking the detector roster to its model cards")?;
 
     // The cross-block roster (wash-trading is the first `Scope::CrossBlock`
     // detector, §22 Sprint 10 t1). Each slot is paired with its resolved
     // `DetectorRef` here, the same link-time discipline as the `Block` plan; the
     // roster is empty in a build that links no cross-block detector feature.
-    let cross_block = register_cross_block_builtins(&FeatureFlags::all_enabled());
+    let cross_block = register_cross_block_builtins(&flags);
 
     tracing::info!(
         chain = cfg.chain.id(),
@@ -102,27 +100,6 @@ async fn run(cfg: Config) -> Result<()> {
     committer_task.await.context("committer task panicked")?;
     tracing::info!("detection shut down");
     Ok(())
-}
-
-/// Catalogue every live detector into a [`ModelRegistry`] so the plan can `link`.
-///
-/// The `config_hash` here is derived from the detector's `(id, version)` as a
-/// **boot placeholder** — detectors don't yet expose their serialized config for a
-/// real [`ConfigHash::of`], and a fabricated-but-stable hash is enough to make the
-/// link total. Computing the real config hash (the §18 reproducibility identifier)
-/// is a model-registry follow-up, confined here so it doesn't leak into the lib.
-fn catalogue(registry: &Registry) -> ModelRegistry {
-    let mut builder = ModelRegistry::builder();
-    for plugin in registry.detectors() {
-        builder.record(ModelCard::for_plugin(
-            plugin.as_ref(),
-            ConfigHash::boot_placeholder(plugin.id(), plugin.version()),
-            Utc::now(),
-        ));
-    }
-    builder
-        .build()
-        .expect("one card per live detector — keys are unique by construction")
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM.
