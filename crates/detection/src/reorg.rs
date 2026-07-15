@@ -63,6 +63,7 @@ use events::primitives::{BlockRef, DetectorRef};
 use events::DomainEvent;
 
 use crate::emit::evidence_events;
+use crate::model::LifecycleStatus;
 use crate::registry::DetectorKey;
 use crate::state::CrossBlockState;
 
@@ -121,10 +122,12 @@ pub trait CrossBlockSlot: Rewindable + Send {
 }
 
 /// One cross-block detector bundled with everything the scheduler needs to run and
-/// rewind it: the detector, its resolved triple, and its per-block snapshot store.
+/// rewind it: the detector, its resolved triple, its rollout status, and its
+/// per-block snapshot store.
 struct Slot<D: CrossBlockDetector> {
     detector: D,
     detector_ref: DetectorRef,
+    status: LifecycleStatus,
     state: CrossBlockState<D::State>,
 }
 
@@ -166,7 +169,13 @@ impl<D: CrossBlockDetector> CrossBlockSlot for Slot<D> {
         evidence
             .iter()
             .flat_map(|evidence| {
-                evidence_events(&self.detector_ref, ctx.block(), ctx.enrichment(), evidence)
+                evidence_events(
+                    &self.detector_ref,
+                    self.status,
+                    ctx.block(),
+                    ctx.enrichment(),
+                    evidence,
+                )
             })
             .collect()
     }
@@ -277,14 +286,20 @@ impl CrossBlockStates {
         Self::default()
     }
 
-    /// Register a [`CrossBlockDetector`] with its resolved [`DetectorRef`], building
-    /// the snapshot store sized to its window and erasing its state type behind
-    /// [`CrossBlockSlot`]. A second insert for the same `(id, version)` replaces the
-    /// first. The `detector_ref` is resolved once at link time (model registry), the
-    /// same fail-fast pairing [`DetectionPlan`](crate::emit::DetectionPlan) does for
-    /// `Block` detectors, so the per-block emit path is total.
-    pub fn insert_detector<D>(&mut self, detector_ref: DetectorRef, detector: D)
-    where
+    /// Register a [`CrossBlockDetector`] with its resolved [`DetectorRef`] and
+    /// [`LifecycleStatus`], building the snapshot store sized to its window and
+    /// erasing its state type behind [`CrossBlockSlot`]. A second insert for the
+    /// same `(id, version)` replaces the first. The `detector_ref`/`status` are
+    /// resolved once at link time (model registry), the same fail-fast pairing
+    /// [`DetectionPlan`](crate::emit::DetectionPlan) does for `Block` detectors,
+    /// so the per-block emit path is total and Shadow-suppression (§6, §18) is
+    /// decided once, not per block.
+    pub fn insert_detector<D>(
+        &mut self,
+        detector_ref: DetectorRef,
+        status: LifecycleStatus,
+        detector: D,
+    ) where
         D: CrossBlockDetector + 'static,
     {
         let key = (detector.id(), detector.version());
@@ -294,6 +309,7 @@ impl CrossBlockStates {
             Box::new(Slot {
                 detector,
                 detector_ref,
+                status,
                 state,
             }),
         );
@@ -593,10 +609,12 @@ mod tests {
         let mut roster = CrossBlockStates::new();
         roster.insert_detector(
             a_ref("wash"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
         );
         roster.insert_detector(
             a_ref("spoof"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<i32>::new("spoof", SemVer::new(1, 0, 0)),
         );
         assert_eq!(roster.len(), 2);
@@ -622,10 +640,12 @@ mod tests {
         let mut roster = CrossBlockStates::new();
         roster.insert_detector(
             a_ref("a"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("a", SemVer::new(1, 0, 0)).with_window(16),
         );
         roster.insert_detector(
             a_ref("b"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("b", SemVer::new(1, 0, 0)).with_window(2),
         );
         advance(&mut roster, 4);
@@ -653,11 +673,13 @@ mod tests {
         let mut roster = CrossBlockStates::new();
         roster.insert_detector(
             a_ref("wash"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0))
                 .returning(finding.clone()),
         );
         roster.insert_detector(
             a_ref("spoof"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("spoof", SemVer::new(1, 0, 0)).returning(finding),
         );
 
@@ -683,12 +705,37 @@ mod tests {
     }
 
     #[test]
+    fn a_shadow_cross_block_detector_still_triggers_but_raises_no_alert() {
+        let finding = vec![Evidence::new(
+            AlertKind::WashTrading,
+            vec![],
+            Confidence::new(0.5),
+        )];
+        let mut roster = CrossBlockStates::new();
+        roster.insert_detector(
+            a_ref("wash"),
+            LifecycleStatus::Shadow,
+            MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)).returning(finding),
+        );
+
+        let events = roster.observe_and_detect(&ctx(1));
+
+        let types: Vec<&str> = events.iter().map(DomainEvent::event_type).collect();
+        assert_eq!(
+            types,
+            vec!["DetectorTriggered"],
+            "a Shadow build is still scored but doesn't alert (§6, §18)"
+        );
+    }
+
+    #[test]
     fn a_detector_that_finds_nothing_emits_nothing_but_still_advances() {
         // No findings ⇒ no events, but the block is still folded in — so a later
         // reorg has a snapshot to pop.
         let mut roster = CrossBlockStates::new();
         roster.insert_detector(
             a_ref("wash"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
         );
         advance(&mut roster, 3);
@@ -720,6 +767,7 @@ mod tests {
 
         roster.insert_detector(
             a_ref("wash"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
         );
         assert!(roster.contains(&key("wash")));
@@ -728,6 +776,7 @@ mod tests {
         // Re-inserting the same key replaces rather than duplicates.
         roster.insert_detector(
             a_ref("wash"),
+            LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
         );
         assert_eq!(roster.len(), 1);

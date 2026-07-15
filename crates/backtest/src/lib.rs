@@ -21,26 +21,26 @@
 //! [`fixtures`] is the ground truth itself — one known-incident scenario per
 //! built-in detector, plus a clean block, built with the same [`CtxBuilder`]
 //! helper the detectors' own regression tests use; [`scoring`] replays a
-//! fixture and rolls the outcomes up into per-detector precision/recall;
+//! fixture and rolls the outcomes up into per-detector precision/recall/hit_rate;
 //! [`baseline`] compares that roll-up against the committed reference numbers
-//! and is the CI gate (§18, Sprint 10 t3).
-//!
-//! # Scope
-//!
-//! Filling `ModelCard::Performance` from these results is the separate
-//! Sprint 10 t4 follow-up (§18).
+//! and is the CI gate (§18, Sprint 10 t3); [`performance`] derives a
+//! [`detection::PerformanceStore`] from a [`Report`] — the artifact
+//! `detection`'s boot reads to fill `ModelCard::Performance` (§18, Sprint 10 t4).
 //!
 //! [`CtxBuilder`]: detector_api::test_util::CtxBuilder
 
 pub mod baseline;
 pub mod fixture;
 pub mod fixtures;
+pub mod performance;
 pub mod scoring;
 
 pub use fixture::{ExpectedIncident, Fixture};
 pub use scoring::{run_backtest, run_fixture, DetectorStats, Finding, FixtureResult, Report};
 
-use detection::{link_builtin_roster, DetectionPlan, DetectorId, FeatureFlags};
+use detection::{
+    link_builtin_roster, DetectionPlan, DetectorId, FeatureFlags, PerformanceStore, RolloutPolicy,
+};
 
 /// The linked `Block` roster plus the flags it was built from — bundled
 /// because every replay needs both together (a plan without the flags that
@@ -64,8 +64,14 @@ pub struct Roster {
 /// "regardless of tx content" (its own module docs — never a real build), so a
 /// `--all-features` build (CI's own invocation) must not let it poison a
 /// detector's measured precision/recall.
+///
+/// Links with [`RolloutPolicy::default`] (every detector `Active`) and an empty
+/// [`PerformanceStore`], regardless of the live service's current staging or
+/// prior measurements: the backtest harness exists to measure a detector's true
+/// detection capability so it can *inform* a Shadow→Active promotion (§18,
+/// Sprint 10 t4), so it can't itself be gated — or seeded — by that decision.
 pub fn boot() -> anyhow::Result<Roster> {
     let flags = FeatureFlags::all_enabled().disable(DetectorId::new("demo"));
-    let plan = link_builtin_roster(&flags)?;
+    let plan = link_builtin_roster(&flags, &RolloutPolicy::default(), &PerformanceStore::new())?;
     Ok(Roster { plan, flags })
 }

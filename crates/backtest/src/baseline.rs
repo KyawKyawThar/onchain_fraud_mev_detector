@@ -199,6 +199,7 @@ mod tests {
                 .iter()
                 .map(|(id, stats)| (id.to_string(), *stats))
                 .collect(),
+            total_blocks: 0,
         }
     }
 
@@ -207,6 +208,7 @@ mod tests {
             true_positives: 1,
             false_positives: 0,
             false_negatives: 0,
+            blocks_hit: 0,
         }
     }
 
@@ -233,6 +235,7 @@ mod tests {
                 true_positives: 1,
                 false_positives: 1,
                 false_negatives: 0,
+                blocks_hit: 0,
             },
         )]);
         let regressions = check(&report, &baseline);
@@ -275,6 +278,7 @@ mod tests {
                 true_positives: 0,
                 false_positives: 0,
                 false_negatives: 1,
+                blocks_hit: 0,
             },
         )]);
         let regressions = check(&report, &baseline);
@@ -292,6 +296,7 @@ mod tests {
                 true_positives: 0,
                 false_positives: 5,
                 false_negatives: 3,
+                blocks_hit: 0,
             },
         )]);
         assert!(check(&report, &baseline).is_empty());

@@ -1,0 +1,51 @@
+{
+  "address-poisoning": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817384Z"
+  },
+  "arb": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817385Z"
+  },
+  "flashloan": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817385Z"
+  },
+  "liquidation": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817386Z"
+  },
+  "rugpull": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817386Z"
+  },
+  "sandwich": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817387Z"
+  },
+  "wash-trading": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "hit_rate": 0.09090909090909091,
+    "sample_size": 11,
+    "measured_at": "2026-07-15T06:35:27.817387Z"
+  }
+}

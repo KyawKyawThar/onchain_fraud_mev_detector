@@ -17,11 +17,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use detection::boot::link_builtin_roster;
 use detection::config::Config;
+use detection::model::{default_performance_store_path, load_performance_store, RolloutPolicy};
 use detection::registry::register_cross_block_builtins;
 use detection::scheduler::{
     build_consumer, run_committer, run_consumer, BlockEvent, Offsets, Scheduler,
 };
-use detection::FeatureFlags;
+use detection::{DetectorId, FeatureFlags};
 use event_bus::KafkaEventSink;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -45,14 +46,32 @@ async fn run(cfg: Config) -> Result<()> {
     // path never has to fabricate a config_hash (the link-or-fail discipline).
     // Shared with the backtest harness via `detection::boot` — see its docs.
     let flags = FeatureFlags::all_enabled();
-    let plan =
-        link_builtin_roster(&flags).context("linking the detector roster to its model cards")?;
+
+    // Staged rollout (§6, §18, Sprint 10 t4): the five detectors that landed this
+    // sprint start `Shadow` — they run and are scored, but don't alert — until a
+    // backtest/production comparison promotes them. Promote one by dropping its
+    // `.shadow(...)` line here.
+    let rollout = RolloutPolicy::new()
+        .shadow(DetectorId::new("flashloan"))
+        .shadow(DetectorId::new("liquidation"))
+        .shadow(DetectorId::new("rugpull"))
+        .shadow(DetectorId::new("wash-trading"))
+        .shadow(DetectorId::new("address-poisoning"));
+
+    // Measured precision/recall/hit_rate from the backtest harness (§18, Sprint 10
+    // t4), committed at `crates/detection/model_performance.json`. A missing file
+    // (no backtest has run yet) just leaves every card `Unmeasured`.
+    let performance = load_performance_store(&default_performance_store_path())
+        .context("loading measured detector performance")?;
+
+    let plan = link_builtin_roster(&flags, &rollout, &performance)
+        .context("linking the detector roster to its model cards")?;
 
     // The cross-block roster (wash-trading is the first `Scope::CrossBlock`
     // detector, §22 Sprint 10 t1). Each slot is paired with its resolved
     // `DetectorRef` here, the same link-time discipline as the `Block` plan; the
     // roster is empty in a build that links no cross-block detector feature.
-    let cross_block = register_cross_block_builtins(&flags);
+    let cross_block = register_cross_block_builtins(&flags, &rollout, &performance);
 
     tracing::info!(
         chain = cfg.chain.id(),
