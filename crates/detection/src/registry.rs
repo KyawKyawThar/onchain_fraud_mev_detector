@@ -222,44 +222,50 @@ pub fn register_builtins(flags: &FeatureFlags) -> Registry {
 /// A [`CrossBlockDetector`](detector_api::CrossBlockDetector) can't live in the
 /// `Block` [`Registry`] (its `detect` threads `&mut State`, so it runs serially, not
 /// on the parallel fan-out), so it registers into a separate
-/// [`CrossBlockStates`](crate::reorg::CrossBlockStates) roster. Each slot is paired
-/// with its resolved [`DetectorRef`] once here, the same fail-fast link-time pairing
-/// [`DetectionPlan`](crate::emit::DetectionPlan) does for `Block` detectors, so the
-/// per-block emit path never fabricates a triple. The `config_hash` is the same boot
-/// placeholder `main::catalogue` stamps on the `Block` roster (real per-detector
-/// config hashing is the Sprint 10 t4 follow-up).
+/// [`CrossBlockStates`](crate::reorg::CrossBlockStates) roster. Each slot is built a
+/// real [`ModelCard`](crate::model::ModelCard) here (via
+/// [`crate::model::card_for`], the same helper the `Block` catalogue uses), so its
+/// resolved [`DetectorRef`] and [`LifecycleStatus`](crate::model::LifecycleStatus)
+/// come from the same `rollout`/`performance` inputs as every other detector — the
+/// same fail-fast link-time pairing [`DetectionPlan`](crate::emit::DetectionPlan)
+/// does for `Block` detectors, so the per-block emit path never fabricates a triple.
+///
+/// The card isn't recorded into a shared [`ModelRegistry`](crate::model::ModelRegistry)
+/// — this and the `Block` catalogue are independently callable (the backtest harness
+/// calls this once per fixture), so there's no single registry instance to record
+/// into. Nothing today queries the model registry for a cross-block id post-boot; if
+/// that changes, this is the place to route the card into a shared registry too.
 ///
 /// In a build with no cross-block detector feature the roster is empty — the case
 /// until `washtrading` is linked.
-pub fn register_cross_block_builtins(flags: &FeatureFlags) -> crate::reorg::CrossBlockStates {
-    let _ = flags; // read only by a linked cross-block feature's arm below.
+pub fn register_cross_block_builtins(
+    flags: &FeatureFlags,
+    rollout: &crate::model::RolloutPolicy,
+    performance: &crate::model::PerformanceStore,
+) -> crate::reorg::CrossBlockStates {
+    let _ = (flags, rollout, performance); // read only by a linked cross-block feature's arm below.
     #[allow(unused_mut)]
     let mut roster = crate::reorg::CrossBlockStates::new();
 
     // ── built-in cross-block detectors plug in here ──
     #[cfg(feature = "washtrading")]
     if flags.is_enabled(washtrading_detector::WashTradingDetector::ID) {
+        use detector_api::CrossBlockDetector as _;
         let detector = washtrading_detector::plugin(); // wash-trading-v1.0
-        roster.insert_detector(boot_detector_ref(&detector), detector);
+        let card = crate::model::card_for(
+            detector.id(),
+            detector.version(),
+            detector.kind(),
+            detector_api::Scope::CrossBlock {
+                window_blocks: detector.window_blocks(),
+            },
+            rollout,
+            performance,
+        );
+        roster.insert_detector(card.detector_ref(), card.status, detector);
     }
 
     roster
-}
-
-/// The boot-placeholder [`DetectorRef`] for a cross-block detector, mirroring the
-/// `(id, version)`-seeded `config_hash` `main::catalogue` computes for the `Block`
-/// roster — so a cross-block detector's emitted triple matches what a model card
-/// would yield, until real config hashing lands (Sprint 10 t4).
-#[cfg(feature = "washtrading")]
-fn boot_detector_ref<D: detector_api::CrossBlockDetector>(
-    detector: &D,
-) -> events::primitives::DetectorRef {
-    let (id, version) = (detector.id(), detector.version());
-    events::primitives::DetectorRef {
-        id: id.as_str().to_owned(),
-        version: version.to_string(),
-        config_hash: crate::model::ConfigHash::boot_placeholder(id, version).to_hex(),
-    }
 }
 
 #[cfg(test)]
@@ -372,7 +378,12 @@ mod tests {
     fn register_cross_block_builtins_honours_the_disable_flag() {
         // Same contract for the cross-block roster: a flags-all-off policy yields an
         // empty roster regardless of which cross-block detector features are linked.
-        assert!(register_cross_block_builtins(&FeatureFlags::all_disabled()).is_empty());
+        assert!(register_cross_block_builtins(
+            &FeatureFlags::all_disabled(),
+            &crate::model::RolloutPolicy::default(),
+            &crate::model::PerformanceStore::new(),
+        )
+        .is_empty());
     }
 
     #[cfg(feature = "washtrading")]
@@ -380,7 +391,26 @@ mod tests {
     fn washtrading_cross_block_detector_is_registered_when_feature_and_flag_are_on() {
         // The first `Scope::CrossBlock` writer lands in the cross-block roster (not
         // the `Block` `Registry`), paired with its resolved `DetectorRef`.
-        let roster = register_cross_block_builtins(&FeatureFlags::all_enabled());
+        let roster = register_cross_block_builtins(
+            &FeatureFlags::all_enabled(),
+            &crate::model::RolloutPolicy::default(),
+            &crate::model::PerformanceStore::new(),
+        );
+        assert!(roster.contains(&(DetectorId::new("wash-trading"), SemVer::new(1, 0, 0))));
+    }
+
+    #[cfg(feature = "washtrading")]
+    #[test]
+    fn a_shadow_rollout_override_still_registers_the_detector_only_the_flag_gates_that() {
+        // Rollout status (Active/Shadow/Deprecated) picks whether a *linked*
+        // detector's alerts are live; it never gates whether it's linked at all —
+        // that's `FeatureFlags`'s job alone.
+        let rollout = crate::model::RolloutPolicy::new().shadow(DetectorId::new("wash-trading"));
+        let roster = register_cross_block_builtins(
+            &FeatureFlags::all_enabled(),
+            &rollout,
+            &crate::model::PerformanceStore::new(),
+        );
         assert!(roster.contains(&(DetectorId::new("wash-trading"), SemVer::new(1, 0, 0))));
     }
 

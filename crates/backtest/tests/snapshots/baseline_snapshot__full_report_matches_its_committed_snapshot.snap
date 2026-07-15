@@ -1,5 +1,6 @@
 ---
 source: crates/backtest/tests/baseline_snapshot.rs
+assertion_line: 19
 expression: report.to_string()
 ---
 backtest: 8 fixtures replayed
@@ -20,11 +21,11 @@ address-poisoning: zero-value bait from an 8-nibble lookalike
   caught      block 700 address-poisoning AddressPoisoning
 clean: one ordinary swap and one plain transfer, no incident
 
-per-detector precision / recall:
-  address-poisoning    precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  arb                  precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  flashloan            precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  liquidation          precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  rugpull              precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  sandwich             precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
-  wash-trading         precision 1.000  recall 1.000  (tp=1 fp=0 fn=0)
+per-detector precision / recall / hit_rate:
+  address-poisoning    precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  arb                  precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  flashloan            precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  liquidation          precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  rugpull              precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  sandwich             precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  wash-trading         precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)

@@ -461,6 +461,7 @@ mod tests {
         let mut roster = CrossBlockStates::new();
         roster.insert_detector(
             a_ref("wash"),
+            crate::model::LifecycleStatus::Active,
             MockCrossBlockDetector::<u64>::new("wash", SemVer::new(1, 0, 0)),
         );
         let mut s = scheduler(plan_with_one_detector(), roster);

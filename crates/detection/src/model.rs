@@ -17,9 +17,10 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use events::primitives::{Confidence, DetectorRef};
+use events::primitives::{Confidence, ConfidenceOutOfRange, DetectorRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -151,6 +152,48 @@ impl std::fmt::Display for LifecycleStatus {
     }
 }
 
+/// Per-detector rollout-stage overrides (§6, §18) — the model-registry analogue
+/// of [`crate::flags::FeatureFlags`]: `FeatureFlags` decides whether a detector
+/// *runs at all*; this decides, for a detector that runs, whether its evidence
+/// is live (`Active`) or canary-only (`Shadow`). Every id defaults to `Active`
+/// unless overridden, so a policy only has to name the detectors being staged.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RolloutPolicy {
+    overrides: BTreeMap<DetectorId, LifecycleStatus>,
+}
+
+impl RolloutPolicy {
+    /// Every detector `Active` unless overridden below.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stage `id` as [`Shadow`](LifecycleStatus::Shadow): it still runs and is
+    /// scored, but [`PreliminaryAlertCreated`](events::detection::PreliminaryAlertCreated)
+    /// is suppressed for it until promoted. Chainable.
+    #[must_use]
+    pub fn shadow(mut self, id: DetectorId) -> Self {
+        self.overrides.insert(id, LifecycleStatus::Shadow);
+        self
+    }
+
+    /// Mark `id` [`Deprecated`](LifecycleStatus::Deprecated). Chainable.
+    #[must_use]
+    pub fn deprecated(mut self, id: DetectorId) -> Self {
+        self.overrides.insert(id, LifecycleStatus::Deprecated);
+        self
+    }
+
+    /// The status `id` should be catalogued at: an explicit override, or
+    /// `Active` by default.
+    pub fn status_of(&self, id: DetectorId) -> LifecycleStatus {
+        self.overrides
+            .get(&id)
+            .copied()
+            .unwrap_or(LifecycleStatus::Active)
+    }
+}
+
 /// A detector build's track record (§6) — either unscored or fully scored,
 /// never half.
 ///
@@ -193,6 +236,138 @@ impl Performance {
     }
 }
 
+/// The wire form of one detector's measured performance (§18, Sprint 10 t4) — the
+/// bridge between the backtest harness's offline scoring
+/// ([`backtest::performance::from_report`](../../backtest/performance/index.html))
+/// and a live boot's [`ModelCard`].
+///
+/// Rates are plain `f64`, not [`Confidence`], on purpose: `Confidence`'s derived
+/// `Deserialize` doesn't range-check (it's `#[serde(transparent)]` over a bare
+/// `f64`), so validating a value from outside the process — this is read from a
+/// checked-in JSON file — has to happen explicitly, in [`into_performance`]
+/// (Self::into_performance), not silently inside serde.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerformanceRecord {
+    pub precision: f64,
+    pub recall: f64,
+    pub hit_rate: f64,
+    pub sample_size: NonZeroU64,
+    pub measured_at: DateTime<Utc>,
+}
+
+impl PerformanceRecord {
+    /// Validate the rates into a [`Performance::Measured`], or the first
+    /// out-of-range field's error.
+    pub fn into_performance(self) -> Result<Performance, ConfidenceOutOfRange> {
+        Ok(Performance::Measured {
+            precision: Confidence::try_new(self.precision)?,
+            recall: Confidence::try_new(self.recall)?,
+            hit_rate: Confidence::try_new(self.hit_rate)?,
+            sample_size: self.sample_size,
+            measured_at: self.measured_at,
+        })
+    }
+}
+
+/// Every detector's persisted measured performance, keyed by [`DetectorId`]
+/// string — the same keying convention as
+/// [`backtest::baseline::Baseline`](../../backtest/baseline/type.Baseline.html).
+pub type PerformanceStore = BTreeMap<String, PerformanceRecord>;
+
+/// Something went wrong loading the committed performance store.
+#[derive(Debug, thiserror::Error)]
+pub enum PerformanceStoreError {
+    #[error("reading performance store at {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parsing performance store at {path}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("performance store at {path} has an out-of-range rate for {id}")]
+    InvalidRecord {
+        path: PathBuf,
+        id: String,
+        #[source]
+        source: ConfidenceOutOfRange,
+    },
+    #[error("serializing performance store")]
+    Serialize(#[source] serde_json::Error),
+    #[error("writing performance store to {path}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// `crates/detection/model_performance.json`, resolved at compile time (so it's
+/// correct regardless of which crate/cwd calls it — `backtest` writes here via
+/// this same function, `detection`'s boot reads it) — the committed bridge from
+/// the backtest harness's measured precision/recall/hit_rate into every
+/// [`ModelCard::performance`] at boot.
+pub fn default_performance_store_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("model_performance.json")
+}
+
+/// Load the committed performance store. A missing file is `Ok`-empty — a
+/// legitimate state before the backtest harness has ever run
+/// (`--update-model-cards`) or for a brand-new detector with no history yet;
+/// every card just stays [`Performance::Unmeasured`]. Malformed JSON or an
+/// out-of-range rate is a typed error: a checked-in artifact drifting from its
+/// schema is a wiring bug, not a runtime condition to paper over.
+pub fn load_performance_store(path: &Path) -> Result<PerformanceStore, PerformanceStoreError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PerformanceStore::new())
+        }
+        Err(source) => {
+            return Err(PerformanceStoreError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let raw: BTreeMap<String, PerformanceRecord> =
+        serde_json::from_str(&text).map_err(|source| PerformanceStoreError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // Validate every record eagerly (rather than lazily on first read) so a bad
+    // artifact fails at boot, not on whichever detector happens to be looked up
+    // first.
+    for (id, record) in &raw {
+        record.clone().into_performance().map_err(|source| {
+            PerformanceStoreError::InvalidRecord {
+                path: path.to_path_buf(),
+                id: id.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(raw)
+}
+
+/// Write `store` back to `path` as pretty JSON — the artifact
+/// `backtest --update-model-cards` commits.
+pub fn save_performance_store(
+    store: &PerformanceStore,
+    path: &Path,
+) -> Result<(), PerformanceStoreError> {
+    let mut json = serde_json::to_string_pretty(store).map_err(PerformanceStoreError::Serialize)?;
+    json.push('\n');
+    std::fs::write(path, json).map_err(|source| PerformanceStoreError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// One detector build's full record in the model registry: its identity (from
 /// the plugin) plus the catalogue metadata (§6).
 #[derive(Debug, Clone, PartialEq)]
@@ -208,26 +383,48 @@ pub struct ModelCard {
 }
 
 impl ModelCard {
-    /// Build a card for a plugin, pulling `id`/`version`/`kind`/`scope` straight
-    /// from it (one source of truth — they can't drift from the live detector)
-    /// and attaching the catalogue metadata. Starts [`Active`](LifecycleStatus::Active)
-    /// with [`Unmeasured`](Performance::Unmeasured) performance; layer the
-    /// builder methods to change either.
-    pub fn for_plugin(
-        plugin: &dyn DetectorPlugin,
+    /// Build a card from its identity fields directly. Starts
+    /// [`Active`](LifecycleStatus::Active) with [`Unmeasured`](Performance::Unmeasured)
+    /// performance; layer the builder methods to change either. The general
+    /// constructor — used both for `Block` plugins (via
+    /// [`for_plugin`](Self::for_plugin)) and `CrossBlockDetector`s, which have no
+    /// `&dyn DetectorPlugin` to pull identity from.
+    pub fn new(
+        id: DetectorId,
+        version: SemVer,
+        kind: ModelKind,
+        scope: Scope,
         config_hash: ConfigHash,
         deployed_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: plugin.id(),
-            version: plugin.version(),
-            kind: plugin.kind(),
-            scope: plugin.scope(),
+            id,
+            version,
+            kind,
+            scope,
             config_hash,
             deployed_at,
             performance: Performance::Unmeasured,
             status: LifecycleStatus::Active,
         }
+    }
+
+    /// Build a card for a plugin, pulling `id`/`version`/`kind`/`scope` straight
+    /// from it (one source of truth — they can't drift from the live detector)
+    /// and attaching the catalogue metadata. See [`new`](Self::new).
+    pub fn for_plugin(
+        plugin: &dyn DetectorPlugin,
+        config_hash: ConfigHash,
+        deployed_at: DateTime<Utc>,
+    ) -> Self {
+        Self::new(
+            plugin.id(),
+            plugin.version(),
+            plugin.kind(),
+            plugin.scope(),
+            config_hash,
+            deployed_at,
+        )
     }
 
     /// Override the lifecycle status (e.g. mark this build `Shadow` or
@@ -359,6 +556,41 @@ impl ModelRegistryBuilder {
         }
         Ok(ModelRegistry { by_key })
     }
+}
+
+/// Build one detector's [`ModelCard`], layering the rollout status and any
+/// measured performance from `performance` on top of a fresh boot-placeholder
+/// card (§18, Sprint 10 t4). Shared by the `Block` catalogue
+/// ([`crate::boot`]) and cross-block registration
+/// ([`crate::registry::register_cross_block_builtins`]) so both stamp a
+/// detector's card the same way regardless of which roster it lives in.
+pub(crate) fn card_for(
+    id: DetectorId,
+    version: SemVer,
+    kind: ModelKind,
+    scope: Scope,
+    rollout: &RolloutPolicy,
+    performance: &PerformanceStore,
+) -> ModelCard {
+    let mut card = ModelCard::new(
+        id,
+        version,
+        kind,
+        scope,
+        ConfigHash::boot_placeholder(id, version),
+        Utc::now(),
+    )
+    .with_status(rollout.status_of(id));
+
+    if let Some(record) = performance.get(id.as_str()) {
+        let perf = record
+            .clone()
+            .into_performance()
+            .expect("load_performance_store already validated every record");
+        card = card.with_performance(perf);
+    }
+
+    card
 }
 
 #[cfg(test)]
@@ -549,5 +781,158 @@ mod tests {
                 version: SemVer::new(1, 2, 0),
             }
         );
+    }
+
+    // ── RolloutPolicy ──────────────────────────────────────────────────
+
+    #[test]
+    fn rollout_policy_defaults_every_id_to_active() {
+        let policy = RolloutPolicy::new();
+        assert_eq!(
+            policy.status_of(DetectorId::new("sandwich")),
+            LifecycleStatus::Active
+        );
+    }
+
+    #[test]
+    fn rollout_policy_override_wins_and_is_scoped_to_its_id() {
+        let policy = RolloutPolicy::new()
+            .shadow(DetectorId::new("flashloan"))
+            .deprecated(DetectorId::new("arb"));
+        assert_eq!(
+            policy.status_of(DetectorId::new("flashloan")),
+            LifecycleStatus::Shadow
+        );
+        assert_eq!(
+            policy.status_of(DetectorId::new("arb")),
+            LifecycleStatus::Deprecated
+        );
+        assert_eq!(
+            policy.status_of(DetectorId::new("sandwich")),
+            LifecycleStatus::Active
+        );
+    }
+
+    // ── PerformanceRecord ─────────────────────────────────────────────
+
+    fn valid_record() -> PerformanceRecord {
+        PerformanceRecord {
+            precision: 0.9,
+            recall: 0.8,
+            hit_rate: 0.05,
+            sample_size: NonZeroU64::new(1_000).unwrap(),
+            measured_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn performance_record_converts_into_measured() {
+        let perf = valid_record().into_performance().unwrap();
+        assert!(perf.is_measured());
+        match perf {
+            Performance::Measured {
+                precision, recall, ..
+            } => {
+                assert_eq!(precision, Confidence::new(0.9));
+                assert_eq!(recall, Confidence::new(0.8));
+            }
+            Performance::Unmeasured => panic!("expected Measured"),
+        }
+    }
+
+    #[test]
+    fn performance_record_rejects_an_out_of_range_rate() {
+        let mut record = valid_record();
+        record.precision = 1.7;
+        assert!(record.into_performance().is_err());
+    }
+
+    #[test]
+    fn performance_record_round_trips_through_json() {
+        let record = valid_record();
+        let json = serde_json::to_string(&record).unwrap();
+        let reloaded: PerformanceRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, reloaded);
+    }
+
+    // ── performance store I/O ────────────────────────────────────────
+
+    #[test]
+    fn a_missing_performance_store_loads_as_empty() {
+        let path = Path::new("/nonexistent/does-not-exist/model_performance.json");
+        let store = load_performance_store(path).unwrap();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn malformed_performance_store_is_a_typed_parse_error() {
+        let path = std::env::temp_dir().join(format!("model-perf-test-{}-bad", std::process::id()));
+        std::fs::write(&path, b"not json").unwrap();
+        let result = load_performance_store(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(result, Err(PerformanceStoreError::Parse { .. })));
+    }
+
+    #[test]
+    fn an_out_of_range_record_is_a_typed_error_not_a_silent_clamp() {
+        let path = std::env::temp_dir().join(format!("model-perf-test-{}-oor", std::process::id()));
+        std::fs::write(
+            &path,
+            br#"{"sandwich":{"precision":1.7,"recall":0.5,"hit_rate":0.1,"sample_size":10,"measured_at":"2024-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let result = load_performance_store(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            result,
+            Err(PerformanceStoreError::InvalidRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn performance_store_save_then_load_round_trips() {
+        let path = std::env::temp_dir().join(format!("model-perf-test-{}-ok", std::process::id()));
+        let store = PerformanceStore::from([("sandwich".to_string(), valid_record())]);
+
+        save_performance_store(&store, &path).unwrap();
+        let reloaded = load_performance_store(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(store, reloaded);
+    }
+
+    // ── card_for ─────────────────────────────────────────────────────
+
+    #[test]
+    fn card_for_applies_rollout_status_and_measured_performance() {
+        let rollout = RolloutPolicy::new().shadow(DetectorId::new("flashloan"));
+        let performance = PerformanceStore::from([("flashloan".to_string(), valid_record())]);
+
+        let card = card_for(
+            DetectorId::new("flashloan"),
+            SemVer::new(2, 1, 0),
+            ModelKind::Rule,
+            Scope::Block,
+            &rollout,
+            &performance,
+        );
+
+        assert_eq!(card.status, LifecycleStatus::Shadow);
+        assert!(card.performance.is_measured());
+    }
+
+    #[test]
+    fn card_for_defaults_to_active_and_unmeasured_without_overrides() {
+        let card = card_for(
+            DetectorId::new("sandwich"),
+            SemVer::new(1, 2, 0),
+            ModelKind::Rule,
+            Scope::Block,
+            &RolloutPolicy::default(),
+            &PerformanceStore::new(),
+        );
+
+        assert_eq!(card.status, LifecycleStatus::Active);
+        assert!(!card.performance.is_measured());
     }
 }

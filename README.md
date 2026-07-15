@@ -290,6 +290,44 @@ binary/container.
 
 ---
 
+## Getting started
+
+Prerequisites: Rust (stable, via [`rustup`](https://rustup.rs)) and
+[`just`](https://github.com/casey/just). Nothing else — no database, no
+Kafka, no Docker. Every `sqlx::query!` verifies against a committed offline
+cache (`SQLX_OFFLINE=true`, the default), so build/lint/test never need a
+live service.
+
+```bash
+git clone https://github.com/KyawKyawThar/onchain_fraud_mev_detector
+cd onchain_fraud_mev_detector
+just check       # fmt --check · clippy -D warnings · nextest · release build
+                  # · the backtest precision/recall gate — exactly what CI runs
+```
+
+Fastest way to see something run — replays labeled ground-truth incidents
+through all seven detectors and prints a measured precision/recall report,
+gated against a committed baseline (no infra required):
+
+```bash
+cargo run -p backtest
+```
+
+| Command | What it runs |
+|---|---|
+| `just test` | Unit tests (nextest) + doctests — hermetic, no infra |
+| `just backtest` | Replay ground-truth fixtures; fail if any detector regressed below its committed baseline |
+| `just check` | The full CI gate, locally: fmt, clippy, tests, release build, backtest gate |
+| `just up` | Bring up the full dev stack (Postgres, Redis, ClickHouse, Kafka, RabbitMQ) via docker-compose |
+| `just test-integration` | + `#[ignore]` tests against the real stack above (needs `just up`) |
+| `just tools` | One-time install of `cargo-nextest`, `sqlx-cli`, `cargo-audit`, `cargo-deny`, etc. |
+
+The engineering conventions behind this (seams + in-memory doubles, typed
+errors, "parse don't validate," the three test layers, supply-chain policy)
+are written up in [docs/engineering-conventions.md](./docs/engineering-conventions.md).
+
+---
+
 ## Contact
 
 Built by **Nicholas** — senior backend engineer, distributed systems,

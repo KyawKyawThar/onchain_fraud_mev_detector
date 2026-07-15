@@ -36,7 +36,7 @@ use events::DomainEvent;
 
 use detector_api::{DetectionCtx, DetectorId, DetectorPlugin, Enrichment, Evidence, SemVer};
 
-use crate::model::ModelRegistry;
+use crate::model::{LifecycleStatus, ModelRegistry};
 use crate::registry::Registry;
 
 /// Map one [`Evidence`] onto the `DetectorTriggered` it justifies — the raw fact
@@ -109,31 +109,45 @@ pub fn implicated_addresses(enrichment: &Enrichment, txs: &[B256]) -> Vec<Accoun
     addresses
 }
 
-/// Map one detector's [`Evidence`] onto the causal pair it emits: the raw
-/// [`DetectorTriggered`] fact immediately followed by the provisional
-/// [`PreliminaryAlertCreated`] it raises (§6, task 5).
+/// Map one detector's [`Evidence`] onto the events it emits: the raw
+/// [`DetectorTriggered`] fact, immediately followed by the provisional
+/// [`PreliminaryAlertCreated`] it raises — **unless** `status` is
+/// [`Shadow`](LifecycleStatus::Shadow), in which case the finding is still
+/// scored (the trigger fact is always emitted, so metrics/backtests see it) but
+/// alerting is suppressed: a canary build is staged before it's promoted (§6,
+/// §18). `Deprecated` is treated the same as `Shadow` here — a superseded build
+/// shouldn't still be raising live alerts.
 ///
 /// The single source of truth every emit path maps findings through — the
 /// sequential [`detection_events`](DetectionPlan::detection_events), the rayon
 /// [`detection_events_parallel`](DetectionPlan::detection_events_parallel), and the
-/// cross-block slot ([`crate::reorg`]) — so the trigger→alert pairing and the
-/// attribution-blind address lookup can't drift between them.
+/// cross-block slot ([`crate::reorg`]) — so the trigger→alert pairing, the
+/// attribution-blind address lookup, and the Shadow-suppression rule can't drift
+/// between them.
 pub(crate) fn evidence_events(
     detector_ref: &DetectorRef,
+    status: LifecycleStatus,
     block: BlockRef,
     enrichment: &Enrichment,
     evidence: &Evidence,
-) -> [DomainEvent; 2] {
-    let addresses = implicated_addresses(enrichment, &evidence.txs);
-    [
-        DomainEvent::DetectorTriggered(detector_triggered(detector_ref.clone(), block, evidence)),
-        DomainEvent::PreliminaryAlertCreated(preliminary_alert(
+) -> Vec<DomainEvent> {
+    let mut events = vec![DomainEvent::DetectorTriggered(detector_triggered(
+        detector_ref.clone(),
+        block,
+        evidence,
+    ))];
+
+    if status == LifecycleStatus::Active {
+        let addresses = implicated_addresses(enrichment, &evidence.txs);
+        events.push(DomainEvent::PreliminaryAlertCreated(preliminary_alert(
             detector_ref.clone(),
             evidence.kind,
             addresses,
             evidence.confidence,
-        )),
-    ]
+        )));
+    }
+
+    events
 }
 
 /// A live detector is in the [`Registry`] but absent from the [`ModelRegistry`],
@@ -155,12 +169,13 @@ pub struct UnlinkedDetector {
     pub version: SemVer,
 }
 
-/// One detector paired with its resolved, immutable [`DetectorRef`] — proven to
-/// exist at link time, so the per-block emit path never has to look it up or
-/// handle its absence.
+/// One detector paired with its resolved, immutable [`DetectorRef`] and
+/// [`LifecycleStatus`] — proven to exist at link time, so the per-block emit
+/// path never has to look either up or handle their absence.
 struct LinkedDetector {
     plugin: Arc<dyn DetectorPlugin>,
     detector_ref: DetectorRef,
+    status: LifecycleStatus,
 }
 
 impl LinkedDetector {
@@ -218,12 +233,13 @@ impl DetectionPlan {
         let mut detectors = Vec::with_capacity(registry.len());
         for plugin in registry.detectors() {
             let (id, version) = (plugin.id(), plugin.version());
-            let detector_ref = models
-                .detector_ref(id, version)
+            let card = models
+                .card(id, version)
                 .ok_or(UnlinkedDetector { id, version })?;
             detectors.push(LinkedDetector {
                 plugin: Arc::clone(plugin),
-                detector_ref,
+                detector_ref: card.detector_ref(),
+                status: card.status,
             });
         }
         Ok(Self { detectors })
@@ -258,6 +274,7 @@ impl DetectionPlan {
             for evidence in linked.detect(ctx) {
                 events.extend(evidence_events(
                     &linked.detector_ref,
+                    linked.status,
                     ctx.block(),
                     ctx.enrichment(),
                     &evidence,
@@ -286,6 +303,7 @@ impl DetectionPlan {
                 linked.detect(ctx).into_iter().flat_map(|evidence| {
                     evidence_events(
                         &linked.detector_ref,
+                        linked.status,
                         ctx.block(),
                         ctx.enrichment(),
                         &evidence,
@@ -610,6 +628,114 @@ mod tests {
         let plan = DetectionPlan::link(&registry, &models).unwrap();
         let events = plan.detection_events(&ctx);
         assert_eq!(events.len(), 4, "two findings ⇒ two trigger/alert pairs");
+    }
+
+    // ── Shadow rollout suppresses alerting, not scoring (§6, §18) ──────
+
+    #[test]
+    fn a_shadow_detector_still_triggers_but_raises_no_alert() {
+        let registry = Registry::builder()
+            .register(
+                MockDetector::new("arb", SemVer::new(1, 0, 0)).returning(vec![evidence(
+                    AlertKind::Arbitrage,
+                    vec![hash(1)],
+                    0.7,
+                )]),
+            )
+            .build()
+            .unwrap();
+        let models = ModelRegistry::builder()
+            .record(
+                card("arb", SemVer::new(1, 0, 0))
+                    .with_status(crate::model::LifecycleStatus::Shadow),
+            )
+            .build()
+            .unwrap();
+        let ctx = ctx_with(&[(hash(1), addr(1), addr(9))]);
+
+        let plan = DetectionPlan::link(&registry, &models).unwrap();
+        let events = plan.detection_events(&ctx);
+
+        let types: Vec<&str> = events.iter().map(DomainEvent::event_type).collect();
+        assert_eq!(
+            types,
+            vec!["DetectorTriggered"],
+            "a Shadow build is still scored (DetectorTriggered) but doesn't alert"
+        );
+    }
+
+    #[test]
+    fn an_active_detector_alerts_normally_alongside_a_shadow_one() {
+        let registry = Registry::builder()
+            .register(
+                MockDetector::new("arb", SemVer::new(1, 0, 0)).returning(vec![evidence(
+                    AlertKind::Arbitrage,
+                    vec![hash(1)],
+                    0.7,
+                )]),
+            )
+            .register(
+                MockDetector::new("sandwich", SemVer::new(1, 2, 0)).returning(vec![evidence(
+                    AlertKind::Sandwich,
+                    vec![hash(2)],
+                    0.9,
+                )]),
+            )
+            .build()
+            .unwrap();
+        let models = ModelRegistry::builder()
+            .record(
+                card("arb", SemVer::new(1, 0, 0))
+                    .with_status(crate::model::LifecycleStatus::Shadow),
+            )
+            .record(card("sandwich", SemVer::new(1, 2, 0))) // default Active
+            .build()
+            .unwrap();
+        let ctx = ctx_with(&[(hash(1), addr(1), addr(9)), (hash(2), addr(2), addr(8))]);
+
+        let plan = DetectionPlan::link(&registry, &models).unwrap();
+        let events = plan.detection_events(&ctx);
+
+        let types: Vec<&str> = events.iter().map(DomainEvent::event_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                "DetectorTriggered", // arb (Shadow) — no alert follows
+                "DetectorTriggered", // sandwich (Active)
+                "PreliminaryAlertCreated",
+            ]
+        );
+    }
+
+    #[test]
+    fn shadow_suppression_still_records_metrics() {
+        let plan_events = || {
+            let registry = Registry::builder()
+                .register(
+                    MockDetector::new("arb", SemVer::new(1, 0, 0)).returning(vec![evidence(
+                        AlertKind::Arbitrage,
+                        vec![hash(1)],
+                        0.7,
+                    )]),
+                )
+                .build()
+                .unwrap();
+            let models = ModelRegistry::builder()
+                .record(
+                    card("arb", SemVer::new(1, 0, 0))
+                        .with_status(crate::model::LifecycleStatus::Shadow),
+                )
+                .build()
+                .unwrap();
+            let ctx = ctx_with(&[(hash(1), addr(1), addr(9))]);
+            DetectionPlan::link(&registry, &models)
+                .unwrap()
+                .detection_events(&ctx)
+        };
+
+        // A Shadow finding still counts as a run+hit — metrics are unaffected by
+        // alert suppression (§19).
+        assert_eq!(runs_and_hits(|| drop(plan_events())), (1, 1));
     }
 
     #[test]

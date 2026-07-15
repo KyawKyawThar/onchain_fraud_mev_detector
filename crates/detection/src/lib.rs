@@ -82,8 +82,9 @@ pub use emit::{
 };
 pub use flags::FeatureFlags;
 pub use model::{
-    ConfigHash, LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder,
-    ModelRegistryError, Performance,
+    default_performance_store_path, load_performance_store, save_performance_store, ConfigHash,
+    LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder, ModelRegistryError,
+    Performance, PerformanceRecord, PerformanceStore, PerformanceStoreError, RolloutPolicy,
 };
 pub use registry::{
     register_builtins, register_cross_block_builtins, Registry, RegistryBuilder, RegistryError,

@@ -17,11 +17,9 @@
 //! [`DetectionPlan`]: crate::emit::DetectionPlan
 //! [`FeatureFlags`]: crate::flags::FeatureFlags
 
-use chrono::Utc;
-
 use crate::emit::{DetectionPlan, UnlinkedDetector};
 use crate::flags::FeatureFlags;
-use crate::model::{ConfigHash, ModelCard, ModelRegistry};
+use crate::model::{card_for, ModelRegistry, PerformanceStore, RolloutPolicy};
 use crate::registry::{register_builtins, Registry};
 
 /// Build the `Block` roster `register_builtins` compiles in, gated by `flags`,
@@ -30,9 +28,18 @@ use crate::registry::{register_builtins, Registry};
 /// enforces everywhere else. Every binary that needs a linked plan — the live
 /// service and the backtest harness alike — calls this, so neither can
 /// silently diverge in how a build's `config_hash` is derived at boot.
-pub fn link_builtin_roster(flags: &FeatureFlags) -> Result<DetectionPlan, UnlinkedDetector> {
+///
+/// `rollout` and `performance` decide each card's [`LifecycleStatus`](crate::model::LifecycleStatus)
+/// and [`Performance`](crate::model::Performance) (§18, Sprint 10 t4) — a pure
+/// function of its inputs, so loading `performance` from disk is the caller's
+/// job (the effectful shell), not this function's.
+pub fn link_builtin_roster(
+    flags: &FeatureFlags,
+    rollout: &RolloutPolicy,
+    performance: &PerformanceStore,
+) -> Result<DetectionPlan, UnlinkedDetector> {
     let registry = register_builtins(flags);
-    let models = catalogue(&registry);
+    let models = catalogue(&registry, rollout, performance);
     DetectionPlan::link(&registry, &models)
 }
 
@@ -40,17 +47,24 @@ pub fn link_builtin_roster(flags: &FeatureFlags) -> Result<DetectionPlan, Unlink
 ///
 /// The `config_hash` here is derived from the detector's `(id, version)` as a
 /// **boot placeholder** — detectors don't yet expose their serialized config for a
-/// real [`ConfigHash::of`], and a fabricated-but-stable hash is enough to make the
-/// link total. Computing the real config hash (the §18 reproducibility identifier)
-/// is a model-registry follow-up (Sprint 10 t4); kept private to this module in
+/// real [`ConfigHash::of`](crate::model::ConfigHash::of), and a fabricated-but-stable
+/// hash is enough to make the link total. Computing the real config hash (the §18
+/// reproducibility identifier) remains a follow-up; kept private to this module in
 /// the meantime (see the module docs).
-fn catalogue(registry: &Registry) -> ModelRegistry {
+fn catalogue(
+    registry: &Registry,
+    rollout: &RolloutPolicy,
+    performance: &PerformanceStore,
+) -> ModelRegistry {
     let mut builder = ModelRegistry::builder();
     for plugin in registry.detectors() {
-        builder.record(ModelCard::for_plugin(
-            plugin.as_ref(),
-            ConfigHash::boot_placeholder(plugin.id(), plugin.version()),
-            Utc::now(),
+        builder.record(card_for(
+            plugin.id(),
+            plugin.version(),
+            plugin.kind(),
+            plugin.scope(),
+            rollout,
+            performance,
         ));
     }
     builder
@@ -61,11 +75,18 @@ fn catalogue(registry: &Registry) -> ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{LifecycleStatus, PerformanceRecord};
+    use detector_api::DetectorId;
+    use std::num::NonZeroU64;
 
     #[test]
     fn links_every_compiled_in_detector_without_drift() {
-        let plan = link_builtin_roster(&FeatureFlags::all_enabled())
-            .expect("register_builtins's roster is exactly what catalogue covers");
+        let plan = link_builtin_roster(
+            &FeatureFlags::all_enabled(),
+            &RolloutPolicy::default(),
+            &PerformanceStore::new(),
+        )
+        .expect("register_builtins's roster is exactly what catalogue covers");
         assert_eq!(
             plan.len(),
             register_builtins(&FeatureFlags::all_enabled()).len(),
@@ -75,8 +96,40 @@ mod tests {
 
     #[test]
     fn an_all_disabled_policy_links_an_empty_plan() {
-        let plan = link_builtin_roster(&FeatureFlags::all_disabled())
-            .expect("an empty roster has nothing to fail linking");
+        let plan = link_builtin_roster(
+            &FeatureFlags::all_disabled(),
+            &RolloutPolicy::default(),
+            &PerformanceStore::new(),
+        )
+        .expect("an empty roster has nothing to fail linking");
         assert!(plan.is_empty());
+    }
+
+    #[cfg(feature = "sandwich")]
+    #[test]
+    fn catalogue_applies_rollout_status_and_measured_performance() {
+        let rollout = RolloutPolicy::new().shadow(DetectorId::new("sandwich"));
+        let performance = PerformanceStore::from([(
+            "sandwich".to_string(),
+            PerformanceRecord {
+                precision: 0.9,
+                recall: 0.8,
+                hit_rate: 0.05,
+                sample_size: NonZeroU64::new(1_000).unwrap(),
+                measured_at: chrono::Utc::now(),
+            },
+        )]);
+
+        let registry = register_builtins(&FeatureFlags::all_enabled());
+        let models = catalogue(&registry, &rollout, &performance);
+        let card = models
+            .card(
+                DetectorId::new("sandwich"),
+                sandwich_detector::SandwichDetector::VERSION,
+            )
+            .expect("sandwich is a built-in Block detector");
+
+        assert_eq!(card.status, LifecycleStatus::Shadow);
+        assert!(card.performance.is_measured());
     }
 }
