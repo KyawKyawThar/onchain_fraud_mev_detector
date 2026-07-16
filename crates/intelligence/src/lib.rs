@@ -114,6 +114,7 @@ pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
 pub mod grpc;
+pub mod leaderboard;
 pub mod merge_actor;
 pub mod model;
 pub mod pb;

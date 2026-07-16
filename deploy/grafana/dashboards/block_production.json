@@ -1,0 +1,121 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["intelligence", "builder", "relay", "mev", "§10", "§19"],
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "",
+  "title": "Intelligence — builder/relay block production (§10)",
+  "uid": "intel-block-production",
+  "version": 1,
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Relay attribution hit rate",
+      "description": "Fraction of opened block records a configured relay's data API attributed (attributed / (attributed + missed)). A drop signals a relay outage or a lagging MEV_RELAY_ENDPOINTS set.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_relay_attributed_total[$__rate_interval])) / (sum(rate(intel_block_production_relay_attributed_total[$__rate_interval])) + sum(rate(intel_block_production_relay_missed_total[$__rate_interval])))",
+          "legendFormat": "relay hit rate"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Snapshots appended / s",
+      "description": "Block-production snapshots written to ClickHouse (one per fold that changes a record — open, incident, retraction, revert). The write throughput behind the /v1/builders leaderboard.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_snapshots_total[$__rate_interval]))",
+          "legendFormat": "snapshots/s"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Relay attributed vs missed / s",
+      "description": "The two legs of the hit-rate ratio, so an outage is visible as an absolute swing, not just a ratio dip.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_relay_attributed_total[$__rate_interval]))",
+          "legendFormat": "attributed/s"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_relay_missed_total[$__rate_interval]))",
+          "legendFormat": "missed/s"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Heuristic builder labels minted / s",
+      "description": "BuilderAddress labels minted from relay bid-trace evidence (§8.1) — a new builder appearing on the leaderboard shows up here first.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 6, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_builder_labels_minted_total[$__rate_interval]))",
+          "legendFormat": "labels/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Incidents buffered (awaiting trigger/record)",
+      "description": "Incidents held pending their DetectorTriggered/block record. A persistently climbing rate means a stalled upstream partition, not healthy reorder tolerance.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 6, "x": 18, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intel_block_production_incidents_buffered_total[$__rate_interval]))",
+          "legendFormat": "buffered/s"
+        }
+      ]
+    }
+  ]
+}

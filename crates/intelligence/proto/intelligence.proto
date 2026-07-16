@@ -16,6 +16,13 @@ service IntelligenceRead {
   // An address's active labels (§8.1), most-authoritative-first. Same
   // cache-aside behavior as GetRiskScore.
   rpc GetLabels(LabelsRequest) returns (LabelsReply);
+
+  // The builder/relay leaderboard (§10, Sprint 11 t2): top builders by
+  // confirmed sandwich volume, and each configured relay's market share by
+  // MEV type. Aggregates the append-only block-production snapshots in
+  // ClickHouse (latest-per-block, reverted excluded) — no cache, it's an
+  // analytics scan, not a hot-path lookup.
+  rpc GetBuilderLeaderboard(BuilderLeaderboardRequest) returns (BuilderLeaderboardReply);
 }
 
 message RiskScoreRequest {
@@ -53,4 +60,46 @@ message Label {
 
 message LabelsReply {
   repeated Label labels = 1;
+}
+
+message BuilderLeaderboardRequest {
+  // Chain id (e.g. 1 = Ethereum mainnet).
+  uint64 chain = 1;
+  // Max builder rows to return; 0 means the server default (relays are always
+  // returned in full — the configured set is small).
+  uint32 limit = 2;
+  // Optional recency floor (Unix milliseconds): only blocks whose latest
+  // snapshot is at/after this instant count. Absent = all history.
+  optional int64 since_unix_millis = 3;
+}
+
+message BuilderStats {
+  // Payout address (feeRecipient), lowercase 0x-hex.
+  string fee_recipient = 1;
+  // Display name from intelligence labels; empty when unlabeled.
+  string builder_label = 2;
+  uint64 blocks_produced = 3;
+  uint64 sandwich_count = 4;
+  uint64 arb_count = 5;
+  uint64 other_mev_count = 6;
+  double mev_extracted_usd = 7;
+}
+
+message RelayStats {
+  string relay = 1;
+  uint64 blocks_delivered = 2;
+  uint64 sandwich_count = 3;
+  uint64 arb_count = 4;
+  uint64 other_mev_count = 5;
+  double mev_extracted_usd = 6;
+  // Market share (0-1) of every relay-delivered block of each MEV type.
+  double sandwich_share = 7;
+  double arb_share = 8;
+  double other_mev_share = 9;
+}
+
+message BuilderLeaderboardReply {
+  // Ranked by sandwich volume, descending.
+  repeated BuilderStats builders = 1;
+  repeated RelayStats relays = 2;
 }
