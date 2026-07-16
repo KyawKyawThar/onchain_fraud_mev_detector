@@ -17,6 +17,16 @@ scrape_configs:
         labels:
           service: detection
 
+  # Intelligence block-production consumer (§10, Sprint 11) — the builder/relay
+  # dashboard metrics: relay attributed/missed, snapshots appended, heuristic
+  # builder labels minted, incidents buffered. Host-run like detection, reached
+  # via `host.docker.internal`; port is INTELLIGENCE_METRICS_ADDR.
+  - job_name: intelligence
+    static_configs:
+      - targets: ["host.docker.internal:9108"] # INTELLIGENCE_METRICS_ADDR
+        labels:
+          service: intelligence
+
   # RabbitMQ sim.jobs work queue (§7/§20) — queue depth is the simulation
   # backpressure signal. Unlike the host-run services above, the broker runs in
   # this compose stack, so it's reachable by service name on the `backend`

@@ -58,7 +58,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, CreateRuleRequest, CreateRuleResponse)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -119,6 +119,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
+        .routes(routes!(builders))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
         .routes(routes!(create_rule))
@@ -268,6 +269,127 @@ async fn address_labels(
     Ok(Json(LabelsResponse {
         address: address_key(&address),
         labels: labels.into_iter().map(LabelResponse::from).collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildersQuery {
+    /// Chain id to rank within. Defaults to Ethereum mainnet.
+    #[serde(default = "default_chain")]
+    chain: u64,
+    /// Max builder rows; `0`/absent uses the intelligence default (relays are
+    /// always returned in full).
+    #[serde(default)]
+    limit: u32,
+    /// Optional recency floor (Unix milliseconds).
+    #[serde(default)]
+    since_unix_millis: Option<i64>,
+}
+
+fn default_chain() -> u64 {
+    Chain::ETHEREUM.id()
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct BuilderEntry {
+    /// Payout address (feeRecipient), lowercase 0x-hex.
+    fee_recipient: String,
+    /// Display name from intelligence labels; empty when unlabeled.
+    builder_label: String,
+    blocks_produced: u64,
+    sandwich_count: u64,
+    arb_count: u64,
+    other_mev_count: u64,
+    mev_extracted_usd: f64,
+}
+
+impl From<intelligence::pb::BuilderStats> for BuilderEntry {
+    fn from(s: intelligence::pb::BuilderStats) -> Self {
+        Self {
+            fee_recipient: s.fee_recipient,
+            builder_label: s.builder_label,
+            blocks_produced: s.blocks_produced,
+            sandwich_count: s.sandwich_count,
+            arb_count: s.arb_count,
+            other_mev_count: s.other_mev_count,
+            mev_extracted_usd: s.mev_extracted_usd,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct RelayEntry {
+    relay: String,
+    blocks_delivered: u64,
+    sandwich_count: u64,
+    arb_count: u64,
+    other_mev_count: u64,
+    mev_extracted_usd: f64,
+    /// Market share (0-1) of every relay-delivered block of each MEV type.
+    sandwich_share: f64,
+    arb_share: f64,
+    other_mev_share: f64,
+}
+
+impl From<intelligence::pb::RelayStats> for RelayEntry {
+    fn from(s: intelligence::pb::RelayStats) -> Self {
+        Self {
+            relay: s.relay,
+            blocks_delivered: s.blocks_delivered,
+            sandwich_count: s.sandwich_count,
+            arb_count: s.arb_count,
+            other_mev_count: s.other_mev_count,
+            mev_extracted_usd: s.mev_extracted_usd,
+            sandwich_share: s.sandwich_share,
+            arb_share: s.arb_share,
+            other_mev_share: s.other_mev_share,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct BuildersResponse {
+    chain: u64,
+    /// Builders ranked by confirmed sandwich volume, descending.
+    builders: Vec<BuilderEntry>,
+    /// Configured relays with their market share by MEV type.
+    relays: Vec<RelayEntry>,
+}
+
+/// `GET /v1/builders` — the §10 builder/relay leaderboard: top builders by
+/// confirmed sandwich volume and each relay's market share by MEV type, via
+/// intelligence's `IntelligenceRead` gRPC service (which aggregates the
+/// append-only block-production snapshots in ClickHouse).
+#[utoipa::path(
+    get,
+    path = "/v1/builders",
+    tag = "api-service",
+    params(
+        ("chain" = Option<u64>, Query, description = "Chain id (default 1 = Ethereum)"),
+        ("limit" = Option<u32>, Query, description = "Max builder rows (0 = server default)"),
+        ("since_unix_millis" = Option<i64>, Query, description = "Only blocks at/after this instant"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Builder/relay leaderboard", body = BuildersResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn builders(
+    State(state): State<AppState>,
+    Query(query): Query<BuildersQuery>,
+) -> Result<Json<BuildersResponse>, ApiError> {
+    let reply = state
+        .intelligence
+        .builder_leaderboard(query.chain, query.limit, query.since_unix_millis)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+
+    Ok(Json(BuildersResponse {
+        chain: query.chain,
+        builders: reply.builders.into_iter().map(BuilderEntry::from).collect(),
+        relays: reply.relays.into_iter().map(RelayEntry::from).collect(),
     }))
 }
 
@@ -567,6 +689,9 @@ mod tests {
             "LabelsResponse",
             "CreateRuleRequest",
             "CreateRuleResponse",
+            "BuildersResponse",
+            "BuilderEntry",
+            "RelayEntry",
         ] {
             assert!(
                 spec["components"]["schemas"].get(name).is_some(),
@@ -580,6 +705,7 @@ mod tests {
             ("/healthz", "get"),
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
+            ("/v1/builders", "get"),
             ("/v1/audit/incident/{incident_id}", "get"),
             ("/v1/incidents", "get"),
             ("/v1/rules", "post"),
@@ -589,6 +715,39 @@ mod tests {
                 "OpenAPI paths missing `{method} {path}`"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn builders_requires_a_bearer_token_and_proxies_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        // No token → rejected by the JWT gate before reaching the handler.
+        let response = router
+            .clone()
+            .oneshot(Request::get("/v1/builders").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Authenticated, but the lazy intelligence channel has no server here,
+        // so the gRPC call fails → 502 (the front door reached the handler and
+        // tried to proxy). Query params parse (defaults applied).
+        let response = router
+            .oneshot(
+                Request::get("/v1/builders?limit=5")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

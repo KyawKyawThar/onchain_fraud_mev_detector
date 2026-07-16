@@ -6,7 +6,10 @@
 use events::primitives::AccountAddress;
 use intelligence::model::address_key;
 use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
-use intelligence::pb::{Label, LabelsRequest, RiskScoreReply, RiskScoreRequest};
+use intelligence::pb::{
+    BuilderLeaderboardReply, BuilderLeaderboardRequest, Label, LabelsRequest, RiskScoreReply,
+    RiskScoreRequest,
+};
 use tonic::transport::Channel;
 use tonic::Status;
 
@@ -44,5 +47,24 @@ impl IntelligenceClient {
             })
             .await?;
         Ok(response.into_inner().labels)
+    }
+
+    /// The §10 builder/relay leaderboard: top builders by sandwich volume and
+    /// per-relay market share by MEV type.
+    pub async fn builder_leaderboard(
+        &self,
+        chain: u64,
+        limit: u32,
+        since_unix_millis: Option<i64>,
+    ) -> Result<BuilderLeaderboardReply, Status> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_builder_leaderboard(BuilderLeaderboardRequest {
+                chain,
+                limit,
+                since_unix_millis,
+            })
+            .await?;
+        Ok(response.into_inner())
     }
 }

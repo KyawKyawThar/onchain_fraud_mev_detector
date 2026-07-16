@@ -788,3 +788,40 @@ impl BlockProductionStore for RecordingProductionStore {
         Ok(())
     }
 }
+
+// ── Leaderboard double (§10, Sprint 11 t2) ───────────────────────────────────
+
+use crate::leaderboard::{Leaderboard, LeaderboardError, LeaderboardQuery, LeaderboardStore};
+
+/// [`LeaderboardStore`] double: returns a preset [`Leaderboard`] and records the
+/// last query it was asked, so a gRPC test can assert the request mapping
+/// without a live ClickHouse.
+#[derive(Default)]
+pub struct FixedLeaderboard {
+    board: Mutex<Leaderboard>,
+    last_query: Mutex<Option<LeaderboardQuery>>,
+}
+
+impl FixedLeaderboard {
+    /// A double answering with `board` for every query.
+    pub fn new(board: Leaderboard) -> Self {
+        Self {
+            board: Mutex::new(board),
+            last_query: Mutex::new(None),
+        }
+    }
+
+    /// The chain/limit/since of the most recent `leaderboard` call (for
+    /// request-mapping assertions).
+    pub fn last_query(&self) -> Option<LeaderboardQuery> {
+        self.last_query.lock().expect("leaderboard lock").clone()
+    }
+}
+
+#[async_trait]
+impl LeaderboardStore for FixedLeaderboard {
+    async fn leaderboard(&self, query: &LeaderboardQuery) -> Result<Leaderboard, LeaderboardError> {
+        *self.last_query.lock().expect("leaderboard lock") = Some(query.clone());
+        Ok(self.board.lock().expect("leaderboard lock").clone())
+    }
+}

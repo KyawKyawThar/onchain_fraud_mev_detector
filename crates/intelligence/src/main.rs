@@ -65,6 +65,7 @@ use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
 use intelligence::grpc::IntelligenceReadService;
+use intelligence::leaderboard::ClickhouseLeaderboard;
 use intelligence::merge_actor::MergeActor;
 use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
 use intelligence::production::BookCapacity;
@@ -110,7 +111,7 @@ async fn main() -> Result<()> {
         Some("risk") => address_risk(&cfg, args).await,
         Some("score") => score(&cfg).await,
         Some("reorg") => reorg_cmd(&cfg).await,
-        Some("grpc") => grpc_serve(&cfg).await,
+        Some("grpc") => grpc_serve(&cfg, client).await,
         Some("block-production") => block_production(&cfg, client).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
@@ -520,6 +521,14 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
         );
     }
 
+    // Export the §19 block-production counters (relay hit/miss, snapshots,
+    // labels minted, incidents buffered) — the data behind the builder/relay
+    // dashboard. A no-op if `INTELLIGENCE_METRICS_ADDR` is unset.
+    if let Some(addr) = cfg.metrics_addr {
+        telemetry::metrics::init(addr).context("starting the metrics exporter")?;
+        tracing::info!(%addr, "serving block-production metrics");
+    }
+
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
@@ -569,11 +578,12 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
     Ok(())
 }
 
-/// Run the `IntelligenceRead` gRPC server (§11): connect the four store seams
-/// and the Redis hot cache, then serve `GetRiskScore`/`GetLabels` until
-/// shutdown. Independently deployable from `attribute`/`score`/`reorg` — pure
-/// reads, no Kafka consumer group of its own.
-async fn grpc_serve(cfg: &Config) -> Result<()> {
+/// Run the `IntelligenceRead` gRPC server (§11): connect the four store seams,
+/// the Redis hot cache and the ClickHouse block-production reader, then serve
+/// `GetRiskScore`/`GetLabels`/`GetBuilderLeaderboard` until shutdown.
+/// Independently deployable from `attribute`/`score`/`reorg` — pure reads, no
+/// Kafka consumer group of its own.
+async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     tracing::info!(addr = %cfg.grpc_addr, "starting intelligence gRPC server");
 
     let pool = db::connect(cfg.postgres_url.expose_secret())
@@ -587,6 +597,10 @@ async fn grpc_serve(cfg: &Config) -> Result<()> {
             .context("connecting to Redis")?,
     );
 
+    // The §10 builder/relay leaderboard reads the same append-only ClickHouse
+    // `block_production` table the block-production consumer writes.
+    let leaderboard = Arc::new(ClickhouseLeaderboard::new(client));
+
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -597,7 +611,7 @@ async fn grpc_serve(cfg: &Config) -> Result<()> {
         }
     });
 
-    let service = IntelligenceReadService::new(StoreSeams::single(store), cache);
+    let service = IntelligenceReadService::new(StoreSeams::single(store), cache, leaderboard);
     tonic::transport::Server::builder()
         .add_service(IntelligenceReadServer::new(service))
         .serve_with_shutdown(cfg.grpc_addr, shutdown.cancelled())

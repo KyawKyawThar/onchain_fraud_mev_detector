@@ -29,6 +29,11 @@ pub struct Config {
     /// Address the `IntelligenceRead` gRPC server (`grpc` subcommand) binds
     /// to — read only by that run mode.
     pub grpc_addr: SocketAddr,
+    /// Optional Prometheus `/metrics` bind address (`INTELLIGENCE_METRICS_ADDR`).
+    /// `None` disables the exporter — the §19 counters (e.g. the block-
+    /// production relay hit/miss the builder/relay dashboard renders) become
+    /// no-ops. Set it in the long-running consumer run modes.
+    pub metrics_addr: Option<SocketAddr>,
     /// §10 block-production pipeline settings — read only by the
     /// `block-production` run mode.
     pub block_production: BlockProductionConfig,
@@ -111,6 +116,14 @@ impl Config {
         .parse()
         .context("INTELLIGENCE_GRPC_HOST:INTELLIGENCE_GRPC_PORT is not a valid socket address")?;
 
+        let metrics_addr = match std::env::var("INTELLIGENCE_METRICS_ADDR") {
+            Ok(raw) => Some(
+                raw.parse()
+                    .context("INTELLIGENCE_METRICS_ADDR is not a valid socket address")?,
+            ),
+            Err(_) => None,
+        };
+
         Ok(Self {
             postgres_url: SecretString::from(env("DATABASE_URL")?),
             redis: RedisConfig {
@@ -130,6 +143,7 @@ impl Config {
                 reorg_group_id: env_or("INTELLIGENCE_REORG_KAFKA_GROUP", "intelligence-reorg"),
             },
             grpc_addr,
+            metrics_addr,
             block_production: BlockProductionConfig {
                 rpc_url: match std::env::var("INTEL_ETH_RPC_URL") {
                     Ok(raw) => Some(
