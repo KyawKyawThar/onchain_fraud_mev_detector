@@ -33,7 +33,7 @@ use crate::model::{
 };
 
 /// A failure reading or writing the Postgres store. Carries the retry/skip
-/// *decision* ([`is_transient`](Self::is_transient)) so every consumer handles
+/// *decision* (its [`event_bus::Transience`] impl) so every consumer handles
 /// faults uniformly — the same contract as the simulation store and
 /// event-store.
 #[derive(Debug, thiserror::Error)]
@@ -63,13 +63,15 @@ impl StoreError {
     fn malformed(what: impl Into<String>) -> Self {
         StoreError::Malformed { what: what.into() }
     }
+}
 
+impl event_bus::Transience for StoreError {
     /// Whether retrying the same operation could plausibly succeed later. A
     /// transient fault is retried/redelivered; a permanent one (an
     /// encoding/schema/parse bug that fails identically every time) is skipped
     /// so it can't wedge the stream (§4). Postgres faults classify through the
     /// shared [`db::is_permanent`] so the decision can't drift across services.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             StoreError::Malformed { .. } => false,
             StoreError::Postgres(err) => !db::is_permanent(err),
@@ -1396,6 +1398,7 @@ impl SanctionsStore for PgIntelligenceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event_bus::Transience;
 
     /// The retry/skip contract: I/O faults retry, our-side parse/schema bugs
     /// don't — same classification the simulation store pins.

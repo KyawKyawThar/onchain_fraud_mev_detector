@@ -94,9 +94,21 @@
 //! [`cache::HotCache`] and [`risk_scorer::load_risk_inputs`]/[`risk::score`]
 //! seams the `score` consumer and `risk` CLI subcommand already use, so this
 //! surface can't drift from how those already compute the same answer.
+//!
+//! Sprint 11 t1 adds the §10 block-production pipeline: [`production`] (the
+//! `BlockProductionRecord` and its pure fold — the `tx → block` join that
+//! attributes a confirmed incident to the block that carried it),
+//! [`production_source`] (the chain full-block read and the MEV-Boost relay
+//! data APIs, behind seams), [`production_store`] (append-only ClickHouse
+//! snapshots, the read surface for the t2 builder leaderboard) and
+//! [`production_consumer`] (the five-topic Kafka consumer tying them
+//! together). Builder identity flows through `BuilderAddress` *labels* — read
+//! from, and heuristically minted into, the same [`store::LabelStore`] the
+//! rest of the service uses — never a hardcoded name table (§10).
 
 pub mod adjacency;
 pub mod attribution;
+mod bounded;
 pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
@@ -105,6 +117,10 @@ pub mod grpc;
 pub mod merge_actor;
 pub mod model;
 pub mod pb;
+pub mod production;
+pub mod production_consumer;
+pub mod production_source;
+pub mod production_store;
 pub mod reorg;
 pub mod risk;
 pub mod risk_scorer;

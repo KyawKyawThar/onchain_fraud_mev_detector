@@ -41,7 +41,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use event_bus::EventSink;
+use event_bus::{EventSink, Transience};
 use events::EventEnvelope;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;

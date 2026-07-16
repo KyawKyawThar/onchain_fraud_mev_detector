@@ -3695,6 +3695,8 @@ name = "intelligence"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
  "anyhow",
  "async-trait",
  "ch-migrate",
@@ -3712,6 +3714,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rdkafka",
  "redis",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -3728,6 +3731,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "url",
  "uuid",
 ]
 

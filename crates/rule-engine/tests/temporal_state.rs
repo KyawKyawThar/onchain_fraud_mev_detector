@@ -4,6 +4,7 @@
 //! `just test-integration`). A test passing on the double only means anything
 //! because the real store provably honours the same semantics.
 
+use event_bus::Transience;
 use std::time::Duration;
 
 use alloy_primitives::Address;

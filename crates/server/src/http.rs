@@ -23,6 +23,7 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use event_bus::EventSink;
+use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
 use events::{DomainEvent, EventEnvelope};

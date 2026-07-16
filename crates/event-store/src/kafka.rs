@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use event_bus::{run_consumer, EventHandler, Handled};
+use event_bus::{run_consumer, EventHandler, Handled, Transience};
 use events::{EventEnvelope, TOPIC_PREFIX};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::consumer::StreamConsumer;

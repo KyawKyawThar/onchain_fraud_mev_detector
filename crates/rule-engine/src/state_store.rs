@@ -40,7 +40,7 @@ pub struct StateKey {
 
 /// A failure talking to (or decoding from) the state store. Same
 /// transient-vs-permanent contract as every other store in the system
-/// (`db::is_permanent`, `CacheError`): [`is_transient`](Self::is_transient)
+/// (`db::is_permanent`, `CacheError`): its [`event_bus::Transience`] impl
 /// is what the worker branches on to decide retry vs discard.
 #[derive(Debug, thiserror::Error)]
 pub enum StateStoreError {
@@ -56,9 +56,9 @@ pub enum StateStoreError {
     Malformed { what: String },
 }
 
-impl StateStoreError {
+impl event_bus::Transience for StateStoreError {
     /// Whether retrying could plausibly succeed.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             StateStoreError::Malformed { .. } => false,
             StateStoreError::Redis(err) => !matches!(
@@ -258,6 +258,7 @@ impl TemporalStateStore for RedisTemporalStore {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
+    use event_bus::Transience;
 
     fn key(rule_byte: u128, addr_byte: u8) -> StateKey {
         StateKey {

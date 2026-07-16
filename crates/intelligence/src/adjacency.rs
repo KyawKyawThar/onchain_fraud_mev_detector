@@ -46,10 +46,10 @@ impl From<AddressKeyError> for GraphError {
     }
 }
 
-impl GraphError {
+impl event_bus::Transience for GraphError {
     /// Whether retrying could plausibly succeed — the shared retry/skip
     /// contract.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, GraphError::Clickhouse(_))
     }
 }
@@ -273,6 +273,7 @@ mod tests {
     use super::*;
     use crate::model::EdgeKind;
     use alloy_primitives::Address;
+    use event_bus::Transience;
 
     #[test]
     fn edge_row_mapping_is_total_and_lowercase() {

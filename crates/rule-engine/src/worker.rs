@@ -78,6 +78,7 @@ use crate::ctx::EventCtx;
 use crate::model::Action;
 use crate::state_store::{StateKey, StateStoreError, TemporalStateStore, TtlPolicy};
 use crate::temporal::{self, TemporalState};
+use event_bus::Transience;
 
 /// The worker partition that owns `address`'s temporal state.
 ///

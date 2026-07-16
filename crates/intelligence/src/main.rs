@@ -36,6 +36,13 @@
 //!     in (its own Kafka consumer group), attribution withdrawn and eligible
 //!     merges reversed, `AttributionRetracted`/`EntitySplit` out, until a
 //!     shutdown signal — see [`intelligence::reorg`].
+//!   - `block-production` — drive the §10 block-production consumer (Sprint 11
+//!     t1): `BlockCanonicalized`/`BlockReverted`/`DetectorTriggered`/
+//!     `IncidentCreated`/`IncidentRetracted` in (its own Kafka consumer
+//!     group), builder/relay-attributed `BlockProductionRecord` snapshots into
+//!     ClickHouse (apply the `block_production` table first via `migrate up`)
+//!     and heuristic `BuilderAddress` `LabelAdded`s out, until a shutdown
+//!     signal — see [`intelligence::production_consumer`].
 //!
 //! The label/entity-split trio above are one-shot operator actions with no Kafka consumer of
 //! their own (nothing else in this service calls `revoke_label`/
@@ -60,6 +67,10 @@ use intelligence::config::Config;
 use intelligence::grpc::IntelligenceReadService;
 use intelligence::merge_actor::MergeActor;
 use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
+use intelligence::production::BookCapacity;
+use intelligence::production_consumer::{self, ProductionConsumer};
+use intelligence::production_source::{HttpRelaySource, RpcBlockFacts};
+use intelligence::production_store::ClickhouseProductionStore;
 use intelligence::reorg::{self, ReorgConsumer};
 use intelligence::risk;
 use intelligence::risk_scorer::{self, RiskScorer};
@@ -72,7 +83,7 @@ use tracing::Instrument;
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
-                     `risk <address>`, `score`, `reorg`, `grpc`, \
+                     `risk <address>`, `score`, `reorg`, `grpc`, `block-production`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -100,6 +111,7 @@ async fn main() -> Result<()> {
         Some("score") => score(&cfg).await,
         Some("reorg") => reorg_cmd(&cfg).await,
         Some("grpc") => grpc_serve(&cfg).await,
+        Some("block-production") => block_production(&cfg, client).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -479,6 +491,81 @@ async fn reorg_cmd(cfg: &Config) -> Result<()> {
         .context("reorg consumer exited with error")?;
 
     tracing::info!("intelligence reorg-rollback consumer shut down");
+    Ok(())
+}
+
+/// Run the §10 block-production consumer (Sprint 11 t1): connect the chain
+/// RPC + relay data-API sources, the label store it reads/mints through, the
+/// ClickHouse snapshot store and the Kafka event sink, then drain the five
+/// block/incident topics until shutdown — building the builder/relay-attributed
+/// `BlockProductionRecord` per canonical block. Its own consumer group
+/// (`cfg.block_production.group_id`) — an independently deployable process,
+/// like `attribute`/`score`/`reorg`. The `block_production` ClickHouse table
+/// must be applied first (`intelligence migrate up`), the same out-of-band
+/// migration convention as the adjacency graph.
+async fn block_production(cfg: &Config, client: Client) -> Result<()> {
+    let bp = &cfg.block_production;
+    let Some(rpc_url) = bp.rpc_url.clone() else {
+        bail!("INTEL_ETH_RPC_URL is required for `block-production` (full-block reads)");
+    };
+    tracing::info!(
+        group = %bp.group_id,
+        relays = bp.relays.len(),
+        "starting intelligence block-production consumer"
+    );
+    if bp.relays.is_empty() {
+        tracing::warn!(
+            "MEV_RELAY_ENDPOINTS is empty — records will carry header facts only, \
+             no relay attribution and no heuristic builder labels"
+        );
+    }
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let labels = Arc::new(PgIntelligenceStore::new(pool));
+
+    let cache = Arc::new(
+        RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+            .await
+            .context("connecting to Redis")?,
+    );
+
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let consumer = ProductionConsumer::new(
+        Arc::new(RpcBlockFacts::new(rpc_url)),
+        Arc::new(
+            HttpRelaySource::new(bp.relays.clone(), bp.relay_timeout)
+                .context("building the relay data-API client")?,
+        ),
+        labels,
+        cache,
+        Arc::new(ClickhouseProductionStore::new(client)),
+        sink,
+        shutdown.clone(),
+        BookCapacity::default(),
+    );
+
+    let kafka_consumer = production_consumer::build_consumer(&cfg.kafka.brokers, &bp.group_id)
+        .context("building the block-production Kafka consumer")?;
+    consumer
+        .run(kafka_consumer, PUBLISH_BACKOFF, &shutdown)
+        .await
+        .context("block-production consumer exited with error")?;
+
+    tracing::info!("intelligence block-production consumer shut down");
     Ok(())
 }
 

@@ -4,6 +4,7 @@
 //! 5xx/transport faults retry with backoff up to the attempt bound, and the
 //! §12 channels log instead of speaking HTTP.
 
+use event_bus::Transience;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

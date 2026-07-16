@@ -49,7 +49,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled};
+use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience};
 use events::primitives::{AccountAddress, Chain, EntityId};
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
@@ -89,10 +89,7 @@ const RECOMPUTE_CONCURRENCY: usize = 32;
 
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
-    CONSUMED_EVENT_TYPES
-        .iter()
-        .map(|ty| events::topic_for(ty))
-        .collect()
+    events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit ties the commit to a fully
@@ -159,9 +156,9 @@ pub enum RiskScoreError {
     Task(#[from] tokio::task::JoinError),
 }
 
-impl RiskScoreError {
+impl Transience for RiskScoreError {
     /// Whether retrying the same event could plausibly succeed.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             RiskScoreError::Store(err) => err.is_transient(),
             RiskScoreError::Cache(err) => err.is_transient(),
@@ -386,7 +383,7 @@ impl RiskScorer {
         match self.process(envelope.payload, chain, at).await {
             Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
             Ok(()) => Handled::Commit,
-            Err(err) => event_bus::handled_for(err.is_transient(), err, "risk_scorer"),
+            Err(err) => event_bus::handled(err, "risk_scorer"),
         }
     }
 }

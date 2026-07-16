@@ -67,7 +67,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use event_bus::{handled_for, publish_resilient, run_consumer, EventHandler, EventSink, Handled};
+use event_bus::{
+    handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
+};
 use events::primitives::{AccountAddress, AlertId, Chain, Confidence};
 use events::rule_engine::{RuleAlertCreated, RuleTriggered};
 use events::simulation::IncidentCreated;
@@ -130,10 +132,7 @@ pub const RULE_FIRES_TOTAL: &str = "rule_fires_total";
 
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
-    CONSUMED_EVENT_TYPES
-        .iter()
-        .map(|ty| events::topic_for(ty))
-        .collect()
+    events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit ties the commit to a fully
@@ -627,7 +626,7 @@ enum EngineError {
     Rewind(#[source] crate::state_store::StateStoreError),
 }
 
-impl EngineError {
+impl Transience for EngineError {
     /// Whether retrying the same record could plausibly succeed (§4).
     /// `Stopped` never reaches this — [`EngineConsumer::verdict`] maps it to
     /// [`Handled::Stop`] first.
@@ -732,7 +731,7 @@ impl EngineConsumer {
             Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
             Ok(()) => Handled::Commit,
             Err(EngineError::Stopped) => Handled::Stop,
-            Err(err) => handled_for(err.is_transient(), err, CONSUMER),
+            Err(err) => handled(err, CONSUMER),
         }
     }
 

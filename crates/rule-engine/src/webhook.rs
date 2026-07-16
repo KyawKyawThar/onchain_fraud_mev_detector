@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::action::{ActionSink, DeliveryError, RuleAlert};
 use crate::model::Action;
+use event_bus::Transience;
 
 /// Counter (labeled by `channel` and `outcome`: `delivered` | `rejected` |
 /// `failed` | `unimplemented`): action-delivery receipts, the §19 signal for

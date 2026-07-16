@@ -65,6 +65,36 @@ pub fn all_topics() -> impl Iterator<Item = String> {
     DomainEvent::VARIANTS.iter().map(|name| topic_for(name))
 }
 
+/// The topics for a consumer's explicit, closed `event_type` list — each
+/// **validated against the schema** ([`DomainEvent::VARIANTS`]) before mapping
+/// through [`topic_for`].
+///
+/// Every consumer on the backbone declares the event types it reads as a
+/// `&[&str]` (a closed list, not a `mev.events.*` regex). The failure mode of
+/// a bare string list is silent: a typo (`"BlockCanonicalised"`) subscribes to
+/// a topic no producer writes, and the consumer just never sees data. Routing
+/// the list through here turns that drift into a **panic at subscribe time** —
+/// loud at boot and caught by any unit test that touches the consumer's
+/// `consumed_topics()`.
+///
+/// # Panics
+///
+/// If any entry is not a [`DomainEvent`] variant name.
+pub fn topics_for(event_types: &[&str]) -> Vec<String> {
+    use strum::VariantNames;
+    event_types
+        .iter()
+        .map(|ty| {
+            assert!(
+                DomainEvent::VARIANTS.contains(ty),
+                "{ty:?} is not a DomainEvent variant — the consumer's topic list \
+                 has drifted from the schema"
+            );
+            topic_for(ty)
+        })
+        .collect()
+}
+
 /// The Kafka record key an [`EventEnvelope`] is partitioned under. A closed set
 /// rather than a bare `String` so the *reason* an event is keyed the way it is
 /// stays legible at the call site and in tests: a chain key (`"1"`) and an alert
@@ -598,6 +628,17 @@ mod tests {
         // Every topic is under the namespace and round-trips through topic_for.
         assert!(topics.iter().all(|t| t.starts_with("mev.events.")));
         assert!(topics.contains(&topic_for("BlockAssembled")));
+    }
+
+    #[test]
+    fn topics_for_maps_real_event_types_and_panics_on_drift() {
+        assert_eq!(
+            topics_for(&["BlockAssembled", "IncidentCreated"]),
+            vec!["mev.events.BlockAssembled", "mev.events.IncidentCreated"]
+        );
+        // A typo'd type must fail loudly, not subscribe to a dead topic.
+        let drifted = std::panic::catch_unwind(|| topics_for(&["BlockCanonicalised"]));
+        assert!(drifted.is_err(), "misspelled event type must panic");
     }
 
     #[test]

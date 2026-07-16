@@ -306,9 +306,9 @@ pub enum SimError {
     Poison(String),
 }
 
-impl SimError {
+impl event_bus::Transience for SimError {
     /// Whether re-running the *same* job could plausibly succeed later.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, SimError::Transient(_))
     }
 }
@@ -774,6 +774,7 @@ fn severity_for(profit_eth: f64) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event_bus::Transience;
 
     /// `n` ether as wei. `10^18` fits a `u64`, so this is exact.
     fn eth(n: u64) -> U256 {

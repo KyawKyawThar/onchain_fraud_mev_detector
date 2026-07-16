@@ -29,6 +29,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
+use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, EntityId, IncidentId};
 
 use crate::adjacency::{AdjacencyStore, GraphError};
@@ -78,13 +79,13 @@ pub enum ClusterError {
     MergeActor(#[from] MergeActorError),
 }
 
-impl ClusterError {
+impl Transience for ClusterError {
     /// Whether retrying the same pass could plausibly succeed — the shared
     /// retry/skip contract every store/graph error carries. A gone merge
     /// actor means the coordinator task died with the process (or is mid
     /// shutdown); a redelivered pass against a freshly booted process gets a
     /// fresh actor, so it's transient like the rest.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             ClusterError::Graph(err) => err.is_transient(),
             ClusterError::Store(err) => err.is_transient(),

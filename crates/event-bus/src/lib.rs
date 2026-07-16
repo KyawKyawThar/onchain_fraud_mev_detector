@@ -52,12 +52,27 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// blip doesn't hot-loop the producer. Producers pass their own (tests shrink it).
 pub const PUBLISH_BACKOFF: Duration = Duration::from_secs(1);
 
+/// The workspace-wide transient-vs-permanent classification every retry/skip
+/// decision keys on (§4): *transient* means retrying the same operation could
+/// plausibly succeed (an I/O blip — broker, store, RPC); *permanent* means it
+/// fails identically on every retry (a parse/encode bug, a corrupt row).
+///
+/// One trait instead of twenty inherent `is_transient` methods so (a) a new
+/// error type can't silently drift out of the shared retry/skip contract, and
+/// (b) the consume-loop helper ([`handled`]) can take *any* classified error —
+/// a wrapper enum implements it by delegating to its children, and the
+/// compiler's exhaustiveness check keeps every future variant classified.
+pub trait Transience {
+    /// Whether retrying the same operation could plausibly succeed.
+    fn is_transient(&self) -> bool;
+}
+
 /// Why publishing one event failed. Deliberately **transport-agnostic** (the
 /// delivery detail is a `String`, not an `rdkafka` type) so the [`EventSink`]
 /// seam doesn't leak Kafka into the producer logic — the same reason
 /// [`telemetry::propagation::HeaderCarrier`] is a plain map.
 ///
-/// [`PublishError::is_transient`] is what a producer branches on to decide
+/// Its [`Transience`] classification is what a producer branches on to decide
 /// *retry* (a broker blip) vs *skip* (an encode bug that can never succeed) — see
 /// [`publish_resilient`].
 #[derive(Debug, thiserror::Error)]
@@ -73,10 +88,10 @@ pub enum PublishError {
     Encode(#[from] EventError),
 }
 
-impl PublishError {
+impl Transience for PublishError {
     /// Whether re-sending the *same* envelope could plausibly succeed later. A
     /// delivery failure is transient (broker recovers); an encode failure is not.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, PublishError::Delivery(_))
     }
 }
@@ -88,7 +103,7 @@ impl PublishError {
 pub trait EventSink: Send + Sync {
     /// Publish one envelope, returning only once it is accepted by the transport
     /// (at-least-once). An `Err` means the event is *not* on the wire; the caller
-    /// uses [`PublishError::is_transient`] to decide whether to retry it.
+    /// uses the error's [`Transience`] classification to decide whether to retry it.
     async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError>;
 }
 
@@ -222,6 +237,15 @@ pub trait EventHandler: Send + Sync {
     async fn handle(&self, envelope: EventEnvelope) -> Handled;
 }
 
+/// Map a [`Transience`]-classified error to the offset action every simple
+/// consumer on the backbone shares (§4) — the preferred entry point: the
+/// classification comes from the error's own trait impl, so a call site can't
+/// pass the wrong boolean for the type in hand. See [`handled_for`] for the
+/// raw-verdict form (composite conditions a single error type can't express).
+pub fn handled(err: impl Transience + std::fmt::Display, consumer: &str) -> Handled {
+    handled_for(err.is_transient(), err, consumer)
+}
+
 /// Map an error's transient/permanent classification to the offset action every
 /// simple consumer on the backbone shares (§4): a transient fault (a downstream
 /// store/cache/broker blip) is logged and retried, leaving the offset for
@@ -229,12 +253,13 @@ pub trait EventHandler: Send + Sync {
 /// permanent one (a parse/encoding bug that fails identically on every retry) is
 /// logged and skipped so it can't wedge the stream.
 ///
-/// Callers classify their own error type (`err.is_transient()`) and pass the
-/// verdict in; this only owns the shared "log + pick the `Handled` variant" shape,
-/// so every consumer's failure log looks the same and a consumer can't drift on
-/// the retry-vs-skip decision itself. `consumer` names the caller in the log line
-/// (mirrors [`run_consumer`]'s own `name` field) so multiple consumers in one
-/// process stay distinguishable.
+/// Callers with a [`Transience`]-implementing error should prefer [`handled`];
+/// this raw form exists for verdicts computed from more than one source. It only
+/// owns the shared "log + pick the `Handled` variant" shape, so every consumer's
+/// failure log looks the same and a consumer can't drift on the retry-vs-skip
+/// decision itself. `consumer` names the caller in the log line (mirrors
+/// [`run_consumer`]'s own `name` field) so multiple consumers in one process
+/// stay distinguishable.
 pub fn handled_for(is_transient: bool, err: impl std::fmt::Display, consumer: &str) -> Handled {
     if is_transient {
         tracing::warn!(

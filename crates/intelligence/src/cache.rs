@@ -42,9 +42,9 @@ pub enum CacheError {
     Malformed { what: String },
 }
 
-impl CacheError {
+impl event_bus::Transience for CacheError {
     /// Whether retrying could plausibly succeed. Mirrors the store contract.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             CacheError::Malformed { .. } => false,
             CacheError::Redis(err) => !matches!(
@@ -251,6 +251,7 @@ impl HotCache for RedisHotCache {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
+    use event_bus::Transience;
 
     /// The two keys per address are the whole eviction surface — pin their
     /// shape so evict() and the writers can never disagree.
