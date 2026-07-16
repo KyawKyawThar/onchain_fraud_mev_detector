@@ -30,6 +30,7 @@ use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 use tokio_util::sync::CancellationToken;
 
 use crate::command::SimulationJob;
+use event_bus::Transience;
 
 /// Default back-off between retries of a transient publish failure, so a broker
 /// blip doesn't hot-loop the dispatcher. Mirrors `event_bus::PUBLISH_BACKOFF`.
@@ -70,10 +71,10 @@ pub enum JobError {
     Encode(#[from] serde_json::Error),
 }
 
-impl JobError {
+impl event_bus::Transience for JobError {
     /// Whether re-publishing the *same* job could plausibly succeed later. A
     /// delivery failure is transient (broker recovers); an encode failure is not.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, JobError::Delivery(_))
     }
 }
@@ -85,7 +86,7 @@ impl JobError {
 pub trait JobSink: Send + Sync {
     /// Publish one command, returning only once the broker has accepted it
     /// (at-least-once). An `Err` means the job is *not* queued; the caller uses
-    /// [`JobError::is_transient`] to decide whether to retry it.
+    /// the error's [`event_bus::Transience`] classification to decide whether to retry it.
     async fn publish(&self, job: &SimulationJob) -> Result<(), JobError>;
 }
 

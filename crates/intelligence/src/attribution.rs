@@ -76,8 +76,7 @@
 //! stance the rest of the backbone takes: consumers of the event stream are
 //! expected to tolerate a redelivered fact, not the producer to suppress it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hash;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -85,7 +84,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled};
+use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience};
 use events::intelligence::{
     AttributionUpdated, EntityCreated, EntityMerged, LabelAdded, SanctionHit,
 };
@@ -96,6 +95,7 @@ use rdkafka::consumer::StreamConsumer;
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::AdjacencyStore;
+use crate::bounded::BoundedFifoMap;
 use crate::cache::{CacheError, HotCache};
 use crate::cluster::{cluster_address, ClusterError, ClusterLimits, ClusterSeams};
 use crate::merge_actor::MergeActorHandle;
@@ -162,10 +162,7 @@ pub const DEFAULT_PENDING_CAPACITY: usize = 100_000;
 
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
-    CONSUMED_EVENT_TYPES
-        .iter()
-        .map(|ty| events::topic_for(ty))
-        .collect()
+    events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) ties the
@@ -179,78 +176,6 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
         .set("auto.offset.reset", "earliest")
         .create()
         .context("creating Kafka consumer")
-}
-
-/// A `HashMap` bounded to `capacity` distinct keys, FIFO-evicting the oldest on
-/// overflow — the same bounded-memory discipline as
-/// `simulation::projection`'s `OrphanBuffer`, shared here by both maps this
-/// consumer buffers (learned alert addresses, and incidents awaiting them): an
-/// attacker (or a stalled upstream partition) flooding either one that never
-/// correlates must not grow memory without bound.
-struct BoundedFifoMap<K, V> {
-    capacity: usize,
-    what: &'static str,
-    entries: HashMap<K, V>,
-    order: VecDeque<K>,
-}
-
-impl<K: Eq + Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
-    fn new(capacity: usize, what: &'static str) -> Self {
-        Self {
-            capacity,
-            what,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    /// Insert/overwrite `key`. Evicts the oldest distinct key first if this is
-    /// a *new* key and the map is at capacity.
-    fn put(&mut self, key: K, value: V) {
-        if !self.entries.contains_key(&key) {
-            self.evict_to_fit();
-            self.order.push_back(key);
-        }
-        self.entries.insert(key, value);
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.entries.get(key)
-    }
-
-    /// Remove and return the value for `key`, if buffered.
-    fn take(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn evict_to_fit(&mut self) {
-        if self.capacity == 0 {
-            return;
-        }
-        while self.entries.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    if self.entries.remove(&oldest).is_some() {
-                        tracing::warn!(
-                            key = %oldest,
-                            capacity = self.capacity,
-                            what = self.what,
-                            "attribution consumer's bounded buffer is full; evicting the \
-                             oldest entry — check for a stalled upstream partition"
-                        );
-                        break;
-                    }
-                    // Already drained by `take`: freed a slot for free, keep popping.
-                }
-                None => break,
-            }
-        }
-    }
 }
 
 /// The pending state the consumer buffers across the two topics, behind one
@@ -289,9 +214,9 @@ pub enum AttributionError {
     Cache(#[from] CacheError),
 }
 
-impl AttributionError {
+impl Transience for AttributionError {
     /// Whether retrying the same incident could plausibly succeed.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             AttributionError::Store(err) => err.is_transient(),
             AttributionError::Cluster(err) => err.is_transient(),
@@ -642,7 +567,7 @@ impl Attributor {
     }
 
     /// Attribute, then translate the outcome into the offset action: a
-    /// transient/permanent store fault maps through [`handled_for`]; success
+    /// transient/permanent store fault maps through [`event_bus::handled`]; success
     /// checks `shutdown` the same way `Dispatcher`/`Scheduler` do — if it fired
     /// mid-publish-retry, some event above may not be on the wire, so the
     /// offset is left for redelivery rather than committed past an
@@ -657,7 +582,7 @@ impl Attributor {
         match self.attribute(incident, addresses, chain, at).await {
             Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
             Ok(()) => Handled::Commit,
-            Err(err) => event_bus::handled_for(err.is_transient(), err, "attribution"),
+            Err(err) => event_bus::handled(err, "attribution"),
         }
     }
 }
@@ -1081,28 +1006,5 @@ mod tests {
             1,
             "the deterministic label id makes the second pass a no-op"
         );
-    }
-
-    /// A `BoundedFifoMap` evicts the oldest distinct key once full, and taking
-    /// a key frees its slot without a spurious extra eviction.
-    #[test]
-    fn bounded_fifo_map_evicts_oldest_first() {
-        let mut map: BoundedFifoMap<AlertId, u8> = BoundedFifoMap::new(2, "test");
-        let a = AlertId::new();
-        let b = AlertId::new();
-        let c = AlertId::new();
-
-        map.put(a, 1);
-        map.put(b, 2);
-        assert_eq!(map.len(), 2);
-
-        map.put(c, 3);
-        assert_eq!(map.len(), 2, "still bounded");
-        assert!(map.get(&a).is_none(), "oldest evicted");
-        assert!(map.get(&b).is_some());
-        assert!(map.get(&c).is_some());
-
-        assert_eq!(map.take(&b), Some(2));
-        assert_eq!(map.len(), 1);
     }
 }

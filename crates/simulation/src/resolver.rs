@@ -47,9 +47,9 @@ pub enum ResolveError {
     Transient(String),
 }
 
-impl ResolveError {
+impl event_bus::Transience for ResolveError {
     /// Whether re-resolving the same job could plausibly succeed later.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, ResolveError::Transient(_))
     }
 }
@@ -85,6 +85,7 @@ impl JobResolver for UnresolvedJobResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event_bus::Transience;
     use events::primitives::{AlertId, AlertKind, Chain, Confidence, DetectorRef};
 
     use crate::command::{Priority, SimulationJob};

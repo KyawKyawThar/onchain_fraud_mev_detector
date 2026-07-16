@@ -215,6 +215,16 @@ intel-score:
 intel-reorg:
     cargo run -p intelligence -- reorg
 
+# ── Block-production pipeline (§10, Sprint 11 t1) ─────────────────
+# Long-running consumer: per canonical block, fetches the header + body
+# (INTEL_ETH_RPC_URL), asks the configured MEV-Boost relays who delivered it
+# (MEV_RELAY_ENDPOINTS), resolves/mints the builder's `BuilderAddress` label,
+# and appends `BlockProductionRecord` snapshots to ClickHouse (apply the table
+# first: `just intel-ch-migrate-up`). Its own Kafka consumer group
+# (INTELLIGENCE_PRODUCTION_KAFKA_GROUP) — deploy/scale independently.
+intel-block-production:
+    cargo run -p intelligence -- block-production
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

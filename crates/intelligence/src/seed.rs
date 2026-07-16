@@ -29,6 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use event_bus::Transience;
 use events::primitives::{AccountAddress, LabelId};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -469,9 +470,9 @@ pub enum ApplyError {
     Cache(#[from] CacheError),
 }
 
-impl ApplyError {
+impl Transience for ApplyError {
     /// Whether re-running the import could plausibly succeed.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             ApplyError::Store(err) => err.is_transient(),
             ApplyError::Cache(err) => err.is_transient(),

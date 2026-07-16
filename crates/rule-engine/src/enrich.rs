@@ -37,6 +37,8 @@ use intelligence::risk_scorer::load_risk_inputs;
 use intelligence::store::StoreSeams;
 
 use crate::compile::EnrichmentNeeds;
+use event_bus::Transience;
+
 use crate::ctx::Enrichment;
 
 /// A failure fetching an enrichment snapshot. Transport-agnostic (a message +
@@ -66,10 +68,12 @@ impl EnrichError {
             transient: false,
         }
     }
+}
 
+impl event_bus::Transience for EnrichError {
     /// Whether retrying the same fetch could plausibly succeed — what the
     /// consumer maps onto the shared retry/skip offset decision (§4).
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         self.transient
     }
 }

@@ -52,8 +52,8 @@ pub enum DeliveryError {
     Transport { reason: String },
 }
 
-impl DeliveryError {
-    pub fn is_transient(&self) -> bool {
+impl event_bus::Transience for DeliveryError {
+    fn is_transient(&self) -> bool {
         match self {
             DeliveryError::Rejected { .. } => false,
             DeliveryError::Transport { .. } => true,

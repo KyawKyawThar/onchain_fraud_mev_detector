@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use event_bus::{run_consumer, EventHandler, Handled};
+use event_bus::{run_consumer, EventHandler, Handled, Transience};
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
 use std::time::Duration;
@@ -64,10 +64,7 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
 
 /// The topics the projection subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
-    CONSUMED_EVENT_TYPES
-        .iter()
-        .map(|ty| events::topic_for(ty))
-        .collect()
+    events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) ties the commit to

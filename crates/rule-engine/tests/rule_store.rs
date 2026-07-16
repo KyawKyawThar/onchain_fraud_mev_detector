@@ -5,6 +5,7 @@
 //! including the §9 isolation guarantee).
 
 use chrono::{DateTime, Utc};
+use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, CustomerId, LabelKind};
 use rule_engine::model::{Action, Condition, Rule, TemporalConstraint};
 use rule_engine::store::{CreateRuleOutcome, PgRuleStore, RuleStore, StoreError};

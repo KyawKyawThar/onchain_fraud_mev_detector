@@ -21,7 +21,7 @@
 //!   through the same `clickhouse` client the event store uses.
 //!
 //! Encoding a row can't fail (the mappings are total), so a [`PersistError`] is normally an
-//! I/O fault the consumer retries. [`PersistError::is_transient`] still classifies it — a
+//! I/O fault the consumer retries. [`PersistError`]'s `Transience` impl still classifies it — a
 //! permanent Postgres fault (a decode/schema bug) is skipped rather than retried forever, so
 //! one poison event can't wedge the stream (§4) — mirroring
 //! [`event-store`'s `StoreError`](../../event-store/src/store.rs) retry-vs-skip contract.
@@ -43,7 +43,7 @@ use crate::projection::{IncidentRecord, IncidentStatus};
 /// A failure writing to (or probing) one of the stores. The variant — and, for Postgres,
 /// the specific `sqlx` error — decides whether retrying the *same* write could ever succeed,
 /// which is how the consumer chooses between "leave the offset and redeliver" and "this row
-/// is poison, skip it so it can't wedge the stream" (§4). See [`PersistError::is_transient`].
+/// is poison, skip it so it can't wedge the stream" (§4). See its [`event_bus::Transience`] impl.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     /// A Postgres round-trip failed. Usually transient (connection/pool/server), but an
@@ -58,14 +58,14 @@ pub enum PersistError {
     Clickhouse(#[from] clickhouse::error::Error),
 }
 
-impl PersistError {
+impl event_bus::Transience for PersistError {
     /// Whether retrying the same write could plausibly succeed later. A transient fault
     /// (I/O, pool, server) is redelivered; a permanent one (a programming/encoding/schema
     /// bug that will fail identically every time) is skipped so it can't wedge the stream
     /// (§4). Postgres faults classify through the shared [`db::is_permanent`] so the
     /// decision can't drift across services; same retry-vs-skip contract as
     /// [`event-store`'s `StoreError`](../../event-store/src/store.rs).
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             PersistError::Clickhouse(_) => true,
             PersistError::Postgres(err) => !db::is_permanent(err),
@@ -552,6 +552,7 @@ impl AnalyticsRow {
 mod tests {
     use super::*;
     use crate::projection::{Applied, IncidentProjection, IncidentStatus};
+    use event_bus::Transience;
     use events::primitives::{AlertKind, IncidentId, Severity};
     use events::simulation::{IncidentCreated, SimulationCompleted};
     use revm::primitives::B256;

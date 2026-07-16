@@ -57,7 +57,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled};
+use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience};
 use events::intelligence::{AttributionRetracted, EntitySplit};
 use events::primitives::Chain;
 use events::simulation::IncidentRetracted;
@@ -72,10 +72,7 @@ const CONSUMED_EVENT_TYPES: &[&str] = &["IncidentRetracted"];
 
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
-    CONSUMED_EVENT_TYPES
-        .iter()
-        .map(|ty| events::topic_for(ty))
-        .collect()
+    events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit ties the commit to a fully
@@ -104,9 +101,9 @@ pub enum ReorgError {
     Store(#[from] StoreError),
 }
 
-impl ReorgError {
+impl Transience for ReorgError {
     /// Whether retrying the same retraction could plausibly succeed.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             ReorgError::Store(err) => err.is_transient(),
         }
@@ -264,7 +261,7 @@ impl ReorgConsumer {
                 match self.process(&retracted, chain, at).await {
                     Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
                     Ok(()) => Handled::Commit,
-                    Err(err) => event_bus::handled_for(err.is_transient(), err, "reorg"),
+                    Err(err) => event_bus::handled(err, "reorg"),
                 }
             }
             other => {

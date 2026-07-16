@@ -657,3 +657,134 @@ impl AdjacencyStore for InMemoryAdjacency {
         })
     }
 }
+
+// ── Block-production doubles (§10, Sprint 11 t1) ─────────────────────────────
+
+use alloy_primitives::B256;
+
+use crate::production::{BlockProductionRecord, RelayAttribution};
+use crate::production_source::{BlockFacts, BlockFactsSource, RelaySource, SourceFault};
+use crate::production_store::{BlockProductionStore, ProductionStoreError};
+
+/// [`BlockFactsSource`] double: a fixed `block hash → facts` map, plus a
+/// transient-failure toggle for retry tests. An unmapped hash answers `None`
+/// (the "node doesn't know it yet" case).
+#[derive(Default)]
+pub struct FixedBlockFacts {
+    facts: Mutex<HashMap<B256, BlockFacts>>,
+    fail_next: Mutex<bool>,
+}
+
+impl FixedBlockFacts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, block_hash: B256, facts: BlockFacts) {
+        self.facts
+            .lock()
+            .expect("facts lock")
+            .insert(block_hash, facts);
+    }
+
+    /// Make the next `block_facts` call fail transiently (an RPC blip).
+    pub fn fail_next(&self) {
+        *self.fail_next.lock().expect("facts lock") = true;
+    }
+}
+
+#[async_trait]
+impl BlockFactsSource for FixedBlockFacts {
+    async fn block_facts(
+        &self,
+        block: events::primitives::BlockRef,
+    ) -> Result<Option<BlockFacts>, SourceFault> {
+        if std::mem::take(&mut *self.fail_next.lock().expect("facts lock")) {
+            return Err(SourceFault::Rpc("injected RPC blip".into()));
+        }
+        Ok(self
+            .facts
+            .lock()
+            .expect("facts lock")
+            .get(&block.hash)
+            .cloned())
+    }
+}
+
+/// [`RelaySource`] double: a fixed `block hash → attribution` map; an unmapped
+/// hash means no configured relay delivered it.
+#[derive(Default)]
+pub struct FixedRelaySource {
+    attributions: Mutex<HashMap<B256, RelayAttribution>>,
+}
+
+impl FixedRelaySource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, block_hash: B256, attribution: RelayAttribution) {
+        self.attributions
+            .lock()
+            .expect("relay lock")
+            .insert(block_hash, attribution);
+    }
+}
+
+#[async_trait]
+impl RelaySource for FixedRelaySource {
+    async fn attribution_for(
+        &self,
+        block: events::primitives::BlockRef,
+    ) -> Option<RelayAttribution> {
+        self.attributions
+            .lock()
+            .expect("relay lock")
+            .get(&block.hash)
+            .cloned()
+    }
+}
+
+/// [`BlockProductionStore`] double: records every appended snapshot in order,
+/// with a transient-failure toggle so tests can prove the pending-writes queue
+/// survives a failed flush.
+#[derive(Default)]
+pub struct RecordingProductionStore {
+    appended: Mutex<Vec<BlockProductionRecord>>,
+    fail_next: Mutex<bool>,
+}
+
+impl RecordingProductionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every snapshot appended so far, in append order.
+    pub fn appended(&self) -> Vec<BlockProductionRecord> {
+        self.appended.lock().expect("store lock").clone()
+    }
+
+    /// Make the next `append` call fail transiently (a ClickHouse blip).
+    pub fn fail_next(&self) {
+        *self.fail_next.lock().expect("store lock") = true;
+    }
+}
+
+#[async_trait]
+impl BlockProductionStore for RecordingProductionStore {
+    async fn append(
+        &self,
+        snapshots: &[BlockProductionRecord],
+    ) -> Result<(), ProductionStoreError> {
+        if std::mem::take(&mut *self.fail_next.lock().expect("store lock")) {
+            return Err(ProductionStoreError::Clickhouse(
+                clickhouse::error::Error::Custom("injected ClickHouse blip".into()),
+            ));
+        }
+        self.appended
+            .lock()
+            .expect("store lock")
+            .extend_from_slice(snapshots);
+        Ok(())
+    }
+}

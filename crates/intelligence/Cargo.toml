@@ -82,6 +82,17 @@ uuid = { workspace = true }
 # same stance as detection's per-detector metrics.
 metrics = { workspace = true }
 
+# The §10 block-production pipeline (Sprint 11 t1): `alloy-provider` fetches
+# each canonical block's header + full body (feeRecipient / extraData /
+# coinbase transfers) over a single HTTP endpoint — the ingestion service's
+# failover pool stays where it is, this is a low-rate per-block read;
+# `reqwest` talks to the configured MEV-Boost relay data APIs; `url` types the
+# endpoints in config.
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+
 [features]
 # Exposes `intelligence::test_util` (in-memory store/cache doubles) to this
 # crate's own integration tests and, later, to the t2–t5 consumers' tests.

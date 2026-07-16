@@ -14,7 +14,7 @@ use crate::config::ClickhouseConfig;
 
 /// A failure appending to (or probing) the store. The variant decides whether
 /// retrying the *same* input could ever succeed — the Kafka consumer uses
-/// [`StoreError::is_transient`] to choose between "back off and redeliver" and
+/// [`StoreError`]'s [`event_bus::Transience`] impl to choose between "back off and redeliver" and
 /// "this will never work, skip it".
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -29,9 +29,9 @@ pub enum StoreError {
     Clickhouse(#[from] clickhouse::error::Error),
 }
 
-impl StoreError {
+impl event_bus::Transience for StoreError {
     /// Whether retrying the same operation could plausibly succeed later.
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, StoreError::Clickhouse(_))
     }
 }

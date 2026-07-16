@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use secrecy::SecretString;
+use url::Url;
+
+use crate::production_source::RelayEndpoint;
 
 /// All runtime configuration for the intelligence service (§8, §14): the three
 /// data stores (Postgres system of record, Redis hot cache, ClickHouse
@@ -26,6 +29,29 @@ pub struct Config {
     /// Address the `IntelligenceRead` gRPC server (`grpc` subcommand) binds
     /// to — read only by that run mode.
     pub grpc_addr: SocketAddr,
+    /// §10 block-production pipeline settings — read only by the
+    /// `block-production` run mode.
+    pub block_production: BlockProductionConfig,
+}
+
+/// Settings for the `block-production` consumer (§10, Sprint 11 t1).
+#[derive(Debug, Clone)]
+pub struct BlockProductionConfig {
+    /// HTTP RPC endpoint for full-block reads (`INTEL_ETH_RPC_URL`). Optional
+    /// at parse time — required (checked) only when the `block-production`
+    /// subcommand actually runs, so every other run mode boots without it.
+    pub rpc_url: Option<Url>,
+    /// The MEV-Boost relays to ask for delivered-payload bid traces
+    /// (`MEV_RELAY_ENDPOINTS`, comma-separated `name=url` pairs; a bare URL
+    /// names itself by host). Empty is legal — the pipeline still records
+    /// header facts, with no relay attribution (§10: the relay landscape is
+    /// configuration, never code).
+    pub relays: Vec<RelayEndpoint>,
+    /// Per-relay-call ceiling — a hung relay is skipped, not waited out.
+    pub relay_timeout: Duration,
+    /// Consumer-group id for the block-production consumer — its own group
+    /// (like `attribute`/`score`/`reorg`), independently deployable.
+    pub group_id: String,
 }
 
 /// How to reach Kafka for the `attribute` and `score` consumers (Sprint 7 t4,
@@ -104,8 +130,52 @@ impl Config {
                 reorg_group_id: env_or("INTELLIGENCE_REORG_KAFKA_GROUP", "intelligence-reorg"),
             },
             grpc_addr,
+            block_production: BlockProductionConfig {
+                rpc_url: match std::env::var("INTEL_ETH_RPC_URL") {
+                    Ok(raw) => Some(
+                        raw.parse()
+                            .context("INTEL_ETH_RPC_URL is not a valid URL")?,
+                    ),
+                    Err(_) => None,
+                },
+                relays: parse_relay_endpoints(
+                    &std::env::var("MEV_RELAY_ENDPOINTS").unwrap_or_default(),
+                )?,
+                relay_timeout: Duration::from_millis(env_parse("MEV_RELAY_TIMEOUT_MS", 5_000u64)?),
+                group_id: env_or(
+                    "INTELLIGENCE_PRODUCTION_KAFKA_GROUP",
+                    "intelligence-block-production",
+                ),
+            },
         })
     }
+}
+
+/// Parse `MEV_RELAY_ENDPOINTS`: comma-separated entries, each `name=url` or a
+/// bare `url` (which names itself by its host). Empty input is an empty list;
+/// a malformed entry is a boot error, not a silently-dropped relay.
+pub fn parse_relay_endpoints(raw: &str) -> Result<Vec<RelayEndpoint>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (name, url_raw) = match entry.split_once('=') {
+                Some((name, url_raw)) => (Some(name.trim()), url_raw.trim()),
+                None => (None, entry),
+            };
+            let url: Url = url_raw
+                .parse()
+                .with_context(|| format!("MEV_RELAY_ENDPOINTS entry {entry:?}: bad URL"))?;
+            let name = match name {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                _ => url
+                    .host_str()
+                    .with_context(|| format!("MEV_RELAY_ENDPOINTS entry {entry:?}: URL has no host to name the relay by"))?
+                    .to_owned(),
+            };
+            Ok(RelayEndpoint { name, url })
+        })
+        .collect()
 }
 
 /// Read a required env var, with the variable name in the error.
@@ -133,5 +203,34 @@ where
             )
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_endpoints_parse_named_and_bare_entries() {
+        let relays = parse_relay_endpoints(
+            "flashbots=https://boost-relay.flashbots.net, https://relay.ultrasound.money",
+        )
+        .expect("well-formed");
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0].name, "flashbots");
+        assert_eq!(relays[0].url.as_str(), "https://boost-relay.flashbots.net/");
+        // A bare URL names itself by host.
+        assert_eq!(relays[1].name, "relay.ultrasound.money");
+    }
+
+    #[test]
+    fn relay_endpoints_empty_input_is_an_empty_list() {
+        assert!(parse_relay_endpoints("").expect("legal").is_empty());
+        assert!(parse_relay_endpoints(" , ").expect("legal").is_empty());
+    }
+
+    #[test]
+    fn relay_endpoints_reject_a_malformed_url() {
+        assert!(parse_relay_endpoints("flashbots=not a url").is_err());
     }
 }

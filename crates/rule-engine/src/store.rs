@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use crate::model::{InvalidRule, LogicOp, Rule};
 
 /// A failure reading or writing the rule store. Carries the retry/skip
-/// *decision* ([`is_transient`](Self::is_transient)) so every consumer handles
+/// *decision* (its [`event_bus::Transience`] impl) so every consumer handles
 /// faults uniformly — the same contract as the intelligence and simulation
 /// stores.
 #[derive(Debug, thiserror::Error)]
@@ -54,11 +54,13 @@ impl StoreError {
     fn malformed(what: impl Into<String>) -> Self {
         StoreError::Malformed { what: what.into() }
     }
+}
 
+impl event_bus::Transience for StoreError {
     /// Whether retrying the same operation could plausibly succeed later.
     /// Postgres faults classify through the shared [`db::is_permanent`] so the
     /// decision can't drift across services (§4).
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             StoreError::Invalid(_) | StoreError::Malformed { .. } => false,
             StoreError::Postgres(err) => !db::is_permanent(err),
