@@ -1,0 +1,49 @@
+[package]
+name = "usage"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Domain schema (the `UsageRecorded` contract this sink persists) + observability.
+events.workspace = true
+telemetry.workspace = true
+# Shared ClickHouse migration runner; this service binds it to its own
+# `usage_schema_migrations` table (see src/migrate.rs).
+ch-migrate = { workspace = true }
+# Shared Kafka-backbone seam (§20): the resilient at-least-once consume loop
+# (`run_consumer`/`EventHandler`), so the sink doesn't re-implement the
+# subscribe/decode/trace/commit mechanics.
+event-bus.workspace = true
+
+# Errors.
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+# Async runtime + storage + transport.
+tokio.workspace = true
+tokio-util.workspace = true
+clickhouse.workspace = true
+rdkafka.workspace = true
+
+# Secret handling (ClickHouse password out of Debug/logs).
+secrecy.workspace = true
+
+# Serialization / primitives shared with the event schema.
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Observability (§19): tracing + the `metrics` facade counters.
+tracing.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+# Real ClickHouse/Kafka in throwaway containers for the `#[ignore]` tests.
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
