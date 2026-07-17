@@ -586,6 +586,14 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
 async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     tracing::info!(addr = %cfg.grpc_addr, "starting intelligence gRPC server");
 
+    // Export the §19 read-path counters (entity graph/timeline) when a metrics
+    // address is configured — a no-op if `INTELLIGENCE_METRICS_ADDR` is unset,
+    // the same optional-exporter stance as the block-production run mode.
+    if let Some(addr) = cfg.metrics_addr {
+        telemetry::metrics::init(addr).context("starting the metrics exporter")?;
+        tracing::info!(%addr, "serving intelligence read metrics");
+    }
+
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
@@ -598,7 +606,10 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     );
 
     // The §10 builder/relay leaderboard reads the same append-only ClickHouse
-    // `block_production` table the block-production consumer writes.
+    // `block_production` table the block-production consumer writes. The
+    // entity-graph hop query (§8.2) reads the `address_adjacency` table in the
+    // same ClickHouse — the client is `Arc`-cheap to clone, so both share it.
+    let graph = Arc::new(ClickhouseAdjacency::new(client.clone()));
     let leaderboard = Arc::new(ClickhouseLeaderboard::new(client));
 
     let shutdown = CancellationToken::new();
@@ -611,7 +622,13 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
         }
     });
 
-    let service = IntelligenceReadService::new(StoreSeams::single(store), cache, leaderboard);
+    let service = IntelligenceReadService::new(
+        StoreSeams::single(store),
+        cache,
+        leaderboard,
+        graph,
+        cfg.graph_limits,
+    );
     tonic::transport::Server::builder()
         .add_service(IntelligenceReadServer::new(service))
         .serve_with_shutdown(cfg.grpc_addr, shutdown.cancelled())

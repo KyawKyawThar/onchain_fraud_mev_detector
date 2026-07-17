@@ -113,6 +113,7 @@ pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
+pub mod graph;
 pub mod grpc;
 pub mod leaderboard;
 pub mod merge_actor;
@@ -127,6 +128,7 @@ pub mod risk;
 pub mod risk_scorer;
 pub mod seed;
 pub mod store;
+pub mod timeline;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;

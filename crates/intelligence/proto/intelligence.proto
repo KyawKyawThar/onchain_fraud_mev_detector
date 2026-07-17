@@ -23,6 +23,18 @@ service IntelligenceRead {
   // ClickHouse (latest-per-block, reverted excluded) — no cache, it's an
   // analytics scan, not a hot-path lookup.
   rpc GetBuilderLeaderboard(BuilderLeaderboardRequest) returns (BuilderLeaderboardReply);
+
+  // The addresses connected to an entity, out to `hops` levels, as a
+  // degree-capped subgraph (§8.2 — critical, §11). Walks the ClickHouse
+  // adjacency store from the entity's members; a hub node (degree over the
+  // cap) is a boundary the walk stops at, never a bridge it crosses.
+  rpc GetEntityGraph(EntityGraphRequest) returns (EntityGraphReply);
+
+  // The entity's curated milestone timeline (§8.4, §11): first seen,
+  // classification/label changes, notable attributed incidents — a narrative
+  // history projected from intelligence's own stores, distinct from the
+  // incident-level audit trail.
+  rpc GetEntityTimeline(EntityTimelineRequest) returns (EntityTimelineReply);
 }
 
 message RiskScoreRequest {
@@ -102,4 +114,72 @@ message BuilderLeaderboardReply {
   // Ranked by sandwich volume, descending.
   repeated BuilderStats builders = 1;
   repeated RelayStats relays = 2;
+}
+
+message EntityGraphRequest {
+  // The entity id (UUID string).
+  string entity_id = 1;
+  // Chain id to walk within (e.g. 1 = Ethereum mainnet).
+  uint64 chain = 2;
+  // Hops out from the entity's members; 0 means the server default. Clamped to
+  // the server's hard ceiling.
+  uint32 hops = 3;
+}
+
+message GraphNode {
+  // 0x-prefixed lowercase hex address.
+  string address = 1;
+  // Distance from the nearest entity member (0 for a member).
+  uint32 hop = 2;
+  // This address is one of the entity's own members (a walk seed).
+  bool is_seed = 3;
+  // This address is a degree-capped hub — the walk stopped here (§8.2).
+  bool is_hub = 4;
+}
+
+message GraphEdge {
+  // Both endpoints, 0x-hex; `from` is the lexicographically smaller address.
+  string from = 1;
+  string to = 2;
+}
+
+message EntityGraphReply {
+  // False when the entity is unknown (the edge maps this to a 404).
+  bool found = 1;
+  // The entity's member addresses — the walk's hop-0 seeds.
+  repeated string seeds = 2;
+  repeated GraphNode nodes = 3;
+  repeated GraphEdge edges = 4;
+  // The walk stopped early — more of the graph may exist beyond these nodes.
+  bool truncated = 5;
+  // Why the walk stopped short, if it did: any of `hub_boundary` (hit a
+  // degree-capped hub), `hop_boundary` (more hops available — fetch deeper),
+  // `node_budget` (too large — narrow the query). Empty = a complete graph.
+  repeated string truncation_reasons = 6;
+}
+
+message EntityTimelineRequest {
+  // The entity id (UUID string).
+  string entity_id = 1;
+}
+
+message TimelineMilestone {
+  // Milestone kind wire string: `first_seen` | `labeled` | `incident`.
+  string kind = 1;
+  // Unix milliseconds.
+  int64 occurred_at_unix_millis = 2;
+  // The member address this milestone concerns, 0x-hex; empty when entity-level.
+  string address = 3;
+  // A one-line narrative rendering of the milestone.
+  string summary = 4;
+  // A stable reference for the audit-trail hop (incident_id / label_id); empty
+  // when none.
+  string reference = 5;
+}
+
+message EntityTimelineReply {
+  // False when the entity is unknown (the edge maps this to a 404).
+  bool found = 1;
+  // Milestones oldest first.
+  repeated TimelineMilestone milestones = 2;
 }

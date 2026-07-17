@@ -865,4 +865,27 @@ async fn adjacency_neighborhoods_are_degree_capped_and_direction_blind() {
         .expect("leaf neighborhood");
     assert_eq!(leaf.neighbors, vec![hub]);
     assert!(!leaf.capped);
+
+    // The batched read (`neighbors_many`, the entity-graph walk's hot path)
+    // must agree with looping single `neighbors` for every input — including a
+    // capped hub, a leaf, and an address with no edges at all — and return one
+    // entry per requested address.
+    let frontier = [hub, addr(1), addr(0xEE)];
+    let batched = graph
+        .neighbors_many(Chain::ETHEREUM, &frontier, 3)
+        .await
+        .expect("batched neighborhoods");
+    assert_eq!(batched.len(), frontier.len(), "one entry per input address");
+    for a in frontier {
+        let single = graph
+            .neighbors(Chain::ETHEREUM, &a, 3)
+            .await
+            .expect("single neighborhood");
+        assert_eq!(batched[&a], single, "batched disagrees with single for {a}");
+    }
+    assert!(batched[&hub].capped, "the hub is capped in the batch too");
+    assert!(
+        !batched[&addr(0xEE)].capped && batched[&addr(0xEE)].neighbors.is_empty(),
+        "an edgeless address maps to an empty, un-capped neighborhood"
+    );
 }

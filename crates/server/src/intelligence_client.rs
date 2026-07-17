@@ -7,7 +7,8 @@ use events::primitives::AccountAddress;
 use intelligence::model::address_key;
 use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
 use intelligence::pb::{
-    BuilderLeaderboardReply, BuilderLeaderboardRequest, Label, LabelsRequest, RiskScoreReply,
+    BuilderLeaderboardReply, BuilderLeaderboardRequest, EntityGraphReply, EntityGraphRequest,
+    EntityTimelineReply, EntityTimelineRequest, Label, LabelsRequest, RiskScoreReply,
     RiskScoreRequest,
 };
 use tonic::transport::Channel;
@@ -64,6 +65,37 @@ impl IntelligenceClient {
                 limit,
                 since_unix_millis,
             })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// The entity's degree-capped connected-address subgraph (§8.2/§11), out to
+    /// `hops` levels (`0` = server default).
+    pub async fn entity_graph(
+        &self,
+        entity_id: String,
+        chain: u64,
+        hops: u32,
+    ) -> Result<EntityGraphReply, Status> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_entity_graph(EntityGraphRequest {
+                entity_id,
+                chain,
+                hops,
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// The entity's curated milestone timeline (§8.4/§11).
+    pub async fn entity_timeline(
+        &self,
+        entity_id: String,
+    ) -> Result<EntityTimelineReply, Status> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_entity_timeline(EntityTimelineRequest { entity_id })
             .await?;
         Ok(response.into_inner())
     }

@@ -213,6 +213,25 @@ pub trait LabelStore: Send + Sync {
         as_of: DateTime<Utc>,
     ) -> Result<Vec<LabelRecord>, StoreError>;
 
+    /// The active labels of *many* addresses at once — the batched form of
+    /// [`labels_for`](Self::labels_for) the entity-timeline projection (§8.4/§11)
+    /// uses to read a whole entity's membership in one round-trip instead of one
+    /// query per address. Returns an entry for **every** requested address
+    /// (empty `Vec` when it has no active labels), so a caller can look each up
+    /// unconditionally. The default loops `labels_for` (correct, N round-trips);
+    /// the Postgres impl overrides it with a single `address = ANY($1)` query.
+    async fn labels_for_many(
+        &self,
+        addresses: &[AccountAddress],
+        as_of: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<AccountAddress, Vec<LabelRecord>>, StoreError> {
+        let mut out = std::collections::HashMap::with_capacity(addresses.len());
+        for address in addresses {
+            out.insert(*address, self.labels_for(address, as_of).await?);
+        }
+        Ok(out)
+    }
+
     /// Revoke a label (soft: the row is kept for audit). Returns `false` when
     /// it was already revoked or never existed — idempotent.
     async fn revoke_label(
@@ -455,7 +474,11 @@ impl PgIntelligenceStore {
 // boundary where database strings/floats become validated domain types, shared
 // by every query over that table ("parse, don't validate").
 
-/// A `labels` row as stored.
+/// A `labels` row as stored. `FromRow` (used only by the runtime-checked
+/// [`LabelStore::labels_for_many`]) maps by column name — every query that
+/// hydrates this aliases its columns to these field names; the compile-time
+/// `query_as!` sites don't use the derive.
+#[derive(sqlx::FromRow)]
 struct LabelRow {
     label_id: Uuid,
     address: String,
@@ -673,6 +696,49 @@ impl LabelStore for PgIntelligenceStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn labels_for_many(
+        &self,
+        addresses: &[AccountAddress],
+        as_of: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<AccountAddress, Vec<LabelRecord>>, StoreError> {
+        use std::collections::HashMap;
+
+        // Seed an empty vec for every requested address so the contract "one
+        // entry per input" holds even for addresses with no active labels.
+        let mut out: HashMap<AccountAddress, Vec<LabelRecord>> =
+            addresses.iter().map(|a| (*a, Vec::new())).collect();
+        if addresses.is_empty() {
+            return Ok(out);
+        }
+
+        let keys: Vec<String> = addresses.iter().map(address_key).collect();
+        // Runtime-checked (not `query_as!`): this batched query is added without
+        // regenerating the offline `.sqlx` cache, and `FromRow` maps the aliased
+        // columns to `LabelRow`. Same predicate/order as single `labels_for`.
+        let rows = sqlx::query_as::<_, LabelRow>(
+            r#"SELECT label_id, address, kind, value, confidence, source, source_detail,
+                      created_at, valid_until
+               FROM labels
+               WHERE address = ANY($1)
+                 AND revoked_at IS NULL
+                 AND created_at <= $2
+                 AND (valid_until IS NULL OR valid_until > $2)
+               ORDER BY address, created_at, label_id"#,
+        )
+        .bind(&keys)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for row in rows {
+            let record: LabelRecord = row.try_into()?;
+            // Every returned row's address is one we asked for, so the entry
+            // always exists; `or_default` is a belt for a hypothetical mismatch.
+            out.entry(record.address).or_default().push(record);
+        }
+        Ok(out)
     }
 
     async fn revoke_label(

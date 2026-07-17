@@ -37,6 +37,10 @@ pub struct Config {
     /// §10 block-production pipeline settings — read only by the
     /// `block-production` run mode.
     pub block_production: BlockProductionConfig,
+    /// Base bounds for the §8.2/§11 entity-graph hop query — read only by the
+    /// `grpc` run mode. `max_hops` here is the per-request default; the
+    /// operator-tunable knobs are `degree_cap` and `max_nodes`.
+    pub graph_limits: crate::graph::GraphLimits,
 }
 
 /// Settings for the `block-production` consumer (§10, Sprint 11 t1).
@@ -160,6 +164,17 @@ impl Config {
                     "INTELLIGENCE_PRODUCTION_KAFKA_GROUP",
                     "intelligence-block-production",
                 ),
+            },
+            graph_limits: crate::graph::GraphLimits {
+                degree_cap: env_parse(
+                    "INTELLIGENCE_GRAPH_DEGREE_CAP",
+                    crate::graph::GraphLimits::default().degree_cap,
+                )?,
+                max_nodes: env_parse(
+                    "INTELLIGENCE_GRAPH_MAX_NODES",
+                    crate::graph::GraphLimits::default().max_nodes,
+                )?,
+                max_hops: crate::graph::GraphLimits::DEFAULT_HOPS,
             },
         })
     }
