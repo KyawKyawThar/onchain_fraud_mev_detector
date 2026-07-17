@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
+use telemetry::env::{parse_or as env_parse, required as env};
 
 /// All runtime configuration for the event-store service.
 ///
@@ -113,30 +114,4 @@ fn kafka_from_env() -> Result<KafkaConfig> {
         topic_replication,
         retention_ms,
     })
-}
-
-/// Read a required env var, with the variable name in the error so a missing
-/// value is self-explanatory in the boot log.
-fn env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("missing required env var {key}"))
-}
-
-/// Read an *optional* env var parsed into `T`, falling back to `default` when
-/// unset. Unlike [`env`], a missing value is fine (these have safe defaults);
-/// only a present-but-unparseable value is an error — caught at boot, not at
-/// first use.
-fn env_parse<T>(key: &str, default: T) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match std::env::var(key) {
-        Ok(raw) => raw.parse().map_err(|err| {
-            anyhow::anyhow!(
-                "env var {key} is not a valid {}: {err}",
-                std::any::type_name::<T>()
-            )
-        }),
-        Err(_) => Ok(default),
-    }
 }

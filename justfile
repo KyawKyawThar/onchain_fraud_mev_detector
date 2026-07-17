@@ -170,6 +170,26 @@ intel-ch-migrate-info:
 intel-ping:
     cargo run -p intelligence -- ping
 
+# ── ClickHouse migrations (usage raw events, §13/§14) ────────────
+# The usage binary owns its own ClickHouse schema (migrations under
+# crates/usage/migrations). Same pattern as the three blocks above.
+
+# Apply all pending usage-events ClickHouse migrations
+usage-ch-migrate-up:
+    cargo run -p usage -- migrate up
+
+# Revert the last one (destructive — drops the usage_events table)
+usage-ch-migrate-down:
+    cargo run -p usage -- migrate down
+
+# Show usage-events ClickHouse migration status
+usage-ch-migrate-info:
+    cargo run -p usage -- migrate info
+
+# Probe the usage service's ClickHouse
+usage-ping:
+    cargo run -p usage -- ping
+
 # ── Label seeding from public feeds (§8.1, Sprint 7 t2) ──────────
 # Import a downloaded feed file. Feeds are fetched out-of-band so an import is
 # a reproducible file, not a moving URL. Re-running the same file is a no-op
@@ -275,6 +295,12 @@ run-detection-demo:
 # sim.jobs yet (Sprint 5 t3) the backlog grows — that's the §7 backpressure signal.
 run-simulation:
     cargo run -p simulation
+
+# Run the usage service (§13, Sprint 12 — metering sink, no billing). Drains
+# mev.events.UsageRecorded into the append-only ClickHouse usage_events table.
+# ClickHouse migrations apply on boot; needs ClickHouse + Kafka up (`just up`).
+run-usage:
+    cargo run -p usage
 
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:

@@ -27,7 +27,7 @@ pub mod simulation;
 pub mod system;
 
 use chrono::{DateTime, Utc};
-use primitives::{AccountAddress, AlertId, Chain, IncidentId};
+use primitives::{AccountAddress, AlertId, Chain, CustomerId, IncidentId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -115,6 +115,14 @@ pub enum PartitionKey {
     /// The simulation result path once only the incident is named:
     /// `IncidentRetracted`/`IncidentFinalized` (§7).
     Incident(IncidentId),
+    /// The metering path: `UsageRecorded` is keyed by its customer, not its
+    /// chain (§13). Usage has no cross-customer ordering need, and every §13
+    /// producer stamps the same chain today — chain-keying would funnel the
+    /// whole metering firehose onto one partition, a hard single-consumer
+    /// throughput ceiling. Per-customer keying preserves the ordering that
+    /// *is* meaningful (one customer's usage stream) while spreading load
+    /// across the topic's partitions.
+    Customer(CustomerId),
 }
 
 impl std::fmt::Display for PartitionKey {
@@ -125,6 +133,7 @@ impl std::fmt::Display for PartitionKey {
             PartitionKey::Chain(chain) => write!(f, "{}", chain.id()),
             PartitionKey::Alert(alert) => write!(f, "{alert}"),
             PartitionKey::Incident(incident) => write!(f, "{incident}"),
+            PartitionKey::Customer(customer) => write!(f, "{customer}"),
         }
     }
 }
@@ -318,9 +327,17 @@ impl DomainEvent {
         }
     }
 
-    /// The [`PartitionKey`] override for the **simulation result path** (§7), or
-    /// `None` for every event that stays chain-partitioned (§20 — see
-    /// [`EventEnvelope::partition_key`], which supplies the `Chain` default).
+    /// The [`PartitionKey`] override for events whose meaningful ordering key is
+    /// a **business key**, not their chain — or `None` for every event that
+    /// stays chain-partitioned (§20 — see [`EventEnvelope::partition_key`],
+    /// which supplies the `Chain` default). Two paths carry an override:
+    ///
+    /// **The metering path (§13).** `UsageRecorded` is keyed by its
+    /// `customer_id`: usage has no cross-customer ordering need, and every
+    /// producer stamps the same chain today, so chain-keying would funnel all
+    /// metering onto one partition (see [`PartitionKey::Customer`]).
+    ///
+    /// **The simulation result path (§7):**
     ///
     /// The confirm/retract lifecycle is keyed by its *incident business key* so a
     /// redelivered or replayed result is deduped and same-key events keep their
@@ -336,18 +353,19 @@ impl DomainEvent {
     /// reasserted at the projection, not demanded of the partition (§7).
     ///
     /// Exhaustive on purpose, like [`DomainEvent::incident_id`]: a future
-    /// result-path event must be classified here or it silently falls back to
-    /// chain-partitioning and loses its per-incident dedup key. Note
+    /// business-keyed event must be classified here or it silently falls back to
+    /// chain-partitioning and loses its dedup/ordering key. Note
     /// `SimulationRequested` is deliberately *not* here — it is the dispatcher's
     /// audit fact, not part of the confirm/retract result path, so it stays
     /// chain-keyed with the rest of the request side.
-    pub fn result_partition_key(&self) -> Option<PartitionKey> {
+    pub fn business_partition_key(&self) -> Option<PartitionKey> {
         use DomainEvent::*;
         match self {
             SimulationCompleted(e) => Some(PartitionKey::Alert(e.alert_id)),
             IncidentCreated(e) => Some(PartitionKey::Alert(e.alert_id)),
             IncidentRetracted(e) => Some(PartitionKey::Incident(e.incident_id)),
             IncidentFinalized(e) => Some(PartitionKey::Incident(e.incident_id)),
+            UsageRecorded(e) => Some(PartitionKey::Customer(e.customer_id)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -368,8 +386,7 @@ impl DomainEvent {
             | SanctionHit(_)
             | RuleCreated(_)
             | RuleTriggered(_)
-            | RuleAlertCreated(_)
-            | UsageRecorded(_) => None,
+            | RuleAlertCreated(_) => None,
         }
     }
 
@@ -476,16 +493,18 @@ impl EventEnvelope {
 
     /// The [`PartitionKey`] this envelope is published under. Simulation-result
     /// events carry their incident business key so the confirm/retract lifecycle
-    /// dedups and stays ordered per incident (§7 —
-    /// [`DomainEvent::result_partition_key`]); every other event falls back to
+    /// dedups and stays ordered per incident (§7), and `UsageRecorded` carries
+    /// its customer so metering load spreads across partitions instead of
+    /// funnelling through one chain key (§13) — see
+    /// [`DomainEvent::business_partition_key`]; every other event falls back to
     /// `chain` so a chain's events keep their order on one partition (§20).
     ///
     /// Producers derive the key from here rather than hard-coding chain, so the
-    /// §7 result-path keying and the §20 default live in one place. The wire key
+    /// business-key overrides and the §20 default live in one place. The wire key
     /// is the returned value's [`Display`](std::fmt::Display).
     pub fn partition_key(&self) -> PartitionKey {
         self.payload
-            .result_partition_key()
+            .business_partition_key()
             .unwrap_or(PartitionKey::Chain(self.chain))
     }
 
@@ -698,7 +717,7 @@ mod tests {
             confirmed: true,
         });
         assert_eq!(
-            completed.result_partition_key(),
+            completed.business_partition_key(),
             Some(PartitionKey::Alert(alert))
         );
 
@@ -714,7 +733,7 @@ mod tests {
         // Keyed by the *alert*, not the incident — co-partitioned with its
         // SimulationCompleted so the two dedup/order together.
         assert_eq!(
-            created.result_partition_key(),
+            created.business_partition_key(),
             Some(PartitionKey::Alert(alert))
         );
 
@@ -725,7 +744,7 @@ mod tests {
             reason: "block reverted".into(),
         });
         assert_eq!(
-            retracted.result_partition_key(),
+            retracted.business_partition_key(),
             Some(PartitionKey::Incident(incident))
         );
 
@@ -734,12 +753,33 @@ mod tests {
             block_hash: B256::repeat_byte(0x11),
         });
         assert_eq!(
-            finalized.result_partition_key(),
+            finalized.business_partition_key(),
             Some(PartitionKey::Incident(incident))
         );
 
         // The wire key renders to the plain id (what the producer hands Kafka).
         assert_eq!(PartitionKey::Alert(alert).to_string(), alert.to_string());
+    }
+
+    #[test]
+    fn usage_is_keyed_by_its_customer_not_its_chain() {
+        use crate::primitives::CustomerId;
+        use crate::system::UsageRecorded;
+
+        let customer = CustomerId(uuid::Uuid::from_u128(0xC0));
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::UsageRecorded(UsageRecorded {
+                customer_id: customer,
+                event_type: "api_call_made".into(),
+                quantity: 1,
+                timestamp: chrono::Utc::now(),
+            }),
+        );
+        // Per-customer ordering + partition spread (§13) — the chain stamp only
+        // fills the envelope column, it is not the wire key.
+        assert_eq!(env.partition_key(), PartitionKey::Customer(customer));
+        assert_eq!(env.partition_key().to_string(), customer.to_string());
     }
 
     #[test]
@@ -755,7 +795,7 @@ mod tests {
                 trace_available: false,
             }),
         );
-        assert_eq!(chain_env.payload.result_partition_key(), None);
+        assert_eq!(chain_env.payload.business_partition_key(), None);
         assert_eq!(
             chain_env.partition_key(),
             PartitionKey::Chain(Chain::ETHEREUM)
@@ -769,7 +809,7 @@ mod tests {
             alert_id: crate::primitives::AlertId::new(),
             evidence: serde_json::json!({}),
         });
-        assert_eq!(requested.result_partition_key(), None);
+        assert_eq!(requested.business_partition_key(), None);
     }
 
     #[test]

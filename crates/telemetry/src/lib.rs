@@ -25,6 +25,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+pub mod env;
 pub mod metrics;
 pub mod propagation;
 

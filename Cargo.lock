@@ -2645,6 +2645,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "events",
+ "metrics",
  "rdkafka",
  "telemetry",
  "thiserror 2.0.18",
@@ -7819,6 +7820,31 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "usage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ch-migrate",
+ "chrono",
+ "clickhouse",
+ "event-bus",
+ "events",
+ "metrics",
+ "rdkafka",
+ "secrecy",
+ "serde",
+ "telemetry",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

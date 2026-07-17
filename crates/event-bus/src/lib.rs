@@ -7,8 +7,9 @@
 //! [`KafkaEventSink`] is the production impl: it routes each envelope to its
 //! schema-derived topic ([`EventEnvelope::topic`]), keys it via
 //! [`EventEnvelope::partition_key`] (by chain for per-chain order, §20 — but the
-//! simulation result path by its incident business key so it dedups per incident,
-//! §7), and injects the current W3C trace context into the record headers so a
+//! simulation result path by its incident business key so it dedups per incident
+//! (§7), and usage by its customer so metering load spreads across partitions,
+//! §13), and injects the current W3C trace context into the record headers so a
 //! downstream consumer continues the same distributed trace across the broker
 //! (§19). Delivery is at-least-once: [`publish_resilient`] retries a transient
 //! broker blip until it succeeds or shutdown, and only gives up on a permanent
@@ -22,7 +23,22 @@
 //! [`EventHandler`] returning a [`Handled`] verdict; the loop owns everything else.
 //! (Detection's consumer is deliberately *not* built on this — it decodes to a
 //! domain command, hands off to a bounded channel, and commits in a separate stage
-//! to preserve per-chain ordering, a genuinely different shape.)
+//! to preserve per-chain ordering, a genuinely different shape.) High-volume
+//! sinks whose store wants few large writes use the [`batch`] variant instead —
+//! same discipline, offsets committed per flush rather than per record.
+//!
+//! Cross-cutting consumer facilities, adopted per consumer as each is touched:
+//! [`dlq`] parks unprocessable records on a per-consumer dead-letter topic
+//! instead of skip-and-forget, and [`lag`] exports the per-partition consumer
+//! lag gauge ops actually pages on (§19).
+
+/// Micro-batching consume loop: accumulate → flush → commit (for ClickHouse-
+/// style stores where every insert is an on-disk part).
+pub mod batch;
+/// Dead-letter queue: park poison/misrouted records for inspection + replay.
+pub mod dlq;
+/// Consumer-lag gauge via librdkafka statistics.
+pub mod lag;
 
 /// Shared test doubles (the recording [`EventSink`]) behind the `test-util`
 /// feature — the producer-seam counterpart to `detector-api::test_util`, so
@@ -372,8 +388,8 @@ pub async fn run_consumer(
 
 /// Decode one record into an [`EventEnvelope`], or `None` for poison (no payload or
 /// undecodable bytes — `from_json_slice` also rejects future schema versions, §2),
-/// logged so a skipped record is visible.
-fn decode(msg: &BorrowedMessage<'_>, name: &str) -> Option<EventEnvelope> {
+/// logged so a skipped record is visible. Shared with the [`batch`] loop.
+pub(crate) fn decode(msg: &BorrowedMessage<'_>, name: &str) -> Option<EventEnvelope> {
     let Some(payload) = msg.payload() else {
         tracing::error!(consumer = name, "record has no payload; skipping");
         return None;
