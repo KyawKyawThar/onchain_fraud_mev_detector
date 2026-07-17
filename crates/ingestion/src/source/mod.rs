@@ -1,18 +1,25 @@
 //! Chain data **source adapters** (§5).
 //!
 //! §5 lists three adapters in order of preference:
-//!   1. reth ExEx (in-node) — deferred to Phase 8.
+//!   1. **reth ExEx (in-node) — post-execution pipeline** — delivered as
+//!      [`exex::ExExSource`] + [`exex::run_bridge`] (Sprint 11). Push-based: it
+//!      translates each reth notification into the same [`ChainHead`] stream the
+//!      poller produces and feeds the *same* pipeline, so the
+//!      `BlockAssembled`/reorg contract is preserved (the reth crate wiring lives
+//!      in the excluded `ingestion-exex-node` crate — see that module's docs).
 //!   2. own-node IPC/WebSocket — deferred to Phase 8.
-//!   3. **RPC failover pool — health-checked, circuit-broken** — delivered here
-//!      as [`rpc::RpcFailoverPool`].
+//!   3. **RPC failover pool — health-checked, circuit-broken** — delivered as
+//!      [`rpc::RpcFailoverPool`] (Sprint 2).
 //!
 //! They share one seam, the [`ChainSource`] trait, so the rest of the ingestion
 //! service (the reorg-aware block tree, tasks 2–4) is written against the trait
-//! and the adapter is chosen by configuration — adding adapter #1/#2 later is a
-//! new `impl`, not a rewrite.
+//! and the adapter is chosen by configuration — adding adapter #2 later is a new
+//! `impl`, not a rewrite. Adapter #1 reuses the pipeline wholesale rather than
+//! re-implementing the reorg walk (see [`exex`]).
 
 pub mod circuit;
 pub mod endpoint;
+pub mod exex;
 pub mod head_stream;
 pub mod rpc;
 
@@ -71,6 +78,15 @@ pub enum SourceError {
     /// e.g. a height ahead of the node's tip, or a hash it doesn't know.
     #[error("block {0} not found")]
     BlockNotFound(String),
+
+    /// The source cannot answer *yet* — not a missing block, but a fact the
+    /// source hasn't observed at all (the in-node [`exex::ExExSource`] before its
+    /// first notification, or before the node has reported a `finalized` tag).
+    /// Distinct from [`BlockNotFound`](Self::BlockNotFound) so a caller can tell
+    /// "no such block" from "come back later"; both are non-fatal to the pipeline
+    /// (a finality tick treats either as "retry next tick").
+    #[error("source unavailable: {0}")]
+    Unavailable(&'static str),
 }
 
 /// The seam every source adapter implements (§5). Object-safe (via
@@ -98,8 +114,11 @@ pub trait ChainSource: Send + Sync {
     /// Whether this source can supply execution traces for an assembled block,
     /// carried onto [`events::chain::BlockAssembled::trace_available`] so
     /// trace-dependent detectors gate on it rather than assuming. The RPC
-    /// failover pool (adapter #3) is header-only and returns `false`; the
-    /// in-node adapters (#1/#2, Phase 8) override this once traces are wired.
+    /// failover pool (adapter #3) is header-only and returns `false`; the in-node
+    /// reth ExEx adapter ([`exex::ExExSource`], #1) *can* observe post-execution
+    /// state, but only advertises `true` once a trace-delivery seam actually backs
+    /// it ([`exex::ExExSource::advertising_traces`]) — a capability follows its
+    /// mechanism, so its header-only default is honestly `false`.
     fn traces_available(&self) -> bool {
         false
     }

@@ -3650,6 +3650,8 @@ dependencies = [
  "axum",
  "event-bus",
  "events",
+ "metrics",
+ "metrics-util",
  "serde_json",
  "telemetry",
  "thiserror 2.0.18",

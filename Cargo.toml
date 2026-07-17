@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# `ingestion-exex-node` embeds the ingestion pipeline in a reth node as an ExEx
+# (§5 adapter #1). reth's crates pin their own alloy/revm versions that clash
+# with this workspace's `alloy = "1"` pin (the same clash that defers revm's
+# `alloydb` in `simulation`), so it is kept OUT of the workspace with its own
+# Cargo.lock — the default `cargo build --workspace --all-features` (CI) never
+# resolves or compiles reth, and stays green on the pinned stable toolchain. Build
+# it from its own directory. See crates/ingestion-exex-node/README.md.
+exclude = ["crates/ingestion-exex-node"]
 
 [workspace.package]
 edition = "2021"
