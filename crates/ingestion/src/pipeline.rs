@@ -53,7 +53,7 @@ use anyhow::{Context, Result};
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
-use events::primitives::Chain;
+use events::primitives::{BlockRef, Chain};
 use events::{DomainEvent, EventEnvelope};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +78,16 @@ pub struct Pipeline {
     /// Back-off between transient publish retries. A field (not the const
     /// directly) so tests can shrink it; production uses [`PUBLISH_BACKOFF`].
     publish_backoff: Duration,
+    /// Optional **durable-progress watermark**: after a head's events are
+    /// published, the new canonical tip is reported here. A push source (the
+    /// reth ExEx) turns this into its "you may prune below N" acknowledgement, so
+    /// the node never prunes a block whose `BlockAssembled` hasn't durably shipped
+    /// — the ack trails the *publish* boundary, not the enqueue. `None` for the
+    /// pull (RPC) path, which has no such contract. See [`Pipeline::report_progress_to`].
+    progress: Option<mpsc::Sender<BlockRef>>,
+    /// The last tip reported on `progress`, to suppress duplicate acks (the tip
+    /// is unchanged across `Fork`/`Duplicate` ingests).
+    last_progress: Option<BlockRef>,
 }
 
 impl Pipeline {
@@ -101,7 +111,23 @@ impl Pipeline {
             trace_available,
             shutdown,
             publish_backoff: PUBLISH_BACKOFF,
+            progress: None,
+            last_progress: None,
         }
+    }
+
+    /// Report the canonical tip on `tx` after each ingest whose events have been
+    /// published — the **durable-progress watermark** (see the [`progress`] field).
+    ///
+    /// A push source acks pruning off this: it fires only once a head's
+    /// `RawBlockReceived`/`BlockAssembled`/canonical events have gone through the
+    /// (at-least-once) publish, so the ack can never outrun durability. Reporting
+    /// uses a non-blocking send — the watermark is monotonic, so a dropped
+    /// intermediate is superseded by the next tip and never lost.
+    ///
+    /// [`progress`]: Self::progress
+    pub fn report_progress_to(&mut self, tx: mpsc::Sender<BlockRef>) {
+        self.progress = Some(tx);
     }
 
     /// Own the pipeline in one task so the block tree has a single writer: ingest
@@ -187,7 +213,31 @@ impl Pipeline {
                 }
             }
         }
+        self.report_progress();
         Ok(())
+    }
+
+    /// Report the current canonical tip on the progress watermark, if one is
+    /// wired and the tip advanced since the last report. Called after a head's
+    /// events are published (so the ack trails durability), and deduplicated so a
+    /// `Fork`/`Duplicate` that didn't move the tip acks nothing.
+    fn report_progress(&mut self) {
+        let (Some(tx), Some(tip)) = (&self.progress, self.tree.canonical_tip()) else {
+            return;
+        };
+        let tip = tip.block_ref();
+        if self.last_progress == Some(tip) {
+            return;
+        }
+        // Non-blocking: never block ingestion on the ack. Only record the tip as
+        // reported on a successful send — if the receiver was momentarily full we
+        // leave `last_progress` untouched so the next ingest retries this tip (or
+        // supersedes it with a higher one); either way the watermark can't be lost.
+        match tx.try_send(tip) {
+            Ok(()) => self.last_progress = Some(tip),
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => self.progress = None,
+        }
     }
 
     /// Poll the source's `finalized` tag and emit a `BlockFinalized` for every
@@ -651,6 +701,52 @@ mod tests {
         assert_eq!(
             *sink.delivered.lock().unwrap(),
             vec!["RawBlockReceived", "BlockAssembled", "BlockCanonicalized"]
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_watermark_reports_the_tip_after_publish_and_dedups() {
+        let source = Arc::new(FakeSource::new(vec![]));
+        let sink = Arc::new(RecordingSink::default());
+        let (tx, mut rx) = mpsc::channel::<BlockRef>(16);
+        let mut p = pipeline(source, sink);
+        p.report_progress_to(tx);
+
+        p.ingest(head(1, 0x01, 0x00)).await.unwrap();
+        p.ingest(head(2, 0x02, 0x01)).await.unwrap();
+        // A duplicate poll doesn't move the tip, so it acks nothing.
+        p.ingest(head(2, 0x02, 0x01)).await.unwrap();
+
+        let mut acked = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            acked.push(b);
+        }
+        assert_eq!(
+            acked,
+            vec![BlockRef::new(1, b(0x01)), BlockRef::new(2, b(0x02))],
+            "watermark advances once per new canonical tip, no duplicate for the repeat poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_watermark_reports_the_new_tip_after_a_reorg() {
+        // The ack must follow the reorg's *new* canonical tip, not the orphaned one.
+        let source = Arc::new(FakeSource::new(vec![head(2, 0x12, 0x01)]));
+        let sink = Arc::new(RecordingSink::default());
+        let (tx, mut rx) = mpsc::channel::<BlockRef>(16);
+        let mut p = pipeline(source, sink);
+        p.report_progress_to(tx);
+
+        p.ingest(head(1, 0x01, 0x00)).await.unwrap();
+        p.ingest(head(2, 0x02, 0x01)).await.unwrap();
+        while rx.try_recv().is_ok() {} // drain up to the pre-reorg tip
+        p.ingest(head(3, 0x13, 0x12)).await.unwrap(); // reorg: 2' back-filled, 3' wins
+
+        let last = std::iter::from_fn(|| rx.try_recv().ok()).last();
+        assert_eq!(
+            last,
+            Some(BlockRef::new(3, b(0x13))),
+            "watermark tracks the new canonical tip after the swap"
         );
     }
 

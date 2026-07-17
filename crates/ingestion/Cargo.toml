@@ -27,6 +27,11 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+# §19 metrics facade — a near-free no-op until a binary installs the Prometheus
+# exporter (`telemetry::metrics::init`), so the library and its tests stay
+# exporter-agnostic. Used by the ExEx bridge (source::exex) to surface
+# notification/reorg/backpressure counters on the in-node path.
+metrics = { workspace = true }
 
 alloy-primitives = { workspace = true }
 alloy-provider = { workspace = true }
@@ -42,6 +47,9 @@ event-bus = { workspace = true, features = ["test-util"] }
 # failover + circuit breaking deterministically in tests/failover.rs.
 axum = { workspace = true }
 serde_json = { workspace = true }
+# Scoped in-memory metrics recorder for asserting the ExEx bridge's counters
+# without installing a global exporter (same pattern as detection's metrics test).
+metrics-util = { workspace = true }
 
 [lints]
 workspace = true

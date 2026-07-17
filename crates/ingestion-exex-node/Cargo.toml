@@ -1,0 +1,59 @@
+[package]
+name = "ingestion-exex-node"
+version = "0.1.0"
+edition = "2021"
+license = "proprietary"
+publish = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELIBERATELY EXCLUDED FROM THE WORKSPACE (see the root Cargo.toml `exclude`).
+#
+# This crate embeds the ingestion pipeline inside a reth node as an Execution
+# Extension (ExEx) — source adapter #1 of §5. reth's crates pin their own
+# alloy/revm versions, which clash with the workspace's `alloy = "1"` pin (the
+# same clash that makes `simulation` defer revm's `alloydb` backend). Keeping it
+# out of `[workspace.members]` gives it its OWN Cargo.lock, so:
+#   * the default `cargo build --workspace --all-features` (CI) never resolves or
+#     compiles reth, and stays green on the pinned stable toolchain;
+#   * the two alloy major versions coexist — this crate converts at the boundary
+#     through raw 32-byte hashes (see `block_to_head`), never by type identity.
+#
+# Build/run it separately, from this directory, with a reth-compatible toolchain:
+#   cd crates/ingestion-exex-node && cargo run --release -- node ...
+# See README.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "ingestion-exex-node"
+path = "src/main.rs"
+
+[dependencies]
+# The in-node adapter reuses the workspace ingestion crate wholesale: the
+# reorg-aware BlockTree, the Pipeline, and the reth-agnostic ExEx bridge
+# (`source::exex`). This crate only supplies the thin reth glue on top.
+ingestion = { path = "../ingestion" }
+events = { path = "../events" }
+telemetry = { path = "../telemetry" }
+event-bus = { path = "../event-bus" }
+
+# reth ExEx surface. Pin these to the SAME release as the reth node you run this
+# against — the ExEx notification/type API is not yet semver-stable across
+# releases, so a mismatch is a compile error, not a silent bug. (Git deps pinned
+# to a tag are the other common choice; see README.)
+reth = "1.8"
+reth-exex = "1.8"
+reth-node-api = "1.8"
+reth-node-ethereum = "1.8"
+
+# reth's error/async idiom. `eyre` (not this workspace's `anyhow`) because that's
+# what reth's node builder returns.
+eyre = "0.6"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+# alloy at the WORKSPACE major version — the one `events`/`ingestion` speak. reth
+# brings its own (possibly different) alloy internally; the boundary conversions
+# go through bytes so the two never have to be the same type.
+alloy-primitives = { version = "1", features = ["serde"] }
