@@ -438,7 +438,10 @@ struct GraphEdgeResponse {
 
 impl From<intelligence::pb::GraphEdge> for GraphEdgeResponse {
     fn from(e: intelligence::pb::GraphEdge) -> Self {
-        Self { from: e.from, to: e.to }
+        Self {
+            from: e.from,
+            to: e.to,
+        }
     }
 }
 
@@ -496,8 +499,16 @@ async fn entity_graph(
     Ok(Json(EntityGraphResponse {
         entity_id: entity_id.to_string(),
         seeds: reply.seeds,
-        nodes: reply.nodes.into_iter().map(GraphNodeResponse::from).collect(),
-        edges: reply.edges.into_iter().map(GraphEdgeResponse::from).collect(),
+        nodes: reply
+            .nodes
+            .into_iter()
+            .map(GraphNodeResponse::from)
+            .collect(),
+        edges: reply
+            .edges
+            .into_iter()
+            .map(GraphEdgeResponse::from)
+            .collect(),
         truncated: reply.truncated,
         truncation_reasons: reply.truncation_reasons,
     }))

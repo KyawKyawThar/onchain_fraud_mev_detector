@@ -265,7 +265,10 @@ pub async fn entity_graph(
                 // Infrastructure endpoint (§8.2): a boundary, not a recursion
                 // point. Its returned `cap` neighbors are an arbitrary subset,
                 // so surfacing them as edges would misrepresent the graph.
-                known.get_mut(address).expect("frontier node is known").is_hub = true;
+                known
+                    .get_mut(address)
+                    .expect("frontier node is known")
+                    .is_hub = true;
                 truncation.insert(TruncationReason::HubBoundary);
                 continue;
             }
@@ -361,7 +364,10 @@ mod tests {
     }
 
     /// Seed one entity owning `members` and return its id.
-    async fn seed_entity(store: &InMemoryIntelligenceStore, members: &[AccountAddress]) -> EntityId {
+    async fn seed_entity(
+        store: &InMemoryIntelligenceStore,
+        members: &[AccountAddress],
+    ) -> EntityId {
         let id = EntityId::new();
         store
             .create_entity(id, &members[0], "test", at(1))
@@ -374,7 +380,10 @@ mod tests {
     }
 
     fn node(g: &EntityGraph, a: AccountAddress) -> &GraphNode {
-        g.nodes.iter().find(|n| n.address == a).expect("node present")
+        g.nodes
+            .iter()
+            .find(|n| n.address == a)
+            .expect("node present")
     }
 
     #[tokio::test]
@@ -469,9 +478,18 @@ mod tests {
         assert_eq!(
             g.edges,
             vec![
-                GraphEdge { from: addr(1), to: addr(2) },
-                GraphEdge { from: addr(1), to: addr(3) },
-                GraphEdge { from: addr(2), to: addr(3) },
+                GraphEdge {
+                    from: addr(1),
+                    to: addr(2)
+                },
+                GraphEdge {
+                    from: addr(1),
+                    to: addr(3)
+                },
+                GraphEdge {
+                    from: addr(2),
+                    to: addr(3)
+                },
             ],
             "each undirected edge appears once, in canonical (min,max) form"
         );
@@ -611,7 +629,11 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(g.nodes.len(), 1, "only the seed — the edge is on another chain");
+        assert_eq!(
+            g.nodes.len(),
+            1,
+            "only the seed — the edge is on another chain"
+        );
         assert!(g.edges.is_empty());
     }
 
@@ -642,12 +664,18 @@ mod tests {
             assert_eq!(batched[&a], single, "mismatch for {a}");
         }
         assert!(batched[&addr(9)].capped, "the hub is capped");
-        assert!(!batched[&addr(0xFF)].capped, "an edgeless address is empty, not capped");
+        assert!(
+            !batched[&addr(0xFF)].capped,
+            "an edgeless address is empty, not capped"
+        );
     }
 
     #[test]
     fn with_hops_clamps_and_defaults() {
-        assert_eq!(GraphLimits::with_hops(0).max_hops, GraphLimits::DEFAULT_HOPS);
+        assert_eq!(
+            GraphLimits::with_hops(0).max_hops,
+            GraphLimits::DEFAULT_HOPS
+        );
         assert_eq!(GraphLimits::with_hops(2).max_hops, 2);
         assert_eq!(GraphLimits::with_hops(99).max_hops, GraphLimits::MAX_HOPS);
     }

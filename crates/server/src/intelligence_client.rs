@@ -89,10 +89,7 @@ impl IntelligenceClient {
     }
 
     /// The entity's curated milestone timeline (§8.4/§11).
-    pub async fn entity_timeline(
-        &self,
-        entity_id: String,
-    ) -> Result<EntityTimelineReply, Status> {
+    pub async fn entity_timeline(&self, entity_id: String) -> Result<EntityTimelineReply, Status> {
         let mut client = self.inner.clone();
         let response = client
             .get_entity_timeline(EntityTimelineRequest { entity_id })

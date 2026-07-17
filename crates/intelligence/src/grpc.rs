@@ -365,7 +365,11 @@ impl IntelligenceRead for IntelligenceReadService {
                 .map(|m| TimelineMilestone {
                     kind: <&'static str>::from(m.kind).to_owned(),
                     occurred_at_unix_millis: millis(m.occurred_at),
-                    address: m.address.as_ref().map(model::address_key).unwrap_or_default(),
+                    address: m
+                        .address
+                        .as_ref()
+                        .map(model::address_key)
+                        .unwrap_or_default(),
                     summary: m.summary,
                     reference: m.reference.unwrap_or_default(),
                 })

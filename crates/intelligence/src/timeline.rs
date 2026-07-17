@@ -205,7 +205,11 @@ pub async fn entity_timeline(
         })
         .collect();
 
-    Ok(Some(project_timeline(entity.created_at, &members, &incidents)))
+    Ok(Some(project_timeline(
+        entity.created_at,
+        &members,
+        &incidents,
+    )))
 }
 
 #[cfg(test)]
@@ -228,7 +232,12 @@ mod tests {
         DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
     }
 
-    fn label(address: AccountAddress, kind: LabelKind, value: &str, at: DateTime<Utc>) -> LabelRecord {
+    fn label(
+        address: AccountAddress,
+        kind: LabelKind,
+        value: &str,
+        at: DateTime<Utc>,
+    ) -> LabelRecord {
         LabelRecord::new(address, kind, value, LabelSource::ExternalFeed, "feed", at)
     }
 
@@ -269,8 +278,14 @@ mod tests {
             ]
         );
         assert_eq!(timeline[0].summary, "entity first seen");
-        assert_eq!(timeline[1].summary, "labeled known_scammer via external_feed");
-        assert_eq!(timeline[3].summary, "labeled mev_bot \"jared\" via external_feed");
+        assert_eq!(
+            timeline[1].summary,
+            "labeled known_scammer via external_feed"
+        );
+        assert_eq!(
+            timeline[3].summary,
+            "labeled mev_bot \"jared\" via external_feed"
+        );
         assert_eq!(
             timeline[2].reference.as_deref(),
             Some("00000000-0000-0000-0000-000000000009")
@@ -318,8 +333,14 @@ mod tests {
         let seams = store_seams(&store);
 
         let id = EntityId::new();
-        store.create_entity(id, &addr(1), "seed", at(10)).await.unwrap();
-        store.link_address(id, &addr(2), "link", at(20)).await.unwrap();
+        store
+            .create_entity(id, &addr(1), "seed", at(10))
+            .await
+            .unwrap();
+        store
+            .link_address(id, &addr(2), "link", at(20))
+            .await
+            .unwrap();
         store
             .add_label(&label(addr(2), LabelKind::MevBot, "bot", at(30)))
             .await
@@ -356,14 +377,23 @@ mod tests {
         let seams = store_seams(&store);
 
         let id = EntityId::new();
-        store.create_entity(id, &addr(1), "seed", at(10)).await.unwrap();
+        store
+            .create_entity(id, &addr(1), "seed", at(10))
+            .await
+            .unwrap();
         let l = label(addr(1), LabelKind::MevBot, "bot", at(30));
         store.add_label(&l).await.unwrap();
-        store.revoke_label(l.label_id, "wrong", at(40)).await.unwrap();
+        store
+            .revoke_label(l.label_id, "wrong", at(40))
+            .await
+            .unwrap();
 
         let timeline = entity_timeline(&seams, id).await.unwrap().unwrap();
         assert_eq!(
-            timeline.iter().filter(|m| m.kind == MilestoneKind::Labeled).count(),
+            timeline
+                .iter()
+                .filter(|m| m.kind == MilestoneKind::Labeled)
+                .count(),
             0,
             "a revoked label is no longer part of the current classification"
         );
