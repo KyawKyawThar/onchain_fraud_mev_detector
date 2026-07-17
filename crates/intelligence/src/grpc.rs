@@ -17,20 +17,24 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use events::primitives::AccountAddress;
+use events::primitives::{AccountAddress, Chain, EntityId};
 use tonic::{Request, Response, Status};
 
+use crate::adjacency::AdjacencyStore;
 use crate::cache::{CachedScore, HotCache};
+use crate::graph::{self, GraphLimits, GraphSeams};
 use crate::leaderboard::{self, LeaderboardQuery, LeaderboardStore, Limit};
 use crate::model::{self, LabelRecord};
 use crate::pb::intelligence_read_server::IntelligenceRead;
 use crate::pb::{
-    BuilderLeaderboardReply, BuilderLeaderboardRequest, BuilderStats, Label, LabelsReply,
-    LabelsRequest, RelayStats, RiskScoreReply, RiskScoreRequest,
+    BuilderLeaderboardReply, BuilderLeaderboardRequest, BuilderStats, EntityGraphReply,
+    EntityGraphRequest, EntityTimelineReply, EntityTimelineRequest, GraphEdge, GraphNode, Label,
+    LabelsReply, LabelsRequest, RelayStats, RiskScoreReply, RiskScoreRequest, TimelineMilestone,
 };
 use crate::risk::{self, MODEL_VERSION};
 use crate::risk_scorer;
 use crate::store::StoreSeams;
+use crate::timeline;
 
 /// The service implementation. Cheap to clone — every field is `Arc`-backed —
 /// which is what tonic requires to hand the service to each connection.
@@ -39,6 +43,11 @@ pub struct IntelligenceReadService {
     stores: StoreSeams,
     cache: Arc<dyn HotCache>,
     leaderboard: Arc<dyn LeaderboardStore>,
+    /// The ClickHouse adjacency store behind the entity-graph hop query (§8.2).
+    graph: Arc<dyn AdjacencyStore>,
+    /// Operator-tuned base bounds for the entity-graph walk; the per-request
+    /// `hops` is clamped onto these.
+    graph_limits: GraphLimits,
 }
 
 impl IntelligenceReadService {
@@ -46,14 +55,35 @@ impl IntelligenceReadService {
         stores: StoreSeams,
         cache: Arc<dyn HotCache>,
         leaderboard: Arc<dyn LeaderboardStore>,
+        graph: Arc<dyn AdjacencyStore>,
+        graph_limits: GraphLimits,
     ) -> Self {
         Self {
             stores,
             cache,
             leaderboard,
+            graph,
+            graph_limits,
         }
     }
 }
+
+// ── §19 read-path metrics ────────────────────────────────────────────────────
+// Counters + a size histogram for the two entity reads. Labelled so rates
+// (found vs. 404, truncation reasons) are derived in PromQL, not stored — the
+// same stance as the per-detector metrics design.
+
+/// Entity-graph requests, labelled `found` = `"true"`/`"false"`.
+const ENTITY_GRAPH_REQUESTS: &str = "intelligence_entity_graph_requests_total";
+/// Entity-graph walks that stopped short, labelled `reason` (one increment per
+/// distinct [`graph::TruncationReason`] hit).
+const ENTITY_GRAPH_TRUNCATIONS: &str = "intelligence_entity_graph_truncations_total";
+/// Distribution of the node count a walk returned.
+const ENTITY_GRAPH_NODES: &str = "intelligence_entity_graph_nodes";
+/// Entity-timeline requests, labelled `found` = `"true"`/`"false"`.
+const ENTITY_TIMELINE_REQUESTS: &str = "intelligence_entity_timeline_requests_total";
+/// Distribution of the milestone count a timeline returned.
+const ENTITY_TIMELINE_MILESTONES: &str = "intelligence_entity_timeline_milestones";
 
 /// Parse the wire address via the crate's canonical [`model::parse_address_key`]
 /// (the same mapping Postgres rows/Redis keys/ClickHouse columns use), mapping
@@ -61,6 +91,14 @@ impl IntelligenceReadService {
 /// failure gets.
 fn parse_address(raw: &str) -> Result<AccountAddress, Status> {
     model::parse_address_key(raw).map_err(|err| Status::invalid_argument(err.to_string()))
+}
+
+/// Parse a wire entity id (a UUID string), mapping a bad value to
+/// `INVALID_ARGUMENT` — the same boundary discipline as [`parse_address`].
+fn parse_entity_id(raw: &str) -> Result<EntityId, Status> {
+    uuid::Uuid::parse_str(raw)
+        .map(EntityId)
+        .map_err(|err| Status::invalid_argument(format!("invalid entity id: {err}")))
 }
 
 fn millis(at: DateTime<Utc>) -> i64 {
@@ -229,6 +267,115 @@ impl IntelligenceRead for IntelligenceReadService {
             relays: board.relays.into_iter().map(to_pb_relay).collect(),
         }))
     }
+
+    async fn get_entity_graph(
+        &self,
+        request: Request<EntityGraphRequest>,
+    ) -> Result<Response<EntityGraphReply>, Status> {
+        let request = request.into_inner();
+        let entity_id = parse_entity_id(&request.entity_id)?;
+        let chain = Chain(request.chain);
+        let limits = self.graph_limits.clamp_hops(request.hops);
+
+        let walked = graph::entity_graph(
+            GraphSeams {
+                graph: self.graph.clone(),
+                entities: self.stores.entities.as_ref(),
+            },
+            chain,
+            entity_id,
+            limits,
+        )
+        .await
+        .map_err(status_for)?;
+
+        let Some(g) = walked else {
+            // Unknown entity — reported as `found = false` so the edge answers
+            // a clean 404 (not an error status a retry policy would act on).
+            metrics::counter!(ENTITY_GRAPH_REQUESTS, "found" => "false").increment(1);
+            return Ok(Response::new(EntityGraphReply {
+                found: false,
+                ..Default::default()
+            }));
+        };
+
+        metrics::counter!(ENTITY_GRAPH_REQUESTS, "found" => "true").increment(1);
+        metrics::histogram!(ENTITY_GRAPH_NODES).record(g.nodes.len() as f64);
+        for reason in &g.truncation {
+            metrics::counter!(ENTITY_GRAPH_TRUNCATIONS, "reason" => <&'static str>::from(*reason))
+                .increment(1);
+        }
+
+        let truncated = g.truncated();
+        Ok(Response::new(EntityGraphReply {
+            found: true,
+            seeds: g.seeds.iter().map(model::address_key).collect(),
+            nodes: g
+                .nodes
+                .into_iter()
+                .map(|n| GraphNode {
+                    address: model::address_key(&n.address),
+                    hop: n.hop,
+                    is_seed: n.is_seed,
+                    is_hub: n.is_hub,
+                })
+                .collect(),
+            edges: g
+                .edges
+                .into_iter()
+                .map(|e| GraphEdge {
+                    from: model::address_key(&e.from),
+                    to: model::address_key(&e.to),
+                })
+                .collect(),
+            truncated,
+            truncation_reasons: g
+                .truncation
+                .iter()
+                .map(|r| <&'static str>::from(*r).to_owned())
+                .collect(),
+        }))
+    }
+
+    async fn get_entity_timeline(
+        &self,
+        request: Request<EntityTimelineRequest>,
+    ) -> Result<Response<EntityTimelineReply>, Status> {
+        let entity_id = parse_entity_id(&request.into_inner().entity_id)?;
+
+        let milestones = timeline::entity_timeline(&self.stores, entity_id)
+            .await
+            .map_err(status_for)?;
+
+        let Some(milestones) = milestones else {
+            metrics::counter!(ENTITY_TIMELINE_REQUESTS, "found" => "false").increment(1);
+            return Ok(Response::new(EntityTimelineReply {
+                found: false,
+                ..Default::default()
+            }));
+        };
+
+        metrics::counter!(ENTITY_TIMELINE_REQUESTS, "found" => "true").increment(1);
+        metrics::histogram!(ENTITY_TIMELINE_MILESTONES).record(milestones.len() as f64);
+
+        Ok(Response::new(EntityTimelineReply {
+            found: true,
+            milestones: milestones
+                .into_iter()
+                .map(|m| TimelineMilestone {
+                    kind: <&'static str>::from(m.kind).to_owned(),
+                    occurred_at_unix_millis: millis(m.occurred_at),
+                    address: m
+                        .address
+                        .as_ref()
+                        .map(model::address_key)
+                        .unwrap_or_default(),
+                    summary: m.summary,
+                    reference: m.reference.unwrap_or_default(),
+                })
+                .collect(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -240,10 +387,11 @@ mod tests {
     use super::*;
     use crate::cache::HotCache;
     use crate::leaderboard::Leaderboard;
-    use crate::model::{LabelKind, LabelRecord, LabelSource};
-    use crate::store::LabelStore;
+    use crate::model::{AdjacencyEdge, EdgeKind, LabelKind, LabelRecord, LabelSource};
+    use crate::store::{EntityStore, LabelStore};
     use crate::test_util::{
-        store_seams, FixedLeaderboard, InMemoryHotCache, InMemoryIntelligenceStore,
+        store_seams, FixedLeaderboard, InMemoryAdjacency, InMemoryHotCache,
+        InMemoryIntelligenceStore,
     };
 
     fn service() -> (
@@ -254,7 +402,14 @@ mod tests {
         let store = Arc::new(InMemoryIntelligenceStore::new());
         let cache = Arc::new(InMemoryHotCache::new());
         let leaderboard = Arc::new(FixedLeaderboard::new(Leaderboard::default()));
-        let service = IntelligenceReadService::new(store_seams(&store), cache.clone(), leaderboard);
+        let graph = Arc::new(InMemoryAdjacency::new());
+        let service = IntelligenceReadService::new(
+            store_seams(&store),
+            cache.clone(),
+            leaderboard,
+            graph,
+            GraphLimits::default(),
+        );
         (service, store, cache)
     }
 
@@ -266,8 +421,36 @@ mod tests {
         let store = Arc::new(InMemoryIntelligenceStore::new());
         let cache = Arc::new(InMemoryHotCache::new());
         let leaderboard = Arc::new(FixedLeaderboard::new(board));
-        let service = IntelligenceReadService::new(store_seams(&store), cache, leaderboard.clone());
+        let graph = Arc::new(InMemoryAdjacency::new());
+        let service = IntelligenceReadService::new(
+            store_seams(&store),
+            cache,
+            leaderboard.clone(),
+            graph,
+            GraphLimits::default(),
+        );
         (service, leaderboard)
+    }
+
+    /// A service sharing one store + one adjacency double, so an entity-graph
+    /// RPC test can seed both the membership and the edges it walks.
+    fn service_with_graph() -> (
+        IntelligenceReadService,
+        Arc<InMemoryIntelligenceStore>,
+        Arc<InMemoryAdjacency>,
+    ) {
+        let store = Arc::new(InMemoryIntelligenceStore::new());
+        let cache = Arc::new(InMemoryHotCache::new());
+        let leaderboard = Arc::new(FixedLeaderboard::new(Leaderboard::default()));
+        let graph = Arc::new(InMemoryAdjacency::new());
+        let service = IntelligenceReadService::new(
+            store_seams(&store),
+            cache,
+            leaderboard,
+            graph.clone(),
+            GraphLimits::default(),
+        );
+        (service, store, graph)
     }
 
     #[tokio::test]
@@ -458,5 +641,131 @@ mod tests {
             .unwrap();
 
         assert!(double.last_query().unwrap().since.is_none());
+    }
+
+    // ── entity graph + timeline (§8.2/§11) ───────────────────────────
+
+    /// Seed a fresh entity owning `seed` and return its id.
+    async fn seed_entity(store: &InMemoryIntelligenceStore, seed: Address) -> EntityId {
+        let id = EntityId::new();
+        store
+            .create_entity(id, &seed, "test", Utc::now())
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn entity_graph_walks_membership_and_maps_the_reply() {
+        use crate::adjacency::AdjacencyStore;
+        use chrono::DateTime;
+
+        let (service, store, graph) = service_with_graph();
+        let seed = Address::repeat_byte(0x01);
+        let neighbor = Address::repeat_byte(0x02);
+
+        let entity_id = seed_entity(&store, seed).await;
+        graph
+            .append(&[AdjacencyEdge {
+                chain: events::primitives::Chain::ETHEREUM,
+                src: seed,
+                dst: neighbor,
+                kind: EdgeKind::Interacted,
+                evidence: "0xtx".into(),
+                block_number: 1,
+                observed_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            }])
+            .await
+            .unwrap();
+
+        let reply = service
+            .get_entity_graph(Request::new(EntityGraphRequest {
+                entity_id: entity_id.to_string(),
+                chain: 1,
+                hops: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(reply.found);
+        assert_eq!(reply.seeds, vec![model::address_key(&seed)]);
+        assert_eq!(reply.nodes.len(), 2);
+        let seed_node = reply
+            .nodes
+            .iter()
+            .find(|n| n.address == model::address_key(&seed))
+            .unwrap();
+        assert!(seed_node.is_seed && seed_node.hop == 0);
+        assert_eq!(reply.edges.len(), 1);
+        assert_eq!(reply.edges[0].from, model::address_key(&seed));
+        assert_eq!(reply.edges[0].to, model::address_key(&neighbor));
+    }
+
+    #[tokio::test]
+    async fn entity_graph_unknown_entity_is_found_false() {
+        let (service, _store, _graph) = service_with_graph();
+        let reply = service
+            .get_entity_graph(Request::new(EntityGraphRequest {
+                entity_id: EntityId::new().to_string(),
+                chain: 1,
+                hops: 3,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.found);
+        assert!(reply.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn entity_timeline_projects_first_seen_and_maps_the_reply() {
+        let (service, store, _graph) = service_with_graph();
+        let seed = Address::repeat_byte(0x01);
+        let entity_id = seed_entity(&store, seed).await;
+        let label = LabelRecord::new(
+            seed,
+            LabelKind::MevBot,
+            "jared",
+            LabelSource::ExternalFeed,
+            "feed",
+            Utc::now(),
+        );
+        store.add_label(&label).await.unwrap();
+
+        let reply = service
+            .get_entity_timeline(Request::new(EntityTimelineRequest {
+                entity_id: entity_id.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(reply.found);
+        assert_eq!(reply.milestones[0].kind, "first_seen");
+        assert!(reply.milestones.iter().any(|m| m.kind == "labeled"
+            && m.address == model::address_key(&seed)
+            && m.summary.contains("mev_bot")));
+    }
+
+    #[tokio::test]
+    async fn entity_timeline_unknown_entity_is_found_false() {
+        let (service, _store, _graph) = service_with_graph();
+        let reply = service
+            .get_entity_timeline(Request::new(EntityTimelineRequest {
+                entity_id: EntityId::new().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.found);
+    }
+
+    #[test]
+    fn invalid_entity_id_is_rejected() {
+        assert_eq!(
+            parse_entity_id("not-a-uuid").unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }

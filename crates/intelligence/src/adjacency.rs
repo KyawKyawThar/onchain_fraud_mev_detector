@@ -74,6 +74,30 @@ pub trait AdjacencyStore: Send + Sync {
         cap: u32,
     ) -> Result<Neighborhood, GraphError>;
 
+    /// The degree-capped neighborhoods of *many* addresses at once — the
+    /// batched form of [`Self::neighbors`] the entity-graph walk (§8.2/§11)
+    /// uses to expand a whole BFS frontier in one round-trip instead of one
+    /// query per node. Returns exactly one [`Neighborhood`] per input address
+    /// (an address with no edges maps to an empty, un-capped neighborhood), so
+    /// the caller can look up each frontier node unconditionally.
+    ///
+    /// The default loops [`Self::neighbors`] (correct, but N round-trips) so a
+    /// double or a future backend gets a working implementation for free; the
+    /// ClickHouse impl overrides it with a single `LIMIT … BY source` query,
+    /// which is the whole point on the hot read path.
+    async fn neighbors_many(
+        &self,
+        chain: Chain,
+        addresses: &[AccountAddress],
+        cap: u32,
+    ) -> Result<std::collections::HashMap<AccountAddress, Neighborhood>, GraphError> {
+        let mut out = std::collections::HashMap::with_capacity(addresses.len());
+        for address in addresses {
+            out.insert(*address, self.neighbors(chain, address, cap).await?);
+        }
+        Ok(out)
+    }
+
     /// The exact distinct-neighbor count — the hub-ness measure (metrics,
     /// hub-labeling); the walk itself only needs [`Self::neighbors`].
     async fn degree(&self, chain: Chain, address: &AccountAddress) -> Result<u64, GraphError>;
@@ -121,6 +145,14 @@ impl EdgeRow {
             observed_at: edge.observed_at,
         }
     }
+}
+
+/// One `(source, neighbor)` pair from the batched [`ClickhouseAdjacency::neighbors_many`]
+/// read — the flat shape ClickHouse returns before it's grouped by source.
+#[derive(Debug, clickhouse::Row, Deserialize)]
+struct NeighborRow {
+    source: String,
+    neighbor: String,
 }
 
 /// Both directions of a neighborhood, as one indexed subquery: the outbound
@@ -193,6 +225,73 @@ impl AdjacencyStore for ClickhouseAdjacency {
             .map(|raw| Ok(parse_address_key(&raw)?))
             .collect::<Result<Vec<_>, GraphError>>()
             .map(|neighbors| Neighborhood { neighbors, capped })
+    }
+
+    async fn neighbors_many(
+        &self,
+        chain: Chain,
+        addresses: &[AccountAddress],
+        cap: u32,
+    ) -> Result<std::collections::HashMap<AccountAddress, Neighborhood>, GraphError> {
+        use std::collections::HashMap;
+
+        if addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Frontier addresses are canonical lowercase 0x-hex — produced by
+        // `address_key`/`parse_address_key`, never user free-text — so inlining
+        // them as an `IN (…)` list is injection-safe, exactly the stance
+        // `clustering_neighbors` takes for its kind list. The `?` binds stay
+        // reserved for `chain`. `cap + 1` per source is an integer literal (no
+        // injection surface) so "there was more" stays observable per node
+        // without a second count query, the same trick single `neighbors` uses.
+        let keys: Vec<String> = addresses.iter().map(address_key).collect();
+        let in_list = keys
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let per_source = u64::from(cap) + 1;
+        let sql = format!(
+            "SELECT source, neighbor FROM ( \
+                SELECT src AS source, dst AS neighbor FROM address_adjacency \
+                  WHERE chain = ? AND src IN ({in_list}) \
+                UNION DISTINCT \
+                SELECT dst AS source, src AS neighbor FROM address_adjacency \
+                  WHERE chain = ? AND dst IN ({in_list}) \
+             ) ORDER BY source, neighbor LIMIT {per_source} BY source"
+        );
+
+        let rows: Vec<NeighborRow> = self
+            .client
+            .query(&sql)
+            .bind(chain.id())
+            .bind(chain.id())
+            .fetch_all()
+            .await?;
+
+        // Group the flat (source, neighbor) rows by source. Order is preserved
+        // per source (the query's `ORDER BY source, neighbor`), so the cap
+        // selects a deterministic prefix.
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            grouped.entry(row.source).or_default().push(row.neighbor);
+        }
+
+        // One neighborhood per *input* address, whether or not it had any rows.
+        let mut out = HashMap::with_capacity(addresses.len());
+        for (address, key) in addresses.iter().zip(keys.iter()) {
+            let raw = grouped.remove(key).unwrap_or_default();
+            let capped = raw.len() as u64 > u64::from(cap);
+            let neighbors = raw
+                .into_iter()
+                .take(cap as usize)
+                .map(|raw| Ok(parse_address_key(&raw)?))
+                .collect::<Result<Vec<_>, GraphError>>()?;
+            out.insert(*address, Neighborhood { neighbors, capped });
+        }
+        Ok(out)
     }
 
     async fn degree(&self, chain: Chain, address: &AccountAddress) -> Result<u64, GraphError> {

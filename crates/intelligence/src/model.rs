@@ -388,7 +388,7 @@ pub struct AdjacencyEdge {
 /// returned, so a graph walk must treat it as an infrastructure endpoint and
 /// stop, not recurse — otherwise a CEX hot wallet collapses the graph into
 /// noise.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Neighborhood {
     pub neighbors: Vec<Address>,
     pub capped: bool,

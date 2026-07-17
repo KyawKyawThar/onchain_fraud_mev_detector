@@ -30,6 +30,12 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// 404 — the addressed resource doesn't exist (an unknown entity id, ...).
+    /// The caller named something real-looking but absent; the detail is safe
+    /// and useful to return.
+    #[error("{0}")]
+    NotFound(String),
+
     /// 413 — the request body exceeds a service-defined limit.
     #[error("{0}")]
     PayloadTooLarge(String),
@@ -56,6 +62,13 @@ impl ApiError {
         Self::BadRequest(message.to_string())
     }
 
+    /// 404 — the addressed resource doesn't exist. `message` names what was
+    /// missing; it's returned to the caller verbatim, so it must not leak
+    /// internals.
+    pub fn not_found(message: impl std::fmt::Display) -> Self {
+        Self::NotFound(message.to_string())
+    }
+
     /// 413 — the request exceeds a size/count limit `message` describes.
     pub fn payload_too_large(message: impl std::fmt::Display) -> Self {
         Self::PayloadTooLarge(message.to_string())
@@ -77,6 +90,7 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,6 +121,7 @@ mod tests {
     #[test]
     fn each_constructor_maps_to_its_documented_status() {
         assert_eq!(ApiError::bad_request("x").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ApiError::not_found("x").status(), StatusCode::NOT_FOUND);
         assert_eq!(
             ApiError::payload_too_large("x").status(),
             StatusCode::PAYLOAD_TOO_LARGE

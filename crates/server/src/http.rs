@@ -58,7 +58,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -120,6 +120,8 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
         .routes(routes!(builders))
+        .routes(routes!(entity_graph))
+        .routes(routes!(entity_timeline))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
         .routes(routes!(create_rule))
@@ -390,6 +392,203 @@ async fn builders(
         chain: query.chain,
         builders: reply.builders.into_iter().map(BuilderEntry::from).collect(),
         relays: reply.relays.into_iter().map(RelayEntry::from).collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityGraphQuery {
+    /// Chain id to walk within. Defaults to Ethereum mainnet.
+    #[serde(default = "default_chain")]
+    chain: u64,
+    /// Hops out from the entity's members; `0`/absent uses the intelligence
+    /// default, and the value is clamped to intelligence's hard ceiling.
+    #[serde(default)]
+    hops: u32,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct GraphNodeResponse {
+    /// 0x-prefixed lowercase hex address.
+    address: String,
+    /// Distance from the nearest entity member (0 for a member).
+    hop: u32,
+    /// This address is one of the entity's own members (a walk seed).
+    is_seed: bool,
+    /// This address is a degree-capped hub — the walk stopped here (§8.2).
+    is_hub: bool,
+}
+
+impl From<intelligence::pb::GraphNode> for GraphNodeResponse {
+    fn from(n: intelligence::pb::GraphNode) -> Self {
+        Self {
+            address: n.address,
+            hop: n.hop,
+            is_seed: n.is_seed,
+            is_hub: n.is_hub,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct GraphEdgeResponse {
+    /// Lexicographically smaller endpoint, 0x-hex.
+    from: String,
+    to: String,
+}
+
+impl From<intelligence::pb::GraphEdge> for GraphEdgeResponse {
+    fn from(e: intelligence::pb::GraphEdge) -> Self {
+        Self {
+            from: e.from,
+            to: e.to,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct EntityGraphResponse {
+    entity_id: String,
+    /// The entity's member addresses — the walk's hop-0 seeds.
+    seeds: Vec<String>,
+    nodes: Vec<GraphNodeResponse>,
+    edges: Vec<GraphEdgeResponse>,
+    /// The walk stopped early — more of the graph may exist beyond these nodes.
+    truncated: bool,
+    /// Why it stopped short (`hub_boundary` | `hop_boundary` | `node_budget`);
+    /// empty for a complete graph.
+    truncation_reasons: Vec<String>,
+}
+
+/// `GET /v1/entity/{entity_id}/graph?hops=3` — the addresses connected to an
+/// entity, out to `hops` levels, as a **degree-capped** subgraph (§8.2 —
+/// critical, §11), via intelligence's `IntelligenceRead` gRPC service (which
+/// walks the ClickHouse adjacency store, stopping at hub nodes).
+#[utoipa::path(
+    get,
+    path = "/v1/entity/{entity_id}/graph",
+    tag = "api-service",
+    params(
+        ("entity_id" = String, Path, format = Uuid, description = "Entity id"),
+        ("chain" = Option<u64>, Query, description = "Chain id (default 1 = Ethereum)"),
+        ("hops" = Option<u32>, Query, description = "Hops out from the entity's members (0 = server default)"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The entity's degree-capped connected-address subgraph", body = EntityGraphResponse),
+        (status = 400, description = "Entity id is not a valid UUID"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "No such entity"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn entity_graph(
+    State(state): State<AppState>,
+    Path(entity_id): Path<uuid::Uuid>,
+    Query(query): Query<EntityGraphQuery>,
+) -> Result<Json<EntityGraphResponse>, ApiError> {
+    let reply = state
+        .intelligence
+        .entity_graph(entity_id.to_string(), query.chain, query.hops)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+
+    if !reply.found {
+        return Err(ApiError::not_found(format!("entity {entity_id} not found")));
+    }
+
+    Ok(Json(EntityGraphResponse {
+        entity_id: entity_id.to_string(),
+        seeds: reply.seeds,
+        nodes: reply
+            .nodes
+            .into_iter()
+            .map(GraphNodeResponse::from)
+            .collect(),
+        edges: reply
+            .edges
+            .into_iter()
+            .map(GraphEdgeResponse::from)
+            .collect(),
+        truncated: reply.truncated,
+        truncation_reasons: reply.truncation_reasons,
+    }))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct TimelineMilestoneResponse {
+    /// `first_seen` | `labeled` | `incident`.
+    kind: String,
+    occurred_at_unix_millis: i64,
+    /// The member address this milestone concerns; absent when entity-level.
+    address: Option<String>,
+    /// A one-line narrative rendering of the milestone.
+    summary: String,
+    /// A stable reference for the audit-trail hop (incident_id / label_id).
+    reference: Option<String>,
+}
+
+impl From<intelligence::pb::TimelineMilestone> for TimelineMilestoneResponse {
+    fn from(m: intelligence::pb::TimelineMilestone) -> Self {
+        // The wire uses empty strings for "absent" (proto3 has no bare optional
+        // string); re-inflate them to `None` at the JSON boundary.
+        let non_empty = |s: String| if s.is_empty() { None } else { Some(s) };
+        Self {
+            kind: m.kind,
+            occurred_at_unix_millis: m.occurred_at_unix_millis,
+            address: non_empty(m.address),
+            summary: m.summary,
+            reference: non_empty(m.reference),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct EntityTimelineResponse {
+    entity_id: String,
+    /// Milestones oldest first.
+    milestones: Vec<TimelineMilestoneResponse>,
+}
+
+/// `GET /v1/entity/{entity_id}/timeline` — the entity's curated milestone
+/// history (§8.4, §11): first seen, label/classification changes, and notable
+/// attributed incidents. Entity-level and narrative, distinct from the
+/// incident-level forensic `GET /v1/audit/incident/{id}`. Projected by
+/// intelligence over its own stores.
+#[utoipa::path(
+    get,
+    path = "/v1/entity/{entity_id}/timeline",
+    tag = "api-service",
+    params(("entity_id" = String, Path, format = Uuid, description = "Entity id")),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The entity's milestone timeline", body = EntityTimelineResponse),
+        (status = 400, description = "Entity id is not a valid UUID"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "No such entity"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn entity_timeline(
+    State(state): State<AppState>,
+    Path(entity_id): Path<uuid::Uuid>,
+) -> Result<Json<EntityTimelineResponse>, ApiError> {
+    let reply = state
+        .intelligence
+        .entity_timeline(entity_id.to_string())
+        .await
+        .map_err(ApiError::bad_gateway)?;
+
+    if !reply.found {
+        return Err(ApiError::not_found(format!("entity {entity_id} not found")));
+    }
+
+    Ok(Json(EntityTimelineResponse {
+        entity_id: entity_id.to_string(),
+        milestones: reply
+            .milestones
+            .into_iter()
+            .map(TimelineMilestoneResponse::from)
+            .collect(),
     }))
 }
 
@@ -692,6 +891,11 @@ mod tests {
             "BuildersResponse",
             "BuilderEntry",
             "RelayEntry",
+            "EntityGraphResponse",
+            "GraphNodeResponse",
+            "GraphEdgeResponse",
+            "EntityTimelineResponse",
+            "TimelineMilestoneResponse",
         ] {
             assert!(
                 spec["components"]["schemas"].get(name).is_some(),
@@ -706,6 +910,8 @@ mod tests {
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
             ("/v1/builders", "get"),
+            ("/v1/entity/{entity_id}/graph", "get"),
+            ("/v1/entity/{entity_id}/timeline", "get"),
             ("/v1/audit/incident/{incident_id}", "get"),
             ("/v1/incidents", "get"),
             ("/v1/rules", "post"),
@@ -748,6 +954,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn entity_graph_and_timeline_are_bearer_gated_and_proxy_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let entity = uuid::Uuid::new_v4();
+
+        for path in [
+            format!("/v1/entity/{entity}/graph?hops=2"),
+            format!("/v1/entity/{entity}/timeline"),
+        ] {
+            // No token → rejected by the JWT gate before the handler.
+            let response = router
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // Authenticated, but the lazy intelligence channel has no server
+            // here, so the gRPC call fails → 502 (reached the handler, tried to
+            // proxy). This also proves the UUID path + query params parse.
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header(header::AUTHORIZATION, &bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+        }
+
+        // A non-UUID entity id is a 400 from axum's path parsing, before any
+        // upstream call.
+        let response = router
+            .oneshot(
+                Request::get("/v1/entity/not-a-uuid/timeline")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
