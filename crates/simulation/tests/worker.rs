@@ -166,8 +166,10 @@ async fn a_worker_runs_a_job_and_acks_it_off_the_queue() {
     );
     delivery.settle(Disposition::Ack).await.expect("ack");
 
-    // The result (SimulationCompleted; not confirmed at a 1 ETH bar) was published.
-    assert_eq!(events.events().len(), 1);
+    // The result (SimulationCompleted; not confirmed at a 1 ETH bar) was published
+    // — filtering out the `SimulationRun` usage fact (§13) that rides the same
+    // sink alongside it (see `RecordingSink::non_usage_events`).
+    assert_eq!(events.non_usage_events().len(), 1);
 
     // Drop the consumer so its prefetch can't hold the (already-acked) message, then
     // confirm the queue is empty.
