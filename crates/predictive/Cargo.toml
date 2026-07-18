@@ -1,0 +1,69 @@
+[package]
+name = "predictive"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Predictive pipeline service (§16, Sprint 13 t1) — a separate binary on a
+# different latency regime (target < block time) from the block-based
+# fast/slow paths: `MempoolSource → decode → predict-engine →
+# PredictedAlert`. Deliberately its own crate so it deploys and scales
+# independently of `detection` (§16 — separate deployment, not a shared
+# process).
+
+[[bin]]
+name = "predictive"
+path = "src/main.rs"
+
+[dependencies]
+events = { workspace = true }
+# Shared publish seam (§20) — ships `PredictedAlert` through the same
+# `EventSink`/`publish_resilient` every other producer uses.
+event-bus = { workspace = true }
+telemetry = { workspace = true }
+# Reuses `TxActions`/`Swap`/`TokenTransfer` — the decoded-action shapes
+# `detection` already models — rather than inventing a parallel set.
+detector-api = { workspace = true }
+# gRPC client into intelligence's `IntelligenceRead.GetLabels` (§8, §16) —
+# reuses the generated `pb` client stub straight from that crate, the same
+# way `server`'s `intelligence_client` does, so the wire contract can't drift.
+intelligence = { workspace = true }
+tonic = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+alloy-primitives = { workspace = true }
+# `join_all` — predict-engine fans its per-counterparty label lookups out
+# concurrently rather than one `.await` at a time (§16, §17 sub-block
+# latency budget).
+futures-util = { workspace = true }
+
+# Mempool source (§16): `RootProvider::watch_full_pending_transactions`
+# polls `eth_getFilterChanges` over the workspace's existing HTTP-only
+# `alloy-provider` build — no websocket transport feature needed.
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-transport = { workspace = true }
+# `Transaction`/`TransactionResponse` trait accessors for reading a streamed
+# pending tx's `to`/`input`/`value`/`from`/`tx_hash` (see root Cargo.toml).
+alloy-consensus = { workspace = true }
+alloy-network-primitives = { workspace = true }
+url = { workspace = true }
+
+# Concurrency model (§17): bounded `mpsc` channels between the mempool
+# source and the decode/predict/publish stage, a `CancellationToken` for
+# graceful shutdown — mirrors `ingestion`/`detection`.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+event-bus = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

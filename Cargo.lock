@@ -4986,6 +4986,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "predictive"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network-primitives",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-transport",
+ "anyhow",
+ "async-trait",
+ "detector-api",
+ "event-bus",
+ "events",
+ "futures-util",
+ "intelligence",
+ "metrics",
+ "serde",
+ "serde_json",
+ "telemetry",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"

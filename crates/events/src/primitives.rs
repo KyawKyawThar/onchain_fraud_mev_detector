@@ -174,6 +174,12 @@ id_newtype!(
     AlertId
 );
 id_newtype!(
+    /// Predictive-pipeline forecast id, minted by the predictive service (§16).
+    /// Distinct from [`AlertId`] — a prediction is a forecast, never
+    /// sim-confirmed, so it never becomes an incident.
+    PredictionId
+);
+id_newtype!(
     /// Confirmed incident id, minted by the simulation service (§7).
     IncidentId
 );

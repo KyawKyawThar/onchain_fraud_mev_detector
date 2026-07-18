@@ -21,6 +21,7 @@
 pub mod chain;
 pub mod detection;
 pub mod intelligence;
+pub mod predictive;
 pub mod primitives;
 pub mod rule_engine;
 pub mod simulation;
@@ -214,6 +215,9 @@ pub enum DomainEvent {
 
     // System (§13)
     UsageRecorded(system::UsageRecorded),
+
+    // Predictive (§16)
+    PredictedAlert(predictive::PredictedAlert),
 }
 
 /// Which service domain an event belongs to. Used for coarse routing/metrics;
@@ -232,6 +236,7 @@ pub enum EventFamily {
     Intelligence,
     RuleEngine,
     System,
+    Predictive,
 }
 
 impl EventFamily {
@@ -282,6 +287,7 @@ impl DomainEvent {
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
             UsageRecorded(_) => EventFamily::System,
+            PredictedAlert(_) => EventFamily::Predictive,
         }
     }
 
@@ -323,7 +329,8 @@ impl DomainEvent {
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
-            | UsageRecorded(_) => None,
+            | UsageRecorded(_)
+            | PredictedAlert(_) => None,
         }
     }
 
@@ -390,7 +397,8 @@ impl DomainEvent {
             | SanctionHit(_)
             | RuleCreated(_)
             | RuleTriggered(_)
-            | RuleAlertCreated(_) => None,
+            | RuleAlertCreated(_)
+            | PredictedAlert(_) => None,
         }
     }
 
@@ -407,6 +415,7 @@ impl DomainEvent {
         use DomainEvent::*;
         match self {
             PreliminaryAlertCreated(e) => e.addresses.clone(),
+            PredictedAlert(e) => e.addresses.clone(),
             LabelAdded(e) => vec![e.address],
             LabelUpdated(e) => vec![e.address],
             LabelRevoked(e) => vec![e.address],

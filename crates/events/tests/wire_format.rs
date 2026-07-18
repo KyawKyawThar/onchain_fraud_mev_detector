@@ -36,9 +36,10 @@ use events::intelligence::{
     AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
     LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
+use events::predictive::PredictedAlert;
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
-    EntityId, IncidentId, LabelId, RuleId, Severity,
+    EntityId, IncidentId, LabelId, PredictionId, RuleId, Severity,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -100,6 +101,10 @@ fn rule_id() -> RuleId {
 
 fn customer_id() -> CustomerId {
     CustomerId(uuid::Uuid::from_u128(0xC0))
+}
+
+fn prediction_id() -> PredictionId {
+    PredictionId(uuid::Uuid::from_u128(0xF1))
 }
 
 /// One representative value for every [`DomainEvent`] variant. The exhaustiveness
@@ -255,6 +260,15 @@ fn sample_events() -> Vec<DomainEvent> {
             quantity: 1,
             timestamp: ts(),
         }),
+        // Predictive (§16)
+        DomainEvent::PredictedAlert(PredictedAlert {
+            prediction_id: prediction_id(),
+            tx_hash: tx(),
+            addresses: vec![addr()],
+            kind: AlertKind::Sandwich,
+            confidence: Confidence::new(0.65),
+            provisional: true,
+        }),
     ]
 }
 
@@ -365,6 +379,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "UsageRecorded",
         r#"{"type":"UsageRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","event_type":"api_query","quantity":1,"timestamp":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "PredictedAlert",
+        r#"{"type":"PredictedAlert","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222","addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.65,"provisional":true}}"#,
     ),
 ];
 

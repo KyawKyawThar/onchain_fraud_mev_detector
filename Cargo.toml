@@ -78,6 +78,13 @@ intelligence = { path = "crates/intelligence" }
 # rule-definition store; the compiler/temporal state machine/consumer land in
 # t2–t5 on top of the `RuleStore` seam.
 rule-engine = { path = "crates/rule-engine" }
+# Predictive pipeline (§16, Sprint 13 t1) — a separate binary on a different
+# latency regime (target < block time): `MempoolSource → decode →
+# predict-engine → PredictedAlert`, scored against intelligence's cached
+# entity labels (`IntelligenceRead.GetLabels`, reused the same way `server`
+# reuses it). Deliberately its own crate rather than folded into `detection` —
+# §16 calls for independent deployment/scaling, not a shared process.
+predictive = { path = "crates/predictive" }
 
 # Errors.
 anyhow = "1"
@@ -135,6 +142,13 @@ alloy-primitives = { version = "1", features = ["serde"] }
 alloy-provider = { version = "1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
 alloy-rpc-types-eth = "1"
 alloy-transport = "1"
+# The `Transaction`/`TransactionResponse` trait accessors (`.to()`, `.input()`,
+# `.value()`, `.from()`, `.tx_hash()`) over an `alloy-rpc-types-eth::Transaction`
+# — that crate re-exports the *types* but not these traits, so a caller that
+# reads a fetched/streamed transaction's fields (the predictive pipeline's
+# mempool decode, §16) needs them as direct deps to bring the methods into scope.
+alloy-consensus = { version = "1", default-features = false }
+alloy-network-primitives = "1"
 # Object-safe async trait for the `ChainSource` adapter seam (§5) so the service
 # can hold a `dyn ChainSource` and swap adapters by config without generics
 # rippling through it.
