@@ -816,8 +816,11 @@ mod tests {
     // ── Same contract as the RPC path (Pipeline over ExExSource) ──────
 
     /// The event *type names* a [`RecordingSink`] captured, for order assertions.
+    /// Excludes `UsageRecorded` (see [`RecordingSink::non_usage_events`]) — the
+    /// per-batch `EventProcessed` metering fact (§13) rides the same sink but
+    /// isn't part of the chain lifecycle these tests assert on.
     fn types(sink: &RecordingSink) -> Vec<String> {
-        sink.events()
+        sink.non_usage_events()
             .iter()
             .map(|e| e.event_type().to_owned())
             .collect()

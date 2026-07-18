@@ -54,6 +54,22 @@ impl RecordingSink {
         self.published.lock().unwrap().clone()
     }
 
+    /// [`events`](Self::events), minus any [`DomainEvent::UsageRecorded`].
+    ///
+    /// Every metering producer publishes its usage facts (§13) onto the same
+    /// sink as its domain events, so a test asserting an exact lifecycle
+    /// sequence (`assert_eq!(sink.types(), [...])`) needs this instead of
+    /// `events()` — otherwise a `UsageRecorded` lands wherever the producer
+    /// happens to emit it and breaks an assertion that has nothing to do with
+    /// metering. Assert on usage facts separately via [`RecordingSink::events`]
+    /// filtered/matched on `DomainEvent::UsageRecorded`.
+    pub fn non_usage_events(&self) -> Vec<DomainEvent> {
+        self.events()
+            .into_iter()
+            .filter(|e| !matches!(e, DomainEvent::UsageRecorded(_)))
+            .collect()
+    }
+
     /// How many published payloads matched `predicate`.
     pub fn count(&self, predicate: impl Fn(&DomainEvent) -> bool) -> usize {
         self.published

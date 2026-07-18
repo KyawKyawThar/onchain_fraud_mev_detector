@@ -471,16 +471,20 @@ fn rule_engine_event() -> impl Strategy<Value = DomainEvent> {
 }
 
 fn system_event() -> impl Strategy<Value = DomainEvent> {
-    (customer_id(), any::<String>(), any::<u64>(), timestamp()).prop_map(
-        |(customer_id, event_type, quantity, timestamp)| {
+    (
+        proptest::option::of(customer_id()),
+        any::<String>(),
+        any::<u64>(),
+        timestamp(),
+    )
+        .prop_map(|(customer_id, event_type, quantity, timestamp)| {
             DomainEvent::UsageRecorded(UsageRecorded {
                 customer_id,
                 event_type,
                 quantity,
                 timestamp,
             })
-        },
-    )
+        })
 }
 
 /// Every `DomainEvent` variant, uniformly across the six families.

@@ -50,10 +50,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use event_bus::usage::UsageFact;
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
 use events::primitives::{BlockRef, Chain};
+use events::system::UsageEventType;
 use events::{DomainEvent, EventEnvelope};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -243,7 +245,22 @@ impl Pipeline {
     /// Poll the source's `finalized` tag and emit a `BlockFinalized` for every
     /// canonical block that crossed the line since the last tick (§5, §15). A
     /// failed fetch is logged and retried next tick — finality only ever advances.
+    ///
+    /// Every tick — whether or not it advances finality — is a
+    /// [`UsageEventType::ChainMonitored`] fact: it's the closest thing ingestion
+    /// has to a recurring "we are actively watching this chain" heartbeat (§13).
+    /// No customer is in scope for it (chain-wide, not customer-triggered), so
+    /// it meters with `customer_id: None` (see [`events::system::UsageRecorded`]).
     pub async fn tick_finalize(&mut self) -> Result<()> {
+        UsageFact::new(UsageEventType::ChainMonitored, 1)
+            .record(
+                self.sink.as_ref(),
+                self.chain,
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await;
+
         let finalized = match self.source.finalized_head().await {
             Ok(head) => head,
             Err(err) => {
@@ -269,7 +286,14 @@ impl Pipeline {
     /// Ship a batch of events in order, each wrapped in a fresh envelope for this
     /// chain. The envelope (and its `event_id`) is built once and reused across
     /// retries so a redelivery is deduped downstream (§7).
+    ///
+    /// One batch's worth of chain events is one [`UsageEventType::EventProcessed`]
+    /// fact (§13), quantity-batched rather than one publish per event — exact,
+    /// since the count is known here, and cheaper than a Kafka round-trip per
+    /// event. No customer is in scope (ingestion is chain-wide), so it meters
+    /// with `customer_id: None`.
     async fn publish_all(&self, payloads: Vec<DomainEvent>) {
+        let processed = payloads.len() as u64;
         for payload in payloads {
             // The shared at-least-once policy ([`event_bus::publish_resilient`]):
             // retry a transient broker blip until it succeeds or shutdown, skip a
@@ -282,6 +306,16 @@ impl Pipeline {
                 &self.shutdown,
             )
             .await;
+        }
+        if processed > 0 {
+            UsageFact::new(UsageEventType::EventProcessed, processed)
+                .record(
+                    self.sink.as_ref(),
+                    self.chain,
+                    self.publish_backoff,
+                    &self.shutdown,
+                )
+                .await;
         }
     }
 }
@@ -434,13 +468,13 @@ mod tests {
 
     impl LifecycleExt for RecordingSink {
         fn types(&self) -> Vec<String> {
-            self.events()
+            self.non_usage_events()
                 .iter()
                 .map(|e| e.event_type().to_owned())
                 .collect()
         }
         fn blocks(&self) -> Vec<(String, BlockRef)> {
-            self.events()
+            self.non_usage_events()
                 .iter()
                 .map(|e| (e.event_type().to_owned(), block_ref_of(e)))
                 .collect()
@@ -562,6 +596,56 @@ mod tests {
                 "BlockCanonicalized",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn each_published_batch_meters_one_event_processed_usage_fact() {
+        let source = Arc::new(FakeSource::new(vec![]));
+        let sink = Arc::new(RecordingSink::default());
+        let mut p = pipeline(source, sink.clone());
+
+        p.ingest(head(1, 0x01, 0x00)).await.unwrap();
+
+        let usage: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1, "one usage fact per published batch");
+        assert_eq!(usage[0].customer_id, None, "ingestion is chain-wide");
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::EventProcessed.as_wire_str()
+        );
+        // RawBlockReceived + BlockAssembled + BlockCanonicalized in this batch.
+        assert_eq!(usage[0].quantity, 3);
+    }
+
+    #[tokio::test]
+    async fn a_finalize_tick_meters_chain_monitored_even_with_nothing_to_finalize() {
+        let source = Arc::new(FakeSource::new(vec![]));
+        let sink = Arc::new(RecordingSink::default());
+        let mut p = pipeline(source, sink.clone());
+
+        p.tick_finalize().await.unwrap();
+
+        let usage: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::ChainMonitored.as_wire_str()
+        );
+        assert_eq!(usage[0].customer_id, None);
     }
 
     #[tokio::test]
@@ -697,10 +781,16 @@ mod tests {
         p.ingest(head(1, 0x01, 0x00)).await.unwrap();
 
         // The first event survived two transient failures; all three landed in
-        // order — none was lost to the blip.
+        // order — none was lost to the blip. The batch's usage fact
+        // (`EventProcessed`) rides the same at-least-once path and lands last.
         assert_eq!(
             *sink.delivered.lock().unwrap(),
-            vec!["RawBlockReceived", "BlockAssembled", "BlockCanonicalized"]
+            vec![
+                "RawBlockReceived",
+                "BlockAssembled",
+                "BlockCanonicalized",
+                "UsageRecorded"
+            ]
         );
     }
 

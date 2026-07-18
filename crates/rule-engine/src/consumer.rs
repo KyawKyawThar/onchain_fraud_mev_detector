@@ -67,12 +67,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use event_bus::usage::UsageFact;
 use event_bus::{
     handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
 };
 use events::primitives::{AccountAddress, AlertId, Chain, Confidence};
 use events::rule_engine::{RuleAlertCreated, RuleTriggered};
 use events::simulation::IncidentCreated;
+use events::system::UsageEventType;
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
 use sha2::{Digest, Sha256};
@@ -397,6 +399,20 @@ impl FireEmitter {
         let explanation = fire.explanation();
         metrics::counter!(RULE_FIRES_TOTAL, "kind" => fire.kind.metric_label()).increment(1);
 
+        // One `RuleEvaluated` usage fact per fire (§13), attributed to the rule's
+        // owner — the customer whose compute this evaluation billed. Alongside
+        // the `RULE_FIRES_TOTAL` metric above: same seam, different audience
+        // (ops dashboard vs. per-customer usage).
+        UsageFact::new(UsageEventType::RuleEvaluated, 1)
+            .for_customer(fire.owner)
+            .record(
+                self.sink.as_ref(),
+                chain,
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await;
+
         self.publish(
             chain,
             DomainEvent::RuleTriggered(RuleTriggered {
@@ -433,13 +449,29 @@ impl FireEmitter {
             matched_blocks: fire.kind.matched_blocks().to_vec(),
         };
         for action in &fire.actions {
-            if let Err(err) = self.actions.deliver(&alert, action).await {
-                tracing::warn!(
-                    rule_id = %fire.rule_id,
-                    error = %err,
-                    transient = err.is_transient(),
-                    "action delivery failed"
-                );
+            match self.actions.deliver(&alert, action).await {
+                Ok(()) => {
+                    // One `AlertDelivered` usage fact per successful delivery
+                    // (§13) — a failed delivery metered nothing, since the
+                    // customer's notification never actually landed.
+                    UsageFact::new(UsageEventType::AlertDelivered, 1)
+                        .for_customer(fire.owner)
+                        .record(
+                            self.sink.as_ref(),
+                            chain,
+                            self.publish_backoff,
+                            &self.shutdown,
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        rule_id = %fire.rule_id,
+                        error = %err,
+                        transient = err.is_transient(),
+                        "action delivery failed"
+                    );
+                }
             }
         }
     }
@@ -1218,6 +1250,53 @@ mod tests {
         assert_eq!(deliveries.len(), 1, "one action on the matched rule");
         assert_eq!(deliveries[0].0.owner, owner, "routed to the rule's owner");
         assert_eq!(deliveries[0].0.alert_id, alert_created.alert_id);
+    }
+
+    /// A fire that matches and successfully delivers meters both
+    /// `RuleEvaluated` (the match) and `AlertDelivered` (the successful
+    /// delivery), each attributed to the rule's owner (§13) — the other
+    /// customer's non-matching rule contributes neither.
+    #[tokio::test]
+    async fn a_matched_and_delivered_fire_meters_rule_evaluated_and_alert_delivered() {
+        let owner = CustomerId::new();
+        let other = CustomerId::new();
+        let mut rules = vec![sanction_rule(owner)];
+        rules.push(
+            RuleBuilder::new(other)
+                .name("High risk")
+                .condition(Condition::RiskScore {
+                    gt: Some(99),
+                    lt: None,
+                })
+                .build(),
+        );
+        let h = harness(rules).await;
+        h.enrichment.set_sanctions(addr(0x05), &["ofac_sdn"]);
+
+        h.consumer.handle(envelope(sanction_hit(addr(0x05)))).await;
+
+        let usage: Vec<_> = h
+            .sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 2, "RuleEvaluated + AlertDelivered");
+        assert!(
+            usage.iter().all(|u| u.customer_id == Some(owner)),
+            "only the matched rule's owner is billed, never the other customer"
+        );
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::RuleEvaluated.as_wire_str()
+        );
+        assert_eq!(
+            usage[1].event_type,
+            events::system::UsageEventType::AlertDelivered.as_wire_str()
+        );
     }
 
     /// An `IncidentCreated` that outruns its `PreliminaryAlertCreated` is

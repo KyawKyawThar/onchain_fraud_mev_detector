@@ -333,9 +333,13 @@ impl DomainEvent {
     /// which supplies the `Chain` default). Two paths carry an override:
     ///
     /// **The metering path (§13).** `UsageRecorded` is keyed by its
-    /// `customer_id`: usage has no cross-customer ordering need, and every
-    /// producer stamps the same chain today, so chain-keying would funnel all
-    /// metering onto one partition (see [`PartitionKey::Customer`]).
+    /// `customer_id` when it has one: usage has no cross-customer ordering
+    /// need, and every producer stamps the same chain today, so chain-keying
+    /// would funnel all metering onto one partition (see
+    /// [`PartitionKey::Customer`]). System-wide usage with no customer in scope
+    /// (`customer_id: None` — block/job-level facts like `EventProcessed` or
+    /// `SimulationRun`, §13) has no such key and falls back to the chain
+    /// default like any other event.
     ///
     /// **The simulation result path (§7):**
     ///
@@ -365,7 +369,7 @@ impl DomainEvent {
             IncidentCreated(e) => Some(PartitionKey::Alert(e.alert_id)),
             IncidentRetracted(e) => Some(PartitionKey::Incident(e.incident_id)),
             IncidentFinalized(e) => Some(PartitionKey::Incident(e.incident_id)),
-            UsageRecorded(e) => Some(PartitionKey::Customer(e.customer_id)),
+            UsageRecorded(e) => e.customer_id.map(PartitionKey::Customer),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -770,7 +774,7 @@ mod tests {
         let env = EventEnvelope::new(
             Chain::ETHEREUM,
             DomainEvent::UsageRecorded(UsageRecorded {
-                customer_id: customer,
+                customer_id: Some(customer),
                 event_type: "api_call_made".into(),
                 quantity: 1,
                 timestamp: chrono::Utc::now(),
@@ -780,6 +784,26 @@ mod tests {
         // fills the envelope column, it is not the wire key.
         assert_eq!(env.partition_key(), PartitionKey::Customer(customer));
         assert_eq!(env.partition_key().to_string(), customer.to_string());
+    }
+
+    #[test]
+    fn system_usage_with_no_customer_falls_back_to_chain_partitioning() {
+        use crate::system::UsageRecorded;
+
+        // Block/job-level metering (`EventProcessed`, `DetectorRun`, …) has no
+        // customer in scope — it must fall back to the chain default rather
+        // than panicking or funnelling onto a fake key (§13).
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::UsageRecorded(UsageRecorded {
+                customer_id: None,
+                event_type: "event_processed".into(),
+                quantity: 3,
+                timestamp: chrono::Utc::now(),
+            }),
+        );
+        assert_eq!(env.payload.business_partition_key(), None);
+        assert_eq!(env.partition_key(), PartitionKey::Chain(Chain::ETHEREUM));
     }
 
     #[test]

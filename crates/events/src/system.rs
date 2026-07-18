@@ -5,11 +5,22 @@ use crate::primitives::CustomerId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A billable usage event, emitted from the API service (§11, §13).
+/// A billable usage event, emitted from every metering producer (§11, §13).
+///
+/// `customer_id` is `None` for system-/chain-wide facts that have no customer
+/// in scope at the point they're measured — [`UsageEventType::EventProcessed`],
+/// [`UsageEventType::DetectorRun`], [`UsageEventType::SimulationRun`],
+/// [`UsageEventType::ChainMonitored`] and [`UsageEventType::IncidentGenerated`]
+/// all happen once per block/job regardless of who (if anyone) is watching —
+/// forcing a fake customer onto them would make the field lie. `Some` for
+/// everything attributable to one customer (`ApiCallMade`, `ScreeningCall`,
+/// `RuleEvaluated`, `AlertDelivered`, `EntityQueried`, …). See
+/// [`DomainEvent::business_partition_key`](crate::DomainEvent::business_partition_key)
+/// for how partitioning falls back to chain-keying when there's no customer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct UsageRecorded {
-    pub customer_id: CustomerId,
+    pub customer_id: Option<CustomerId>,
     pub event_type: String,
     pub quantity: u64,
     pub timestamp: DateTime<Utc>,

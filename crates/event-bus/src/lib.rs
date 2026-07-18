@@ -40,6 +40,10 @@ pub mod dlq;
 /// Consumer-lag gauge via librdkafka statistics.
 pub mod lag;
 
+/// The shared `UsageRecorded` (§13) builder + publish helper every metering
+/// producer (background or HTTP-buffered) goes through.
+pub mod usage;
+
 /// Shared test doubles (the recording [`EventSink`]) behind the `test-util`
 /// feature — the producer-seam counterpart to `detector-api::test_util`, so
 /// every producer crate's tests share one double instead of copying it.

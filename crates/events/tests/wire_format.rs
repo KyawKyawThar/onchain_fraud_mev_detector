@@ -249,7 +249,7 @@ fn sample_events() -> Vec<DomainEvent> {
         }),
         // System (§13)
         DomainEvent::UsageRecorded(UsageRecorded {
-            customer_id: customer_id(),
+            customer_id: Some(customer_id()),
             event_type: "api_query".into(),
             quantity: 1,
             timestamp: ts(),
