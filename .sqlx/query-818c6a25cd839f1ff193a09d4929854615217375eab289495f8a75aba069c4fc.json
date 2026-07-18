@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO incident_alerts (incident_id, alert_id, recorded_at)\n             VALUES ($1, $2, $3)\n             ON CONFLICT (incident_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "818c6a25cd839f1ff193a09d4929854615217375eab289495f8a75aba069c4fc"
+}

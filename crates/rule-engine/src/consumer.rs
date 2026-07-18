@@ -433,6 +433,7 @@ impl FireEmitter {
             DomainEvent::RuleAlertCreated(RuleAlertCreated {
                 alert_id,
                 rule_id: fire.rule_id,
+                owner: fire.owner,
                 address: fire.address,
                 explanation: explanation.clone(),
             }),

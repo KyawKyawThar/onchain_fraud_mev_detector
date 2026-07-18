@@ -33,7 +33,7 @@ Still ahead — each lands as its own `crates/<service>` binary when its sprint
 begins, consuming/producing `events` over the backbone (§3, §22):
 
 `simulation` · `intelligence` · `rule-engine` ·
-`api` · `notification` · `billing`
+`api` · `billing`
 
 No cross-service database joins — services share data via events or read APIs
 (§3). Keep that boundary at code review.

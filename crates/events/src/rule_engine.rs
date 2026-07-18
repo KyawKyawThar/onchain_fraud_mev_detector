@@ -33,6 +33,15 @@ pub struct RuleTriggered {
 pub struct RuleAlertCreated {
     pub alert_id: AlertId,
     pub rule_id: RuleId,
+    /// The rule's owner (mirrors [`RuleCreated::owner`]) — carried on the
+    /// wire so a cross-customer consumer (the notification service, §11) can
+    /// route this alert to the *owning* customer's subscribers only, without
+    /// a side lookup back into the rule store. Deliberately present here even
+    /// though `rule_engine::webhook::WebhookPayload` omits it from what an
+    /// individual customer's own webhook receives (§9) — that payload is
+    /// already scoped to one customer by construction; this event crosses
+    /// service boundaries, where scope must travel with the data.
+    pub owner: CustomerId,
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub address: AccountAddress,
     pub explanation: String,

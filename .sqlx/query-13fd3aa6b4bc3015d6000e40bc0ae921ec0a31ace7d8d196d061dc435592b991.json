@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO subscribers (subscriber_id, owner, channels, min_severity, kinds, chains, enabled, created_at, updated_at)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)\n             ON CONFLICT (subscriber_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Bool",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "13fd3aa6b4bc3015d6000e40bc0ae921ec0a31ace7d8d196d061dc435592b991"
+}

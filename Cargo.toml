@@ -328,6 +328,24 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 futures-util = "0.3"
 tokio-tungstenite = "0.29"
 
+# Email delivery (§11/§12): the notification service's SMTP channel — the one
+# non-HTTP delivery target (webhook/Slack/PagerDuty are all HTTP POSTs behind
+# the shared `reqwest` client above). `default-features = false` then re-add
+# only what's used: `tokio1-rustls-tls` (the async transport over pure-Rust
+# TLS, same self-contained-image stance as sqlx/reqwest/rdkafka — no system
+# OpenSSL), `smtp-transport` + `pool` (the SMTP client + its connection reuse,
+# mirroring upstream's own default feature set minus `native-tls`), `builder`
+# (the typed `Message::builder()` API, so a malformed header is a
+# compile-time-checked builder call, not hand-assembled RFC 5322 text), and
+# `hostname` (EHLO identifies this host, not a hardcoded placeholder).
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1-rustls-tls",
+    "smtp-transport",
+    "pool",
+    "builder",
+    "hostname",
+] }
+
 # Observability (§19): tracing + W3C trace-context distributed tracing.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

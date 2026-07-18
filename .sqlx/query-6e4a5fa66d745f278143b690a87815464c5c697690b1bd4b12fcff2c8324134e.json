@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO notice_deliveries\n                (id, subscriber_id, dedup_key, stage, channel, status, attempts, created_at, updated_at)\n             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7)\n             ON CONFLICT (subscriber_id, dedup_key, stage, channel) DO NOTHING\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "notice_deliveries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6e4a5fa66d745f278143b690a87815464c5c697690b1bd4b12fcff2c8324134e"
+}

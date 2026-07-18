@@ -302,6 +302,20 @@ run-simulation:
 run-usage:
     cargo run -p usage
 
+# Run the notification service (§11, Sprint 12 — delivery hardening).
+# Consumes PreliminaryAlertCreated/IncidentCreated/IncidentRetracted/
+# IncidentFinalized/RuleAlertCreated/SanctionHit off Kafka, routes each to
+# severity/kind/chain-filtered subscribers over webhook/email/Slack/
+# PagerDuty with retry/backoff, per-subscriber dedup and delivery receipts.
+# Needs Postgres + Kafka up (`just up`) and `just migrate-up` applied; no
+# subscriber-management API yet — seed via `NotificationStore::create_subscriber`.
+run-notification:
+    cargo run -p notification
+
+# Probe the notification service's Postgres schema
+notification-ping:
+    cargo run -p notification -- ping
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon
