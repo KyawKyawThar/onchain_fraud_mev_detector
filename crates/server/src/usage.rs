@@ -38,6 +38,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::Extension;
 use chrono::Utc;
+use event_bus::usage::USAGE_RECORDED_TOTAL;
 use event_bus::{publish_resilient, EventSink};
 use events::primitives::{Chain, CustomerId};
 use events::system::{UsageEventType, UsageRecorded};
@@ -45,13 +46,13 @@ use events::{DomainEvent, EventEnvelope};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Counter (labeled by `event_type`): usage events accepted onto the publish
-/// queue — the "billable actions seen at the API boundary" count, the
-/// denominator a §13 reconciliation checks event-store's landed rows against.
-pub const USAGE_RECORDED_TOTAL: &str = "usage_events_recorded_total";
 /// Counter (labeled by `event_type`): usage events *lost* — dropped because the
 /// publish queue was full (broker backlog) or still queued at shutdown past
 /// [`FLUSH_GRACE`]. Any non-zero rate is a billing gap; alert on it (§13).
+///
+/// No background-producer counterpart: `event_bus::usage::UsageFact::record`
+/// blocks and retries instead of dropping (see its module docs) — "dropped"
+/// is a concept unique to this bounded-queue, never-block-the-request path.
 pub const USAGE_DROPPED_TOTAL: &str = "usage_events_dropped_total";
 
 /// How long, after shutdown is signalled, [`run`] keeps draining its queue
@@ -84,7 +85,7 @@ impl UsageRecorder {
     /// the customer-facing call it is metering.
     pub fn record(&self, customer_id: CustomerId, event_type: UsageEventType) {
         let usage = UsageRecorded {
-            customer_id,
+            customer_id: Some(customer_id),
             event_type: event_type.as_wire_str().to_owned(),
             quantity: 1,
             timestamp: Utc::now(),
@@ -265,7 +266,7 @@ mod tests {
         let DomainEvent::UsageRecorded(ref usage) = envelope.payload else {
             panic!("expected a UsageRecorded payload");
         };
-        assert_eq!(usage.customer_id, customer());
+        assert_eq!(usage.customer_id, Some(customer()));
         assert_eq!(usage.event_type, UsageEventType::ApiCallMade.as_wire_str());
         assert_eq!(usage.quantity, 1);
     }

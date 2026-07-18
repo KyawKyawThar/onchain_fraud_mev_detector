@@ -60,7 +60,7 @@ fn usage_envelope(id: u128, customer: u128, quantity: u64) -> EventEnvelope {
         at,
         Chain::ETHEREUM,
         DomainEvent::UsageRecorded(UsageRecorded {
-            customer_id: CustomerId(Uuid::from_u128(customer)),
+            customer_id: Some(CustomerId(Uuid::from_u128(customer))),
             event_type: UsageEventType::ApiCallMade.as_wire_str().to_owned(),
             quantity,
             timestamp: at,

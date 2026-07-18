@@ -41,8 +41,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use event_bus::usage::UsageFact;
 use event_bus::{EventSink, Transience};
-use events::EventEnvelope;
+use events::system::UsageEventType;
+use events::{DomainEvent, EventEnvelope};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -160,9 +162,27 @@ impl Worker {
             "simulation finished"
         );
 
+        // The revm run actually happened, regardless of whether it confirms the
+        // alert — one `SimulationRun` usage fact per job (§13). No customer is in
+        // scope (simulation is triggered off the detection pipeline, not by a
+        // customer), so it meters with `customer_id: None`.
+        UsageFact::new(UsageEventType::SimulationRun, 1)
+            .record(
+                self.event_sink.as_ref(),
+                job.chain,
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await;
+
         // 3. Publish the result(s) back onto Kafka (at-least-once). The command
         //    never re-enters the event store — only its outcome does (§7).
-        for event in events_for_outcome(&outcome) {
+        let result_events = events_for_outcome(&outcome);
+        let incidents_created = result_events
+            .iter()
+            .filter(|e| matches!(e, DomainEvent::IncidentCreated(_)))
+            .count() as u64;
+        for event in result_events {
             event_bus::publish_resilient(
                 self.event_sink.as_ref(),
                 EventEnvelope::new(job.chain, event),
@@ -170,6 +190,20 @@ impl Worker {
                 &self.shutdown,
             )
             .await;
+        }
+        // A confirmed alert mints an incident — a second, distinct usage fact
+        // (§13): `IncidentGenerated` isn't attributable to a customer either, an
+        // incident only fans out to zero/one/many rule owners downstream in
+        // rule-engine (see `events::system::UsageRecorded`'s doc).
+        if incidents_created > 0 {
+            UsageFact::new(UsageEventType::IncidentGenerated, incidents_created)
+                .record(
+                    self.event_sink.as_ref(),
+                    job.chain,
+                    self.publish_backoff,
+                    &self.shutdown,
+                )
+                .await;
         }
 
         // 4. Ack only if the result truly made it out. If shutdown interrupted a
@@ -241,7 +275,6 @@ mod tests {
 
     use async_trait::async_trait;
     use events::primitives::Severity;
-    use events::DomainEvent;
 
     use crate::consumer::JobDelivery;
     use crate::reorg::{NeverOrphaned, SharedOrphanedBlocks};
@@ -321,7 +354,7 @@ mod tests {
         let disposition = w.process(&sample_job()).await;
         assert_eq!(disposition, Disposition::Ack);
 
-        let emitted = events.events();
+        let emitted = events.non_usage_events();
         assert_eq!(emitted.len(), 2, "SimulationCompleted + IncidentCreated");
         assert!(matches!(emitted[0], DomainEvent::SimulationCompleted(_)));
         assert!(matches!(emitted[1], DomainEvent::IncidentCreated(_)));
@@ -337,9 +370,66 @@ mod tests {
         );
 
         assert_eq!(w.process(&sample_job()).await, Disposition::Ack);
-        let emitted = events.events();
+        let emitted = events.non_usage_events();
         assert_eq!(emitted.len(), 1);
         assert!(matches!(emitted[0], DomainEvent::SimulationCompleted(_)));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_job_meters_both_simulation_run_and_incident_generated() {
+        let events = Arc::new(RecordingEventSink::default());
+        let w = worker(
+            Arc::new(CannedResolver(Ok(()))),
+            Arc::new(CannedSimulator(Ok(true))),
+            events.clone(),
+        );
+
+        w.process(&sample_job()).await;
+
+        let usage: Vec<_> = events
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 2, "SimulationRun + IncidentGenerated");
+        assert!(usage.iter().all(|u| u.customer_id.is_none()));
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::SimulationRun.as_wire_str()
+        );
+        assert_eq!(
+            usage[1].event_type,
+            events::system::UsageEventType::IncidentGenerated.as_wire_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_job_meters_only_simulation_run() {
+        let events = Arc::new(RecordingEventSink::default());
+        let w = worker(
+            Arc::new(CannedResolver(Ok(()))),
+            Arc::new(CannedSimulator(Ok(false))),
+            events.clone(),
+        );
+
+        w.process(&sample_job()).await;
+
+        let usage: Vec<_> = events
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1, "no incident, so no IncidentGenerated fact");
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::SimulationRun.as_wire_str()
+        );
     }
 
     #[tokio::test]
@@ -484,6 +574,6 @@ mod tests {
         w.run(OneShotSource(Some(delivery))).await.unwrap();
 
         assert_eq!(recorder.settled(), Some(Disposition::Ack));
-        assert_eq!(events.events().len(), 2);
+        assert_eq!(events.non_usage_events().len(), 2);
     }
 }

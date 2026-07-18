@@ -60,6 +60,19 @@ pub async fn require_jwt(State(jwt): State<JwtConfig>, mut req: Request, next: N
                 );
                 return StatusCode::UNAUTHORIZED.into_response();
             };
+            // The nil UUID is reserved: `crates/usage`'s ClickHouse store uses it
+            // as the sentinel for system-wide usage that has no customer at all
+            // (`UsageRecorded.customer_id: None` — see `events::system::
+            // UsageRecorded` and `usage::store::NIL_CUSTOMER`). A real customer
+            // minted with this id would be indistinguishable from that system
+            // bucket in every usage query, so it's rejected here — the one place
+            // every `CustomerId` in the system originates from.
+            if customer.is_nil() {
+                tracing::warn!(
+                    "bearer token rejected: sub is the nil UUID (reserved for system usage, §13)"
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             req.extensions_mut().insert(CustomerId(customer));
             next.run(req).await
         }
@@ -239,6 +252,33 @@ mod tests {
         // CustomerId, so the call would be unmeterable (§13). Rejected.
         let claims = Claims {
             sub: "not-a-customer-uuid".to_owned(),
+            exp: future_exp(),
+            iss: "mev".to_owned(),
+        };
+        let jwt = jwt_config();
+        let bearer = token(&claims, jwt.secret.expose_secret());
+
+        let response = app(jwt)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn nil_uuid_sub_is_rejected() {
+        // The nil UUID is reserved as the system-usage sentinel in ClickHouse
+        // (§13) — a token naming it as `sub` would be indistinguishable from
+        // system-wide usage in every query, so it's rejected like a malformed
+        // sub rather than accepted as a "customer."
+        let claims = Claims {
+            sub: Uuid::nil().to_string(),
             exp: future_exp(),
             iss: "mev".to_owned(),
         };

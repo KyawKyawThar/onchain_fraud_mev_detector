@@ -53,9 +53,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use event_bus::usage::UsageFact;
 use event_bus::{header_carrier, publish_resilient, EventSink};
 use events::chain::BlockReverted;
 use events::primitives::Chain;
+use events::system::UsageEventType;
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::{Message, Offset, TopicPartitionList};
@@ -76,6 +78,15 @@ pub enum BlockEvent {
     Assembled(DetectionCtx),
     /// A block was orphaned by a reorg: rewind cross-block state (tip-first; §15).
     Reverted(BlockReverted),
+}
+
+/// [`Scheduler::process`]'s result: the events to publish, paired with exactly
+/// how many detector invocations produced them — the two computed together so
+/// the [`UsageEventType::DetectorRun`] fact metered from `detector_runs` can
+/// never disagree with what the roster actually ran.
+pub struct ProcessOutcome {
+    pub events: Vec<DomainEvent>,
+    pub detector_runs: u64,
 }
 
 /// Where a Kafka record sits, kept owned so the committer can advance the offset
@@ -122,14 +133,14 @@ impl Scheduler {
         }
     }
 
-    /// Run the roster over one decoded [`BlockEvent`] and return the events to
-    /// publish — the scheduler **core**, free of Kafka so it's `assert_eq!`-testable.
+    /// Run the roster over one decoded [`BlockEvent`] — the scheduler **core**,
+    /// free of Kafka so it's `assert_eq!`-testable.
     ///
     /// `Assembled` fans the `Block`-scoped detectors out over rayon (off the async
     /// reactor via `spawn_blocking`), then advances the cross-block roster serially
     /// (it threads `&mut` state); `Reverted` rewinds the cross-block roster to the
     /// common ancestor and publishes nothing.
-    pub async fn process(&mut self, event: BlockEvent) -> Vec<DomainEvent> {
+    pub async fn process(&mut self, event: BlockEvent) -> ProcessOutcome {
         match event {
             BlockEvent::Assembled(ctx) => {
                 let ctx = Arc::new(ctx);
@@ -142,10 +153,19 @@ impl Scheduler {
                         .await
                         .expect("detection fan-out task panicked");
 
+                // Every detector in both rosters runs unconditionally for an
+                // Assembled block (§6) — computed right here, where the roster
+                // actually ran, rather than re-derived by the caller, so the
+                // `DetectorRun` usage fact (§13) can never drift from the truth.
+                let detector_runs = (self.plan.len() + self.cross_block.len()) as u64;
+
                 // Cross-block detectors run serially (mutable state); usually a
                 // no-op (empty roster) until the first CrossBlock detector lands.
                 events.extend(self.cross_block.observe_and_detect(&ctx));
-                events
+                ProcessOutcome {
+                    events,
+                    detector_runs,
+                }
             }
             BlockEvent::Reverted(reverted) => {
                 let rewind = self
@@ -159,7 +179,10 @@ impl Scheduler {
                         "rewound cross-block state through reorg"
                     );
                 }
-                Vec::new()
+                ProcessOutcome {
+                    events: Vec::new(),
+                    detector_runs: 0,
+                }
             }
         }
     }
@@ -186,12 +209,12 @@ impl Scheduler {
                 }
                 msg = work.recv() => match msg {
                     Some((event, token)) => {
-                        let events = self.process(event).await;
+                        let outcome = self.process(event).await;
                         // Publish borrowing only the individual `Sync` fields (sink,
                         // shutdown) — never a shared `&self`, which would force the
                         // whole `Scheduler` (and so every cross-block slot) to be
                         // `Sync`; the slots run serially and needn't be.
-                        for payload in events {
+                        for payload in outcome.events {
                             publish_resilient(
                                 self.sink.as_ref(),
                                 EventEnvelope::new(self.chain, payload),
@@ -199,6 +222,19 @@ impl Scheduler {
                                 &self.shutdown,
                             )
                             .await;
+                        }
+                        // One `DetectorRun` usage fact per block, batched to the
+                        // exact count run — no customer in scope (detection is
+                        // chain-wide, §13).
+                        if outcome.detector_runs > 0 {
+                            UsageFact::new(UsageEventType::DetectorRun, outcome.detector_runs)
+                                .record(
+                                    self.sink.as_ref(),
+                                    self.chain,
+                                    self.publish_backoff,
+                                    &self.shutdown,
+                                )
+                                .await;
                         }
                         // Block is durably published — safe to advance its offset.
                         // A closed `done` (committer gone) means we're shutting down.
@@ -376,14 +412,16 @@ mod tests {
     use event_bus::test_util::RecordingSink;
 
     /// The emitted event *type names*, in order — a crate-local projection over
-    /// the shared [`RecordingSink`] (which owns only generic recording).
+    /// the shared [`RecordingSink::non_usage_events`] (the `DetectorRun`
+    /// metering fact, §13, rides the same sink but isn't part of the
+    /// detection lifecycle these tests assert on).
     trait EventTypesExt {
         fn types(&self) -> Vec<String>;
     }
 
     impl EventTypesExt for RecordingSink {
         fn types(&self) -> Vec<String> {
-            self.events()
+            self.non_usage_events()
                 .iter()
                 .map(|e| e.event_type().to_owned())
                 .collect()
@@ -450,9 +488,13 @@ mod tests {
     #[tokio::test]
     async fn process_assembled_fans_out_and_returns_a_trigger_alert_pair() {
         let mut s = scheduler(plan_with_one_detector(), CrossBlockStates::new());
-        let events = s.process(assembled(7)).await;
-        let types: Vec<&str> = events.iter().map(DomainEvent::event_type).collect();
+        let outcome = s.process(assembled(7)).await;
+        let types: Vec<&str> = outcome.events.iter().map(DomainEvent::event_type).collect();
         assert_eq!(types, vec!["DetectorTriggered", "PreliminaryAlertCreated"]);
+        assert_eq!(
+            outcome.detector_runs, 1,
+            "the one-detector plan, no cross-block roster"
+        );
     }
 
     #[tokio::test]
@@ -470,13 +512,14 @@ mod tests {
             let _ = s.process(assembled(n)).await;
         }
         // The revert for the tip (block 3) emits nothing.
-        let events = s
+        let outcome = s
             .process(BlockEvent::Reverted(BlockReverted {
                 block: BlockRef::new(3, hash(3)),
                 replaced_by: hash(0x33),
             }))
             .await;
-        assert!(events.is_empty(), "a revert publishes no events");
+        assert!(outcome.events.is_empty(), "a revert publishes no events");
+        assert_eq!(outcome.detector_runs, 0, "a revert runs no detector");
     }
 
     #[tokio::test]
@@ -516,6 +559,72 @@ mod tests {
             tokens.push(t);
         }
         assert_eq!(tokens, vec![1, 2], "commit tokens signalled in block order");
+    }
+
+    #[tokio::test]
+    async fn run_loop_meters_one_detector_run_fact_per_assembled_block() {
+        let sink = Arc::new(RecordingSink::default());
+        let s = Scheduler::new(
+            Chain::ETHEREUM,
+            Arc::new(plan_with_one_detector()),
+            CrossBlockStates::new(),
+            sink.clone(),
+            CancellationToken::new(),
+        );
+
+        let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (done_tx, _done_rx) = mpsc::channel::<u64>(4);
+        let handle = tokio::spawn(s.run(work_rx, done_tx));
+
+        work_tx.send((assembled(1), 1)).await.unwrap();
+        drop(work_tx);
+        handle.await.unwrap();
+
+        let usage: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::UsageRecorded(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1, "one usage fact per assembled block");
+        assert_eq!(usage[0].customer_id, None, "detection is chain-wide");
+        assert_eq!(
+            usage[0].event_type,
+            events::system::UsageEventType::DetectorRun.as_wire_str()
+        );
+        // The one-detector plan, no cross-block roster.
+        assert_eq!(usage[0].quantity, 1);
+    }
+
+    #[tokio::test]
+    async fn a_reverted_block_meters_no_detector_run_fact() {
+        let sink = Arc::new(RecordingSink::default());
+        let s = Scheduler::new(
+            Chain::ETHEREUM,
+            Arc::new(plan_with_one_detector()),
+            CrossBlockStates::new(),
+            sink.clone(),
+            CancellationToken::new(),
+        );
+
+        let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (done_tx, _done_rx) = mpsc::channel::<u64>(4);
+        let handle = tokio::spawn(s.run(work_rx, done_tx));
+
+        let reverted = BlockEvent::Reverted(BlockReverted {
+            block: BlockRef::new(1, hash(1)),
+            replaced_by: hash(0x11),
+        });
+        work_tx.send((reverted, 1)).await.unwrap();
+        drop(work_tx);
+        handle.await.unwrap();
+
+        assert!(
+            sink.events().is_empty(),
+            "a revert runs no detector, so it publishes nothing at all"
+        );
     }
 
     #[tokio::test]

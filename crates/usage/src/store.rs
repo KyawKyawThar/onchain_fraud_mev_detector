@@ -20,6 +20,13 @@ use uuid::Uuid;
 
 use crate::config::ClickhouseConfig;
 
+/// The stored stand-in for [`UsageRecorded::customer_id`](events::system::UsageRecorded)
+/// being `None` — see [`UsageRow::customer_id`] for why a sentinel, not a
+/// nullable column. A real customer id can never collide with this: the API
+/// service's JWT gate (`server::auth::require_jwt`) rejects a nil-UUID `sub`
+/// outright, the one place a `CustomerId` is minted from user input.
+pub const NIL_CUSTOMER: Uuid = Uuid::nil();
+
 /// A failure mapping or writing a usage row. The variant decides whether
 /// retrying the *same* input could ever succeed — the Kafka consumer uses the
 /// [`event_bus::Transience`] impl to choose between "back off and redeliver"
@@ -112,6 +119,16 @@ pub struct UsageRow {
     /// reconciliation key against the event store's copy of the stream.
     #[serde(with = "clickhouse::serde::uuid")]
     pub event_id: Uuid,
+    /// [`NIL_CUSTOMER`] (the all-zero UUID) for system-/chain-wide usage with
+    /// no customer in scope (`UsageRecorded.customer_id: None` — see
+    /// [`events::system::UsageRecorded`]) rather than a `Nullable(UUID)`
+    /// column: ClickHouse's own guidance is against nullable columns in a
+    /// `MergeTree` `ORDER BY` key (worse compression, no min/max index skip),
+    /// and this table's whole query shape leans on `ORDER BY (customer_id,
+    /// …)`. A real customer id can never collide with the sentinel — v4/v7
+    /// UUIDs practically never land on all-zero bits, and application code
+    /// never mints one. Filter system rows out with `WHERE customer_id !=
+    /// '00000000-0000-0000-0000-000000000000'`.
     #[serde(with = "clickhouse::serde::uuid")]
     pub customer_id: Uuid,
     /// The §13 vocabulary in its snake_case wire form (`api_call_made`, …),
@@ -150,7 +167,7 @@ impl TryFrom<&EventEnvelope> for UsageRow {
         };
         Ok(Self {
             event_id: env.event_id,
-            customer_id: customer_id.0,
+            customer_id: customer_id.map_or(NIL_CUSTOMER, |c| c.0),
             event_type: event_type.clone(),
             quantity: *quantity,
             chain: env.chain.id(),
@@ -170,7 +187,7 @@ mod tests {
         EventEnvelope::new(
             Chain::ETHEREUM,
             DomainEvent::UsageRecorded(UsageRecorded {
-                customer_id: CustomerId(Uuid::from_u128(7)),
+                customer_id: Some(CustomerId(Uuid::from_u128(7))),
                 event_type: UsageEventType::ApiCallMade.as_wire_str().to_owned(),
                 quantity: 3,
                 timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_123).unwrap(),
@@ -193,6 +210,21 @@ mod tests {
             row.occurred_at,
             DateTime::<Utc>::from_timestamp_millis(1_700_000_000_123).unwrap()
         );
+    }
+
+    #[test]
+    fn a_system_fact_with_no_customer_stores_as_the_nil_sentinel() {
+        // `EventProcessed`, `DetectorRun`, … have no customer in scope
+        // (§13) — the row still lands, keyed by the well-known sentinel
+        // rather than a nullable column (see `UsageRow::customer_id`).
+        let mut env = usage_envelope();
+        if let DomainEvent::UsageRecorded(ref mut usage) = env.payload {
+            usage.customer_id = None;
+            usage.event_type = UsageEventType::EventProcessed.as_wire_str().to_owned();
+        }
+        let row = UsageRow::try_from(&env).expect("map");
+        assert_eq!(row.customer_id, NIL_CUSTOMER);
+        assert_eq!(row.event_type, "event_processed");
     }
 
     #[test]

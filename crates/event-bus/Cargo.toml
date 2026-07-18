@@ -24,6 +24,7 @@ test-util = []
 events = { workspace = true }
 telemetry = { workspace = true }
 
+chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -38,6 +39,9 @@ tokio-util = { workspace = true }
 
 # librdkafka producer — the same vendored build the event-store consumer uses.
 rdkafka = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
 
 [lints]
 workspace = true

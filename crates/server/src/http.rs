@@ -483,6 +483,7 @@ struct EntityGraphResponse {
 )]
 async fn entity_graph(
     State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
     Path(entity_id): Path<uuid::Uuid>,
     Query(query): Query<EntityGraphQuery>,
 ) -> Result<Json<EntityGraphResponse>, ApiError> {
@@ -495,6 +496,10 @@ async fn entity_graph(
     if !reply.found {
         return Err(ApiError::not_found(format!("entity {entity_id} not found")));
     }
+
+    state
+        .usage
+        .record(customer, events::system::UsageEventType::EntityQueried);
 
     Ok(Json(EntityGraphResponse {
         entity_id: entity_id.to_string(),
@@ -570,6 +575,7 @@ struct EntityTimelineResponse {
 )]
 async fn entity_timeline(
     State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
     Path(entity_id): Path<uuid::Uuid>,
 ) -> Result<Json<EntityTimelineResponse>, ApiError> {
     let reply = state
@@ -581,6 +587,10 @@ async fn entity_timeline(
     if !reply.found {
         return Err(ApiError::not_found(format!("entity {entity_id} not found")));
     }
+
+    state
+        .usage
+        .record(customer, events::system::UsageEventType::EntityQueried);
 
     Ok(Json(EntityTimelineResponse {
         entity_id: entity_id.to_string(),
@@ -1057,7 +1067,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
         let usage = usage_rx.try_recv().expect("the call must be metered");
-        assert_eq!(usage.customer_id.to_string(), customer);
+        assert_eq!(
+            usage
+                .customer_id
+                .expect("ApiCallMade is customer-attributed"),
+            events::primitives::CustomerId(customer.parse().unwrap())
+        );
         assert_eq!(
             usage.event_type,
             events::system::UsageEventType::ApiCallMade.as_wire_str()
