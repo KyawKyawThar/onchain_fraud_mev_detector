@@ -33,6 +33,7 @@ set of types that drift freely.
 | **Intelligence** (§8) | `LabelAdded`, `LabelUpdated`, `LabelRevoked`, `EntityCreated`, `EntityMerged`, `EntitySplit`, `AttributionUpdated`, `RiskScoreUpdated`, `SanctionHit` | intelligence |
 | **Rule engine** (§9) | `RuleCreated`, `RuleTriggered`, `RuleAlertCreated` | rule-engine |
 | **System** (§13) | `UsageRecorded` | api |
+| **Predictive** (§16) | `PredictedAlert` | predictive |
 
 ### Not in the contract: commands
 
