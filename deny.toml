@@ -37,6 +37,10 @@ allow = [
   # xxhash-rust, the hash the redis client uses for cluster slot mapping (§8
   # intelligence hot cache).
   "BSL-1.0",
+  # BSD Zero Clause License — public-domain-equivalent, OSI-approved. Covers
+  # quoted_printable, which lettre pulls in for the notification service's
+  # SMTP path.
+  "0BSD",
 ]
 confidence-threshold = 0.8
 # Our own crates are `license = "proprietary"` + `publish = false`; ignore them.
