@@ -244,6 +244,7 @@ fn sample_events() -> Vec<DomainEvent> {
         DomainEvent::RuleAlertCreated(RuleAlertCreated {
             alert_id: alert_id(),
             rule_id: rule_id(),
+            owner: customer_id(),
             address: addr(),
             explanation: "large inflow then mixer".into(),
         }),
@@ -359,7 +360,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "RuleAlertCreated",
-        r#"{"type":"RuleAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","rule_id":"00000000-0000-0000-0000-00000000004e","address":"0x3333333333333333333333333333333333333333","explanation":"large inflow then mixer"}}"#,
+        r#"{"type":"RuleAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","rule_id":"00000000-0000-0000-0000-00000000004e","owner":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","explanation":"large inflow then mixer"}}"#,
     ),
     (
         "UsageRecorded",

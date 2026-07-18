@@ -1,0 +1,98 @@
+[package]
+name = "notification"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Notification service (§11, Sprint 12 t4) — severity-routed delivery over
+# webhook/email/Slack/PagerDuty, with retry/backoff, dedup per incident per
+# subscriber, delivery receipts, and the provisional → confirmed → retracted
+# lifecycle paired to the original alert. Mirrors rule-engine's t4/t5 shape
+# (`consumer.rs` on `event-bus::run_consumer`, `delivery.rs` mirroring
+# `rule_engine::action`'s `ActionSink` seam) but as its own service: the
+# subscribers here are cross-customer alert subscriptions, not per-rule
+# actions.
+
+[dependencies]
+events = { workspace = true }
+
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+# Derive-driven wire/storage string mappings for `ChannelKind`/`LifecycleStage`
+# (the notice_deliveries `channel`/`stage` columns) — same pattern as
+# `events::primitives::AlertKind`/`Severity`, so a new variant can't drift
+# between the Rust enum and what's stored.
+strum = { workspace = true }
+# `Notice.addresses`/webhook payload fields carry the event schema's `Address`
+# type.
+alloy-primitives = { workspace = true }
+
+# Postgres system of record (§14: this service owns its tables — subscribers,
+# delivery receipts, the incident↔alert correlation index — the shared `db`
+# crate supplies only the pool + fault classification).
+db = { workspace = true }
+sqlx = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# The consumer: the shared consume/produce seams (`run_consumer`,
+# `EventSink`/`publish_resilient`, the `UsageFact` builder for the
+# `AlertDelivered` usage fact) — never raw rdkafka in the logic; rdkafka
+# itself only to build the `StreamConsumer` the seam drives.
+event-bus = { workspace = true }
+rdkafka = { workspace = true }
+anyhow = { workspace = true }
+
+# Webhook/Slack/PagerDuty channels: all three are HTTP POSTs behind one
+# shared client (workspace-pinned rustls build, no native TLS).
+reqwest = { workspace = true }
+# The webhook/Slack SSRF guard resolves the target host before connecting.
+url = { workspace = true }
+
+# The email channel: SMTP over the async, rustls-backed transport.
+lettre = { workspace = true }
+
+# Deterministic dedup-key derivation for `SanctionHit` (no native id on the
+# event) — SHA-256 → UUIDv8, the same recipe `rule_engine::consumer::Fire`
+# and `intelligence::seed` already use for the identical reason: an
+# at-least-once redelivery must re-derive the same key, not mint a new one.
+sha2 = { workspace = true }
+
+# Service binary plumbing (src/main.rs): tracing/metrics boot + env config +
+# secrets kept out of `Debug`/logs (SMTP password, PagerDuty routing keys).
+telemetry = { workspace = true }
+secrecy = { workspace = true }
+# §19 counters (`notification_deliveries_total`, `notification_notices_total`)
+# through the `metrics` facade — a no-op until the binary's exporter installs
+# the recorder.
+metrics = { workspace = true }
+
+[features]
+# Exposes `notification::test_util` (the in-memory `NotificationStore` +
+# recording `ChannelSink` doubles) to this crate's own tests.
+test-util = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Self-dependency with `test-util` on, so `tests/` sees the in-memory doubles.
+notification = { path = ".", features = ["test-util"] }
+# The recording `EventSink` the consumer tests assert emissions against.
+event-bus = { workspace = true, features = ["test-util"] }
+# Throwaway loopback HTTP endpoint the webhook/Slack delivery tests point at —
+# real requests, zero external network (mirrors rule-engine's webhook test).
+axum = { workspace = true }
+# Live-store integration tests (`#[ignore]`): real Postgres via a throwaway
+# container, run by `just test-integration` — proves `PgNotificationStore`
+# honours the same dedup/claim contract the in-memory double does.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres"] }
+
+[lints]
+workspace = true

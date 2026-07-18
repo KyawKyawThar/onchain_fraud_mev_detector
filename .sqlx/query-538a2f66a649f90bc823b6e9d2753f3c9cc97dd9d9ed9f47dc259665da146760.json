@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT alert_id FROM incident_alerts WHERE incident_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alert_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "incident_alerts",
+            "name": "alert_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "538a2f66a649f90bc823b6e9d2753f3c9cc97dd9d9ed9f47dc259665da146760"
+}

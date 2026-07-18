@@ -457,16 +457,22 @@ fn rule_engine_event() -> impl Strategy<Value = DomainEvent> {
                     context,
                 })
             }),
-        (rule_id(), alert_id(), address(), any::<String>()).prop_map(
-            |(rule_id, alert_id, address, explanation)| {
+        (
+            rule_id(),
+            alert_id(),
+            customer_id(),
+            address(),
+            any::<String>(),
+        )
+            .prop_map(|(rule_id, alert_id, owner, address, explanation)| {
                 DomainEvent::RuleAlertCreated(RuleAlertCreated {
                     alert_id,
                     rule_id,
+                    owner,
                     address,
                     explanation,
                 })
-            }
-        ),
+            }),
     ]
 }
 

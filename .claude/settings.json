@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk ' *)",
+      "Bash(SQLX_OFFLINE=true cargo test -p rule-engine -p notification --tests -- --ignored)",
+      "Bash(DATABASE_URL=\"postgres://mev:changeme_postgres_password@127.0.0.1:5432/mev?sslmode=disable\" NOTIFICATION_KAFKA_GROUP=notification-live-check KAFKA_BROKERS=localhost:9092 SMTP_HOST=localhost SMTP_PORT=2525 SMTP_USERNAME=notification SMTP_PASSWORD=dummy SMTP_FROM=alerts@mevwatch.example cargo run -p notification -- ping)",
+      "Bash(:)",
+      "Bash(curl -s http://localhost:9110/metrics)",
+      "Bash(SQLX_OFFLINE=true cargo fmt -p notification)",
+      "Bash(SQLX_OFFLINE=true cargo clippy -p notification --all-targets --all-features -- -D warnings)",
+      "Bash(SQLX_OFFLINE=true cargo test -p notification --lib --tests)",
+      "Bash(pkill -f \"target/debug/notification run\")",
+      "Bash(curl -s http://localhost:9111/metrics)",
+      "Bash(SQLX_OFFLINE=true cargo check -p notification --all-targets --all-features)",
+      "Bash(grep -n \"\\\\.store\\\\.\\\\|h\\\\.store$\" crates/notification/src/consumer.rs)",
+      "Bash(SQLX_OFFLINE=true cargo test -p notification --test store_contract -- --ignored)",
+      "Bash(curl -s http://localhost:9112/metrics)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

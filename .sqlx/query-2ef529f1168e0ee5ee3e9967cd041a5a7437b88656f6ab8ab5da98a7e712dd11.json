@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT nd.subscriber_id, s.owner, nd.channel, s.channels AS \"channels: serde_json::Value\"\n               FROM notice_deliveries nd\n               JOIN subscribers s ON s.subscriber_id = nd.subscriber_id\n               WHERE nd.dedup_key = $1 AND nd.status = 'delivered'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subscriber_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "notice_deliveries",
+            "name": "subscriber_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "subscribers",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "channel",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "notice_deliveries",
+            "name": "channel"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "channels: serde_json::Value",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "subscribers",
+            "name": "channels"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2ef529f1168e0ee5ee3e9967cd041a5a7437b88656f6ab8ab5da98a7e712dd11"
+}
