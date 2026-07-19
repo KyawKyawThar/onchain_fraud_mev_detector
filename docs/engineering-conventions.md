@@ -29,6 +29,8 @@ A change is "done" when:
 - [ ] **Config is resolved once at boot**, fail-fast.
 - [ ] **Supply chain is deliberate** — heavy deps pinned `default-features = false` with a comment; `just deny` clean.
 - [ ] **The gates pass locally** — `just check` green (local == CI).
+- [ ] **New Kafka consumer?** — every line of the §12 conformance list, no exceptions.
+- [ ] **Doc comments state constraints** the code can't express (§13) — never narration of the next line.
 
 ---
 
@@ -76,6 +78,15 @@ canned double in its `#[cfg(test)]` module.
 
 **Anti-pattern.** Reaching for `rdkafka`/`lapin`/`reqwest` types directly in service
 logic. If a test needs a broker to run, the seam is missing.
+
+**Enforcement.** The dependency-direction half of this rule is *mechanical*, not
+review-vigilance: [`crates/arch-conformance`](../crates/arch-conformance/) runs the
+seam rules (detector crates → `detector-api` never `detection`; `rdkafka` never
+without `event-bus`; `lapin` in `simulation` only; one Prometheus exporter; `sqlx`
+alongside `db`; `clickhouse` alongside `ch-migrate`; `events`/`detector-api` stay at
+the bottom of the graph) against `cargo metadata` on every `cargo test` — a
+violation fails the same gate locally and in CI. Changing a rule is an architecture
+decision: edit the rule in the same PR, with the reasoning in the commit.
 
 ---
 
@@ -253,6 +264,67 @@ command, the same result locally and in CI, keeps the foundation trustworthy.
 
 **Reference.** [`Justfile`](../Justfile) (`check: fmt-check lint test build`),
 mirrored by the GitHub Actions workflows (§20).
+
+---
+
+## 12. New Kafka consumer conformance
+
+Every new consumer binary (or new consumer inside an existing binary) adopts the
+whole hardening surface — none of it is optional, because each line exists as the
+fix for a production failure mode:
+
+- [ ] **`event_bus::run_consumer`** with `Handled::Skip` + a DLQ topic for records
+  this consumer can *never* process — parked and replayable, not skip-and-forgot,
+  never a poison loop.
+- [ ] **Lag-reporting consumer builder** — `kafka_consumer_lag` is the
+  keeping-up signal ops actually pages on; a consumer without it is invisible.
+- [ ] **Commit discipline**: commit/ack only after the durable downstream write
+  (§7). A record that isn't yours (foreign chain, misrouted type) rides the work
+  channel as a *commit-only* marker so its offset advances **in order** with real
+  work — an out-of-band commit can overtake unpublished work sharing the
+  partition; dropping it uncommitted pins lag and forces full re-reads on
+  restart.
+- [ ] **Per-chain consumer group naming** where the consumer is
+  one-instance-per-chain (`detection-8453` pattern): same-group instances would
+  partition-split and commit-skip each other's chains. Keep the legacy bare name
+  for chain 1 so committed offsets survive.
+- [ ] **Idempotent processing** keyed on a stable id — redelivery after a crash
+  is normal, not exceptional (§7).
+- [ ] **`telemetry::health` wired** (two lines: `spawn_from_env` right after
+  telemetry init, `set_ready(true)` after boot wiring) + a `*_METRICS_ADDR`
+  standardized to `0.0.0.0:9100` in K8s.
+- [ ] **Config through `telemetry::env`** (`required`/`parse_or`), resolved once
+  at boot, fail-fast (§9).
+- [ ] **Publishing through `event-bus`** (`EventSink` / `publish_resilient`) —
+  never raw `rdkafka` producers (§2, enforced by arch-conformance).
+- [ ] **A K8s manifest entry** in `deploy/k8s/base/services/` that states its
+  scaling shape honestly (see the README table there): HPA only if replicas are
+  truly interchangeable; `Recreate` + 1 if there's a single-writer anywhere in
+  the loop; reorg-rewindable if it holds cross-block state (§15).
+
+**Reference.** [`usage`](../crates/usage/) is the smallest complete example;
+[`detection`'s scheduler](../crates/detection/src/scheduler.rs) shows the
+foreign-record commit-ordering pattern.
+
+---
+
+## 13. Doc comments state the constraint, not the mechanics
+
+**Rule.** A comment earns its place by stating something the code *cannot* express:
+an invariant ("starts **not ready** — a booting pod must stay out of rotation"), a
+rejected alternative and why, a cross-service contract, a production lesson
+("probe the broker, not the port"). Never what the next line does, where code was
+moved from, or why a change is correct — that's PR-review talk, noise the moment it
+merges.
+
+**Why here.** At this codebase's scale the doc comments *are* the architecture
+record: the §-references and invariant statements are how the next engineer learns
+which lines are load-bearing. Narration comments train readers to skip all
+comments, including the load-bearing ones.
+
+**Reference.** [`telemetry/src/health.rs`](../crates/telemetry/src/health.rs) and
+[`event-store`'s config](../crates/event-store/src/config.rs) — every comment is a
+constraint, a trade-off, or a trap.
 
 ---
 

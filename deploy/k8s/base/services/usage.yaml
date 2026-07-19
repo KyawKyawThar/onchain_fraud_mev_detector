@@ -1,0 +1,69 @@
+# ── usage (§13) — UsageRecorded → ClickHouse metering sink ─────────────
+# Customer-keyed partitioning means this consumer group scales toward
+# KAFKA_TOPIC_PARTITIONS; inserts are micro-batched and the exact read path
+# dedups by event_id, so rolling overlap is safe. Consumes only — emits
+# nothing, gates nothing (metering, not billing).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage
+  labels:
+    app.kubernetes.io/name: usage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usage
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: usage
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usage
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/usage:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: USAGE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

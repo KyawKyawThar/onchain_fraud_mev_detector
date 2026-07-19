@@ -1,0 +1,86 @@
+# ── event-store (§4/§14) — Kafka → ClickHouse projector + internal HTTP ──
+# Applies its own ClickHouse migrations and provisions the Kafka topic
+# topology on boot (fail-fast; the startup probe gives it the time). Scales
+# out as a consumer group up to KAFKA_TOPIC_PARTITIONS; inserts are keyed by
+# event id, so a rolling overlap is safe.
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-store
+  labels:
+    app.kubernetes.io/name: event-store
+spec:
+  selector:
+    app.kubernetes.io/name: event-store
+  ports:
+    - name: http
+      port: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-store
+  labels:
+    app.kubernetes.io/name: event-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: event-store
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: event-store
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: event-store
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: event-store
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/event-store:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials # CLICKHOUSE_USER/PASSWORD/DB
+          env:
+            - name: EVENT_STORE_HOST
+              value: 0.0.0.0
+            - name: EVENT_STORE_PORT
+              value: "8081"
+            - name: EVENT_STORE_WRITE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: EVENT_STORE_WRITE_TOKEN
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

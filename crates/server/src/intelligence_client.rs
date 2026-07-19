@@ -3,6 +3,7 @@
 //! rather than recompiling the proto here, so the wire contract can never
 //! drift between the two.
 
+use api_error::ApiError;
 use events::primitives::AccountAddress;
 use intelligence::model::address_key;
 use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
@@ -12,7 +13,36 @@ use intelligence::pb::{
     RiskScoreRequest,
 };
 use tonic::transport::Channel;
-use tonic::Status;
+use tonic::{Code, Status};
+
+/// Classify a failed `IntelligenceRead` call into the caller's HTTP error —
+/// the gRPC seam's analogue of `db::is_permanent` and the notification
+/// channels' HTTP/SMTP split: the *class* of the failure decides the status,
+/// because the status is the caller's retry contract.
+///
+/// * Caller-addressable — intelligence rejected the request itself
+///   (`InvalidArgument`/`OutOfRange`) or the named thing doesn't exist
+///   (`NotFound`) → 400/404 with the detail (authored by our own service,
+///   safe to return). Retrying unchanged will never help.
+/// * Transient — the read path is momentarily unavailable (`Unavailable`,
+///   `DeadlineExceeded`, `ResourceExhausted`, `Aborted`, `Cancelled`) →
+///   502, the "try again" signal. Blanket-mapping everything here (the old
+///   behavior) told callers to retry requests that could never succeed.
+/// * Everything else (`Internal`, `Unknown`, `DataLoss`, ...) is a platform
+///   bug → 500: detail logged, generic body, and *not* an invitation to
+///   retry.
+pub fn to_api_error(status: Status) -> ApiError {
+    match status.code() {
+        Code::NotFound => ApiError::not_found(status.message()),
+        Code::InvalidArgument | Code::OutOfRange => ApiError::bad_request(status.message()),
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::ResourceExhausted
+        | Code::Aborted
+        | Code::Cancelled => ApiError::bad_gateway(format!("intelligence: {status}")),
+        _ => ApiError::internal(format!("intelligence: {status}")),
+    }
+}
 
 #[derive(Clone)]
 pub struct IntelligenceClient {
@@ -95,5 +125,55 @@ impl IntelligenceClient {
             .get_entity_timeline(EntityTimelineRequest { entity_id })
             .await?;
         Ok(response.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_codes_classify_into_the_documented_error_classes() {
+        // Caller-addressable: the detail (ours) is returned, retry won't help.
+        assert!(matches!(
+            to_api_error(Status::not_found("entity x")),
+            ApiError::NotFound(m) if m == "entity x"
+        ));
+        assert!(matches!(
+            to_api_error(Status::invalid_argument("bad hops")),
+            ApiError::BadRequest(m) if m == "bad hops"
+        ));
+        assert!(matches!(
+            to_api_error(Status::out_of_range("cursor")),
+            ApiError::BadRequest(_)
+        ));
+
+        // Transient: 502 is the retry signal.
+        for status in [
+            Status::unavailable("connect refused"),
+            Status::deadline_exceeded("slow"),
+            Status::resource_exhausted("quota"),
+            Status::aborted("conflict"),
+            Status::cancelled("deadline"),
+        ] {
+            assert!(
+                matches!(to_api_error(status.clone()), ApiError::BadGateway(_)),
+                "{status:?} should be transient"
+            );
+        }
+
+        // Permanent platform faults: 500, never an invitation to retry.
+        for status in [
+            Status::internal("bug"),
+            Status::unknown("??"),
+            Status::data_loss("gone"),
+            Status::unimplemented("nope"),
+            Status::failed_precondition("state"),
+        ] {
+            assert!(
+                matches!(to_api_error(status.clone()), ApiError::Internal(_)),
+                "{status:?} should be permanent"
+            );
+        }
     }
 }

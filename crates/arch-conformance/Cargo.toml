@@ -1,0 +1,21 @@
+[package]
+name = "arch-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The workspace's seam rules as a test (docs/engineering-conventions.md §2):
+# the dependency-direction decisions (detector-api, event-bus, db, ch-migrate,
+# the single lapin seam, the metrics facade) are enforced by `cargo test`, not
+# by review vigilance. See src/lib.rs for the rules; tests/workspace.rs runs
+# them against `cargo metadata`.
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
