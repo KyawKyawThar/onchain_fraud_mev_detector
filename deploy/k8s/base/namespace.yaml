@@ -1,0 +1,9 @@
+# One namespace for the whole platform (§20). Isolation between environments
+# is per-cluster (or per-namespace via the overlay's namespace field), not
+# per-service — the services are one product and share the event backbone.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mev
+  labels:
+    app.kubernetes.io/part-of: mevwatch

@@ -41,7 +41,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
-use crate::intelligence_client::IntelligenceClient;
+use crate::intelligence_client::{self, IntelligenceClient};
 use crate::stream::{self, WsMessage};
 use crate::upstream;
 use crate::usage::{self, UsageRecorder};
@@ -199,7 +199,7 @@ async fn address_risk(
         .intelligence
         .risk_score(address)
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(intelligence_client::to_api_error)?;
 
     Ok(Json(RiskResponse {
         address: address_key(&address),
@@ -266,7 +266,7 @@ async fn address_labels(
         .intelligence
         .labels(address)
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(intelligence_client::to_api_error)?;
 
     Ok(Json(LabelsResponse {
         address: address_key(&address),
@@ -386,7 +386,7 @@ async fn builders(
         .intelligence
         .builder_leaderboard(query.chain, query.limit, query.since_unix_millis)
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(intelligence_client::to_api_error)?;
 
     Ok(Json(BuildersResponse {
         chain: query.chain,
@@ -491,7 +491,7 @@ async fn entity_graph(
         .intelligence
         .entity_graph(entity_id.to_string(), query.chain, query.hops)
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(intelligence_client::to_api_error)?;
 
     if !reply.found {
         return Err(ApiError::not_found(format!("entity {entity_id} not found")));
@@ -582,7 +582,7 @@ async fn entity_timeline(
         .intelligence
         .entity_timeline(entity_id.to_string())
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(intelligence_client::to_api_error)?;
 
     if !reply.found {
         return Err(ApiError::not_found(format!("entity {entity_id} not found")));
@@ -619,7 +619,7 @@ type RawQuery = std::collections::BTreeMap<String, String>;
     responses(
         (status = 200, description = "The incident's event sequence (proxied from event-store)"),
         (status = 401, description = "Missing or invalid bearer token"),
-        (status = 502, description = "event-store is unreachable"),
+        (status = 502, description = "event-store is unreachable or answered 5xx"),
     ),
 )]
 async fn audit_incident(
@@ -634,7 +634,8 @@ async fn audit_incident(
         &params,
     )
     .await
-    .map_err(ApiError::bad_gateway)?;
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("event-store")?;
 
     Ok((proxied.status, Json(proxied.body)).into_response())
 }
@@ -649,7 +650,7 @@ async fn audit_incident(
     responses(
         (status = 200, description = "A page of confirmed incidents (proxied from simulation-projection)"),
         (status = 401, description = "Missing or invalid bearer token"),
-        (status = 502, description = "simulation-projection is unreachable"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
     ),
 )]
 async fn list_incidents(
@@ -663,7 +664,8 @@ async fn list_incidents(
         &params,
     )
     .await
-    .map_err(ApiError::bad_gateway)?;
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
 
     Ok((proxied.status, Json(proxied.body)).into_response())
 }

@@ -1,0 +1,81 @@
+# ── notification (§11) — alert delivery (webhook/email/Slack/PagerDuty) ─
+# §20 "scale by customer count": overlap-safe (the Postgres dedup-by-stage
+# ledger absorbs redelivery), so this can roll normally and grow toward the
+# partition count as customers do.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  labels:
+    app.kubernetes.io/name: notification
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notification
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notification
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: notification
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: notification
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/notification:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config # SMTP_HOST/PORT/FROM ride here
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: SMTP_USERNAME
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: SMTP_PASSWORD
+            - name: NOTIFICATION_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

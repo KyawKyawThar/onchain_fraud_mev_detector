@@ -1,0 +1,73 @@
+# Dev overlay: a full stack on a laptop cluster (kind). Secrets are generated
+# from the committed secrets/*.env files — the same changeme_* posture as
+# .env.example: fine for a local cluster, NEVER for staging/production (those
+# come from Vault / a cloud secrets manager; see ../prod). Generated secrets
+# get a content-hash suffix, so editing one rolls every pod that consumes it.
+#
+#   just k8s-build-images   # build + kind-load the service images (:dev)
+#   kubectl apply -k deploy/k8s/overlays/dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Must match the base: the generated Secrets have to land in the same
+# namespace as their consumers, or kustomize won't rewrite the (hashed)
+# name references and pods would point at Secrets that don't exist.
+namespace: mev
+
+resources:
+  - ../../base
+
+secretGenerator:
+  - name: postgres-credentials
+    envs: [secrets/postgres.env]
+  - name: redis-credentials
+    envs: [secrets/redis.env]
+  - name: clickhouse-credentials
+    envs: [secrets/clickhouse.env]
+  - name: rabbitmq-credentials
+    envs: [secrets/rabbitmq.env]
+  - name: app-secrets
+    envs: [secrets/app.env]
+  - name: rpc-endpoints
+    envs: [secrets/rpc.env]
+
+patches:
+  # Dev logging: human-noisy, pretty is still wrong in-cluster (kubectl logs
+  # pipes fine through jq) — keep json, raise the level.
+  - target:
+      kind: ConfigMap
+      name: app-config
+    patch: |-
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: debug
+      - op: replace
+        path: /data/APP_ENV
+        value: development
+
+# Locally-built images loaded into kind (`just k8s-build-images`).
+images:
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/server
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/ingestion
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/event-store
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-worker
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-projection
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/rule-engine
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/notification
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/usage
+    newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/predictive
+    newTag: dev

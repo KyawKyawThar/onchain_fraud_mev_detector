@@ -1,0 +1,69 @@
+# Production overlay. Two deliberate differences from dev:
+#
+#   1. NO secretGenerator. The six Secrets (postgres-credentials,
+#      redis-credentials, clickhouse-credentials, rabbitmq-credentials,
+#      app-secrets, rpc-endpoints) are provisioned by the cluster's secrets
+#      machinery — External Secrets Operator / Vault agent injector / cloud
+#      secrets-store CSI — under exactly those names and the key names the dev
+#      overlay's secrets/*.env files document (§20: secrets via Vault or a
+#      cloud secrets manager). Nothing credential-bearing is committed here.
+#
+#   2. Pinned images. CI publishes sha-tagged images to GHCR on every merge to
+#      main (ci.yml); a deploy is editing newTag below to the release you mean
+#      and applying — rollback is the same edit backwards.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Pin to a release: replace `latest` with a `sha-<commit>` or `vX.Y.Z` tag.
+images:
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/server
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/ingestion
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/event-store
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-worker
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-projection
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/rule-engine
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/notification
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/usage
+    newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/predictive
+    newTag: latest
+
+patches:
+  # Production floor/ceiling bumps on the two HPA-scaled hot paths (§20:
+  # simulation scales aggressively, api is stateless behind the LB).
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: simulation-worker
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 4
+      - op: replace
+        path: /spec/maxReplicas
+        value: 16
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-server
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10

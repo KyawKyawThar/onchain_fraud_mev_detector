@@ -17,6 +17,7 @@ crates — scaffold them with `just new-lib <name>` / `just new-bin <name>`.
 | [`events`](events/) | The domain event schema (§2): every event family, versioned, with an `EventEnvelope` wrapper. The contract every service produces/consumes; **Sprint 1 locks it**. Pure data — no I/O, no transport deps. |
 | [`telemetry`](telemetry/) | Observability foundation (§19): `tracing` init (pretty/json) + **W3C trace-context propagation** across message boundaries, so traces stitch across services. Transport-agnostic header carrier (Kafka adapts it in Sprint 1). |
 | [`db`](db/) | Database access layer; migrations under `db/migrations` (run via `just migrate-*`). |
+| [`arch-conformance`](arch-conformance/) | The workspace's seam rules as a test (conventions §2): dependency-direction decisions (detector-api, event-bus, db, ch-migrate, the single `lapin` seam, the one metrics exporter) checked against `cargo metadata` on every `cargo test`, so a shortcut around a seam fails the build, not the review. |
 | [`server`](server/) | Placeholder service binary + Docker target. Demonstrates the service skeleton (`telemetry::init` → run); real services replace/join it per sprint. |
 
 ## Service crates (added per sprint)

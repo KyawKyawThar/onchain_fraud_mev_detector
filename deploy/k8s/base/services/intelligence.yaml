@@ -1,0 +1,290 @@
+# ── intelligence (§8/§10/§11) — three run modes, three Deployments ─────
+#   attribute        — the label/attribution consumer (default mode).
+#                      Single writer: the in-process MergeActor serializes
+#                      entity merges and does NOT coordinate across processes,
+#                      so replicas: 1 + Recreate.
+#   grpc             — the IntelligenceRead read path (§20 "scale read path"):
+#                      stateless over Redis cache-aside + Postgres/ClickHouse
+#                      → replicas + HPA.
+#   block-production — §10 builder/relay pipeline (PBS/Ethereum-specific,
+#                      gated on INTEL_PRODUCTION_CHAIN_ID=1). Pending-writes
+#                      flush queue is per-instance → 1 + Recreate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-attribute
+  labels:
+    app.kubernetes.io/name: intelligence-attribute
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-attribute
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-attribute
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          # No arg = the attribute consumer.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: intelligence-grpc
+  labels:
+    app.kubernetes.io/name: intelligence-grpc
+spec:
+  selector:
+    app.kubernetes.io/name: intelligence-grpc
+  ports:
+    - name: grpc
+      port: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-grpc
+  labels:
+    app.kubernetes.io/name: intelligence-grpc
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-grpc
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-grpc
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          args: [grpc]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+            - name: INTELLIGENCE_GRPC_HOST
+              value: 0.0.0.0
+            - name: INTELLIGENCE_GRPC_PORT
+              value: "50051"
+            - name: INTELLIGENCE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: intelligence-grpc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: intelligence-grpc
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: intelligence-grpc
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-block-production
+  labels:
+    app.kubernetes.io/name: intelligence-block-production
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-block-production
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-block-production
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          args: [block-production]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+            # Full-block read endpoint for builder/relay attribution (§10) —
+            # a single URL by design; the failover pool stays ingestion's.
+            - name: INTEL_ETH_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rpc-endpoints
+                  key: INTEL_ETH_RPC_URL
+            - name: INTELLIGENCE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

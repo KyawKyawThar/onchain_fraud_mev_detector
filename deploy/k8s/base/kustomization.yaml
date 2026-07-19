@@ -1,0 +1,31 @@
+# Base: the full platform topology (§20) — infra StatefulSets + one workload
+# per service binary. Environment-specific concerns (Secrets, image tags,
+# replica bumps) live in ../overlays/*; the base never carries a credential.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mev
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: mevwatch
+
+resources:
+  - namespace.yaml
+  - app-config.yaml
+  - infra/postgres.yaml
+  - infra/redis.yaml
+  - infra/clickhouse.yaml
+  - infra/kafka.yaml
+  - infra/rabbitmq.yaml
+  - services/ingestion.yaml
+  - services/detection.yaml
+  - services/event-store.yaml
+  - services/simulation.yaml
+  - services/intelligence.yaml
+  - services/rule-engine.yaml
+  - services/server.yaml
+  - services/notification.yaml
+  - services/usage.yaml
+  - services/predictive.yaml

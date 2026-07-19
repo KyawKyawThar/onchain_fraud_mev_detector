@@ -1,0 +1,75 @@
+# ── predictive (§16) — mempool → PredictedAlert, sub-block latency ─────
+# One instance per chain: it owns a single eth_newPendingTransactionFilter
+# on its RPC endpoint and an in-process dedup ring — a second replica would
+# double-predict. Recreate for the same reason. Ethereum-only today
+# (MEMPOOL_RPC_URL is one endpoint by design — no failover pool, t1's
+# scoped-down cut).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive
+  labels:
+    app.kubernetes.io/name: predictive
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: predictive
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: predictive
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: predictive
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: predictive
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/predictive:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config # CHAIN_ID=1, INTELLIGENCE_GRPC_ADDR
+          env:
+            - name: MEMPOOL_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rpc-endpoints
+                  key: MEMPOOL_RPC_URL
+            - name: METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

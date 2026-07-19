@@ -1,0 +1,65 @@
+# Shared non-secret configuration every service pod imports via `envFrom`.
+# In-cluster addresses use plain Service DNS (§20 — service discovery via DNS
+# in Kubernetes); anything credential-bearing lives in the Secrets the
+# overlays provide (see ../overlays/dev/kustomization.yaml), never here.
+#
+# Per-pod values (CHAIN_ID overrides, *_METRICS_ADDR, consumer-group
+# overrides) are set as explicit `env` entries on each Deployment — container
+# `env` wins over `envFrom`, so a per-chain instance overrides cleanly.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  LOG_FORMAT: json # every pod logs one JSON line per event for the cluster log pipeline
+
+  # Every binary serves /livez + /readyz here (telemetry::health, opt-in via
+  # HEALTH_ADDR) — one port for every pod means one probe stanza shape.
+  HEALTH_ADDR: 0.0.0.0:8086
+
+  # ── Event backbone (Kafka, §2/§4) ─────────────────────────────
+  KAFKA_BROKERS: kafka:9092
+  # Topic topology event-store provisions on boot (§20). Partitions cap
+  # per-chain parallelism (chain is the message key); replication is 1 while
+  # the broker is a single-node KRaft StatefulSet.
+  KAFKA_TOPIC_PARTITIONS: "3"
+  KAFKA_TOPIC_REPLICATION: "1"
+  KAFKA_RETENTION_MS: "604800000"
+
+  # ── ClickHouse (event store + analytics, §14) ─────────────────
+  # Credential-free HTTP base for the `clickhouse` Rust client; user/password/
+  # db ride separately in the clickhouse-credentials Secret.
+  CLICKHOUSE_HTTP_URL: http://clickhouse:8123
+
+  # ── Simulation work queue (RabbitMQ, §7) ──────────────────────
+  RABBITMQ_SIM_QUEUE: sim.jobs
+  RABBITMQ_SIM_DLX: sim.jobs.dlx
+  RABBITMQ_SIM_DLQ: sim.jobs.dlq
+  RABBITMQ_SIM_DELIVERY_LIMIT: "5"
+
+  # ── Internal read APIs the api-service fronts (§11) ───────────
+  EVENT_STORE_URL: http://event-store:8081
+  SIMULATION_URL: http://simulation-projection:8082
+  INTELLIGENCE_GRPC_ADDR: http://intelligence-grpc:50051
+
+  # ── Chain defaults ────────────────────────────────────────────
+  # Ethereum-mainnet default; the per-chain instances (ingestion-base,
+  # detection-base) override CHAIN_ID in their own env. Finality depth
+  # defaults per chain in code (eth 64, base 1024) — no global override here.
+  CHAIN_ID: "1"
+
+  # ── api-service (§11) ─────────────────────────────────────────
+  JWT_ISSUER: mev
+
+  # ── Notification email channel (§11) ──────────────────────────
+  # Relay host/from are deploy config; the credentials are in app-secrets.
+  SMTP_HOST: smtp.example.internal
+  SMTP_PORT: "587"
+  SMTP_FROM: alerts@mevwatch.example
+
+  # ── §10 block-production pipeline (intelligence) ──────────────
+  # Public MEV-Boost relay data APIs; relay identity is configuration, never
+  # code. Empty ⇒ header facts only.
+  MEV_RELAY_ENDPOINTS: flashbots=https://boost-relay.flashbots.net,ultrasound=https://relay.ultrasound.money,agnostic=https://agnostic-relay.net

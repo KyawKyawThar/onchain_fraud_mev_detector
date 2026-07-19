@@ -18,13 +18,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Build: cook deps (cached), then build the requested binary ───
 FROM chef AS builder
 ARG BIN=server
+# Optional cargo features in package/feature form (virtual workspace), e.g.
+# FEATURES=detection/detectors — the detection image MUST set this or it
+# links no built-in detectors (the lib default leaves the roster to the
+# composing binary).
+ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 # Heavy, cached layer — only invalidated when dependencies change.
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json ${FEATURES:+--features "${FEATURES}"}
 COPY . .
 # Build against the committed .sqlx cache (no live DB at image-build time).
 ENV SQLX_OFFLINE=true
-RUN cargo build --release --locked --bin "${BIN}" \
+RUN cargo build --release --locked --bin "${BIN}" ${FEATURES:+--features "${FEATURES}"} \
     && cp "target/release/${BIN}" /app/service
 
 # ── Runtime: minimal, non-root ───────────────────────────────────

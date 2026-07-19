@@ -1,0 +1,87 @@
+# ── ClickHouse (event store + incident/usage analytics, §14) ───────────
+# Single-node StatefulSet for now; §20's "cluster with replication" is a
+# storage-topology upgrade behind the same Service name. Each consumer
+# (event-store, usage, intelligence, simulation-projection) applies its own
+# migrations at boot via the shared ch-migrate crate.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  labels:
+    app.kubernetes.io/name: clickhouse
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: clickhouse
+  ports:
+  - name: http
+    port: 8123
+  - name: native
+    port: 9000
+---
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse
+        app.kubernetes.io/part-of: mevwatch
+    spec:
+      containers:
+      - name: clickhouse
+        # Compose tracks :latest; a deployment pins. Bump deliberately.
+        image: clickhouse/clickhouse-server:25.6
+        ports:
+        - name: http
+          containerPort: 8123
+        - name: native
+          containerPort: 9000
+        envFrom:
+        # CLICKHOUSE_DB / CLICKHOUSE_USER / CLICKHOUSE_PASSWORD — image-native names.
+        - secretRef:
+            name: clickhouse-credentials
+        env:
+        - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+          value: "1"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/clickhouse
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 5
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ ReadWriteOnce ]
+      resources:
+        requests:
+          storage: 20Gi

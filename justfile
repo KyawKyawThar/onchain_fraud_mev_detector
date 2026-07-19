@@ -420,6 +420,50 @@ backtest-update-baseline:
 backtest-accept-snapshot:
     INSTA_UPDATE=always cargo test -p backtest --all-features --test baseline_snapshot
 
+# ── Kubernetes (deploy/k8s, §20) ─────────────────────────────────
+
+# The deployable service binaries — one GHCR image each (matches ci.yml's
+# docker matrix). detection carries its feature flag inline.
+k8s_bins := "server ingestion detection:detection/detectors event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive"
+k8s_image := "ghcr.io/kyawkyawthar/onchain_fraud_mev_detector"
+
+# Build every service image locally (:dev) and load it into the kind cluster —
+# the local stand-in for CI's GHCR publish. Slow the first time; cargo-chef
+# caches the dependency layer after that.
+k8s-build-images cluster="kind":
+    #!/usr/bin/env sh
+    set -eu
+    for entry in {{k8s_bins}}; do
+        bin="${entry%%:*}"
+        features="${entry#*:}"; [ "$features" = "$entry" ] && features=""
+        echo "── building ${bin}${features:+ (features: $features)}"
+        docker build -f deploy/Dockerfile \
+            --build-arg BIN="$bin" \
+            --build-arg FEATURES="$features" \
+            -t "{{k8s_image}}/${bin}:dev" .
+        kind load docker-image "{{k8s_image}}/${bin}:dev" --name "{{cluster}}"
+    done
+
+# Render the dev overlay (review what would apply)
+k8s-render overlay="dev":
+    kubectl kustomize deploy/k8s/overlays/{{overlay}}
+
+# Apply the dev overlay to the current kubectl context
+k8s-apply overlay="dev":
+    kubectl apply -k deploy/k8s/overlays/{{overlay}}
+
+# Diff the dev overlay against the live cluster
+k8s-diff overlay="dev":
+    kubectl diff -k deploy/k8s/overlays/{{overlay}} || true
+
+# Tear the stack down (keeps PVCs; delete the namespace's pvc objects to wipe data)
+k8s-delete overlay="dev":
+    kubectl delete -k deploy/k8s/overlays/{{overlay}}
+
+# Watch the whole namespace converge
+k8s-status:
+    kubectl -n mev get pods,statefulsets,deployments,hpa
+
 # ── Security / supply chain ──────────────────────────────────────
 
 # Check for vulnerable dependencies (cargo-audit)

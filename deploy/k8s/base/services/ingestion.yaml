@@ -1,0 +1,136 @@
+# ── ingestion (§5) — one instance per chain, never horizontally scaled ──
+# Each instance is the single head-poller for its chain: the RPC failover
+# pool is *inside* the process, so resilience comes from the endpoint pool,
+# not replicas. Two concurrent pollers would double-publish heads, hence
+# replicas: 1 + Recreate (no old/new overlap during a rollout).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-eth
+  labels:
+    app.kubernetes.io/name: ingestion-eth
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingestion-eth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingestion-eth
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: ingestion
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ingestion
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/ingestion:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            # CHAIN_ID=1 comes from app-config; finality depth defaults per
+            # chain in code (eth 64).
+            - name: RPC_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: rpc-endpoints
+                  key: ETH_RPC_URLS
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+# Base (chain 8453, Sprint 13 t2). Same shape; its own RPC pool + the
+# per-chain finality default (1024) from code.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-base
+  labels:
+    app.kubernetes.io/name: ingestion-base
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingestion-base
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingestion-base
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: ingestion
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ingestion
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/ingestion:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: CHAIN_ID # container env wins over the envFrom default of 1
+              value: "8453"
+            - name: RPC_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: rpc-endpoints
+                  key: BASE_RPC_URLS
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

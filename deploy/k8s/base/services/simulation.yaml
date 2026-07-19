@@ -1,0 +1,249 @@
+# ── simulation (§7) — dispatcher, worker pool, projection ──────────────
+# Three binaries, three scaling shapes:
+#   dispatcher   — Kafka consumer publishing SimulationJob commands; 1 is plenty
+#   worker       — revm CPU is THE bottleneck (§20 "scale aggressively"):
+#                  competing consumers on the sim.jobs quorum queue, so
+#                  replicas scale linearly → HPA on CPU
+#   projection   — incidents read model (Postgres+ClickHouse) + internal
+#                  GET /v1/incidents the api-service fronts
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulation-dispatcher
+  labels:
+    app.kubernetes.io/name: simulation-dispatcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: simulation-dispatcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: simulation-dispatcher
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: simulation
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dispatcher
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_URL
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulation-worker
+  labels:
+    app.kubernetes.io/name: simulation-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: simulation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: simulation-worker
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: simulation
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # Long revm jobs get time to finish; an unacked job a killed worker held
+      # is redelivered anyway (per-message ack — crashes on hostile bytecode
+      # are an expected failure mode, §7).
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-worker:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_URL
+            # Per-replica concurrency; horizontal scale is replicas (HPA below).
+            - name: SIMULATION_WORKERS
+              value: "4"
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+# The one true horizontal scaler in the system: workers are interchangeable
+# competing consumers, so CPU pressure → more replicas, linearly.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: simulation-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: simulation-worker
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: simulation-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: simulation-worker
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simulation-projection
+  labels:
+    app.kubernetes.io/name: simulation-projection
+spec:
+  selector:
+    app.kubernetes.io/name: simulation-projection
+  ports:
+    - name: http
+      port: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulation-projection
+  labels:
+    app.kubernetes.io/name: simulation-projection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: simulation-projection
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: simulation-projection
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: simulation
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: projection
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/simulation-projection:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: SIMULATION_PROJECTION_HTTP_HOST
+              value: 0.0.0.0
+            - name: SIMULATION_PROJECTION_HTTP_PORT
+              value: "8082"
+          ports:
+            - name: http
+              containerPort: 8082
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

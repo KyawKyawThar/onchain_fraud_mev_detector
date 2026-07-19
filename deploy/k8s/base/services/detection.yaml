@@ -1,0 +1,141 @@
+# ── detection (§6/§17) — one instance per chain ────────────────────────
+# §20 says "scale by CPU", but the ceiling is structural: chain is the Kafka
+# partition key, so all of one chain's blocks land in one partition and a
+# second same-group replica would only idle (and cross-block detectors keep
+# per-instance state). Scale *up* (CPU limit / rayon fan-out) per chain, and
+# *out* by adding chains. Recreate avoids two instances briefly sharing the
+# group mid-rollout. The image must be built with FEATURES=detection/detectors
+# (see deploy/Dockerfile) or no built-in detectors are linked.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detection-eth
+  labels:
+    app.kubernetes.io/name: detection-eth
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: detection-eth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: detection-eth
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: detection
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: detection
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            # CHAIN_ID=1 from app-config; consumer group defaults to
+            # "detection" (per-chain groups keep offsets separate, t2).
+            - name: DETECTION_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detection-base
+  labels:
+    app.kubernetes.io/name: detection-base
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: detection-base
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: detection-base
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: detection
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: detection
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: CHAIN_ID # group defaults to detection-8453 (per-chain, t2)
+              value: "8453"
+            - name: DETECTION_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

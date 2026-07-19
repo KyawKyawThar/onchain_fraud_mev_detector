@@ -1,0 +1,80 @@
+# ── rule-engine (§9) — customer-defined alerting ───────────────────────
+# §20 "scale by partition count": as a consumer group it can grow toward
+# KAFKA_TOPIC_PARTITIONS, but the TemporalPool is single-writer-per-address
+# *per instance* and partitions split by chain — so scaling out only helps
+# once multiple chains flow. 1 replica + Recreate keeps the temporal windows
+# on one writer; revisit when chain count > partition heat.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rule-engine
+  labels:
+    app.kubernetes.io/name: rule-engine
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rule-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rule-engine
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: rule-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rule-engine
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/rule-engine:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+            - name: RULE_ENGINE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
