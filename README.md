@@ -333,5 +333,5 @@ are written up in [docs/engineering-conventions.md](./docs/engineering-conventio
 Built by **Nicholas** — senior backend engineer, distributed systems,
 Go + Rust.
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat-square&logo=linkedin)](https://linkedin.com/in/your-profile)
-[![Email](https://img.shields.io/badge/Email-Contact-grey?style=flat-square)](mailto:your@email.com)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/kyawkyaw-thar-210602185/)
+[![Email](https://img.shields.io/badge/Email-Contact-grey?style=flat-square)](kyawkyaw.thar84@gmail.com)
