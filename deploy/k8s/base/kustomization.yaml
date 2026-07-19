@@ -19,6 +19,10 @@ resources:
   - infra/clickhouse.yaml
   - infra/kafka.yaml
   - infra/rabbitmq.yaml
+  - infra/prometheus.yaml
+  - infra/alertmanager.yaml
+  - infra/tempo.yaml
+  - infra/grafana.yaml
   - services/ingestion.yaml
   - services/detection.yaml
   - services/event-store.yaml
@@ -29,3 +33,29 @@ resources:
   - services/notification.yaml
   - services/usage.yaml
   - services/predictive.yaml
+
+# Dashboards/datasources feed both the compose Grafana and this in-cluster one
+# from the same source files (deploy/grafana/...) — one place to edit, no
+# drift between the two deploy targets (§19, Sprint 13 t4).
+configMapGenerator:
+  - name: grafana-dashboards
+    files:
+      - ../../grafana/dashboards/api-service.json
+      - ../../grafana/dashboards/billing-usage.json
+      - ../../grafana/dashboards/block_production.json
+      - ../../grafana/dashboards/detection.json
+      - ../../grafana/dashboards/event-store.json
+      - ../../grafana/dashboards/ingestion.json
+      - ../../grafana/dashboards/intelligence.json
+      - ../../grafana/dashboards/notification.json
+      - ../../grafana/dashboards/pipeline-overview.json
+      - ../../grafana/dashboards/rule-engine.json
+      - ../../grafana/dashboards/simulation.json
+  - name: grafana-dashboard-provider
+    files:
+      - ../../grafana/provisioning/dashboards/dashboards.yml
+  - name: grafana-datasources
+    files:
+      - ../../grafana/provisioning/datasources/clickhouse.yml
+      - ../../grafana/provisioning/datasources/prometheus.yml
+      - ../../grafana/provisioning/datasources/tempo.yml

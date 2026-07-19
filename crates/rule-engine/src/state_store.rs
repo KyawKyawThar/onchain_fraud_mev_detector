@@ -61,10 +61,7 @@ impl event_bus::Transience for StateStoreError {
     fn is_transient(&self) -> bool {
         match self {
             StateStoreError::Malformed { .. } => false,
-            StateStoreError::Redis(err) => !matches!(
-                err.kind(),
-                redis::ErrorKind::UnexpectedReturnType | redis::ErrorKind::Parse
-            ),
+            StateStoreError::Redis(err) => db::redis::is_transient(err),
         }
     }
 }
@@ -180,10 +177,10 @@ pub struct RedisTemporalStore {
 
 impl RedisTemporalStore {
     /// Connect and prove Redis is reachable (fail-fast at boot: the manager
-    /// performs the initial connect + `PING` here).
-    pub async fn connect(url: &str) -> Result<Self, StateStoreError> {
-        let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client).await?;
+    /// performs the initial connect + `PING` here) — via the shared
+    /// [`db::redis::connect`] every Redis-backed store in the workspace uses.
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        let conn = db::redis::connect(url).await?;
         Ok(Self { conn })
     }
 }

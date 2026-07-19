@@ -19,6 +19,11 @@ data:
   # HEALTH_ADDR) — one port for every pod means one probe stanza shape.
   HEALTH_ADDR: 0.0.0.0:8086
 
+  # Distributed tracing (§19, Sprint 13 t4): opt-in in crates/telemetry
+  # (unset elsewhere keeps spans in-process only), defaulted ON here since
+  # the in-cluster Tempo (infra/tempo.yaml) is part of this deployment.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+
   # ── Event backbone (Kafka, §2/§4) ─────────────────────────────
   KAFKA_BROKERS: kafka:9092
   # Topic topology event-store provisions on boot (§20). Partitions cap

@@ -71,6 +71,7 @@ fn notice() -> Notice {
         addresses: vec![],
         owner: Some(CustomerId::new()),
         summary: "confirmed sandwich".into(),
+        occurred_at: chrono::Utc::now(),
     }
 }
 

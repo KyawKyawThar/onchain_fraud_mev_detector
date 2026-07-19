@@ -18,3 +18,6 @@ tracing.workspace = true
 # (no shared tables, §14). `tokio` is sqlx's async runtime.
 sqlx.workspace = true
 tokio.workspace = true
+# Shared Redis plumbing (§8/§9) — the `redis` module's connection builder +
+# transient/permanent classification, the Redis analog of the sqlx half above.
+redis.workspace = true

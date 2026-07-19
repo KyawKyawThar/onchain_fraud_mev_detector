@@ -3,6 +3,7 @@
 //! Everything downstream takes an explicit [`Config`] so the rest of the
 //! service stays pure and testable.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -27,6 +28,11 @@ pub struct Config {
     pub finalize_interval: Duration,
     pub rpc: RpcPoolConfig,
     pub kafka: KafkaConfig,
+    /// Address the Prometheus `/metrics` endpoint binds to (§19 — ingestion lag,
+    /// assembly latency, reorg depth/frequency). Defaults to `0.0.0.0:9103`, a
+    /// slot distinct from detection's `9100`/`9101` (base) and event-store's
+    /// `9102` (§20 standardized port table).
+    pub metrics_addr: SocketAddr,
 }
 
 /// How to reach Kafka for *producing* chain events (§20). The ingestion service
@@ -69,6 +75,10 @@ impl Config {
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
             },
+            metrics_addr: env_parse(
+                "INGESTION_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9103)),
+            )?,
         })
     }
 }

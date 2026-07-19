@@ -155,6 +155,11 @@ pub fn router(state: AppState) -> Router {
             REQUEST_TIMEOUT,
         ))
         .layer(TraceLayer::new_for_http())
+        // §19 — the API p50/p99 panel. Added via `Router::layer` (not a
+        // ServiceBuilder wrapping the whole app), so routing has already run
+        // and `MatchedPath` is in the request's extensions, same as the
+        // `TraceLayer` above.
+        .layer(middleware::from_fn(crate::metrics::record_http_metrics))
         .with_state(state)
 }
 

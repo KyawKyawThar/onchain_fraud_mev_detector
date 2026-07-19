@@ -1,0 +1,24 @@
+# Auto-provisioned ClickHouse datasource (§13, §19, Sprint 13 t4) — feeds the
+# billing-usage dashboard. Deliberately separate from Prometheus: per-customer
+# breakdown is a Prometheus label-cardinality anti-pattern, so billing-by-
+# customer reads ClickHouse's usage_rollup_daily table (crates/usage) instead
+# of a Prometheus series. `${CLICKHOUSE_PASSWORD}` is expanded by Grafana from
+# its own process environment at provisioning time (docker-compose.yml's
+# `grafana` service loads ../.env for this — no secret committed here).
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse
+    access: proxy
+    editable: false
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      username: "${CLICKHOUSE_USER}"
+      defaultDatabase: "${CLICKHOUSE_DB}"
+      tlsSkipVerify: true
+    secureJsonData:
+      password: "${CLICKHOUSE_PASSWORD}"

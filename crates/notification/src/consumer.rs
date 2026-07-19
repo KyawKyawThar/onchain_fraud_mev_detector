@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
@@ -158,7 +158,11 @@ impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V>
 /// What a buffered `IncidentRetracted`/`IncidentFinalized` needs replayed
 /// once its `alert_id` mapping resolves.
 enum PendingCorrelation {
-    Retracted { reason: String, chain: Chain },
+    Retracted {
+        reason: String,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    },
     Finalized,
 }
 
@@ -360,12 +364,13 @@ impl NotificationConsumer {
         &self,
         event: events::simulation::IncidentCreated,
         chain: Chain,
+        occurred_at: DateTime<Utc>,
     ) -> Result<(), ConsumerError> {
         let (incident_id, alert_id) = notice::incident_alert_link(&event);
         self.store
             .record_incident_alert(incident_id, alert_id, Utc::now())
             .await?;
-        let notice = Notice::from_incident_created(&event, chain);
+        let notice = Notice::from_incident_created(&event, chain, occurred_at);
         self.route_and_deliver(notice).await?;
 
         let replay = self
@@ -405,8 +410,12 @@ impl NotificationConsumer {
         correlate: PendingCorrelation,
     ) -> Result<(), ConsumerError> {
         match correlate {
-            PendingCorrelation::Retracted { reason, chain } => {
-                let notice = Notice::retraction(alert_id, chain, &reason);
+            PendingCorrelation::Retracted {
+                reason,
+                chain,
+                occurred_at,
+            } => {
+                let notice = Notice::retraction(alert_id, chain, &reason, occurred_at);
                 self.route_and_deliver(notice).await
             }
             PendingCorrelation::Finalized => {
@@ -421,16 +430,18 @@ impl NotificationConsumer {
 
 #[async_trait]
 impl EventHandler for NotificationConsumer {
+    #[tracing::instrument(skip_all, fields(chain = %envelope.chain, event = envelope.payload.event_type()))]
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
         let chain = envelope.chain;
+        let occurred_at = envelope.occurred_at;
         match envelope.payload {
             DomainEvent::PreliminaryAlertCreated(event) => {
-                let notice = Notice::from_preliminary_alert(&event, chain);
+                let notice = Notice::from_preliminary_alert(&event, chain, occurred_at);
                 self.verdict(self.route_and_deliver(notice).await)
             }
 
             DomainEvent::IncidentCreated(event) => {
-                self.verdict(self.on_incident_created(event, chain).await)
+                self.verdict(self.on_incident_created(event, chain, occurred_at).await)
             }
 
             DomainEvent::IncidentRetracted(event) => {
@@ -440,6 +451,7 @@ impl EventHandler for NotificationConsumer {
                         PendingCorrelation::Retracted {
                             reason: event.reason,
                             chain,
+                            occurred_at,
                         },
                     )
                     .await;
@@ -454,12 +466,12 @@ impl EventHandler for NotificationConsumer {
             }
 
             DomainEvent::RuleAlertCreated(event) => {
-                let notice = Notice::from_rule_alert(&event, chain);
+                let notice = Notice::from_rule_alert(&event, chain, occurred_at);
                 self.verdict(self.route_and_deliver(notice).await)
             }
 
             DomainEvent::SanctionHit(event) => {
-                let notice = Notice::from_sanction_hit(&event, chain);
+                let notice = Notice::from_sanction_hit(&event, chain, occurred_at);
                 self.verdict(self.route_and_deliver(notice).await)
             }
 

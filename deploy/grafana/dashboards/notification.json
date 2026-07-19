@@ -1,0 +1,98 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["notification", "mev", "§11", "§19"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Notification — notices, deliveries, end-to-end latency (§19)",
+  "uid": "notification-delivery",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Notices / sec, by lifecycle stage",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (stage) (rate(notification_notices_total[$__rate_interval]))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Deliveries / sec, by channel + outcome",
+      "description": "delivered / rejected / failed. A rising rejected/failed rate means a revoked or dead subscriber endpoint.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (channel, outcome) (rate(notification_deliveries_total[$__rate_interval]))",
+          "legendFormat": "{{channel}}/{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "End-to-end alert latency p50 / p95 (s), by channel",
+      "description": "notification_alert_end_to_end_seconds — time from the domain event that produced a notice (block/incident occurred_at) to a successful delivery. Sampled only on `delivered` outcomes.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (channel, le) (rate(notification_alert_end_to_end_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{channel}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (channel, le) (rate(notification_alert_end_to_end_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{channel}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Subscriber cache refresh outcomes",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(notification_subscriber_refresh_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    }
+  ]
+}

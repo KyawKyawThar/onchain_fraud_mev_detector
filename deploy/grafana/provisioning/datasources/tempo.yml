@@ -1,0 +1,22 @@
+# Auto-provisioned Tempo datasource (§19, Sprint 13 t4). Grafana reads this on
+# boot, so trace search/explore works without any click-ops. `tempo` is the
+# compose service name, reachable on the `backend` network; :3200 is Tempo's
+# query API (see ../../../tempo.yaml).
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      httpMethod: GET
+      # Correlate a trace's service.name/span attributes back to Prometheus
+      # series for the same window — lets an on-call engineer jump from a
+      # slow span straight to that service's dashboard.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"

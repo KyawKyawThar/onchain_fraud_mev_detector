@@ -57,6 +57,8 @@ async fn main() -> Result<()> {
 /// Run the service: apply pending migrations, then the Kafka consumer and HTTP
 /// server together until shutdown.
 async fn serve(cfg: config::Config, client: Client) -> Result<()> {
+    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+
     // Bring the schema up to date before accepting any writes.
     migrate::MIGRATOR
         .run(&client)

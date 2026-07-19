@@ -1,0 +1,31 @@
+# Grafana Tempo config (§19, Sprint 13 t4) — single-binary, local-disk
+# storage. The dev-loop trace backend: receives OTLP/HTTP spans from any
+# service that sets OTEL_EXPORTER_OTLP_ENDPOINT (crates/telemetry), and serves
+# them to Grafana's Tempo datasource (./grafana/provisioning/datasources).
+# Not a production topology — production Tempo runs distributed, with object
+# storage (S3/GCS) as the backend, not `local`.
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  trace_idle_period: 10s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 48h # bounded, like the Kafka topic retention (§4/§20) — this is a dev trace store, not the audit record
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

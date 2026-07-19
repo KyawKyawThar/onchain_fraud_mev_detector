@@ -1,21 +1,76 @@
-# Prometheus scrape config (§19). Scrapes each service's /metrics endpoint —
-# today the detection service's per-detector hit rate + latency
-# (detector_runs_total / detector_hits_total / detector_detect_duration_seconds).
+# Prometheus scrape config (§19). Scrapes each service's /metrics endpoint.
 #
 # The services run on the **host** (they aren't containerized in this compose yet),
 # so targets reach them via `host.docker.internal`, mapped to the host gateway in
 # the Prometheus service's `extra_hosts`. When a service is containerized, switch
 # its target to the compose service name on the `backend` network.
+#
+# Only each service's primary (Ethereum) instance is listed — the optional
+# per-chain Base instances (`just run-detection-base` / `run-ingestion-base`,
+# Sprint 13 t2) bind distinct ports (detection 9101, ingestion 9104) but aren't
+# scraped by default here, so a Prometheus that starts before you happen to run
+# them doesn't show a permanently "down" target; add a target for the port if
+# you're running a Base instance locally.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+rule_files:
+  - /etc/prometheus/rules/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
+  - job_name: ingestion
+    static_configs:
+      - targets: ["host.docker.internal:9103"] # INGESTION_METRICS_ADDR
+        labels:
+          service: ingestion
+
+  - job_name: event-store
+    static_configs:
+      - targets: ["host.docker.internal:9102"] # EVENT_STORE_METRICS_ADDR
+        labels:
+          service: event-store
+
   - job_name: detection
     static_configs:
       - targets: ["host.docker.internal:9100"] # DETECTION_METRICS_ADDR
         labels:
           service: detection
+
+  # The three simulation binaries (§7/§20): the dispatcher, the revm worker
+  # pool (confirmation rate + job latency, §19), and the incident/job
+  # projection consumer.
+  - job_name: simulation-dispatcher
+    static_configs:
+      - targets: ["host.docker.internal:9105"] # SIMULATION_METRICS_ADDR
+        labels:
+          service: simulation
+          role: dispatcher
+
+  - job_name: simulation-worker
+    static_configs:
+      - targets: ["host.docker.internal:9106"] # SIMULATION_WORKER_METRICS_ADDR
+        labels:
+          service: simulation
+          role: worker
+
+  - job_name: simulation-projection
+    static_configs:
+      - targets: ["host.docker.internal:9111"] # SIMULATION_PROJECTION_METRICS_ADDR
+        labels:
+          service: simulation
+          role: projection
+
+  - job_name: rule-engine
+    static_configs:
+      - targets: ["host.docker.internal:9107"] # RULE_ENGINE_METRICS_ADDR
+        labels:
+          service: rule-engine
 
   # Intelligence block-production consumer (§10, Sprint 11) — the builder/relay
   # dashboard metrics: relay attributed/missed, snapshots appended, heuristic
@@ -26,6 +81,30 @@ scrape_configs:
       - targets: ["host.docker.internal:9108"] # INTELLIGENCE_METRICS_ADDR
         labels:
           service: intelligence
+
+  - job_name: usage
+    static_configs:
+      - targets: ["host.docker.internal:9109"] # USAGE_METRICS_ADDR
+        labels:
+          service: usage
+
+  - job_name: notification
+    static_configs:
+      - targets: ["host.docker.internal:9110"] # NOTIFICATION_METRICS_ADDR
+        labels:
+          service: notification
+
+  - job_name: api-service
+    static_configs:
+      - targets: ["host.docker.internal:9112"] # SERVER_METRICS_ADDR
+        labels:
+          service: api-service
+
+  - job_name: predictive
+    static_configs:
+      - targets: ["host.docker.internal:9465"] # METRICS_ADDR (predictive)
+        labels:
+          service: predictive
 
   # RabbitMQ sim.jobs work queue (§7/§20) — queue depth is the simulation
   # backpressure signal. Unlike the host-run services above, the broker runs in

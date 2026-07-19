@@ -49,8 +49,11 @@ pub struct Config {
     pub usage_channel_capacity: usize,
     /// Address the Prometheus `/metrics` endpoint binds to (§19). Exposes this
     /// service's counters — including `usage_events_recorded_total` /
-    /// `usage_events_dropped_total` (§13, `src/usage.rs`), which ops alerts on.
-    /// Defaults to `0.0.0.0:9100` (per-service, overridden per container).
+    /// `usage_events_dropped_total` (§13, `src/usage.rs`) and the request
+    /// p50/p99 panel (`src/metrics.rs`), which ops alerts on. Defaults to
+    /// `0.0.0.0:9112` — each container sets its own explicitly (§20), but the
+    /// default is picked distinct from `DETECTION_METRICS_ADDR`'s `9100` so
+    /// both binaries can run on one host in local dev without colliding.
     pub metrics_addr: SocketAddr,
 }
 
@@ -117,7 +120,7 @@ impl Config {
             )?,
             metrics_addr: env_parse(
                 "SERVER_METRICS_ADDR",
-                SocketAddr::from(([0, 0, 0, 0], 9100)),
+                SocketAddr::from(([0, 0, 0, 0], 9112)),
             )?,
         })
     }

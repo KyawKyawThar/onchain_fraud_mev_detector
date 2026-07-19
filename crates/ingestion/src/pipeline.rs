@@ -181,7 +181,11 @@ impl Pipeline {
     /// a strictly-lower-numbered parent to fetch first. The returned `Err` is a
     /// *source* failure (couldn't fetch a parent); publish failures don't surface
     /// here — they're retried internally (see [module docs](self)).
+    #[tracing::instrument(skip_all, fields(chain = %self.chain, number = head.number))]
     pub async fn ingest(&mut self, head: ChainHead) -> Result<()> {
+        crate::metrics::record_ingestion_lag(head.timestamp);
+        let started = std::time::Instant::now();
+
         let mut stack = vec![head];
 
         while let Some(&current) = stack.last() {
@@ -208,6 +212,7 @@ impl Pipeline {
                     stack.pop();
                 }
                 AddOutcome::Canonical(update) => {
+                    crate::metrics::record_canonical_update(&update);
                     let mut events = observed_events(current, self.trace_available).to_vec();
                     events.extend(canonical_events(&update));
                     self.publish_all(events).await;
@@ -216,6 +221,7 @@ impl Pipeline {
             }
         }
         self.report_progress();
+        crate::metrics::record_assembly_duration(started.elapsed());
         Ok(())
     }
 

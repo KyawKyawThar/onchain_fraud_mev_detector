@@ -1,0 +1,259 @@
+# ── Prometheus (metrics scrape + SLO alert rules, §19, Sprint 13 t4) ────
+# In-cluster twin of deploy/prometheus.yml, but target discovery is
+# `kubernetes_sd_configs: role: pod` with relabeling on the `prometheus.io/
+# scrape` + `prometheus.io/port` annotations every service pod already
+# carries (§20's t4 hook) — one scrape job covers every annotated pod instead
+# of a static target per service. Plain RBAC (ServiceAccount + ClusterRole to
+# list/watch pods), no Prometheus Operator/CRDs — consistent with how Kafka/
+# RabbitMQ/etc. are hand-rolled StatefulSets rather than operator-managed.
+#
+# Alert rules are the same PromQL as deploy/prometheus-rules.yml (environment-
+# agnostic — a rule doesn't care how its targets were discovered), inlined
+# here rather than shared via a file reference so this manifest tree stays
+# self-contained like the rest of infra/.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mev-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mev-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mev-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: mev
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - /etc/prometheus/rules/alerts.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [mev]
+        relabel_configs:
+          # Only pods that opted in via the annotation (§20's t4 hook).
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Default to the pod IP's :9100, but honor an explicit
+          # prometheus.io/port annotation when the pod uses a different one.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: replace
+            target_label: service
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+
+      # RabbitMQ sim.jobs queue depth (§7/§20) — the broker's own plugin, not
+      # a pod annotation (its Service is what's stable, not an ephemeral pod).
+      - job_name: rabbitmq
+        metrics_path: /metrics/per-object
+        static_configs:
+          - targets: ["rabbitmq:15692"]
+            labels:
+              service: simulation
+  alerts.yml: |
+    groups:
+      - name: mevwatch-slo
+        rules:
+          - alert: FastPathLatencyHigh
+            expr: histogram_quantile(0.99, sum(rate(detector_detect_duration_seconds_bucket[5m])) by (le)) > 1
+            for: 5m
+            labels:
+              severity: page
+            annotations:
+              summary: "Detector fast-path p99 latency exceeds the §6 <1s SLO"
+              description: "detector_detect_duration_seconds p99 has been above 1s for 5m."
+          - alert: ApiLatencyHigh
+            expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 1
+            for: 5m
+            labels:
+              severity: page
+            annotations:
+              summary: "api-service p99 request latency is high"
+              description: "http_request_duration_seconds p99 has been above 1s for 5m. Placeholder threshold — tune once real load/SLA numbers exist."
+          - alert: KafkaConsumerLagHigh
+            expr: max(kafka_consumer_lag) by (consumer) > 10000
+            for: 10m
+            labels:
+              severity: page
+            annotations:
+              summary: "A Kafka consumer is falling behind"
+              description: "kafka_consumer_lag above 10000 for 10m on {{ $labels.consumer }}."
+          - alert: DlqReceivingRecords
+            expr: sum(rate(dlq_published_total[5m])) by (consumer) > 0
+            for: 15m
+            labels:
+              severity: page
+            annotations:
+              summary: "A consumer is steadily parking records on its DLQ"
+              description: "{{ $labels.consumer }} has published to its DLQ continuously for 15m."
+          - alert: EventStoreAppendErrorsHigh
+            expr: sum(rate(event_store_append_errors_total[5m])) > 0
+            for: 5m
+            labels:
+              severity: page
+            annotations:
+              summary: "The event store is failing to append"
+              description: "event_store_append_errors_total has been increasing for 5m."
+          - alert: ServiceDown
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: page
+            annotations:
+              summary: "{{ $labels.service }} ({{ $labels.pod }}) is not being scraped"
+              description: "Prometheus has failed to scrape this pod for 2m."
+          - alert: SimulationConfirmationRateAnomaly
+            expr: |
+              sum(rate(simulation_jobs_total{outcome="confirmed"}[1h]))
+              /
+              clamp_min(sum(rate(simulation_jobs_total[1h])), 1e-9) < 0.01
+            for: 1h
+            labels:
+              severity: informational
+            annotations:
+              summary: "Simulation confirmation rate looks anomalously low"
+              description: "No production baseline yet — placeholder to prove the wiring, not a tuned SLO."
+          - alert: ReorgFrequencyHigh
+            expr: sum(rate(reorgs_total[1h])) by (chain) > 0.5
+            for: 1h
+            labels:
+              severity: informational
+            annotations:
+              summary: "Reorg frequency is elevated on {{ $labels.chain }}"
+              description: "More than 1 reorg per 2h sustained for 1h on {{ $labels.chain }} — placeholder threshold (no production baseline yet)."
+          - alert: AlertEndToEndLatencyHigh
+            expr: histogram_quantile(0.95, sum(rate(notification_alert_end_to_end_seconds_bucket[10m])) by (le)) > 30
+            for: 10m
+            labels:
+              severity: informational
+            annotations:
+              summary: "Block → notification latency (p95) is elevated"
+              description: "notification_alert_end_to_end_seconds p95 above 30s for 10m. Placeholder threshold."
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: observability
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+            items:
+              - key: prometheus.yml
+                path: prometheus.yml
+              - key: alerts.yml
+                path: rules/alerts.yml
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

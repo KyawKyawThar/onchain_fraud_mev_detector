@@ -11,6 +11,7 @@
 pub mod config;
 pub mod http;
 pub mod kafka;
+pub mod metrics;
 pub mod migrate;
 pub mod query;
 pub mod store;

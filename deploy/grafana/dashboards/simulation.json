@@ -3,10 +3,10 @@
   "editable": true,
   "graphTooltip": 1,
   "schemaVersion": 39,
-  "tags": ["simulation", "rabbitmq", "mev", "§7", "§20"],
+  "tags": ["simulation", "rabbitmq", "mev", "§7", "§19", "§20"],
   "time": { "from": "now-1h", "to": "now" },
   "timezone": "",
-  "title": "Simulation — sim.jobs queue (§7)",
+  "title": "Simulation — sim.jobs queue, confirmation rate, latency (§7, §19)",
   "uid": "simulation-sim-jobs",
   "version": 1,
   "templating": { "list": [] },
@@ -143,6 +143,52 @@
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rabbitmq_queue_consumers{queue=\"sim.jobs\"})",
           "legendFormat": "consumers"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Confirmation rate",
+      "description": "confirmed / (confirmed + unconfirmed) — the §19 simulation confirmation rate panel. No production baseline yet (production_readiness.md Epic E); watch trend, not an absolute target.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(simulation_jobs_total{outcome=\"confirmed\"}[$__rate_interval])) / sum(rate(simulation_jobs_total[$__rate_interval]))",
+          "legendFormat": "confirmation rate"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Job latency p50 / p99 (s)",
+      "description": "Worker::process wall-clock latency — resolve, the reorg generation check, revm simulation, and result publish, whichever branch it took.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(simulation_job_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(simulation_job_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
         }
       ]
     }

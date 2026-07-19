@@ -293,7 +293,7 @@ impl HttpDelivery {
             }
             Err(err) => Err(err),
         };
-        count_delivery("webhook", outcome_label(&outcome));
+        count_delivery("webhook", notice, outcome_label(&outcome));
         outcome
     }
 
@@ -309,7 +309,7 @@ impl HttpDelivery {
             }
             Err(err) => Err(err),
         };
-        count_delivery("slack", outcome_label(&outcome));
+        count_delivery("slack", notice, outcome_label(&outcome));
         outcome
     }
 
@@ -321,7 +321,7 @@ impl HttpDelivery {
         // No SSRF guard: PAGERDUTY_ENQUEUE_URL is fixed, never customer input.
         let event = PagerDutyEvent::from_notice(notice, routing_key);
         let outcome = self.post_with_retry(PAGERDUTY_ENQUEUE_URL, &event).await;
-        count_delivery("pager_duty", outcome_label(&outcome));
+        count_delivery("pager_duty", notice, outcome_label(&outcome));
         outcome
     }
 }
@@ -349,6 +349,7 @@ mod tests {
             addresses: vec![AccountAddress::repeat_byte(0xAB)],
             owner: Some(CustomerId::new()),
             summary: "confirmed sandwich".into(),
+            occurred_at: chrono::Utc::now(),
         }
     }
 

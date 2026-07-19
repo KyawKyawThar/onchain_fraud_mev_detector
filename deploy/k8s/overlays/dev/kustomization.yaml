@@ -30,6 +30,8 @@ secretGenerator:
     envs: [secrets/app.env]
   - name: rpc-endpoints
     envs: [secrets/rpc.env]
+  - name: grafana-admin
+    envs: [secrets/grafana.env]
 
 patches:
   # Dev logging: human-noisy, pretty is still wrong in-cluster (kubectl logs

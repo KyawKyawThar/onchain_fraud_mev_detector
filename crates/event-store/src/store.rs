@@ -79,11 +79,22 @@ impl EventStore {
     ///
     /// At-least-once by design — callers commit their source offset only *after*
     /// this returns, so a crash mid-append re-delivers rather than loses (§4).
+    #[tracing::instrument(skip_all, fields(rows = envelopes.len()))]
     pub async fn append_batch(&self, envelopes: &[EventEnvelope]) -> Result<(), StoreError> {
         if envelopes.is_empty() {
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
+        let result = self.append_batch_inner(envelopes).await;
+        match &result {
+            Ok(()) => crate::metrics::record_append_success(started.elapsed(), envelopes.len()),
+            Err(err) => crate::metrics::record_append_error(started.elapsed(), err),
+        }
+        result
+    }
+
+    async fn append_batch_inner(&self, envelopes: &[EventEnvelope]) -> Result<(), StoreError> {
         let mut insert = self.client.insert::<EventRow>("events").await?;
         for envelope in envelopes {
             // Encode failures are permanent (`StoreError::Encode`); I/O failures

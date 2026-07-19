@@ -1,0 +1,116 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["ingestion", "mev", "§19"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Ingestion — lag, assembly latency, reorgs (§19)",
+  "uid": "ingestion-pipeline",
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "chain",
+        "label": "Chain",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(ingestion_lag_seconds, chain)", "refId": "chains" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingestion lag (now − head timestamp)",
+      "description": "How far behind wall clock the most recently observed head's own chain timestamp is — propagation lag plus this instance's poll interval.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (chain) (ingestion_lag_seconds{chain=~\"$chain\"})",
+          "legendFormat": "{{chain}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Assembly latency p50 / p99 (s)",
+      "description": "One Pipeline::ingest() call's wall-clock latency — back-fill RPC fetches and publish retries included.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (chain, le) (rate(assembly_duration_seconds_bucket{chain=~\"$chain\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{chain}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (chain, le) (rate(assembly_duration_seconds_bucket{chain=~\"$chain\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{chain}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Reorgs / hour",
+      "description": "Canonical updates that orphaned at least one block — the reorg-frequency signal.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (chain) (increase(reorgs_total{chain=~\"$chain\"}[1h]))",
+          "legendFormat": "{{chain}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Reorg depth p99 (blocks)",
+      "description": "How many blocks the deepest recent reorgs orphaned.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (chain, le) (rate(reorg_depth_bucket{chain=~\"$chain\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{chain}}"
+        }
+      ]
+    }
+  ]
+}

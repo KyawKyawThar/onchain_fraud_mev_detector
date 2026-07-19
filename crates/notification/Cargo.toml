@@ -93,6 +93,9 @@ axum = { workspace = true }
 # honours the same dedup/claim contract the in-memory double does.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["postgres"] }
+# Scoped in-memory metrics recorder for the delivery metrics test (same
+# pattern as detection/ingestion/simulation/event-store's metrics tests).
+metrics-util = { workspace = true }
 
 [lints]
 workspace = true

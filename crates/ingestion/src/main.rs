@@ -34,6 +34,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    // Prometheus exporter (§19): one instance per chain, so the chain is a
+    // global label on every series — the same convention detection/predictive
+    // use, so a dashboard can filter/aggregate across chains cleanly.
+    telemetry::metrics::init_labeled(cfg.metrics_addr, &[("chain", cfg.chain.metrics_label())])
+        .context("starting the metrics exporter")?;
+
     let RpcPoolConfig {
         endpoints,
         poll_interval,

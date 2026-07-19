@@ -365,7 +365,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
-opentelemetry_sdk = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+# OTLP span export (§19, Sprint 13 t4): opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`.
+# HTTP transport (not gRPC/tonic) so this doesn't couple to the workspace's
+# separately-pinned `tonic` version — Tempo/collectors accept OTLP/HTTP natively.
+opentelemetry-otlp = { version = "0.27", default-features = false, features = [
+    "http-proto",
+    "reqwest-client",
+] }
 
 # Application metrics (§19): `metrics` is the lightweight facade a service records
 # through at the call site (e.g. per-detector hit/latency). The recording is a

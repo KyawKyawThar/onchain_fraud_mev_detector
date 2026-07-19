@@ -23,6 +23,9 @@ spec:
         app.kubernetes.io/name: simulation-dispatcher
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: simulation
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -45,9 +48,13 @@ spec:
                 secretKeyRef:
                   name: rabbitmq-credentials
                   key: RABBITMQ_URL
+            - name: SIMULATION_METRICS_ADDR
+              value: 0.0.0.0:9100
           ports:
             - name: health
               containerPort: 8086
+            - name: metrics
+              containerPort: 9100
           startupProbe:
             httpGet: { path: /livez, port: health }
             periodSeconds: 5
@@ -84,6 +91,9 @@ spec:
         app.kubernetes.io/name: simulation-worker
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: simulation
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -113,9 +123,13 @@ spec:
             # Per-replica concurrency; horizontal scale is replicas (HPA below).
             - name: SIMULATION_WORKERS
               value: "4"
+            - name: SIMULATION_WORKER_METRICS_ADDR
+              value: 0.0.0.0:9100
           ports:
             - name: health
               containerPort: 8086
+            - name: metrics
+              containerPort: 9100
           startupProbe:
             httpGet: { path: /livez, port: health }
             periodSeconds: 5
@@ -196,6 +210,9 @@ spec:
         app.kubernetes.io/name: simulation-projection
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: simulation
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -224,11 +241,15 @@ spec:
               value: 0.0.0.0
             - name: SIMULATION_PROJECTION_HTTP_PORT
               value: "8082"
+            - name: SIMULATION_PROJECTION_METRICS_ADDR
+              value: 0.0.0.0:9100
           ports:
             - name: http
               containerPort: 8082
             - name: health
               containerPort: 8086
+            - name: metrics
+              containerPort: 9100
           startupProbe:
             httpGet: { path: /livez, port: health }
             periodSeconds: 5
