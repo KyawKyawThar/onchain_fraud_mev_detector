@@ -42,7 +42,7 @@ Run these *after* the MVP path is green, sequenced by the exit gates below — n
 - [ ] **Graceful degradation:** if simulation backlogs, provisional alerts still flow (fast path independent of slow path, §6). If intelligence is down, API serves stale-but-flagged cache.
 - [ ] **Resilience primitives everywhere:** timeouts, retries with jitter, circuit breakers (already on the RPC pool §5 — extend to all gRPC/HTTP hops), bounded channels verified to apply backpressure end-to-end (§17).
 - [ ] **DLQ operations:** `sim.jobs.dlx` drain + replay runbook; alert on DLQ depth (§7).
-- [ ] **Consumer-lag & gap detection:** alert on Kafka lag; detect event-store sequence gaps (no silent loss).
+- [x] **Consumer-lag & gap detection (lag half, 2026-07-19):** every durable Kafka consumer is built through `event_bus::lag::build_reporting_consumer`, exporting the per-partition `kafka_consumer_lag` gauge; every consume loop parks unprocessable records on its own `mev.dlq.<consumer>` topic (`Handled::Skip` + poison), and every binary serves `/livez` + `/readyz` (`telemetry::health`, `HEALTH_ADDR`). The `RuleCreated` dual-write went through a transactional outbox (`rule_outbox` + `rule_engine::outbox`). Still open: event-store sequence-gap detection, and the dashboards/alerts themselves (Sprint 13 t4).
 
 **Exit gate:** chaos suite passes; killing any single node loses no audit history and recovers within RTO.
 

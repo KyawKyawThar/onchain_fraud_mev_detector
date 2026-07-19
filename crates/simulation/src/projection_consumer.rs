@@ -39,8 +39,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{run_consumer, EventHandler, Handled, Transience};
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
@@ -70,14 +72,8 @@ pub fn consumed_topics() -> Vec<String> {
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) ties the commit to
 /// a successful write-through; `earliest` means a fresh group projects from the start of
 /// retained history (cf. the dispatcher / event-store consumers).
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "projection")
 }
 
 /// The persistence consumer: the in-memory fold plus the two store seams. The fold is
@@ -103,8 +99,9 @@ impl ProjectionConsumer {
     /// shared [`run_consumer`] loop. `retry_backoff` paces a store-fault redelivery.
     pub async fn run(
         self,
-        consumer: StreamConsumer,
+        consumer: StreamConsumer<LagReporting>,
         retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let topics = consumed_topics();
@@ -114,6 +111,7 @@ impl ProjectionConsumer {
             &topic_refs,
             "projection",
             retry_backoff,
+            dlq,
             self,
             shutdown,
         )

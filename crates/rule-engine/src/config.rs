@@ -36,6 +36,10 @@ pub struct Config {
     pub kafka: KafkaConfig,
     /// Periodic rule-set refresh interval (see [`DEFAULT_REFRESH_SECS`]).
     pub refresh_interval: Duration,
+    /// How often the outbox flusher drains pending `RuleCreated`
+    /// announcements (`RULE_OUTBOX_FLUSH_SECS`, default 2s — announcement
+    /// latency is a UX concern, not a correctness one).
+    pub outbox_flush_interval: Duration,
     /// Temporal-fires channel capacity (see [`DEFAULT_FIRES_CAPACITY`]).
     pub fires_capacity: usize,
     /// Intelligence hot-cache TTL for scores this service repopulates.
@@ -71,6 +75,7 @@ impl Config {
                 "RULE_REFRESH_SECS",
                 DEFAULT_REFRESH_SECS,
             )?),
+            outbox_flush_interval: Duration::from_secs(env_parse("RULE_OUTBOX_FLUSH_SECS", 2u64)?),
             fires_capacity: env_parse("RULE_FIRES_CAPACITY", DEFAULT_FIRES_CAPACITY)?.max(1),
             cache_ttl: Duration::from_secs(env_parse(
                 "INTEL_CACHE_TTL_SECS",

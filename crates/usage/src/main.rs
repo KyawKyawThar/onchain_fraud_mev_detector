@@ -66,6 +66,12 @@ async fn serve(cfg: config::Config, client: clickhouse::Client) -> Result<()> {
 
     let store = store::UsageStore::new(client);
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
 
     // Translate OS signals into a cancel.
     tokio::spawn({
@@ -89,6 +95,7 @@ async fn serve(cfg: config::Config, client: clickhouse::Client) -> Result<()> {
     .context("provisioning the usage DLQ topic")?;
 
     let consumer = usage::kafka::build_consumer(&cfg.kafka)?;
+    health.set_ready(true);
     let result = usage::kafka::run(consumer, store, cfg.batch, Some(&dlq), shutdown).await;
     tracing::info!("usage service shut down");
     result.context("Kafka consumer exited with error")

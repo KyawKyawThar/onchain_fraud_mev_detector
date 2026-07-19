@@ -69,6 +69,12 @@ async fn run(cfg: &Config) -> Result<()> {
     );
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -126,8 +132,15 @@ async fn run(cfg: &Config) -> Result<()> {
     let sink: Arc<dyn EventSink> =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka producer")?);
     let consumer_handle = build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)?;
+    // The uniform poison policy (§20): parked-not-lost, provisioned fail-fast.
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "notification")
+        .await
+        .context("provisioning the notification DLQ topic")?;
     let engine = NotificationConsumer::new(store, channels, sink, subscribers, shutdown.clone());
-    let result = engine.run(consumer_handle, RETRY_BACKOFF, &shutdown).await;
+    health.set_ready(true);
+    let result = engine
+        .run(consumer_handle, RETRY_BACKOFF, Some(&dlq), &shutdown)
+        .await;
 
     shutdown.cancel();
     let _ = refresh_task.await;

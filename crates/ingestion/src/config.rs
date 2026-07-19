@@ -57,9 +57,13 @@ impl Config {
     /// Resolve config from the process environment, erroring on anything missing
     /// or malformed (fail fast at boot rather than at first request).
     pub fn from_env() -> Result<Self> {
+        let chain = Chain(env_parse("CHAIN_ID", 1u64)?);
         Ok(Self {
-            chain: Chain(env_parse("CHAIN_ID", 1u64)?),
-            finalization_depth: env_parse("FINALIZATION_DEPTH", 64u64)?,
+            chain,
+            finalization_depth: resolve_finalization_depth(
+                chain,
+                env_parse_opt::<u64>("FINALIZATION_DEPTH")?,
+            )?,
             finalize_interval: Duration::from_millis(env_parse("FINALIZE_INTERVAL_MS", 12_000u64)?),
             rpc: rpc_from_env()?,
             kafka: KafkaConfig {
@@ -69,8 +73,33 @@ impl Config {
     }
 }
 
+/// Pick the finalization depth: an explicit `FINALIZATION_DEPTH` always wins;
+/// otherwise the chain's default ([`Chain::default_finalization_depth`] —
+/// Ethereum 64, Base 1024). A chain with no default and no explicit depth is a
+/// boot error — guessing Ethereum's 64 for an unknown L2 would prune blocks
+/// the source still considers reorgable (§15).
+fn resolve_finalization_depth(chain: Chain, explicit: Option<u64>) -> Result<u64> {
+    if let Some(depth) = explicit {
+        if depth < 1 {
+            bail!("FINALIZATION_DEPTH must be >= 1");
+        }
+        return Ok(depth);
+    }
+    chain.default_finalization_depth().ok_or_else(|| {
+        anyhow::anyhow!(
+            "chain {chain} has no default finalization depth; set FINALIZATION_DEPTH explicitly"
+        )
+    })
+}
+
 fn rpc_from_env() -> Result<RpcPoolConfig> {
-    let endpoints = parse_endpoints(&env("ETH_RPC_URLS")?)?;
+    // `RPC_URLS` is the chain-neutral name (a Base instance's endpoints aren't
+    // "ETH"); `ETH_RPC_URLS` stays as the fallback existing deployments set.
+    let raw = match std::env::var("RPC_URLS") {
+        Ok(raw) => raw,
+        Err(_) => env("ETH_RPC_URLS").context("set RPC_URLS (or legacy ETH_RPC_URLS)")?,
+    };
+    let endpoints = parse_endpoints(&raw)?;
 
     let breaker = BreakerConfig {
         failure_threshold: env_parse("RPC_BREAKER_FAILURE_THRESHOLD", 5u32)?,
@@ -93,20 +122,19 @@ fn rpc_from_env() -> Result<RpcPoolConfig> {
     })
 }
 
-/// Parse a comma-separated `ETH_RPC_URLS` into validated [`Url`]s, rejecting an
-/// empty list (a pool with no endpoints can never serve a request — fail fast).
+/// Parse a comma-separated `RPC_URLS`/`ETH_RPC_URLS` into validated [`Url`]s,
+/// rejecting an empty list (a pool with no endpoints can never serve a
+/// request — fail fast).
 fn parse_endpoints(raw: &str) -> Result<Vec<Url>> {
     let endpoints = raw
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            Url::parse(s).with_context(|| format!("ETH_RPC_URLS contains an invalid URL: {s}"))
-        })
+        .map(|s| Url::parse(s).with_context(|| format!("RPC_URLS contains an invalid URL: {s}")))
         .collect::<Result<Vec<_>>>()?;
 
     if endpoints.is_empty() {
-        bail!("ETH_RPC_URLS is empty; the RPC failover pool needs at least one endpoint");
+        bail!("RPC_URLS is empty; the RPC failover pool needs at least one endpoint");
     }
     Ok(endpoints)
 }
@@ -134,9 +162,62 @@ where
     }
 }
 
+/// Read an *optional* env var parsed into `T`, `None` when unset. A
+/// present-but-unparseable value is an error, caught at boot.
+fn env_parse_opt<T>(key: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(raw) => raw.parse().map(Some).map_err(|err| {
+            anyhow::anyhow!(
+                "env var {key} is not a valid {}: {err}",
+                std::any::type_name::<T>()
+            )
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_finalization_depth_wins_over_the_chain_default() {
+        assert_eq!(
+            resolve_finalization_depth(Chain::ETHEREUM, Some(128)).unwrap(),
+            128
+        );
+        assert_eq!(
+            resolve_finalization_depth(Chain::BASE, Some(2048)).unwrap(),
+            2048
+        );
+    }
+
+    #[test]
+    fn known_chains_fall_back_to_their_default_depth() {
+        assert_eq!(
+            resolve_finalization_depth(Chain::ETHEREUM, None).unwrap(),
+            64
+        );
+        assert_eq!(resolve_finalization_depth(Chain::BASE, None).unwrap(), 1024);
+    }
+
+    #[test]
+    fn unknown_chain_without_explicit_depth_is_a_boot_error() {
+        assert!(resolve_finalization_depth(Chain(424242), None).is_err());
+        assert_eq!(
+            resolve_finalization_depth(Chain(424242), Some(300)).unwrap(),
+            300
+        );
+    }
+
+    #[test]
+    fn zero_explicit_depth_is_rejected() {
+        assert!(resolve_finalization_depth(Chain::ETHEREUM, Some(0)).is_err());
+    }
 
     #[test]
     fn parses_and_trims_a_comma_separated_endpoint_list() {

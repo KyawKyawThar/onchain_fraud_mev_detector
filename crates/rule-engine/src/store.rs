@@ -97,6 +97,21 @@ pub trait RuleStore: Send + Sync {
         at: DateTime<Utc>,
     ) -> Result<CreateRuleOutcome, StoreError>;
 
+    /// [`Self::create_rule`] plus `announcement` (the rule's `RuleCreated`
+    /// [`events::EventEnvelope`], wire form) written to the **transactional
+    /// outbox** in the same transaction (§20) — so a stored rule can never
+    /// silently miss its announcement to a crash between the INSERT and the
+    /// Kafka publish. The outbox flusher ([`crate::outbox`]) publishes it
+    /// asynchronously, at-least-once. The announcement is enqueued only when
+    /// the outcome is `Created` (an idempotent replay or name conflict
+    /// announces nothing).
+    async fn create_rule_announced(
+        &self,
+        rule: &Rule,
+        announcement: &serde_json::Value,
+        at: DateTime<Utc>,
+    ) -> Result<CreateRuleOutcome, StoreError>;
+
     /// One of `owner`'s live rules by id. `None` when the id doesn't exist,
     /// is deleted, **or belongs to another customer** — deliberately
     /// indistinguishable.
@@ -204,6 +219,49 @@ impl TryFrom<RuleRow> for Rule {
 /// [`CreateRuleOutcome::NameTaken`], anything else is a real fault.
 const OWNER_NAME_LIVE_IDX: &str = "rules_owner_name_live_idx";
 
+/// The three JSONB documents a rule row stores, encoded once for either
+/// create path (plain or outbox-transactional).
+fn encode_rule_documents(
+    rule: &Rule,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<serde_json::Value>,
+        serde_json::Value,
+    ),
+    StoreError,
+> {
+    let conditions = serde_json::to_value(&rule.conditions)
+        .map_err(|err| StoreError::malformed(format!("encoding conditions: {err}")))?;
+    let temporal = rule
+        .temporal
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|err| StoreError::malformed(format!("encoding temporal clause: {err}")))?;
+    let actions = serde_json::to_value(&rule.actions)
+        .map_err(|err| StoreError::malformed(format!("encoding actions: {err}")))?;
+    Ok((conditions, temporal, actions))
+}
+
+/// Map the rule INSERT's result onto the tri-state outcome (shared by both
+/// create paths — the `ON CONFLICT`/partial-index semantics must never drift
+/// between them).
+fn create_outcome(
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) -> Result<CreateRuleOutcome, StoreError> {
+    match result {
+        Ok(done) if done.rows_affected() == 1 => Ok(CreateRuleOutcome::Created),
+        Ok(_) => Ok(CreateRuleOutcome::AlreadyExists),
+        // The partial unique index on (owner, name) fired: same owner,
+        // different rule_id, same live name.
+        Err(sqlx::Error::Database(db_err)) if db_err.constraint() == Some(OWNER_NAME_LIVE_IDX) => {
+            Ok(CreateRuleOutcome::NameTaken)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 #[async_trait]
 impl RuleStore for PgRuleStore {
     async fn create_rule(
@@ -212,16 +270,7 @@ impl RuleStore for PgRuleStore {
         at: DateTime<Utc>,
     ) -> Result<CreateRuleOutcome, StoreError> {
         rule.validate()?;
-        let conditions = serde_json::to_value(&rule.conditions)
-            .map_err(|err| StoreError::malformed(format!("encoding conditions: {err}")))?;
-        let temporal = rule
-            .temporal
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|err| StoreError::malformed(format!("encoding temporal clause: {err}")))?;
-        let actions = serde_json::to_value(&rule.actions)
-            .map_err(|err| StoreError::malformed(format!("encoding actions: {err}")))?;
+        let (conditions, temporal, actions) = encode_rule_documents(rule)?;
 
         let result = sqlx::query!(
             "INSERT INTO rules (rule_id, owner, name, enabled, conditions, logic,
@@ -241,18 +290,58 @@ impl RuleStore for PgRuleStore {
         .execute(&self.pool)
         .await;
 
-        match result {
-            Ok(done) if done.rows_affected() == 1 => Ok(CreateRuleOutcome::Created),
-            Ok(_) => Ok(CreateRuleOutcome::AlreadyExists),
-            // The partial unique index on (owner, name) fired: same owner,
-            // different rule_id, same live name.
-            Err(sqlx::Error::Database(db_err))
-                if db_err.constraint() == Some(OWNER_NAME_LIVE_IDX) =>
-            {
-                Ok(CreateRuleOutcome::NameTaken)
+        create_outcome(result)
+    }
+
+    async fn create_rule_announced(
+        &self,
+        rule: &Rule,
+        announcement: &serde_json::Value,
+        at: DateTime<Utc>,
+    ) -> Result<CreateRuleOutcome, StoreError> {
+        rule.validate()?;
+        let (conditions, temporal, actions) = encode_rule_documents(rule)?;
+
+        // One transaction: the rule row and its outbox announcement commit or
+        // roll back together (§20) — the whole point of the outbox.
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query!(
+            "INSERT INTO rules (rule_id, owner, name, enabled, conditions, logic,
+                                temporal, actions, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+             ON CONFLICT (rule_id) DO NOTHING",
+            rule.id.0,
+            rule.owner.0,
+            rule.name,
+            rule.enabled,
+            conditions,
+            <&str>::from(rule.logic),
+            temporal,
+            actions,
+            at,
+        )
+        .execute(&mut *tx)
+        .await;
+
+        let outcome = match create_outcome(result) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // Roll back explicitly for the error log's sake; Drop would too.
+                let _ = tx.rollback().await;
+                return Err(err);
             }
-            Err(err) => Err(err.into()),
+        };
+        if outcome == CreateRuleOutcome::Created {
+            sqlx::query!(
+                "INSERT INTO rule_outbox (envelope, created_at) VALUES ($1, $2)",
+                announcement,
+                at,
+            )
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     async fn rule(&self, owner: CustomerId, rule_id: RuleId) -> Result<Option<Rule>, StoreError> {

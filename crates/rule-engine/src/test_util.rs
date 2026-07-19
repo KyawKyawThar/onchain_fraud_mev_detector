@@ -39,6 +39,9 @@ use crate::temporal::TemporalState;
 #[derive(Default)]
 pub struct InMemoryRuleStore {
     inner: Mutex<Vec<StoredRule>>,
+    /// Announcements enqueued by [`RuleStore::create_rule_announced`] — what a
+    /// Pg store would have written to the `rule_outbox` table.
+    announcements: Mutex<Vec<serde_json::Value>>,
 }
 
 /// One stored rule + the row metadata the queries filter on.
@@ -51,6 +54,15 @@ struct StoredRule {
 impl InMemoryRuleStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The announcements `create_rule_announced` enqueued — a test's view of
+    /// what would sit in the Pg `rule_outbox` table.
+    pub fn announcements(&self) -> Vec<serde_json::Value> {
+        self.announcements
+            .lock()
+            .expect("announcements lock")
+            .clone()
     }
 }
 
@@ -81,6 +93,23 @@ impl RuleStore for InMemoryRuleStore {
             deleted_at: None,
         });
         Ok(CreateRuleOutcome::Created)
+    }
+
+    async fn create_rule_announced(
+        &self,
+        rule: &Rule,
+        announcement: &serde_json::Value,
+        at: DateTime<Utc>,
+    ) -> Result<CreateRuleOutcome, StoreError> {
+        let outcome = self.create_rule(rule, at).await?;
+        // Mirror the Pg transaction: the announcement lands iff the rule did.
+        if outcome == CreateRuleOutcome::Created {
+            self.announcements
+                .lock()
+                .expect("announcements lock")
+                .push(announcement.clone());
+        }
+        Ok(outcome)
     }
 
     async fn rule(&self, owner: CustomerId, rule_id: RuleId) -> Result<Option<Rule>, StoreError> {

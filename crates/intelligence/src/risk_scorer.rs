@@ -46,9 +46,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience};
 use events::primitives::{AccountAddress, Chain, EntityId};
 use events::{DomainEvent, EventEnvelope};
@@ -95,14 +97,8 @@ pub fn consumed_topics() -> Vec<String> {
 /// Build the consumer. Manual offset commit ties the commit to a fully
 /// recomputed-and-published score, same as the attribution consumer; `earliest`
 /// means a fresh group recomputes from the start of retained history.
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "risk_scorer")
 }
 
 /// Fetch every current-state input [`risk::score`] needs for one address —
@@ -205,8 +201,9 @@ impl RiskScorer {
     /// via the shared [`run_consumer`] loop.
     pub async fn run(
         self,
-        consumer: StreamConsumer,
+        consumer: StreamConsumer<LagReporting>,
         retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let topics = consumed_topics();
@@ -216,6 +213,7 @@ impl RiskScorer {
             &topic_refs,
             "risk_scorer",
             retry_backoff,
+            dlq,
             self,
             shutdown,
         )

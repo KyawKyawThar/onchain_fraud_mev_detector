@@ -87,6 +87,12 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     let analytics = Arc::new(analytics);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -102,11 +108,16 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     // (mirrors event-store's `serve()`).
     let consumer = build_consumer(&cfg.kafka_brokers, &cfg.group_id)
         .context("building the result-path Kafka consumer")?;
+    // The uniform poison policy (§20): parked-not-lost, provisioned fail-fast.
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka_brokers, "sim-projection")
+            .await
+            .context("provisioning the projection DLQ topic")?;
     let consumer_task = tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
             let result = ProjectionConsumer::new(store, analytics)
-                .run(consumer, PUBLISH_BACKOFF, &shutdown)
+                .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
                 .await;
             if let Err(ref err) = result {
                 tracing::error!(error = %err, "projection consumer failed; initiating shutdown");
@@ -125,6 +136,7 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {}", cfg.http_addr))?;
     tracing::info!(addr = %cfg.http_addr, "simulation-projection HTTP API listening");
+    health.set_ready(true);
 
     axum::serve(listener, http::router(http_state))
         .with_graceful_shutdown({

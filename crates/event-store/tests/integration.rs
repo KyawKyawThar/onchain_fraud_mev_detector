@@ -446,7 +446,7 @@ async fn event_published_to_kafka_lands_in_store() {
     let shutdown = CancellationToken::new();
     let consumer_task = tokio::spawn({
         let shutdown = shutdown.clone();
-        async move { kafka::run(consumer, consumer_store, shutdown).await }
+        async move { kafka::run(consumer, consumer_store, None, shutdown).await }
     });
 
     // Poll until it lands (or time out).

@@ -39,7 +39,10 @@ async fn run(cfg: Config) -> Result<()> {
     // Install the Prometheus exporter before any detection runs, so the
     // per-detector hit/latency series (§19) are exported from the first block.
     // Inside the Tokio runtime: the exporter spawns its `/metrics` listener here.
-    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+    // Every series this per-chain instance exports carries its chain (§19), so
+    // two chains' instances aggregate and filter cleanly in PromQL.
+    telemetry::metrics::init_labeled(cfg.metrics_addr, &[("chain", cfg.chain.metrics_label())])
+        .context("starting the metrics exporter")?;
 
     // Roster (compile-time + runtime flags) paired with its model cards once at
     // boot — `link` fails fast if any live detector is uncatalogued, so the hot
@@ -88,6 +91,12 @@ async fn run(cfg: Config) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -98,10 +107,22 @@ async fn run(cfg: Config) -> Result<()> {
     });
 
     // Bounded channels = inter-stage backpressure (§17).
-    let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, Offsets)>(cfg.work_buffer);
+    let (work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, Offsets)>(cfg.work_buffer);
     let (done_tx, done_rx) = mpsc::channel::<Offsets>(cfg.commit_buffer);
 
-    let consumer_task = tokio::spawn(run_consumer(consumer.clone(), work_tx, shutdown.clone()));
+    // The uniform poison policy (§20). Named by the (per-chain) consumer group
+    // so two chains' detection instances never share a DLQ topic.
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, &cfg.kafka.group_id)
+            .await
+            .context("provisioning the detection DLQ topic")?;
+    let consumer_task = tokio::spawn(run_consumer(
+        consumer.clone(),
+        cfg.chain,
+        work_tx,
+        Some(dlq),
+        shutdown.clone(),
+    ));
     let scheduler = Scheduler::new(
         cfg.chain,
         Arc::new(plan),
@@ -111,6 +132,7 @@ async fn run(cfg: Config) -> Result<()> {
     );
     let scheduler_task = tokio::spawn(scheduler.run(work_rx, done_tx));
     let committer_task = tokio::spawn(run_committer(consumer, done_rx));
+    health.set_ready(true);
 
     // The consumer drops `work_tx` on shutdown, ending the scheduler, which drops
     // `done_tx`, ending the committer — a clean drain in dependency order.

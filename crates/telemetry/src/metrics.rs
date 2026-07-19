@@ -46,12 +46,25 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[
 /// recorder in the same process fails — there is only one global — so this is a
 /// boot-time, fail-fast call, mirroring [`crate::init`].
 pub fn init(addr: SocketAddr) -> anyhow::Result<()> {
+    init_labeled(addr, &[])
+}
+
+/// [`init`] with process-wide labels stamped onto **every** series this
+/// process exports — the §19 convention for per-chain service instances
+/// (`("chain", chain.metrics_label())` on detection/predictive): one label at
+/// the exporter beats threading a chain through every call site, and two
+/// chains' instances then aggregate/filter cleanly in PromQL.
+pub fn init_labeled(addr: SocketAddr, global_labels: &[(&str, String)]) -> anyhow::Result<()> {
     // Any `_seconds` metric is a latency histogram; bucket it (see above).
     let latency = Matcher::Suffix("_seconds".to_owned());
-    PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(latency, LATENCY_BUCKETS_SECONDS)
-        .context("configuring latency histogram buckets")?
+        .context("configuring latency histogram buckets")?;
+    for (key, value) in global_labels {
+        builder = builder.add_global_label(*key, value.clone());
+    }
+    builder
         .install()
         .context("installing the Prometheus metrics exporter")?;
     tracing::info!(%addr, "metrics exporter listening on /metrics");

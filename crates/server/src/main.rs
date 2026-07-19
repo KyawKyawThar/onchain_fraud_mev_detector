@@ -76,6 +76,12 @@ async fn main() -> Result<()> {
     };
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -114,6 +120,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {}", cfg.http_addr))?;
     tracing::info!(addr = %cfg.http_addr, "server HTTP API listening");
+    health.set_ready(true);
 
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown({

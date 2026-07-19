@@ -769,18 +769,27 @@ async fn create_rule(
             .into_response());
     }
 
-    match state.rules.create_rule(&rule, Utc::now()).await {
-        Ok(CreateRuleOutcome::Created) => {
-            announce_rule_created(state.events.as_ref(), &rule).await;
-            Ok((
-                StatusCode::CREATED,
-                Json(CreateRuleResponse {
-                    rule_id: rule.id.to_string(),
-                    status: "created",
-                }),
-            )
-                .into_response())
-        }
+    // Compose the §2 `RuleCreated` announcement up front: the store writes it
+    // to the transactional outbox in the same transaction as the rule row
+    // (§20), and the rule-engine binary's outbox flusher publishes it — so a
+    // crash anywhere after the commit can no longer lose the announcement
+    // (the old direct-publish path could, leaving the engine blind until its
+    // periodic backstop refresh).
+    let announcement = rule_created_announcement(&rule).map_err(ApiError::internal)?;
+
+    match state
+        .rules
+        .create_rule_announced(&rule, &announcement, Utc::now())
+        .await
+    {
+        Ok(CreateRuleOutcome::Created) => Ok((
+            StatusCode::CREATED,
+            Json(CreateRuleResponse {
+                rule_id: rule.id.to_string(),
+                status: "created",
+            }),
+        )
+            .into_response()),
         Ok(CreateRuleOutcome::AlreadyExists) => Ok((
             StatusCode::OK,
             Json(CreateRuleResponse {
@@ -801,33 +810,18 @@ async fn create_rule(
     }
 }
 
-/// Publish the §2 `RuleCreated` announcement for a freshly stored rule —
-/// one-shot best-effort (see [`create_rule`]'s docs for why not
-/// `publish_resilient` on a request path).
-async fn announce_rule_created(sink: &dyn EventSink, rule: &Rule) {
-    let definition = match serde_json::to_value(rule) {
-        Ok(definition) => definition,
-        Err(err) => {
-            tracing::error!(rule_id = %rule.id, error = %err, "encoding the rule definition failed");
-            return;
-        }
-    };
+/// Encode the §2 `RuleCreated` announcement for a rule as a full wire-form
+/// [`EventEnvelope`] value — what [`create_rule`] hands the store to write
+/// into the transactional outbox (§20). Publishing happens later, off the
+/// request path, in the rule-engine binary's outbox flusher.
+fn rule_created_announcement(rule: &Rule) -> Result<serde_json::Value, serde_json::Error> {
+    let definition = serde_json::to_value(rule)?;
     let event = DomainEvent::RuleCreated(RuleCreated {
         rule_id: rule.id,
         owner: rule.owner,
         definition,
     });
-    if let Err(err) = sink
-        .publish(EventEnvelope::new(RULE_EVENT_CHAIN, event))
-        .await
-    {
-        tracing::error!(
-            rule_id = %rule.id,
-            error = %err,
-            "publishing RuleCreated failed; the rule is stored — the engine's \
-             periodic refresh will pick it up"
-        );
-    }
+    serde_json::to_value(EventEnvelope::new(RULE_EVENT_CHAIN, event))
 }
 
 #[cfg(test)]
@@ -1174,9 +1168,14 @@ mod tests {
         assert!(stored[0].enabled, "enabled defaults to true");
         assert_eq!(stored[0].id.to_string(), reply["rule_id"]);
 
-        let announced = ts.events.events();
+        // The announcement rides the store's transactional outbox (§20) —
+        // nothing publishes on the request path itself.
+        assert!(ts.events.events().is_empty(), "no direct publish");
+        let announced = ts.rules.announcements();
         assert_eq!(announced.len(), 1);
-        match &announced[0] {
+        let envelope: events::EventEnvelope =
+            serde_json::from_value(announced[0].clone()).expect("outbox row is a wire envelope");
+        match envelope.payload {
             events::DomainEvent::RuleCreated(created) => {
                 assert_eq!(created.owner, owner);
                 assert_eq!(created.rule_id, stored[0].id);
@@ -1229,7 +1228,7 @@ mod tests {
     async fn post_rules_is_idempotent_by_id_and_conflicts_by_name() {
         let ts = test_state();
         let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
-        let events = ts.events.clone();
+        let rules = ts.rules.clone();
         let router = super::router(ts.state);
 
         let rule_id = uuid::Uuid::new_v4().to_string();
@@ -1243,9 +1242,9 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(reply["status"], "already_exists");
         assert_eq!(
-            events.count(|e| matches!(e, events::DomainEvent::RuleCreated(_))),
+            rules.announcements().len(),
             1,
-            "an idempotent retry announces nothing new"
+            "an idempotent retry enqueues nothing new on the outbox"
         );
 
         // Same name, fresh id → the per-owner live-name constraint.

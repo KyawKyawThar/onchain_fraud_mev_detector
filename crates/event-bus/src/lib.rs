@@ -230,13 +230,21 @@ pub async fn publish_resilient(
 // ── Consume seam (the symmetric half of EventSink) ───────────────────────────
 
 /// What an [`EventHandler`] decided should happen to a consumed record's offset —
-/// the three outcomes the at-least-once consume policy needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the four outcomes the at-least-once consume policy needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handled {
-    /// Fully handled (stored/published) *or* an un-actionable record deliberately
-    /// skipped — advance the offset either way, so a poison record can't wedge the
-    /// stream.
+    /// Fully handled (stored/published), or a record this consumer deliberately
+    /// doesn't act on (another chain's block, an event type outside its remit) —
+    /// advance the offset. Nothing is wrong with the record, so it is *not*
+    /// dead-lettered; use [`Handled::Skip`] for a record that should have been
+    /// processable but wasn't.
     Commit,
+    /// A **permanent** per-record failure (a parse/encoding bug that fails
+    /// identically on every retry): park the record on the consumer's
+    /// [`dlq::DeadLetterQueue`] (when one is wired — best-effort) and then
+    /// advance the offset so it can't wedge the stream. The reason lands in the
+    /// parked record's `dlq.error` header and the log.
+    Skip { reason: String },
     /// A transient fault (a downstream store/broker blip): leave the offset, back
     /// off, and let the broker redeliver. The handler must be idempotent, since a
     /// redelivery re-runs it.
@@ -292,9 +300,11 @@ pub fn handled_for(is_transient: bool, err: impl std::fmt::Display, consumer: &s
         tracing::error!(
             consumer,
             error = %err,
-            "permanent fault; skipping record so it cannot wedge the stream"
+            "permanent fault; parking record on the DLQ and skipping it"
         );
-        Handled::Commit
+        Handled::Skip {
+            reason: err.to_string(),
+        }
     }
 }
 
@@ -314,15 +324,28 @@ pub fn handled_for(is_transient: bool, err: impl std::fmt::Display, consumer: &s
 /// `name` labels the span + logs so multiple consumers in one process stay
 /// distinguishable. Manual commit (`enable.auto.commit=false`) on the passed
 /// consumer is what ties the offset to the handler's verdict — the caller builds the
-/// consumer with the group/offset-reset it wants.
-pub async fn run_consumer(
-    consumer: StreamConsumer,
+/// consumer with the group/offset-reset it wants (prefer
+/// [`lag::build_reporting_consumer`], which also exports the per-partition lag
+/// gauge, §19).
+///
+/// `dlq` is the uniform poison policy (§20): when wired, an undecodable record
+/// and every [`Handled::Skip`] verdict park the original bytes on the
+/// consumer's dead-letter topic (best-effort — see [`dlq`]) before the offset
+/// advances, so a skipped record is inspectable and replayable instead of a
+/// log line. Generic over the consumer context so a lag-reporting consumer
+/// ([`lag::LagReporting`]) runs through the same loop.
+pub async fn run_consumer<C>(
+    consumer: StreamConsumer<C>,
     topics: &[&str],
     name: &str,
     retry_backoff: Duration,
+    dlq: Option<&dlq::DeadLetterQueue>,
     handler: impl EventHandler,
     shutdown: &CancellationToken,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: rdkafka::consumer::ConsumerContext + 'static,
+{
     consumer
         .subscribe(topics)
         .with_context(|| format!("{name}: subscribing to {topics:?}"))?;
@@ -351,8 +374,12 @@ pub async fn run_consumer(
         };
 
         // Poison (no payload / undecodable / future schema version) can never be
-        // handled — commit to skip it so one bad record can't wedge the stream.
+        // handled — park it (inspectable, replayable), then commit to skip it so
+        // one bad record can't wedge the stream.
         let Some(envelope) = decode(&msg, name) else {
+            if let Some(dlq) = dlq {
+                dlq.publish(&msg, "undecodable event envelope").await;
+            }
             commit(&consumer, &msg, name);
             continue;
         };
@@ -369,6 +396,12 @@ pub async fn run_consumer(
 
         match handler.handle(envelope).instrument(span).await {
             Handled::Commit => commit(&consumer, &msg, name),
+            Handled::Skip { reason } => {
+                if let Some(dlq) = dlq {
+                    dlq.publish(&msg, &reason).await;
+                }
+                commit(&consumer, &msg, name);
+            }
             Handled::Retry => {
                 tracing::warn!(
                     consumer = name,
@@ -409,7 +442,10 @@ pub(crate) fn decode(msg: &BorrowedMessage<'_>, name: &str) -> Option<EventEnvel
 
 /// Advance the offset for a handled record; a commit failure is logged, not fatal
 /// (the broker redelivers an uncommitted record).
-fn commit(consumer: &StreamConsumer, msg: &BorrowedMessage<'_>, name: &str) {
+fn commit<C>(consumer: &StreamConsumer<C>, msg: &BorrowedMessage<'_>, name: &str)
+where
+    C: rdkafka::consumer::ConsumerContext + 'static,
+{
     if let Err(err) = consumer.commit_message(msg, CommitMode::Async) {
         tracing::error!(consumer = name, error = %err, "offset commit failed");
     }
@@ -459,16 +495,20 @@ mod tests {
 
     /// `handled_for` maps the caller's transient/permanent verdict straight to
     /// the matching `Handled` variant — the one behavior every consumer
-    /// depends on, regardless of what error type or message it passes in.
+    /// depends on, regardless of what error type or message it passes in. A
+    /// permanent fault becomes `Skip` (parked on the DLQ, then committed), and
+    /// the error's own text is the parked record's `dlq.error` reason.
     #[test]
-    fn handled_for_maps_transient_to_retry_and_permanent_to_commit() {
+    fn handled_for_maps_transient_to_retry_and_permanent_to_skip() {
         assert_eq!(
             handled_for(true, "broker blip", "test-consumer"),
             Handled::Retry
         );
         assert_eq!(
             handled_for(false, "malformed row", "test-consumer"),
-            Handled::Commit
+            Handled::Skip {
+                reason: "malformed row".to_owned()
+            }
         );
     }
 

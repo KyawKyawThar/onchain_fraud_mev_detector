@@ -58,6 +58,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{run_consumer, EventHandler, EventSink, Handled};
 use events::chain::BlockReverted;
 use events::primitives::{BlockRef, Chain, IncidentId};
@@ -310,14 +312,8 @@ pub fn consumed_topic() -> String {
 /// Build a `BlockReverted` consumer. Manual commit ties the offset to a revert being
 /// fully handled; `earliest` means a fresh group processes retained reverts from the
 /// start (cf. the dispatcher / event-store consumers).
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka BlockReverted consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "reorg-retractor")
 }
 
 /// Build a **broadcast** `BlockReverted` consumer for the worker-side generation-check
@@ -420,7 +416,11 @@ impl ReorgConsumer {
     /// Drive the consumer via the shared [`event_bus::run_consumer`] loop until shutdown
     /// or a fatal subscribe error — the reorg consumer supplies only its per-revert
     /// decision ([`EventHandler`]).
-    pub async fn run(self, consumer: StreamConsumer) -> Result<()> {
+    pub async fn run(
+        self,
+        consumer: StreamConsumer<LagReporting>,
+        dlq: Option<&DeadLetterQueue>,
+    ) -> Result<()> {
         let topic = consumed_topic();
         let shutdown = self.shutdown.clone();
         let backoff = self.publish_backoff;
@@ -429,6 +429,7 @@ impl ReorgConsumer {
             &[topic.as_str()],
             "reorg-retractor",
             backoff,
+            dlq,
             self,
             &shutdown,
         )
@@ -498,6 +499,9 @@ pub async fn run_revert_tracker(
         &[topic.as_str()],
         "revert-tracker",
         event_bus::PUBLISH_BACKOFF,
+        // Live-tail broadcast consumer: no DLQ — a skip here parks nothing the
+        // backbone doesn't already durably own, once per worker replica.
+        None,
         RevertTracker(orphaned),
         &shutdown,
     )

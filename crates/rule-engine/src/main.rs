@@ -82,6 +82,12 @@ async fn run(cfg: &Config) -> Result<()> {
     );
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -101,7 +107,7 @@ async fn run(cfg: &Config) -> Result<()> {
 
     // The enrichment adapter reads the intelligence stores/hot cache through
     // that crate's own seams — see `rule_engine::enrich`'s module docs.
-    let intel = Arc::new(PgIntelligenceStore::new(pool));
+    let intel = Arc::new(PgIntelligenceStore::new(pool.clone()));
     let cache = Arc::new(
         RedisHotCache::connect(cfg.redis_url.expose_secret(), cfg.cache_ttl)
             .await
@@ -130,6 +136,20 @@ async fn run(cfg: &Config) -> Result<()> {
     // ── Emission + temporal pool + fire drain ──────────────────────
     let sink =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka producer")?);
+
+    // ── Outbox flusher (§20) ───────────────────────────────────────
+    // Publishes the `RuleCreated` announcements POST /v1/rules wrote to the
+    // transactional outbox — the async half of `create_rule_announced`. Rides
+    // this binary (the store's owner, §14), not the API service.
+    // Detached on purpose: the flusher exits when `shutdown` cancels; the
+    // consume loop below is the process's lifetime anchor.
+    tokio::spawn(rule_engine::outbox::run_flusher(
+        pool.clone(),
+        sink.clone(),
+        cfg.outbox_flush_interval,
+        shutdown.clone(),
+    ));
+
     let actions = Arc::new(
         WebhookActionSink::new(cfg.webhook, shutdown.clone())
             .context("building the webhook delivery client")?,
@@ -170,8 +190,15 @@ async fn run(cfg: &Config) -> Result<()> {
 
     // ── The consume loop ───────────────────────────────────────────
     let consumer = build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)?;
+    // The uniform poison policy (§20): parked-not-lost, provisioned fail-fast.
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "rule-engine")
+        .await
+        .context("provisioning the rule-engine DLQ topic")?;
     let engine = EngineConsumer::new(rules, store, enrichment, pool, emitter, shutdown.clone());
-    let result = engine.run(consumer, RETRY_BACKOFF, &shutdown).await;
+    health.set_ready(true);
+    let result = engine
+        .run(consumer, RETRY_BACKOFF, Some(&dlq), &shutdown)
+        .await;
 
     // The consumer (and with it the pool + fire senders) is gone — the drain
     // task ends when the channel closes.

@@ -19,9 +19,54 @@ pub struct Chain(pub u64);
 
 impl Chain {
     pub const ETHEREUM: Chain = Chain(1);
+    /// Base (OP-stack L2, chain id 8453) — the first L2 through the pipeline
+    /// (Phase 10, Sprint 13 t2).
+    pub const BASE: Chain = Chain(8453);
 
     pub fn id(self) -> u64 {
         self.0
+    }
+
+    /// Human-readable name for the chains this deployment knows, for logs and
+    /// metrics labels. `None` for an id we carry but don't recognize — callers
+    /// fall back to [`Display`](std::fmt::Display) (`chain-<id>`), which is
+    /// also the Kafka partition-key string and must never change.
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Chain::ETHEREUM => Some("ethereum"),
+            Chain::BASE => Some("base"),
+            _ => None,
+        }
+    }
+
+    /// The chain's metrics-label value (§19): the human name for chains we
+    /// know (`ethereum`, `base`), the partition-key form (`chain-<id>`) for
+    /// ones we don't — so per-chain instances' series aggregate and filter by
+    /// a stable, readable `chain` label.
+    pub fn metrics_label(self) -> String {
+        match self.name() {
+            Some(name) => name.to_owned(),
+            None => self.to_string(),
+        }
+    }
+
+    /// Default finalization depth (blocks below the tip treated as final, §15)
+    /// for chains we know; `None` means the deployment must configure a depth
+    /// explicitly. The depth is the in-memory block-tree bound and reorg prune
+    /// backstop — the authoritative finality signal is still the source's
+    /// `finalized` tag (Sprint 1).
+    ///
+    /// * Ethereum: 64 — two epochs (2 × 32 slots), the standard finality lag.
+    /// * Base: 1024 — an OP-stack L2's `finalized` tag trails the unsafe head
+    ///   by batch-posting lag plus L1 finality (~20–35 min); at 2 s blocks
+    ///   that's up to ~1050 blocks, so 1024 (~34 min) bounds the tree while
+    ///   the tag drives actual finality.
+    pub fn default_finalization_depth(self) -> Option<u64> {
+        match self {
+            Chain::ETHEREUM => Some(64),
+            Chain::BASE => Some(1024),
+            _ => None,
+        }
     }
 }
 
@@ -265,3 +310,38 @@ impl TryFrom<f64> for Confidence {
 
 /// Convenience alias for an on-chain account address.
 pub type AccountAddress = Address;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_chains_have_names_and_finality_defaults() {
+        assert_eq!(Chain::ETHEREUM.name(), Some("ethereum"));
+        assert_eq!(Chain::BASE.name(), Some("base"));
+        assert_eq!(Chain::ETHEREUM.default_finalization_depth(), Some(64));
+        assert_eq!(Chain::BASE.default_finalization_depth(), Some(1024));
+    }
+
+    #[test]
+    fn unknown_chains_require_explicit_config() {
+        let unknown = Chain(424242);
+        assert_eq!(unknown.name(), None);
+        assert_eq!(unknown.default_finalization_depth(), None);
+        // The partition-key string still works for any id.
+        assert_eq!(unknown.to_string(), "chain-424242");
+    }
+
+    #[test]
+    fn base_display_is_the_partition_key_form() {
+        // Display is the Kafka partition-key string (§20) — locked.
+        assert_eq!(Chain::BASE.to_string(), "chain-8453");
+    }
+
+    #[test]
+    fn metrics_label_is_the_name_with_a_partition_key_fallback() {
+        assert_eq!(Chain::ETHEREUM.metrics_label(), "ethereum");
+        assert_eq!(Chain::BASE.metrics_label(), "base");
+        assert_eq!(Chain(424242).metrics_label(), "chain-424242");
+    }
+}
