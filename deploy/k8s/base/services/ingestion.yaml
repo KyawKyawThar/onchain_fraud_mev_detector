@@ -22,6 +22,9 @@ spec:
         app.kubernetes.io/name: ingestion-eth
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: ingestion
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -46,9 +49,13 @@ spec:
                 secretKeyRef:
                   name: rpc-endpoints
                   key: ETH_RPC_URLS
+            - name: INGESTION_METRICS_ADDR
+              value: 0.0.0.0:9100
           ports:
             - name: health
               containerPort: 8086
+            - name: metrics
+              containerPort: 9100
           startupProbe:
             httpGet: { path: /livez, port: health }
             periodSeconds: 5
@@ -89,6 +96,9 @@ spec:
         app.kubernetes.io/name: ingestion-base
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: ingestion
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -113,9 +123,13 @@ spec:
                 secretKeyRef:
                   name: rpc-endpoints
                   key: BASE_RPC_URLS
+            - name: INGESTION_METRICS_ADDR
+              value: 0.0.0.0:9100
           ports:
             - name: health
               containerPort: 8086
+            - name: metrics
+              containerPort: 9100
           startupProbe:
             httpGet: { path: /livez, port: health }
             periodSeconds: 5

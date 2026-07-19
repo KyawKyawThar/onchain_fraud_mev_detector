@@ -24,6 +24,14 @@ pub struct Config {
     pub rabbitmq: RabbitConfig,
     /// Worker-pool tuning — read by `simulation-worker`, ignored by the dispatcher.
     pub worker: WorkerConfig,
+    /// Address the `simulation` dispatcher's Prometheus `/metrics` endpoint binds
+    /// to (§19). Defaults to `0.0.0.0:9105` — distinct from `worker_metrics_addr`
+    /// so both binaries can run on one host in local dev without colliding.
+    pub metrics_addr: SocketAddr,
+    /// Address the `simulation-worker` binary's Prometheus `/metrics` endpoint
+    /// binds to (§19 — simulation confirmation rate, job latency). Defaults to
+    /// `0.0.0.0:9106`.
+    pub worker_metrics_addr: SocketAddr,
 }
 
 /// Tuning for the revm worker pool (§7, §17). Competing-consumer concurrency
@@ -109,6 +117,9 @@ pub struct ProjectionConfig {
     pub clickhouse: ClickhouseConfig,
     /// Address the internal `GET /v1/incidents` read API (§11) binds to.
     pub http_addr: SocketAddr,
+    /// Address the Prometheus `/metrics` endpoint binds to (§19). Defaults to
+    /// `0.0.0.0:9111`.
+    pub metrics_addr: SocketAddr,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base URL plus
@@ -148,6 +159,10 @@ impl ProjectionConfig {
                 database: env("CLICKHOUSE_DB")?,
             },
             http_addr,
+            metrics_addr: env_parse(
+                "SIMULATION_PROJECTION_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9111)),
+            )?,
         })
     }
 }
@@ -188,6 +203,14 @@ impl Config {
                 },
                 cache_capacity: env_parse("SIMULATION_CACHE_CAPACITY", 1024usize)?,
             },
+            metrics_addr: env_parse(
+                "SIMULATION_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9105)),
+            )?,
+            worker_metrics_addr: env_parse(
+                "SIMULATION_WORKER_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9106)),
+            )?,
         })
     }
 }

@@ -5,7 +5,8 @@
 //! intelligence/rule-engine/notification/billing, §14) constructs its pool the same
 //! way. The per-service tables and repositories live in the owning service crate:
 //! §14's rule is *no shared tables and no cross-service joins*, so this crate
-//! deliberately holds no schema or query — just the pool.
+//! deliberately holds no schema or query — just the pool. [`redis`] is the same
+//! idea for the workspace's other shared datastore (§8/§9's hot-path Redis).
 //!
 //! Migrations live in `crates/db/migrations` and are applied out-of-band by
 //! `sqlx-cli` (the `just migrate-*` recipes / the `migrate.yml` workflow), not at
@@ -16,6 +17,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+
+pub mod redis;
 
 /// Default ceiling on pooled connections. Sized for a single service replica; a
 /// hot service can raise it via [`connect_with`]. Kept modest so N replicas don't

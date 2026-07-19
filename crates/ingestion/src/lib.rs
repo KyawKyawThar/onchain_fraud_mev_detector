@@ -10,6 +10,7 @@
 //! source-driven reorg walk on top of the [`tree::AddOutcome`] seam.
 
 pub mod config;
+pub mod metrics;
 pub mod pipeline;
 pub mod publisher;
 pub mod source;

@@ -1,0 +1,73 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["usage", "billing", "mev", "§13", "§19"],
+  "time": { "from": "now-30d", "to": "now" },
+  "timezone": "",
+  "title": "Billing usage — by customer (§13, §19)",
+  "uid": "billing-usage",
+  "version": 1,
+  "description": "ClickHouse-backed, not Prometheus: per-customer breakdown is high-cardinality by nature (crates/usage's usage_rollup_daily table), so this reads the same ClickHouse rollup the usage service writes rather than a Prometheus series. Query verified against a live ClickHouse (grafana-clickhouse-datasource v4.19.0, format 0/1 both tested).",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Metered quantity / day, by event type",
+      "type": "timeseries",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT day AS time, event_type, sum(total_quantity) AS quantity FROM usage_rollup_daily WHERE $__timeFilter(day) GROUP BY day, event_type ORDER BY day"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Top 20 customers by metered quantity (window)",
+      "description": "SummingMergeTree — this aggregates on read (GROUP BY) rather than trusting a bare SELECT, per the table's own doc comment (unmerged parts).",
+      "type": "table",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT customer_id, event_type, sum(total_quantity) AS quantity, sum(events) AS events FROM usage_rollup_daily WHERE $__timeFilter(day) GROUP BY customer_id, event_type ORDER BY quantity DESC LIMIT 20"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Total metered events / day",
+      "type": "timeseries",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT day AS time, sum(events) AS events FROM usage_rollup_daily WHERE $__timeFilter(day) GROUP BY day ORDER BY day"
+        }
+      ]
+    }
+  ]
+}

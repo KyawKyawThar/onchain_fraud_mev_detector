@@ -52,6 +52,10 @@ events = { workspace = true }
 # use, so the at-least-once policy lives in one place.
 event-bus = { workspace = true }
 telemetry = { workspace = true }
+# §19 metrics facade — a near-free no-op until a binary installs the Prometheus
+# exporter (`telemetry::metrics::init`), so `worker`'s confirmation-rate/latency
+# recording stays exporter-agnostic (same convention as detection/ingestion).
+metrics = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -132,6 +136,9 @@ testcontainers-modules = { workspace = true, features = [
     "postgres",
     "clickhouse",
 ] }
+# Scoped in-memory metrics recorder for the worker metrics tests (same pattern
+# as detection/ingestion's metrics tests).
+metrics-util = { workspace = true }
 
 [lints]
 workspace = true

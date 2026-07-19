@@ -47,10 +47,7 @@ impl event_bus::Transience for CacheError {
     fn is_transient(&self) -> bool {
         match self {
             CacheError::Malformed { .. } => false,
-            CacheError::Redis(err) => !matches!(
-                err.kind(),
-                redis::ErrorKind::UnexpectedReturnType | redis::ErrorKind::Parse
-            ),
+            CacheError::Redis(err) => db::redis::is_transient(err),
         }
     }
 }
@@ -148,10 +145,10 @@ pub struct RedisHotCache {
 
 impl RedisHotCache {
     /// Connect to Redis and prove it is reachable (fail-fast at boot: the
-    /// manager performs the initial connect + `PING` here).
-    pub async fn connect(url: &str, ttl: Duration) -> Result<Self, CacheError> {
-        let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client).await?;
+    /// manager performs the initial connect + `PING` here) — via the shared
+    /// [`db::redis::connect`] every Redis-backed store in the workspace uses.
+    pub async fn connect(url: &str, ttl: Duration) -> anyhow::Result<Self> {
+        let conn = db::redis::connect(url).await?;
         Ok(Self { conn, ttl })
     }
 

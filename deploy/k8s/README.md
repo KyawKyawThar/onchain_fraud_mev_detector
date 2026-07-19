@@ -7,7 +7,8 @@ remains the laptop dev loop; this tree is the deployment.
 
 ```
 base/                 # topology — no credentials, no environment specifics
-  infra/              # 5 StatefulSets + headless Services
+  infra/              # 9 StatefulSets/Deployments + headless Services
+                       # (5 app infra + prometheus/alertmanager/tempo/grafana, §19)
   services/           # 16 workloads (Deployments, Services, HPAs, PDBs)
 overlays/dev/         # kind/laptop: generated dev secrets, :dev images, debug logs
 overlays/prod/        # pinned images, HPA floors raised, secrets EXPECTED (see below)
@@ -19,9 +20,15 @@ overlays/prod/        # pinned images, HPA floors raised, secrets EXPECTED (see 
 kind create cluster
 just k8s-build-images        # build all service images (:dev) + kind load
 # edit overlays/dev/secrets/rpc.env → real RPC endpoints
-just k8s-apply               # kubectl apply -k deploy/k8s/overlays/dev
+just k8s-apply               # kustomize build ... | kubectl apply -f - (deploy/k8s/overlays/dev)
 just k8s-status
 ```
+
+`k8s-apply`/`-render`/`-diff`/`-delete` go through the standalone `kustomize`
+CLI with `--load-restrictor LoadRestrictionsNone`, not `kubectl -k` directly —
+the Grafana dashboards/datasources `configMapGenerator` (§19) reads
+`deploy/grafana/...` files outside this tree on purpose (one source shared
+with the compose stack), which `kubectl apply -k` has no flag to allow.
 
 Postgres schema migrations are **not** applied by any pod — run them the same
 way CI does (`migrate.yml` / `sqlx migrate run`, e.g. via
@@ -67,24 +74,55 @@ HPAs need metrics-server (kind: `helm install metrics-server ...` or the
 components.yaml with `--kubelet-insecure-tls`); without it they just stay at
 minReplicas.
 
+## Observability (§19, Sprint 13 t4)
+
+`infra/prometheus.yaml`, `infra/alertmanager.yaml`, `infra/tempo.yaml`,
+`infra/grafana.yaml` — the in-cluster twin of the compose stack's monitoring
+services, using the scrape annotations/metrics ports every service pod
+already carries:
+
+- **Prometheus** discovers targets via `kubernetes_sd_configs: role: pod`
+  (RBAC: a `ServiceAccount` + `ClusterRole` scoped to `get/list/watch` on
+  `pods`, nothing else), relabeled off each pod's `prometheus.io/scrape` +
+  `prometheus.io/port` annotations — one job covers every annotated pod
+  instead of a static target per service. SLO alert rules
+  (`FastPathLatencyHigh`, `ApiLatencyHigh`, `KafkaConsumerLagHigh`, …) are
+  inlined in its ConfigMap, same PromQL as `deploy/prometheus-rules.yml`.
+- **Alertmanager** routes firing alerts — a placeholder webhook receiver
+  (no real Slack/PagerDuty/email destination; swap before go-live, see the
+  manifest's header comment).
+- **Tempo** receives OTLP/HTTP spans on `:4318`. `app-config`'s
+  `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318` turns tracing export on for
+  every pod by default (unset elsewhere, e.g. local `cargo run`, keeps spans
+  in-process-only — `crates/telemetry`). Pinned to the 2.x image line
+  deliberately (3.0 restructured config around a Kafka-backed ingest path).
+- **Grafana** dashboards + datasources are generated from the *same* files
+  the compose stack reads (`deploy/grafana/...`, via the base
+  `kustomization.yaml`'s `configMapGenerator`) — one source of truth, no
+  drift between the two deploy targets. The billing-usage dashboard's
+  ClickHouse datasource plugin installs at pod start
+  (`GF_PLUGINS_PREINSTALL`). Admin credentials come from the `grafana-admin`
+  Secret (see below).
+
 ## Secrets
 
-Six Secrets, referenced by fixed name from the base, **never committed with
+Seven Secrets, referenced by fixed name from the base, **never committed with
 real values**:
 
 | Secret | Keys | Consumers |
 |---|---|---|
 | `postgres-credentials` | `POSTGRES_DB/USER/PASSWORD` (image), `DATABASE_URL` (apps) | postgres, projection, intelligence×3, rule-engine, api-server, notification |
 | `redis-credentials` | `REDIS_PASSWORD` (image), `REDIS_URL` (apps) | redis, intelligence×3, rule-engine |
-| `clickhouse-credentials` | `CLICKHOUSE_DB/USER/PASSWORD` | clickhouse, event-store, projection, intelligence×3, usage |
+| `clickhouse-credentials` | `CLICKHOUSE_DB/USER/PASSWORD` | clickhouse, event-store, projection, intelligence×3, usage, grafana (§19 billing-usage datasource) |
 | `rabbitmq-credentials` | `RABBITMQ_DEFAULT_USER/PASS/VHOST` (image), `RABBITMQ_URL` (apps — vhost `/` percent-encoded `%2f`!) | rabbitmq, dispatcher, worker |
 | `app-secrets` | `JWT_SECRET`, `EVENT_STORE_WRITE_TOKEN`, `SMTP_USERNAME/PASSWORD` | api-server, event-store, notification |
 | `rpc-endpoints` | `ETH_RPC_URLS`, `BASE_RPC_URLS`, `MEMPOOL_RPC_URL`, `INTEL_ETH_RPC_URL` | ingestion×2, predictive, intelligence-block-production |
+| `grafana-admin` | `GF_SECURITY_ADMIN_USER/PASSWORD` (§19) | grafana |
 
 - **dev**: `overlays/dev` generates them from `secrets/*.env` (committed
   `changeme_*` values — the `.env.example` posture). The generator hash-suffixes
   names, so editing a secret rolls its consumers.
-- **prod**: `overlays/prod` generates nothing. Provision the six names via
+- **prod**: `overlays/prod` generates nothing. Provision the seven names via
   External Secrets Operator / Vault agent / secrets-store CSI (§20: Vault or
   cloud secrets manager). Each pod gets only the secret keys it consumes —
   the worker never sees Postgres, ingestion never sees JWT.
@@ -104,9 +142,13 @@ lockfile, out of workspace).
 
 ## What deliberately stayed behind
 
-- Prometheus/Grafana: the in-cluster observability rollout is Sprint 13 t4;
-  pods already carry `prometheus.io/scrape` annotations and standardized
-  `:9100` metrics ports for it.
+- Prometheus/Grafana/Alertmanager/Tempo (§19) run as single instances with no
+  HA, no long-term/object-storage backend, and Alertmanager's receiver is a
+  placeholder — matching the same "good enough for one cluster, not yet a
+  distributed deployment" posture as Kafka/ClickHouse below. A real alerting
+  destination and, if retention needs outlast a node, remote storage
+  (Thanos/Mimir for Prometheus, S3/GCS for Tempo) are go-live gates, not done
+  here.
 - Kafka is a single-node KRaft StatefulSet (official `apache/kafka` image —
   the compose stack's wurstmeister+ZooKeeper pair was a dev-era relic).
   Replication factor rides `app-config`; growing to a quorum is a

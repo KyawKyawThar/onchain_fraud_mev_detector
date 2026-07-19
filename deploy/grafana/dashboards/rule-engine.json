@@ -1,0 +1,112 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["rule-engine", "mev", "§9", "§19"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Rule engine — evaluation latency, fires, delivery (§19)",
+  "uid": "rule-engine-eval",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Rule evaluation latency p50 / p99 (s), by trigger",
+      "description": "EngineConsumer::evaluate wall-clock latency — enrichment reads, instant-rule matching, temporal steps, and the flush barrier.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (trigger, le) (rate(rule_eval_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{trigger}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (trigger, le) (rate(rule_eval_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 {{trigger}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Rule fires / sec, by kind",
+      "description": "The §9 throughput signal — a customer's rule storm shows up here first.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (kind) (rate(rule_fires_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Rule set refresh outcomes",
+      "description": "kept_stale means a reload compiled dirty and the previous snapshot stayed live — a bug (the store validates on insert), not customer input. Any non-zero rate is worth paging on.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(rule_set_refresh_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Webhook action / outbox delivery, by outcome",
+      "description": "rule_action_deliveries_total (customer webhook actions) and the RuleCreated transactional outbox's publish outcomes.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(rule_action_deliveries_total[$__rate_interval]))",
+          "legendFormat": "action: {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rule_outbox_published_total[$__rate_interval]))",
+          "legendFormat": "outbox: published"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rule_outbox_publish_failures_total[$__rate_interval]))",
+          "legendFormat": "outbox: failed"
+        }
+      ]
+    }
+  ]
+}

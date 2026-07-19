@@ -24,6 +24,9 @@ pub struct Config {
     /// Shared secret a caller must present (`Authorization: Bearer …`) to append.
     /// Internal service-to-service auth, distinct from the public §11 JWT.
     pub write_token: SecretString,
+    /// Address the Prometheus `/metrics` endpoint binds to (§19 — append
+    /// latency/throughput/errors). Defaults to `0.0.0.0:9102`.
+    pub metrics_addr: SocketAddr,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base
@@ -80,6 +83,10 @@ impl Config {
             kafka: kafka_from_env()?,
             http_addr,
             write_token: SecretString::from(env("EVENT_STORE_WRITE_TOKEN")?),
+            metrics_addr: env_parse(
+                "EVENT_STORE_METRICS_ADDR",
+                SocketAddr::from(([0, 0, 0, 0], 9102)),
+            )?,
         })
     }
 }

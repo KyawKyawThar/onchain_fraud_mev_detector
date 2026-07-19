@@ -55,6 +55,10 @@ utoipa-axum.workspace = true
 
 # Observability.
 tracing.workspace = true
+# §19 metrics facade — a near-free no-op until the binary installs the
+# Prometheus exporter (`telemetry::metrics::init`); append latency/throughput/
+# errors record through it (same convention as detection/ingestion).
+metrics.workspace = true
 
 [dev-dependencies]
 # Real ClickHouse/Kafka in throwaway containers for the `#[ignore]` tests.
@@ -62,3 +66,6 @@ testcontainers.workspace = true
 testcontainers-modules.workspace = true
 # Build sample events (B256 block hashes) in unit/integration tests.
 alloy-primitives.workspace = true
+# Scoped in-memory metrics recorder for the store metrics tests (same pattern
+# as detection/ingestion/simulation's metrics tests).
+metrics-util.workspace = true

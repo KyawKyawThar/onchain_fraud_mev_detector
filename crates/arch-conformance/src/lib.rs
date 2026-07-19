@@ -111,6 +111,20 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             ));
         }
 
+        // ── Redis access rides the same shared db plumbing (§8/§9) ────────
+        // The redis analog of the sqlx rule above: `db::redis::connect` +
+        // `db::redis::is_transient` are the one place connection setup and
+        // retry classification are decided, so a Redis-backed cache/store's
+        // Transience impl can't drift from its siblings (this rule exists
+        // because intelligence::cache and rule_engine::state_store both
+        // hand-rolled byte-identical logic before `db::redis` existed).
+        if has("redis") && !has("db") && krate != "db" {
+            out.push(format!(
+                "{krate}: uses redis without the shared `db` crate — connection setup \
+                 and transient-vs-permanent error classification live in db::redis"
+            ));
+        }
+
         // ── ClickHouse access rides ch-migrate (§14) ──────────────────────
         // Every ClickHouse consumer applies its own migrations at boot via the
         // shared migrator (which also rejects the `?`-binding trap).
@@ -182,7 +196,7 @@ mod tests {
             ("detection", &["detector-api", "event-bus", "rdkafka"]),
             ("backtest", &["detection", "detector-api"]),
             ("telemetry", &["metrics-exporter-prometheus"]),
-            ("db", &["sqlx"]),
+            ("db", &["sqlx", "redis"]),
             ("ch-migrate", &["clickhouse"]),
             (
                 "simulation",
@@ -196,7 +210,10 @@ mod tests {
                     "ch-migrate",
                 ],
             ),
-            ("rule-engine", &["event-bus", "rdkafka", "sqlx", "db"]),
+            (
+                "rule-engine",
+                &["event-bus", "rdkafka", "sqlx", "db", "redis"],
+            ),
         ]);
         assert_eq!(violations(&g), Vec::<String>::new());
     }
@@ -223,6 +240,7 @@ mod tests {
                 "telemetry::metrics::init",
             ),
             ("reporting", &["sqlx"], "without the shared `db` crate"),
+            ("reporting", &["redis"], "db::redis"),
             ("reporting", &["clickhouse"], "without ch-migrate"),
         ];
         for (krate, deps, expected) in cases {

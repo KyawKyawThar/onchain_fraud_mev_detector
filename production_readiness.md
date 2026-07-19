@@ -42,7 +42,7 @@ Run these *after* the MVP path is green, sequenced by the exit gates below — n
 - [ ] **Graceful degradation:** if simulation backlogs, provisional alerts still flow (fast path independent of slow path, §6). If intelligence is down, API serves stale-but-flagged cache.
 - [ ] **Resilience primitives everywhere:** timeouts, retries with jitter, circuit breakers (already on the RPC pool §5 — extend to all gRPC/HTTP hops), bounded channels verified to apply backpressure end-to-end (§17).
 - [ ] **DLQ operations:** `sim.jobs.dlx` drain + replay runbook; alert on DLQ depth (§7).
-- [x] **Consumer-lag & gap detection (lag half, 2026-07-19):** every durable Kafka consumer is built through `event_bus::lag::build_reporting_consumer`, exporting the per-partition `kafka_consumer_lag` gauge; every consume loop parks unprocessable records on its own `mev.dlq.<consumer>` topic (`Handled::Skip` + poison), and every binary serves `/livez` + `/readyz` (`telemetry::health`, `HEALTH_ADDR`). The `RuleCreated` dual-write went through a transactional outbox (`rule_outbox` + `rule_engine::outbox`). Still open: event-store sequence-gap detection, and the dashboards/alerts themselves (Sprint 13 t4).
+- [x] **Consumer-lag & gap detection (lag half, 2026-07-19):** every durable Kafka consumer is built through `event_bus::lag::build_reporting_consumer`, exporting the per-partition `kafka_consumer_lag` gauge; every consume loop parks unprocessable records on its own `mev.dlq.<consumer>` topic (`Handled::Skip` + poison), and every binary serves `/livez` + `/readyz` (`telemetry::health`, `HEALTH_ADDR`). The `RuleCreated` dual-write went through a transactional outbox (`rule_outbox` + `rule_engine::outbox`). The dashboards/alerts on this signal (`kafka_consumer_lag` panel + `KafkaConsumerLagHigh` alert) shipped in Sprint 13 t4, 2026-07-19. Still open: event-store sequence-gap detection — a distinct correctness feature, not an observability wire-up.
 
 **Exit gate:** chaos suite passes; killing any single node loses no audit history and recovers within RTO.
 
@@ -76,7 +76,7 @@ Run these *after* the MVP path is green, sequenced by the exit gates below — n
 
 **Goal:** the latency budgets in the doc hold *under production load*, with headroom.
 
-- [ ] **Define SLOs** (the doc names the panels, §19 — turn them into targets): end-to-end alert latency (block → notification), fast-path < 1s (§6) at p99 under load, API p50/p99, simulation confirmation rate, uptime.
+- [ ] **Define SLOs** (the doc names the panels, §19 — turn them into targets): end-to-end alert latency (block → notification), fast-path < 1s (§6) at p99 under load, API p50/p99, simulation confirmation rate, uptime. Every named panel now has a metric and a dashboard (Sprint 13 t4), and `deploy/prometheus-rules.yml` wires a first pass of alert thresholds — but they're explicitly provisional (seeded from the one hard number the source doc states, §6's <1s p99; everything else is a conservative placeholder with no production traffic to calibrate against). This item stays open until those are validated/tuned against real load, not just wired.
 - [ ] **Screening API critical-path SLO:** the synchronous `/screen` decision (§11) sits inline on customer withdrawals — a hard **p50 < 100ms** / bounded p99 budget *under load*, dedicated rate limits + payload caps, and **graceful degradation** (serve a stale-but-flagged cached score rather than block the customer's path if intelligence is slow). It is the one API surface where latency is contractual, not aesthetic.
 - [ ] **Load testing** at target throughput: chain tps, peak alert volume, API qps. Verify the < 1s fast path holds under load, not just in isolation.
 - [ ] **Autoscaling:** simulation worker pool on `sim.jobs` queue depth (the designed backpressure signal, §7, §20); HPA on detection/api by CPU/qps.
@@ -158,4 +158,4 @@ A single checklist; GA only when all are true.
 - [ ] Backtest gate enforced; sanctions freshness + FP rate within SLO (Epic E).
 - [ ] Zero-downtime canary deploy with auto-rollback demonstrated; runbooks + on-call live (Epic F).
 - [ ] Retention/erasure policy signed off; audit completeness + billing reconciliation proven (Epic G).
-- [ ] SLO dashboards + alerting live; every named failure mode has a runbook (§19).
+- [ ] SLO dashboards + alerting live; every named failure mode has a runbook (§19). Dashboards + alerting shipped in Sprint 13 t4 (compose and K8s, thresholds provisional — see Epic D above); the runbook half is still open.

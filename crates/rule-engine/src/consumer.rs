@@ -134,6 +134,11 @@ pub const RULE_SET_REFRESH_TOTAL: &str = "rule_set_refresh_total";
 /// §9 throughput signal (a customer's rule storm shows up here first).
 pub const RULE_FIRES_TOTAL: &str = "rule_fires_total";
 
+/// Histogram (labeled by `trigger`: `incident` | `state_change` |
+/// `entity_merged`): one [`EngineConsumer::evaluate`] call's wall-clock
+/// latency (§19).
+pub const RULE_EVAL_DURATION_SECONDS: &str = "rule_eval_duration_seconds";
+
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
     events::topics_for(CONSUMED_EVENT_TYPES)
@@ -766,11 +771,34 @@ impl EngineConsumer {
         }
     }
 
-    /// Evaluate one consumed event for a set of subject addresses: build all
-    /// ctxs (enrichment reads — side-effect free, so a transient fault here
-    /// retries via redelivery with nothing half-applied), evaluate instant
-    /// rules, step temporal machines, then flush (the commit barrier).
+    /// Evaluate one consumed event for a set of subject addresses — timed as a
+    /// whole (§19: a slow enrichment read or a jammed temporal pool are both
+    /// latency this should surface), labeled by `trigger` so instant/incident/
+    /// state-change/entity-merge evaluation latency can be told apart. The
+    /// actual work is [`Self::evaluate_inner`].
+    #[tracing::instrument(skip_all, fields(chain = %chain, trigger, subjects = subjects.len()))]
     async fn evaluate(
+        &self,
+        subjects: Vec<(AccountAddress, EventFacts)>,
+        chain: Chain,
+        at: DateTime<Utc>,
+        trigger: &'static str,
+        trigger_id: Uuid,
+    ) -> Result<(), EngineError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .evaluate_inner(subjects, chain, at, trigger, trigger_id)
+            .await;
+        metrics::histogram!(RULE_EVAL_DURATION_SECONDS, "trigger" => trigger)
+            .record(started.elapsed().as_secs_f64());
+        result
+    }
+
+    /// The core: build all ctxs (enrichment reads — side-effect free, so a
+    /// transient fault here retries via redelivery with nothing half-applied),
+    /// evaluate instant rules, step temporal machines, then flush (the commit
+    /// barrier).
+    async fn evaluate_inner(
         &self,
         subjects: Vec<(AccountAddress, EventFacts)>,
         chain: Chain,

@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    telemetry::metrics::init_labeled(cfg.metrics_addr, &[("chain", cfg.chain.metrics_label())])
+        .context("starting the metrics exporter")?;
+
     tracing::info!(
         chain = cfg.chain.id(),
         queue = %cfg.rabbitmq.queue,

@@ -276,9 +276,10 @@ run-ingestion:
 # per chain; chain is the partition key on every event). Needs BASE_RPC_URLS
 # set to Base RPC endpoints. Finality depth defaults per chain (Base: 1024,
 # the OP-stack unsafe-head→L1-finality lag at 2 s blocks); override with
-# FINALIZATION_DEPTH.
+# FINALIZATION_DEPTH. The metrics port moves off 9103 so both instances can
+# run on one host (§19, Sprint 13 t4).
 run-ingestion-base:
-    CHAIN_ID=8453 RPC_URLS="$BASE_RPC_URLS" cargo run -p ingestion
+    CHAIN_ID=8453 RPC_URLS="$BASE_RPC_URLS" INGESTION_METRICS_ADDR=0.0.0.0:9104 cargo run -p ingestion
 
 # Run the detection service (§6, §17). The fast path: consumes
 # BlockAssembled/BlockReverted off Kafka, fans detectors out on rayon, and
@@ -444,21 +445,29 @@ k8s-build-images cluster="kind":
         kind load docker-image "{{k8s_image}}/${bin}:dev" --name "{{cluster}}"
     done
 
+# The Grafana dashboards/datasources configMapGenerator (§19, Sprint 13 t4)
+# reads deploy/grafana/... directly, outside deploy/k8s/base's own tree — one
+# source of truth shared with the compose stack, at the cost of needing
+# kustomize's file-access sandbox relaxed. `kubectl apply/diff/delete -k`
+# don't expose --load-restrictor, so every k8s-* recipe below builds through
+# the standalone `kustomize` CLI and pipes into kubectl instead.
+k8s_kustomize := "kustomize build --load-restrictor LoadRestrictionsNone"
+
 # Render the dev overlay (review what would apply)
 k8s-render overlay="dev":
-    kubectl kustomize deploy/k8s/overlays/{{overlay}}
+    {{k8s_kustomize}} deploy/k8s/overlays/{{overlay}}
 
 # Apply the dev overlay to the current kubectl context
 k8s-apply overlay="dev":
-    kubectl apply -k deploy/k8s/overlays/{{overlay}}
+    {{k8s_kustomize}} deploy/k8s/overlays/{{overlay}} | kubectl apply -f -
 
 # Diff the dev overlay against the live cluster
 k8s-diff overlay="dev":
-    kubectl diff -k deploy/k8s/overlays/{{overlay}} || true
+    {{k8s_kustomize}} deploy/k8s/overlays/{{overlay}} | kubectl diff -f - || true
 
 # Tear the stack down (keeps PVCs; delete the namespace's pvc objects to wipe data)
 k8s-delete overlay="dev":
-    kubectl delete -k deploy/k8s/overlays/{{overlay}}
+    {{k8s_kustomize}} deploy/k8s/overlays/{{overlay}} | kubectl delete -f -
 
 # Watch the whole namespace converge
 k8s-status:

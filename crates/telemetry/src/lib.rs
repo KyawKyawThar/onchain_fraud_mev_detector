@@ -5,7 +5,10 @@
 //! 1. [`init`] — stand up `tracing` for a service: an `EnvFilter` (via
 //!    `RUST_LOG`), a fmt layer (`pretty` or `json`, chosen by `LOG_FORMAT`), and
 //!    an OpenTelemetry layer so spans carry real W3C trace ids. It also installs
-//!    the global [W3C trace-context] propagator.
+//!    the global [W3C trace-context] propagator. When `OTEL_EXPORTER_OTLP_ENDPOINT`
+//!    is set, spans additionally batch-export over OTLP/HTTP to a collector
+//!    (Tempo, §19); unset, spans stay in-process and propagation-only, same as
+//!    before.
 //! 2. [`propagation`] — inject the current trace context into outbound message
 //!    headers and re-establish it on the consumer side, so a trace started in
 //!    one service continues in the next. The carrier is a plain string map,
@@ -19,6 +22,7 @@
 
 use anyhow::Context as _;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
@@ -58,31 +62,41 @@ pub struct TelemetryConfig {
     pub json: bool,
     /// `tracing` filter directive, in `RUST_LOG` syntax (e.g. `"info,sqlx=warn"`).
     pub filter: String,
+    /// OTLP/HTTP collector endpoint (e.g. `http://localhost:4318`) spans export
+    /// to. `None` (the default) keeps spans in-process only — propagation still
+    /// works, nothing is queryable. Set via `OTEL_EXPORTER_OTLP_ENDPOINT`
+    /// ([`Self::from_env`]), same opt-in shape as `HEALTH_ADDR` in
+    /// [`crate::health`]: unset means no exporter, no behavior change.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl TelemetryConfig {
-    /// Sensible defaults for `service_name`: `pretty` logs at `info`.
+    /// Sensible defaults for `service_name`: `pretty` logs at `info`, no OTLP export.
     pub fn new(service_name: &'static str) -> Self {
         Self {
             service_name,
             json: false,
             filter: "info".to_owned(),
+            otlp_endpoint: None,
         }
     }
 
     /// Resolve config from the environment — the one place env is read.
     /// `LOG_FORMAT=json` selects JSON logs; `RUST_LOG` sets the filter (matching
-    /// the `.env` knobs). Builders/tests can construct [`TelemetryConfig`]
-    /// directly instead.
+    /// the `.env` knobs); `OTEL_EXPORTER_OTLP_ENDPOINT` (unset by default) turns
+    /// on span export. Builders/tests can construct [`TelemetryConfig`] directly
+    /// instead.
     pub fn from_env(service_name: &'static str) -> Self {
         let json = std::env::var("LOG_FORMAT")
             .map(|f| f.eq_ignore_ascii_case("json"))
             .unwrap_or(false);
         let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+        let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
         Self {
             service_name,
             json,
             filter,
+            otlp_endpoint,
         }
     }
 }
@@ -94,9 +108,22 @@ pub fn init(config: TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     // A tracer provider with the default sampler (AlwaysOn) so spans get valid
-    // trace ids. No exporter is wired yet — spans stay in-process until an OTLP
-    // exporter is added; propagation works regardless.
-    let provider = SdkTracerProvider::builder().build();
+    // trace ids regardless of export. With `otlp_endpoint` set, spans batch-export
+    // over OTLP/HTTP to a collector (Tempo, §19); unset, they stay in-process —
+    // propagation (trace_id continuity across services) works either way.
+    let provider = match &config.otlp_endpoint {
+        Some(endpoint) => {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint.clone())
+                .build()
+                .context("building the OTLP span exporter")?;
+            SdkTracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .build()
+        }
+        None => SdkTracerProvider::builder().build(),
+    };
     let tracer = provider.tracer(config.service_name);
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 

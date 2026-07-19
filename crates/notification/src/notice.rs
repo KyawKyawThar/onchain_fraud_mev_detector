@@ -3,6 +3,7 @@
 //! imperative shell builds against (mirrors how `rule_engine::consumer::Fire`
 //! is derived from a rule match). See `crate::model` for the subscriber side.
 
+use chrono::{DateTime, Utc};
 use events::detection::PreliminaryAlertCreated;
 use events::intelligence::SanctionHit;
 use events::primitives::{
@@ -36,6 +37,14 @@ pub struct Notice {
     /// subscriber is a candidate for.
     pub owner: Option<CustomerId>,
     pub summary: String,
+    /// When the domain event that produced *this* notice was recorded
+    /// (`EventEnvelope::occurred_at`) — the §19 "end-to-end alert latency"
+    /// panel is `delivery time - occurred_at`, sampled at each successful
+    /// [`crate::delivery::ChannelSink::deliver`]. Per-notice, not
+    /// per-lineage: a Confirmed notice's `occurred_at` is `IncidentCreated`'s
+    /// own timestamp, not the original provisional alert's — each stage
+    /// measures its own event-to-delivery hop.
+    pub occurred_at: DateTime<Utc>,
 }
 
 /// Confidence → coarse severity, for events that carry a [`Confidence`] but
@@ -61,7 +70,11 @@ impl Notice {
     /// Severity is approximated from confidence (see
     /// [`confidence_bucket`]); `dedup_key` is the `alert_id` this incident's
     /// eventual confirm/retract shares (see [`Self::from_incident_created`]).
-    pub fn from_preliminary_alert(event: &PreliminaryAlertCreated, chain: Chain) -> Self {
+    pub fn from_preliminary_alert(
+        event: &PreliminaryAlertCreated,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             dedup_key: event.alert_id.to_string(),
             stage: LifecycleStage::Provisional,
@@ -75,6 +88,7 @@ impl Notice {
                 event.kind,
                 event.confidence.get() * 100.0
             ),
+            occurred_at,
         }
     }
 
@@ -94,7 +108,11 @@ impl Notice {
     /// them through here would mean a second cross-topic correlation buffer
     /// (alert_id → addresses) purely for repeated payload context; not worth
     /// the complexity since addresses play no part in routing.
-    pub fn from_incident_created(event: &IncidentCreated, chain: Chain) -> Self {
+    pub fn from_incident_created(
+        event: &IncidentCreated,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             dedup_key: event.alert_id.to_string(),
             stage: LifecycleStage::Confirmed,
@@ -107,6 +125,7 @@ impl Notice {
                 "confirmed {:?} incident: ${:.2} profit, ${:.2} victim loss",
                 event.kind, event.profit, event.victim_loss
             ),
+            occurred_at,
         }
     }
 
@@ -116,7 +135,11 @@ impl Notice {
     /// subscribers regardless of how they've set those filters (they chose
     /// to author this exact rule; see `model::SubscriptionFilter`'s
     /// Option-bypass docs). `owner` scopes fan-out to that customer alone.
-    pub fn from_rule_alert(event: &RuleAlertCreated, chain: Chain) -> Self {
+    pub fn from_rule_alert(
+        event: &RuleAlertCreated,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             dedup_key: event.alert_id.to_string(),
             stage: LifecycleStage::Standalone,
@@ -126,6 +149,7 @@ impl Notice {
             addresses: vec![event.address],
             owner: Some(event.owner),
             summary: event.explanation.clone(),
+            occurred_at,
         }
     }
 
@@ -138,7 +162,11 @@ impl Notice {
     /// `dedup_key` is derived deterministically from its content — the same
     /// SHA-256-preimage recipe `rule_engine::consumer::Fire::alert_id` uses,
     /// so a redelivered event dedups instead of re-notifying.
-    pub fn from_sanction_hit(event: &SanctionHit, chain: Chain) -> Self {
+    pub fn from_sanction_hit(
+        event: &SanctionHit,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             dedup_key: sanction_dedup_key(event).to_string(),
             stage: LifecycleStage::Standalone,
@@ -148,6 +176,7 @@ impl Notice {
             addresses: vec![event.address],
             owner: None,
             summary: format!("sanctions match: {} ({})", event.list, event.entry),
+            occurred_at,
         }
     }
 
@@ -162,7 +191,12 @@ impl Notice {
     /// provisional/confirmed delivery, via
     /// `store::NotificationStore::delivered_targets_for`, not a fresh
     /// subscriber scan (a subscriber's filter may have changed since).
-    pub fn retraction(alert_id: AlertId, chain: Chain, reason: &str) -> Self {
+    pub fn retraction(
+        alert_id: AlertId,
+        chain: Chain,
+        reason: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             dedup_key: alert_id.to_string(),
             stage: LifecycleStage::Retracted,
@@ -172,6 +206,7 @@ impl Notice {
             addresses: Vec::new(),
             owner: None,
             summary: format!("retracted: {reason}"),
+            occurred_at,
         }
     }
 }
@@ -237,7 +272,7 @@ mod tests {
             confidence: Confidence::new(0.95),
             provisional: true,
         };
-        let notice = Notice::from_preliminary_alert(&event, Chain::ETHEREUM);
+        let notice = Notice::from_preliminary_alert(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Provisional);
         assert_eq!(notice.severity, Some(Severity::High));
         assert_eq!(notice.kind, Some(AlertKind::Sandwich));
@@ -257,7 +292,7 @@ mod tests {
             victim_loss: 2.0,
             severity: Severity::Critical,
         };
-        let notice = Notice::from_incident_created(&event, Chain::ETHEREUM);
+        let notice = Notice::from_incident_created(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Confirmed);
         assert_eq!(
             notice.dedup_key,
@@ -277,7 +312,7 @@ mod tests {
             address: addr(5),
             explanation: "matched".into(),
         };
-        let notice = Notice::from_rule_alert(&event, Chain::ETHEREUM);
+        let notice = Notice::from_rule_alert(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.severity, None, "bypasses the severity gate");
         assert_eq!(notice.kind, None, "bypasses the kind gate");
         assert_eq!(notice.owner, Some(owner), "scoped to the rule's owner only");
@@ -291,7 +326,7 @@ mod tests {
             list: "ofac_sdn".into(),
             entry: "SDN-1".into(),
         };
-        let notice = Notice::from_sanction_hit(&event, Chain::ETHEREUM);
+        let notice = Notice::from_sanction_hit(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.severity, Some(Severity::Critical));
         assert_eq!(notice.kind, None);
         assert_eq!(notice.owner, None, "platform-wide");
@@ -330,7 +365,7 @@ mod tests {
     #[test]
     fn retraction_carries_no_filter_axis() {
         let alert_id = AlertId::new();
-        let notice = Notice::retraction(alert_id, Chain::ETHEREUM, "block reverted");
+        let notice = Notice::retraction(alert_id, Chain::ETHEREUM, "block reverted", Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Retracted);
         assert_eq!(notice.severity, None);
         assert_eq!(notice.kind, None);

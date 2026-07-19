@@ -1,0 +1,137 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["intelligence", "mev", "§8", "§19"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Intelligence — cache hit rate, score recompute, reads (§19)",
+  "uid": "intelligence-reads",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Cache hit rate, by cache",
+      "description": "risk_score / labels cache-aside hit rate — hit / (hit + miss). A dropping rate means Redis is degraded or the model version just rolled (invalidating every cached score).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (cache) (rate(intelligence_cache_requests_total{outcome=\"hit\"}[$__rate_interval])) / sum by (cache) (rate(intelligence_cache_requests_total[$__rate_interval]))",
+          "legendFormat": "{{cache}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Score recompute latency p50 / p99 (s)",
+      "description": "The live risk_scorer::load_risk_inputs + risk::score path, sampled only on a risk-score cache miss.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(intelligence_score_recompute_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(intelligence_score_recompute_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Entity graph / timeline requests, by found",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (found) (rate(intelligence_entity_graph_requests_total[$__rate_interval]))",
+          "legendFormat": "graph found={{found}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (found) (rate(intelligence_entity_timeline_requests_total[$__rate_interval]))",
+          "legendFormat": "timeline found={{found}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Entity graph truncations, by reason",
+      "description": "A walk that stopped short of its requested hops — the degree-cap/hub-node discipline (§8.2) in action.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason) (rate(intelligence_entity_graph_truncations_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Seed ingest (labels/sanctions), most recent run",
+      "description": "OFAC/EU list ingestion — production_readiness.md's sanctions-freshness SLA depends on this running on schedule.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(intel_seed_labels_inserted_total[$__range]))",
+          "legendFormat": "labels inserted"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(intel_seed_sanction_rows_total[$__range]))",
+          "legendFormat": "sanction rows"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(intel_seed_addresses_evicted_total[$__range]))",
+          "legendFormat": "addresses evicted"
+        }
+      ]
+    }
+  ]
+}

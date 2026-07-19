@@ -1,0 +1,32 @@
+# Alertmanager routing (§19, Sprint 13 t4) — receives firing alerts from
+# Prometheus (deploy/prometheus.yml's `alerting:` block) and routes them.
+#
+# The default receiver is a placeholder webhook pointed at nothing real: this
+# repo has no Slack/PagerDuty/email credentials to wire (and shouldn't invent
+# fake ones). Before go-live, replace `receivers[0].webhook_configs` with a
+# real destination — Slack incoming webhook, PagerDuty Events API, or an SMTP
+# receiver (mirroring notification's own webhook/Slack/PagerDuty/email
+# adapters, crates/notification/src/{http_delivery,email_delivery}.rs) — this
+# is a distinct, ops-facing routing tree from that customer-facing one, not a
+# thing to merge with it.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: ops-placeholder
+  group_by: ["alertname", "service"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Page-severity alerts repeat sooner than the informational default —
+    # an unacked page shouldn't go quiet for 4h.
+    - matchers:
+        - severity = page
+      repeat_interval: 1h
+
+receivers:
+  - name: ops-placeholder
+    webhook_configs:
+      - url: "http://localhost:5001/placeholder-ops-webhook"
+        send_resolved: true

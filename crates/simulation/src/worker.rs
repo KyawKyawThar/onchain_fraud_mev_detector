@@ -118,9 +118,22 @@ impl Worker {
         }
     }
 
-    /// Handle one job — the **core**, free of the consume/ack loop. Resolve →
-    /// simulate (on rayon) → publish the result(s) → return the disposition.
+    /// Handle one job — resolve → simulate (on rayon) → publish the result(s) →
+    /// return the disposition, timing the whole call regardless of how it
+    /// resolves (§19 — a slow resolver or a long revm run are both latency this
+    /// should surface). The actual work is [`Self::process_inner`]; this is the
+    /// one seam every job passes through, so it's the single metrics call site.
+    #[tracing::instrument(skip_all, fields(alert_id = %job.alert_id))]
     pub async fn process(&self, job: &SimulationJob) -> Disposition {
+        let started = std::time::Instant::now();
+        let disposition = self.process_inner(job).await;
+        crate::metrics::record_job_duration(started.elapsed());
+        disposition
+    }
+
+    /// The core, free of timing/the consume/ack loop. Resolve → simulate (on
+    /// rayon) → publish the result(s) → return the disposition.
+    async fn process_inner(&self, job: &SimulationJob) -> Disposition {
         // 1. Resolve the alert to a runnable `(block, tx_set)` scenario.
         let request = match self.resolver.resolve(job).await {
             Ok(request) => request,
@@ -161,6 +174,7 @@ impl Worker {
             profit = outcome.profit,
             "simulation finished"
         );
+        crate::metrics::record_job_outcome(outcome.confirmed);
 
         // The revm run actually happened, regardless of whether it confirms the
         // alert — one `SimulationRun` usage fact per job (§13). No customer is in

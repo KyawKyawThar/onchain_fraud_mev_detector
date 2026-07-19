@@ -72,11 +72,99 @@ impl Default for DeliveryConfig {
 /// subscriber never sees them" (mirrors `rule_engine::webhook::ACTION_DELIVERIES_TOTAL`).
 pub const NOTIFICATION_DELIVERIES_TOTAL: &str = "notification_deliveries_total";
 
-pub(crate) fn count_delivery(channel: &'static str, outcome: &'static str) {
+/// Histogram (labeled by `channel`): the §19 "end-to-end alert latency
+/// (block → notification)" panel — `now - notice.occurred_at`, sampled only
+/// on a successful delivery (a rejected/failed attempt hasn't reached a
+/// subscriber yet, so it isn't a latency sample).
+pub const ALERT_END_TO_END_SECONDS: &str = "notification_alert_end_to_end_seconds";
+
+/// Record one delivery's outcome, and — only when it succeeded — its
+/// end-to-end latency from `notice.occurred_at`. One call site every channel
+/// adapter (`email_delivery`, `http_delivery`) shares, so the two metrics
+/// can't drift apart.
+pub(crate) fn count_delivery(channel: &'static str, notice: &Notice, outcome: &'static str) {
     metrics::counter!(
         NOTIFICATION_DELIVERIES_TOTAL,
         "channel" => channel,
         "outcome" => outcome
     )
     .increment(1);
+
+    if outcome == "delivered" {
+        // Clock skew or a stale/future test timestamp could make `occurred_at`
+        // land after `now()`; clamp to zero rather than record garbage.
+        let elapsed = (chrono::Utc::now() - notice.occurred_at)
+            .to_std()
+            .unwrap_or_default();
+        metrics::histogram!(ALERT_END_TO_END_SECONDS, "channel" => channel)
+            .record(elapsed.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::Utc;
+    use events::primitives::{AlertId, Chain};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::CompositeKey;
+
+    type Series = Vec<(
+        CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    )>;
+
+    fn captured(f: impl FnOnce()) -> Series {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, f);
+        snapshotter.snapshot().into_vec()
+    }
+
+    fn has_series(series: &Series, name: &str) -> bool {
+        series.iter().any(|(ck, ..)| ck.key().name() == name)
+    }
+
+    #[test]
+    fn a_delivered_outcome_counts_and_samples_end_to_end_latency() {
+        let notice = Notice::retraction(AlertId::new(), Chain::ETHEREUM, "x", Utc::now());
+        let series = captured(|| count_delivery("webhook", &notice, "delivered"));
+        assert!(has_series(&series, NOTIFICATION_DELIVERIES_TOTAL));
+        assert!(has_series(&series, ALERT_END_TO_END_SECONDS));
+    }
+
+    #[test]
+    fn a_rejected_outcome_counts_but_samples_no_latency() {
+        let notice = Notice::retraction(AlertId::new(), Chain::ETHEREUM, "x", Utc::now());
+        let series = captured(|| count_delivery("webhook", &notice, "rejected"));
+        assert!(has_series(&series, NOTIFICATION_DELIVERIES_TOTAL));
+        assert!(
+            !has_series(&series, ALERT_END_TO_END_SECONDS),
+            "a rejected delivery never reached a subscriber, so it isn't a latency sample"
+        );
+    }
+
+    #[test]
+    fn a_future_occurred_at_clamps_latency_to_zero_not_negative() {
+        let notice = Notice::retraction(
+            AlertId::new(),
+            Chain::ETHEREUM,
+            "x",
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let series = captured(|| count_delivery("webhook", &notice, "delivered"));
+        match series
+            .iter()
+            .find(|(ck, ..)| ck.key().name() == ALERT_END_TO_END_SECONDS)
+        {
+            Some((_, _, _, DebugValue::Histogram(samples))) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(f64::from(samples[0]), 0.0);
+            }
+            other => panic!("expected a histogram, got {other:?}"),
+        }
+    }
 }

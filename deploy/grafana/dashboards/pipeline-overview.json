@@ -1,0 +1,132 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["overview", "slo", "mev", "§19"],
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "",
+  "title": "Pipeline overview — SLO panels (§19)",
+  "uid": "pipeline-overview",
+  "version": 1,
+  "description": "The single dashboard an on-call engineer opens first: end-to-end alert latency, the fast-path SLO, Kafka lag, DLQ activity, and service liveness across every scraped target. Alert thresholds live in deploy/prometheus-rules.yml.",
+  "panels": [
+    {
+      "id": 1,
+      "title": "End-to-end alert latency (block → notification), p50 / p95 / p99",
+      "description": "notification_alert_end_to_end_seconds — the §19 headline panel. Per-stage: each notice's occurred_at is the domain event that produced it, not necessarily the original block.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(notification_alert_end_to_end_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(notification_alert_end_to_end_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(notification_alert_end_to_end_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Fast-path detector latency p99 vs. the §6 <1s SLO",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(detector_detect_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "1",
+          "legendFormat": "§6 SLO (1s)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Kafka consumer lag, by consumer",
+      "description": "kafka_consumer_lag — the keeping-up signal FastPathLatencyHigh's sibling alert (KafkaConsumerLagHigh) pages on.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (consumer) (kafka_consumer_lag)",
+          "legendFormat": "{{consumer}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ publish rate, by consumer",
+      "description": "dlq_published_total — a poison record parked on mev.dlq.<consumer>. Should normally be zero; sustained non-zero is DlqReceivingRecords' trigger.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (consumer) (rate(dlq_published_total[$__rate_interval]))",
+          "legendFormat": "{{consumer}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Service liveness (scrape targets down)",
+      "description": "up == 0 for any scraped target — ServiceDown's trigger. A basic uptime SLO input.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 1, "custom": { "drawStyle": "bars", "fillOpacity": 30 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "up == 0",
+          "legendFormat": "{{job}} down"
+        }
+      ]
+    }
+  ]
+}

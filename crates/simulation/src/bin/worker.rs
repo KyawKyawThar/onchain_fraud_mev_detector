@@ -31,6 +31,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    // §19 — the simulation-confirmation-rate + job-latency source; a distinct
+    // port from the dispatcher's so both run on one host without colliding.
+    telemetry::metrics::init_labeled(
+        cfg.worker_metrics_addr,
+        &[("chain", cfg.chain.metrics_label())],
+    )
+    .context("starting the metrics exporter")?;
+
     tracing::info!(
         chain = cfg.chain.id(),
         queue = %cfg.rabbitmq.queue,

@@ -20,6 +20,7 @@ tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 # Prometheus exporter (§19): `telemetry::metrics::init` installs the global
 # recorder + `/metrics` HTTP listener — the metrics counterpart to `init`.
 metrics-exporter-prometheus.workspace = true

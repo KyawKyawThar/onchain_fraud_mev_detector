@@ -147,10 +147,11 @@ services:
       retries: 5
       start_period: 20s
 
-  # ── Prometheus (metrics scrape, §19) ────────────────────────────
-  # Scrapes each service's /metrics — today the detection service's per-detector
-  # hit rate + latency. Targets live in ./prometheus.yml; services run on the
-  # host, so `host.docker.internal` (mapped below for Linux too) reaches them.
+  # ── Prometheus (metrics scrape + SLO alert rules, §19) ──────────
+  # Scrapes every service's /metrics — targets live in ./prometheus.yml;
+  # services run on the host, so `host.docker.internal` (mapped below for
+  # Linux too) reaches them. Alert rules in ./prometheus-rules.yml (Sprint 13
+  # t4) are evaluated here and routed to the `alertmanager` service below.
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
@@ -159,6 +160,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yml:/etc/prometheus/rules/alerts.yml:ro
       - prometheus_data:/prometheus
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
@@ -169,21 +171,76 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── Grafana (metrics dashboards, §19) ───────────────────────────
-  # Datasource + per-detector dashboard are auto-provisioned from
-  # ./grafana/provisioning + ./grafana/dashboards, so they exist on first boot
-  # with no click-ops. Login: GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD (.env),
-  # defaulting to admin / admin.
+  # ── Alertmanager (SLO alert routing, §19) ────────────────────────
+  # Receives firing alerts from Prometheus and routes them per
+  # ./alertmanager.yml — a placeholder webhook receiver until a real
+  # destination (Slack/PagerDuty/email) is wired ahead of go-live.
+  alertmanager:
+    image: prom/alertmanager:latest
+    restart: unless-stopped
+    networks: [backend]
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Tempo (distributed tracing backend, §19) ─────────────────────
+  # Receives spans over OTLP/HTTP on :4318 from any service that sets
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 (unset by default —
+  # telemetry::init stays in-process-only otherwise, see crates/telemetry).
+  # Single-binary, local-disk storage — the dev-loop equivalent of the
+  # Prometheus/Grafana setup above, not a production topology.
+  #
+  # Pinned to the 2.x line deliberately: Tempo 3.0 restructured config around
+  # a Kafka-backed ingest path (its `ingester`/`compactor` blocks moved and no
+  # longer match this simple single-binary/local-storage shape) — pulling our
+  # own Kafka cluster into the trace path is unwarranted complexity for a dev
+  # trace store. Config verified against 2.6.1 (`docker run ... -config.file`
+  # boots clean, HTTP OTLP listener up on :4318).
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    networks: [backend]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "${TEMPO_OTLP_HTTP_PORT:-4318}:4318" # OTLP/HTTP span ingest
+      - "${TEMPO_QUERY_PORT:-3200}:3200" # Grafana's Tempo datasource reads this
+
+  # ── Grafana (dashboards + trace explore, §19) ────────────────────
+  # Datasources + dashboards are auto-provisioned from ./grafana/provisioning
+  # + ./grafana/dashboards, so they exist on first boot with no click-ops.
+  # Login: GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD (.env), defaulting to
+  # admin / admin.
   grafana:
     image: grafana/grafana:latest
     restart: unless-stopped
     networks: [backend]
     depends_on:
       - prometheus
+      - tempo
+      - clickhouse
+    # CLICKHOUSE_* (for the billing-usage dashboard's ClickHouse datasource
+    # provisioning, ./grafana/provisioning/datasources/clickhouse.yml — Grafana
+    # expands ${CLICKHOUSE_PASSWORD} from its own process env at provisioning
+    # time) alongside the admin/plugin settings below.
+    env_file: ../.env
     environment:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # The billing-usage dashboard (§13, §19) needs the ClickHouse datasource
+      # plugin — not bundled by default, installed at container start.
+      GF_PLUGINS_PREINSTALL: grafana-clickhouse-datasource
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -214,3 +271,5 @@ volumes:
   rabbitmq_data:
   prometheus_data:
   grafana_data:
+  alertmanager_data:
+  tempo_data:

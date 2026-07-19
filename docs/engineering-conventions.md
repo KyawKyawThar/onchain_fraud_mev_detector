@@ -26,6 +26,7 @@ A change is "done" when:
 - [ ] **Backpressure is bounded** — no unbounded `spawn`, no CPU on the reactor.
 - [ ] **At-least-once + idempotent** — commit/ack only after a durable downstream write; dedup by a stable key.
 - [ ] **Observability is wired through the seam** — a span that propagates, a metric, both no-op until the binary opts in.
+- [ ] **A cross-cutting concern (timing, a span) is a wrapper + `_inner` split**, not a call scattered across every return site (§14).
 - [ ] **Config is resolved once at boot**, fail-fast.
 - [ ] **Supply chain is deliberate** — heavy deps pinned `default-features = false` with a comment; `just deny` clean.
 - [ ] **The gates pass locally** — `just check` green (local == CI).
@@ -73,8 +74,10 @@ direction explicit and acyclic.
 [`simulation::consumer::JobSource`](../crates/simulation/src/consumer.rs),
 [`simulation::simulator::Simulator`](../crates/simulation/src/simulator.rs),
 [`detector-api::DetectorPlugin`](../crates/detector-api/src/plugin.rs),
-[`ingestion`](../crates/ingestion/) `ChainSource`. Each pairs with a `Recording*` /
-canned double in its `#[cfg(test)]` module.
+[`ingestion`](../crates/ingestion/) `ChainSource`,
+[`intelligence::cache::HotCache`](../crates/intelligence/src/cache.rs),
+[`rule_engine::state_store::TemporalStateStore`](../crates/rule-engine/src/state_store.rs).
+Each pairs with a `Recording*` / canned double in its `#[cfg(test)]` module.
 
 **Anti-pattern.** Reaching for `rdkafka`/`lapin`/`reqwest` types directly in service
 logic. If a test needs a broker to run, the seam is missing.
@@ -83,7 +86,9 @@ logic. If a test needs a broker to run, the seam is missing.
 review-vigilance: [`crates/arch-conformance`](../crates/arch-conformance/) runs the
 seam rules (detector crates → `detector-api` never `detection`; `rdkafka` never
 without `event-bus`; `lapin` in `simulation` only; one Prometheus exporter; `sqlx`
-alongside `db`; `clickhouse` alongside `ch-migrate`; `events`/`detector-api` stay at
+alongside `db`; `redis` alongside `db` too (§8/§9 — `db::redis` is the shared
+connect + transient/permanent classification, the Redis analog of the sqlx rule);
+`clickhouse` alongside `ch-migrate`; `events`/`detector-api` stay at
 the bottom of the graph) against `cargo metadata` on every `cargo test` — a
 violation fails the same gate locally and in CI. Changing a rule is an architecture
 decision: edit the rule in the same PR, with the reasoning in the commit.
@@ -133,6 +138,12 @@ enums over booleans.
 
 **Anti-pattern.** Passing a raw `u8` priority or `f64` price into the core and
 checking the range there. Parse it into a newtype at the seam.
+
+**Standing review question.** Every new Sprint adds new domain concepts under time
+pressure, and a bare `String`/`u64`/`f64` field is the path of least resistance in
+the moment. When a new field shows up that isn't already a newtype elsewhere, ask
+"can this hold an invalid value, and would that value be wrong at every use site?" —
+if yes, it's a newtype, not a review comment for later.
 
 ---
 
@@ -325,6 +336,35 @@ comments, including the load-bearing ones.
 **Reference.** [`telemetry/src/health.rs`](../crates/telemetry/src/health.rs) and
 [`event-store`'s config](../crates/event-store/src/config.rs) — every comment is a
 constraint, a trade-off, or a trap.
+
+---
+
+## 14. Wrap cross-cutting concerns with a thin timed/observed outer, never scatter them
+
+**Rule.** When a function needs a cross-cutting concern applied uniformly regardless
+of which branch it returns from — timing for a metric, a tracing span, anything that
+must fire on every exit path including early `return`s and `?`-propagated errors —
+split it: a thin **outer** function owns the concern and calls a private **`_inner`**
+that owns the actual logic. Never scatter the same `record_*`/span-entry call across
+every return site by hand.
+
+**Why here.** A function with several early returns is exactly where a
+hand-maintained metric or span goes stale first: someone adds a new branch six
+months later, forgets the one line that records it, and the dashboard quietly
+under-counts with no compile error to catch it. The wrapper/`_inner` split makes the
+concern *structural* — it fires because of where the code sits, not because every
+future editor remembers to keep four call sites in sync.
+
+**Reference.**
+[`simulation::worker::Worker::process`](../crates/simulation/src/worker.rs) (timed
+outer) / `process_inner` (the resolve → simulate → publish logic);
+[`event_store::store::EventStore::append_batch`](../crates/event-store/src/store.rs)
+(timed outer, records success/error via [`crate::metrics`](../crates/event-store/src/metrics.rs))
+/ `append_batch_inner` (the actual RowBinary insert).
+
+**Anti-pattern.** A function with a metric recorded at its single `Ok` return but not
+at its three early `Err` returns — the classic way a "detector run" counter and a
+"detector error" counter drift out of sync with each other.
 
 ---
 

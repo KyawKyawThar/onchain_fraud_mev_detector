@@ -105,7 +105,7 @@ impl EmailDelivery {
                 let outcome = Err(DeliveryError::Rejected {
                     reason: format!("invalid recipient address {address:?}: {err}"),
                 });
-                count_delivery("email", outcome_label(&outcome));
+                count_delivery("email", notice, outcome_label(&outcome));
                 return outcome;
             }
         };
@@ -128,7 +128,7 @@ impl EmailDelivery {
                 Err(err) => break Err(err),
             }
         };
-        count_delivery("email", outcome_label(&outcome));
+        count_delivery("email", notice, outcome_label(&outcome));
         outcome
     }
 }

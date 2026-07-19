@@ -84,6 +84,13 @@ const ENTITY_GRAPH_NODES: &str = "intelligence_entity_graph_nodes";
 const ENTITY_TIMELINE_REQUESTS: &str = "intelligence_entity_timeline_requests_total";
 /// Distribution of the milestone count a timeline returned.
 const ENTITY_TIMELINE_MILESTONES: &str = "intelligence_entity_timeline_milestones";
+/// Risk-score/labels cache reads, labelled `cache` (`risk_score`/`labels`) and
+/// `outcome` (`hit`/`miss`) — the §19 "label cache hit rate" panel, derived in
+/// PromQL as `hit / (hit + miss)` per `cache` label.
+const CACHE_REQUESTS_TOTAL: &str = "intelligence_cache_requests_total";
+/// Wall-clock latency of a live risk-score recompute (`risk_scorer::load_risk_inputs`
+/// + `risk::score`) — only sampled on a cache miss, since a hit never reaches it.
+const SCORE_RECOMPUTE_DURATION_SECONDS: &str = "intelligence_score_recompute_duration_seconds";
 
 /// Parse the wire address via the crate's canonical [`model::parse_address_key`]
 /// (the same mapping Postgres rows/Redis keys/ClickHouse columns use), mapping
@@ -167,6 +174,8 @@ impl IntelligenceRead for IntelligenceReadService {
         let address = parse_address(&request.into_inner().address)?;
 
         if let Ok(Some(cached)) = self.cache.score(&address, MODEL_VERSION).await {
+            metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "risk_score", "outcome" => "hit")
+                .increment(1);
             return Ok(Response::new(RiskScoreReply {
                 score: u32::from(cached.score),
                 confidence: cached.confidence.get(),
@@ -174,12 +183,17 @@ impl IntelligenceRead for IntelligenceReadService {
                 computed_at_unix_millis: millis(cached.computed_at),
             }));
         }
+        metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "risk_score", "outcome" => "miss")
+            .increment(1);
 
         let as_of = Utc::now();
+        let recompute_started = std::time::Instant::now();
         let (entity_id, inputs) = risk_scorer::load_risk_inputs(&self.stores, &address, as_of)
             .await
             .map_err(status_for)?;
         let result = risk::score(address, entity_id, &inputs, as_of);
+        metrics::histogram!(SCORE_RECOMPUTE_DURATION_SECONDS)
+            .record(recompute_started.elapsed().as_secs_f64());
 
         // Best-effort repopulate — a failed cache write never fails the read,
         // but it's worth knowing about (an ops-visible Redis blip), not silent.
@@ -218,10 +232,14 @@ impl IntelligenceRead for IntelligenceReadService {
         let address = parse_address(&request.into_inner().address)?;
 
         if let Ok(Some(cached)) = self.cache.labels(&address).await {
+            metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "labels", "outcome" => "hit")
+                .increment(1);
             return Ok(Response::new(LabelsReply {
                 labels: cached.iter().map(to_pb_label).collect(),
             }));
         }
+        metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "labels", "outcome" => "miss")
+            .increment(1);
 
         let labels = self
             .stores

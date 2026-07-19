@@ -1,12 +1,13 @@
 # Production overlay. Two deliberate differences from dev:
 #
-#   1. NO secretGenerator. The six Secrets (postgres-credentials,
+#   1. NO secretGenerator. The seven Secrets (postgres-credentials,
 #      redis-credentials, clickhouse-credentials, rabbitmq-credentials,
-#      app-secrets, rpc-endpoints) are provisioned by the cluster's secrets
-#      machinery — External Secrets Operator / Vault agent injector / cloud
-#      secrets-store CSI — under exactly those names and the key names the dev
-#      overlay's secrets/*.env files document (§20: secrets via Vault or a
-#      cloud secrets manager). Nothing credential-bearing is committed here.
+#      app-secrets, rpc-endpoints, grafana-admin) are provisioned by the
+#      cluster's secrets machinery — External Secrets Operator / Vault agent
+#      injector / cloud secrets-store CSI — under exactly those names and the
+#      key names the dev overlay's secrets/*.env files document (§20: secrets
+#      via Vault or a cloud secrets manager). Nothing credential-bearing is
+#      committed here.
 #
 #   2. Pinned images. CI publishes sha-tagged images to GHCR on every merge to
 #      main (ci.yml); a deploy is editing newTag below to the release you mean

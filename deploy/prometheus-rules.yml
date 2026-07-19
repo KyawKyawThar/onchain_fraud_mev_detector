@@ -1,0 +1,100 @@
+# SLO alert rules (§19, Sprint 13 t4; production_readiness.md Epic D — "Define
+# SLOs ... turn them into targets"). Loaded by deploy/prometheus.yml's
+# `rule_files`, evaluated by Prometheus, routed through Alertmanager
+# (deploy/alertmanager.yml).
+#
+# Thresholds are PROVISIONAL. Only `FastPathLatencyHigh` is seeded from a hard
+# number the source doc actually states (§6: fast path < 1s p99); every other
+# threshold below is a conservative placeholder picked with no production
+# traffic to calibrate against — tune them once real load/latency data exists,
+# per production_readiness.md's own framing of this as an open, iterative
+# task, not a one-shot. `severity: page` alerts are the ones with load-bearing
+# numbers; `severity: informational` alerts have no numeric baseline yet and
+# exist so the panel/rule wiring is proven end-to-end before real thresholds
+# land — expect to tune or delete them once traffic exists.
+groups:
+  - name: mevwatch-slo
+    rules:
+      - alert: FastPathLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(detector_detect_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Detector fast-path p99 latency exceeds the §6 <1s SLO"
+          description: "detector_detect_duration_seconds p99 has been above 1s for 5m. The fast path (block → provisional alert) is the platform's headline latency claim; investigate detector CPU or a rayon pool backlog."
+
+      - alert: ApiLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "api-service p99 request latency is high"
+          description: "http_request_duration_seconds p99 has been above 1s for 5m. Threshold is a placeholder pending a real SLA — tune once load-test/production numbers exist."
+
+      - alert: KafkaConsumerLagHigh
+        expr: max(kafka_consumer_lag) by (consumer) > 10000
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "A Kafka consumer is falling behind"
+          description: "kafka_consumer_lag has stayed above 10000 records for 10m on {{ $labels.consumer }} — the pipeline is backlogging faster than it drains. Check for a stalled/crash-looping consumer before this becomes customer-visible staleness."
+
+      - alert: DlqReceivingRecords
+        expr: sum(rate(dlq_published_total[5m])) by (consumer) > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "A consumer is steadily parking records on its DLQ"
+          description: "{{ $labels.consumer }} has published to its mev.dlq.<consumer> topic continuously for 15m — poison messages are accumulating, not a one-off blip. Drain/inspect per the DLQ runbook (production_readiness.md Epic A)."
+
+      - alert: EventStoreAppendErrorsHigh
+        expr: sum(rate(event_store_append_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The event store is failing to append"
+          description: "event_store_append_errors_total has been increasing for 5m — the audit trail's write path is degraded. A `permanent`-labeled error is a bug (encode failure); `transient` points at ClickHouse."
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped"
+          description: "Prometheus has failed to scrape {{ $labels.job }} ({{ $labels.instance }}) for 2m — the process is down, unreachable, or its /metrics endpoint hung."
+
+      - alert: SimulationConfirmationRateAnomaly
+        expr: |
+          sum(rate(simulation_jobs_total{outcome="confirmed"}[1h]))
+          /
+          clamp_min(sum(rate(simulation_jobs_total[1h])), 1e-9) < 0.01
+        for: 1h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Simulation confirmation rate looks anomalously low"
+          description: "Confirmed/(confirmed+unconfirmed) has been below 1% for 1h. No real baseline exists yet (production_readiness.md Epic E) — this is a placeholder to prove the panel/alert wiring, not a tuned SLO. Revisit once precision/recall baselines exist."
+
+      - alert: ReorgFrequencyHigh
+        expr: sum(rate(reorgs_total[1h])) by (chain) > 0.5
+        for: 1h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Reorg frequency is elevated on {{ $labels.chain }}"
+          description: "More than 1 reorg per 2h sustained for 1h on {{ $labels.chain }} — a placeholder threshold (no production baseline yet); a real spike here is worth a manual look regardless (RPC endpoint on a minority fork, or a genuinely unstable chain head)."
+
+      - alert: AlertEndToEndLatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(notification_alert_end_to_end_seconds_bucket[10m])) by (le)) > 30
+        for: 10m
+        labels:
+          severity: informational
+        annotations:
+          summary: "Block → notification latency (p95) is elevated"
+          description: "notification_alert_end_to_end_seconds p95 has been above 30s for 10m — the §19 headline end-to-end panel. Placeholder threshold; tune once a real customer-facing SLA is set."

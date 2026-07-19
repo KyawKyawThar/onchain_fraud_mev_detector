@@ -60,6 +60,8 @@ async fn main() -> Result<()> {
 /// Run the consumer: apply pending ClickHouse migrations, connect the stores, then drain the
 /// result topics until shutdown.
 async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
+    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+
     tracing::info!(
         group = %cfg.group_id,
         "starting simulation incident/job projection consumer"
