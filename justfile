@@ -265,12 +265,20 @@ dev-server:
 run-event-store:
     cargo run -p event-store
 
-# Run the ingestion service (§5). Needs ETH_RPC_URLS set (comma-separated RPC
-# endpoints); the source adapter is the health-checked, circuit-broken RPC
-# failover pool. Logs each new head (block-tree + event emission are Sprint 2
-# tasks 2–4).
+# Run the ingestion service (§5). Needs RPC_URLS set (comma-separated RPC
+# endpoints; legacy ETH_RPC_URLS still works); the source adapter is the
+# health-checked, circuit-broken RPC failover pool. Logs each new head
+# (block-tree + event emission are Sprint 2 tasks 2–4).
 run-ingestion:
     cargo run -p ingestion
+
+# Run a second ingestion instance for Base (§5, Sprint 13 t2 — one instance
+# per chain; chain is the partition key on every event). Needs BASE_RPC_URLS
+# set to Base RPC endpoints. Finality depth defaults per chain (Base: 1024,
+# the OP-stack unsafe-head→L1-finality lag at 2 s blocks); override with
+# FINALIZATION_DEPTH.
+run-ingestion-base:
+    CHAIN_ID=8453 RPC_URLS="$BASE_RPC_URLS" cargo run -p ingestion
 
 # Run the detection service (§6, §17). The fast path: consumes
 # BlockAssembled/BlockReverted off Kafka, fans detectors out on rayon, and
@@ -279,6 +287,13 @@ run-ingestion:
 # sandwich + arb detectors (the lib default links none).
 run-detection:
     cargo run -p detection --features detectors
+
+# Run a second detection instance for Base (§6, Sprint 13 t2). Its own consumer
+# group (defaulted to detection-8453) keeps offsets separate from the Ethereum
+# instance; another chain's blocks on the shared topics are commit-skipped. The
+# metrics port moves off 9100 so both instances can run on one host.
+run-detection-base:
+    CHAIN_ID=8453 DETECTION_METRICS_ADDR=0.0.0.0:9101 cargo run -p detection --features detectors
 
 # Run detection with the synthetic `demo` detector linked (§19). It fires on a
 # fixed schedule regardless of tx content, so the per-detector metrics (hit rate,

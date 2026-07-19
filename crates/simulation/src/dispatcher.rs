@@ -32,8 +32,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{run_consumer, EventHandler, EventSink, Handled};
 use events::detection::PreliminaryAlertCreated;
 use events::primitives::Chain;
@@ -54,14 +56,8 @@ pub fn consumed_topic() -> String {
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) is what
 /// ties the commit to a job being queued; `earliest` means a fresh group dispatches
 /// from the start of retained history (cf. detection/event-store).
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "dispatcher")
 }
 
 /// The dispatcher: holds the two publish seams and turns each provisional alert into
@@ -143,7 +139,11 @@ impl Dispatcher {
     /// Drive the dispatcher off Kafka until shutdown or a fatal subscribe error, via
     /// the shared [`run_consumer`] loop (subscribe, decode, trace, commit). The
     /// dispatcher supplies only the per-alert decision ([`EventHandler`]).
-    pub async fn run(self, consumer: StreamConsumer) -> Result<()> {
+    pub async fn run(
+        self,
+        consumer: StreamConsumer<LagReporting>,
+        dlq: Option<&DeadLetterQueue>,
+    ) -> Result<()> {
         let topic = consumed_topic();
         let shutdown = self.shutdown.clone();
         let backoff = self.publish_backoff;
@@ -152,6 +152,7 @@ impl Dispatcher {
             &[topic.as_str()],
             "dispatcher",
             backoff,
+            dlq,
             self,
             &shutdown,
         )

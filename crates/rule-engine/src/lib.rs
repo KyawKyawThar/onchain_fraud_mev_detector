@@ -49,6 +49,7 @@ pub mod consumer;
 pub mod ctx;
 pub mod enrich;
 pub mod model;
+pub mod outbox;
 pub mod state_store;
 pub mod store;
 pub mod temporal;

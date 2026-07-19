@@ -46,9 +46,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{
     handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
 };
@@ -106,14 +108,8 @@ pub fn consumed_topics() -> Vec<String> {
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) ties
 /// the commit to a fully-flushed fold; `earliest` means a fresh group builds
 /// records from the start of retained history (cf. the attribution consumer).
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "block-production")
 }
 
 /// A failure handling one event. Wraps every seam's error and forwards the
@@ -159,6 +155,10 @@ struct BookState {
 /// reads/mints through, the snapshot store, and the event sink for
 /// `LabelAdded`.
 pub struct ProductionConsumer {
+    /// The one chain this pipeline attributes (§10 is PBS/Ethereum-specific and
+    /// `facts` reads exactly one chain); other chains' events on the shared
+    /// topics are commit-skipped in [`EventHandler::handle`] (Sprint 13 t2).
+    chain: Chain,
     state: Mutex<BookState>,
     facts: Arc<dyn BlockFactsSource>,
     relays: Arc<dyn RelaySource>,
@@ -173,6 +173,7 @@ pub struct ProductionConsumer {
 impl ProductionConsumer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        chain: Chain,
         facts: Arc<dyn BlockFactsSource>,
         relays: Arc<dyn RelaySource>,
         labels: Arc<dyn LabelStore>,
@@ -183,6 +184,7 @@ impl ProductionConsumer {
         capacity: BookCapacity,
     ) -> Self {
         Self {
+            chain,
             state: Mutex::new(BookState {
                 book: ProductionBook::new(capacity),
                 pending_writes: Vec::new(),
@@ -202,8 +204,9 @@ impl ProductionConsumer {
     /// via the shared [`run_consumer`] loop.
     pub async fn run(
         self,
-        consumer: StreamConsumer,
+        consumer: StreamConsumer<LagReporting>,
         retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let topics = consumed_topics();
@@ -213,6 +216,7 @@ impl ProductionConsumer {
             &topic_refs,
             "block-production",
             retry_backoff,
+            dlq,
             self,
             shutdown,
         )
@@ -408,6 +412,13 @@ impl EventHandler for ProductionConsumer {
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
         let at = envelope.occurred_at;
         let chain = envelope.chain;
+        // Another chain's event on the shared topics (Sprint 13 t2): this
+        // pipeline attributes exactly one chain (its facts RPC and relays are
+        // that chain's), so commit-skip rather than error on a block hash the
+        // RPC will never know.
+        if chain != self.chain {
+            return Handled::Commit;
+        }
         let result = match envelope.payload {
             DomainEvent::BlockCanonicalized(canonicalized) => {
                 self.open_block(chain, canonicalized.block, at).await
@@ -483,6 +494,7 @@ mod tests {
         let store = Arc::new(RecordingProductionStore::new());
         let sink = Arc::new(RecordingSink::default());
         let consumer = ProductionConsumer::new(
+            Chain::ETHEREUM,
             facts.clone(),
             relays.clone(),
             labels.clone(),
@@ -579,6 +591,27 @@ mod tests {
             }),
             secs,
         )
+    }
+
+    #[tokio::test]
+    async fn another_chains_block_is_commit_skipped_without_touching_the_stores() {
+        let h = harness();
+        // A Base block on the shared topics (Sprint 13 t2): the Ethereum-only
+        // pipeline must commit-skip it — asking the facts RPC would error
+        // (`BlockNotYetKnown`) forever and wedge the stream on retries.
+        let foreign = EventEnvelope::with_metadata(
+            Uuid::new_v4(),
+            at(0),
+            Chain::BASE,
+            DomainEvent::BlockCanonicalized(BlockCanonicalized {
+                block: block(7, 0x07),
+            }),
+        );
+
+        let handled = h.consumer.handle(foreign).await;
+        assert_eq!(handled, Handled::Commit);
+        assert!(h.store.appended().is_empty(), "no record opened");
+        assert!(h.sink.events().is_empty(), "nothing published");
     }
 
     #[tokio::test]

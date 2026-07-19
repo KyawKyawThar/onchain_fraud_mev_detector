@@ -65,6 +65,12 @@ async fn run(cfg: Config) -> Result<()> {
     }
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -116,6 +122,7 @@ async fn run(cfg: Config) -> Result<()> {
         shutdown.clone(),
     );
     let pipeline_task = tokio::spawn(pipeline.run(rx, cfg.finalize_interval));
+    health.set_ready(true);
 
     // Join the tasks. The poller drops `tx` on shutdown, which ends the pipeline.
     health_task.await.context("health task panicked")?;

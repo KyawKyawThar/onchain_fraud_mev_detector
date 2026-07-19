@@ -366,6 +366,12 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -387,10 +393,15 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
         MergeActor::spawn(),
     );
 
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "intel-attribution")
+            .await
+            .context("provisioning the attribution DLQ topic")?;
     let consumer = build_consumer(&cfg.kafka.brokers, &cfg.kafka.group_id)
         .context("building the attribution Kafka consumer")?;
+    health.set_ready(true);
     attributor
-        .run(consumer, PUBLISH_BACKOFF, &shutdown)
+        .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
         .await
         .context("attribution consumer exited with error")?;
 
@@ -428,6 +439,12 @@ async fn score(cfg: &Config) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -439,10 +456,15 @@ async fn score(cfg: &Config) -> Result<()> {
 
     let scorer = RiskScorer::new(StoreSeams::single(store), cache, sink, shutdown.clone());
 
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "intel-risk-scorer")
+            .await
+            .context("provisioning the risk-scorer DLQ topic")?;
     let consumer = risk_scorer::build_consumer(&cfg.kafka.brokers, &cfg.kafka.risk_group_id)
         .context("building the risk-score Kafka consumer")?;
+    health.set_ready(true);
     scorer
-        .run(consumer, PUBLISH_BACKOFF, &shutdown)
+        .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
         .await
         .context("risk-score consumer exited with error")?;
 
@@ -473,6 +495,12 @@ async fn reorg_cmd(cfg: &Config) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -484,10 +512,14 @@ async fn reorg_cmd(cfg: &Config) -> Result<()> {
 
     let consumer = ReorgConsumer::new(StoreSeams::single(store), sink, shutdown.clone());
 
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "intel-reorg")
+        .await
+        .context("provisioning the reorg DLQ topic")?;
     let kafka_consumer = reorg::build_consumer(&cfg.kafka.brokers, &cfg.kafka.reorg_group_id)
         .context("building the reorg Kafka consumer")?;
+    health.set_ready(true);
     consumer
-        .run(kafka_consumer, PUBLISH_BACKOFF, &shutdown)
+        .run(kafka_consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
         .await
         .context("reorg consumer exited with error")?;
 
@@ -544,6 +576,12 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -554,6 +592,7 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
     });
 
     let consumer = ProductionConsumer::new(
+        bp.chain,
         Arc::new(RpcBlockFacts::new(rpc_url)),
         Arc::new(
             HttpRelaySource::new(bp.relays.clone(), bp.relay_timeout)
@@ -567,10 +606,17 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
         BookCapacity::default(),
     );
 
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(
+        &cfg.kafka.brokers,
+        "intel-block-production",
+    )
+    .await
+    .context("provisioning the block-production DLQ topic")?;
     let kafka_consumer = production_consumer::build_consumer(&cfg.kafka.brokers, &bp.group_id)
         .context("building the block-production Kafka consumer")?;
+    health.set_ready(true);
     consumer
-        .run(kafka_consumer, PUBLISH_BACKOFF, &shutdown)
+        .run(kafka_consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
         .await
         .context("block-production consumer exited with error")?;
 
@@ -613,6 +659,12 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     let leaderboard = Arc::new(ClickhouseLeaderboard::new(client));
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -629,6 +681,7 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
         graph,
         cfg.graph_limits,
     );
+    health.set_ready(true);
     tonic::transport::Server::builder()
         .add_service(IntelligenceReadServer::new(service))
         .serve_with_shutdown(cfg.grpc_addr, shutdown.cancelled())

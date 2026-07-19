@@ -64,9 +64,11 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
 use event_bus::{
     handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
@@ -140,14 +142,8 @@ pub fn consumed_topics() -> Vec<String> {
 /// Build the consumer. Manual offset commit ties the commit to a fully
 /// processed (and temporal-flushed) record; `earliest` means a fresh group
 /// evaluates from the start of retained history.
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, CONSUMER)
 }
 
 /// What a [`refresh_rules`] pass did — distinguishable outcomes rather than a
@@ -724,8 +720,9 @@ impl EngineConsumer {
     /// via the shared [`run_consumer`] loop.
     pub async fn run(
         self,
-        consumer: StreamConsumer,
+        consumer: StreamConsumer<LagReporting>,
         retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let topics = consumed_topics();
@@ -735,6 +732,7 @@ impl EngineConsumer {
             &topic_refs,
             CONSUMER,
             retry_backoff,
+            dlq,
             self,
             shutdown,
         )

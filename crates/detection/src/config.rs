@@ -47,11 +47,12 @@ impl Config {
         if work_buffer < 1 || commit_buffer < 1 {
             bail!("DETECTION_WORK_BUFFER and DETECTION_COMMIT_BUFFER must be >= 1");
         }
+        let chain = Chain(env_parse("CHAIN_ID", 1u64)?);
         Ok(Self {
-            chain: Chain(env_parse("CHAIN_ID", 1u64)?),
+            chain,
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
-                group_id: env_or("DETECTION_KAFKA_GROUP", "detection"),
+                group_id: env_or("DETECTION_KAFKA_GROUP", &default_group_id(chain)),
             },
             work_buffer,
             commit_buffer,
@@ -60,6 +61,20 @@ impl Config {
                 SocketAddr::from(([0, 0, 0, 0], 9100)),
             )?,
         })
+    }
+}
+
+/// Default Kafka consumer group for a chain's detection instance. Each chain's
+/// instance needs its **own** group — instances sharing one group would split
+/// the partitions arbitrarily, and each would commit-skip the other chain's
+/// blocks (§20). Ethereum keeps the historical bare `detection` so an existing
+/// deployment's committed offsets survive this change; every other chain gets
+/// a chain-suffixed group.
+fn default_group_id(chain: Chain) -> String {
+    if chain == Chain::ETHEREUM {
+        "detection".to_owned()
+    } else {
+        format!("detection-{}", chain.id())
     }
 }
 
@@ -88,5 +103,17 @@ where
             )
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ethereum_keeps_the_historical_group_and_l2s_get_a_suffixed_one() {
+        assert_eq!(default_group_id(Chain::ETHEREUM), "detection");
+        assert_eq!(default_group_id(Chain::BASE), "detection-8453");
+        assert_eq!(default_group_id(Chain(10)), "detection-10");
     }
 }

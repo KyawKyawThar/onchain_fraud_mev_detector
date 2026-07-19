@@ -20,6 +20,7 @@
 //! ```text
 //! [run_consumer]  StreamConsumer (async I/O)
 //!    BlockAssembled → DetectionCtx ;  BlockReverted → revert
+//!    another chain's block → commit-only `None` (topics are shared, §20)
 //!    work_tx.send(work).await            ── bounded: backpressure when detection lags
 //!         ▼
 //! [Scheduler::run]  owns the one DetectionPlan + cross-block roster (single writer)
@@ -53,6 +54,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
 use event_bus::{header_carrier, publish_resilient, EventSink};
 use events::chain::BlockReverted;
@@ -193,10 +196,20 @@ impl Scheduler {
     /// committer can advance the offset — keeping commits in lock-step with durable
     /// publication (at-least-once).
     ///
+    /// A `None` work item is a record the consumer decoded but this instance
+    /// doesn't act on — another chain's block on the shared topics (§20, one
+    /// detection instance per chain). It publishes nothing but its token still
+    /// flows through `done`, so the offset advances **in order** with the real
+    /// work (committing it out of band could overtake an unpublished block
+    /// sharing the partition).
+    ///
     /// Generic over the commit token `T` so the core is testable with `T = ()`; the
     /// binary uses `T = Offsets`.
-    pub async fn run<T>(mut self, mut work: mpsc::Receiver<(BlockEvent, T)>, done: mpsc::Sender<T>)
-    where
+    pub async fn run<T>(
+        mut self,
+        mut work: mpsc::Receiver<(Option<BlockEvent>, T)>,
+        done: mpsc::Sender<T>,
+    ) where
         T: Send + 'static,
     {
         let shutdown = self.shutdown.clone();
@@ -208,7 +221,14 @@ impl Scheduler {
                     return;
                 }
                 msg = work.recv() => match msg {
-                    Some((event, token)) => {
+                    Some((None, token)) => {
+                        // Not ours (another chain) — commit-only pass-through.
+                        if done.send(token).await.is_err() {
+                            tracing::warn!("commit channel closed; scheduler stopping");
+                            return;
+                        }
+                    }
+                    Some((Some(event), token)) => {
                         let outcome = self.process(event).await;
                         // Publish borrowing only the individual `Sync` fields (sink,
                         // shutdown) — never a shared `&self`, which would force the
@@ -283,14 +303,8 @@ pub fn consumed_topics() -> [String; 2] {
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) is what
 /// ties the commit to a block's successful publication; `earliest` means a fresh
 /// group back-fills from the start of retained history (cf. event-store).
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "detection")
 }
 
 /// Pull `BlockAssembled`/`BlockReverted` records off Kafka, decode them, and feed
@@ -300,8 +314,10 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
 /// Returns on shutdown or a fatal subscribe error. The bounded `work` send is the
 /// backpressure point: when the scheduler lags, this awaits rather than buffering.
 pub async fn run_consumer(
-    consumer: Arc<StreamConsumer>,
-    work: mpsc::Sender<(BlockEvent, Offsets)>,
+    consumer: Arc<StreamConsumer<LagReporting>>,
+    chain: Chain,
+    work: mpsc::Sender<(Option<BlockEvent>, Offsets)>,
+    dlq: Option<DeadLetterQueue>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let topics = consumed_topics();
@@ -343,17 +359,42 @@ pub async fn run_consumer(
         propagation::set_parent_from_headers(&span, &header_carrier(&msg));
 
         let Some(payload) = msg.payload() else {
-            tracing::error!("record has no payload; skipping");
+            tracing::error!("record has no payload; parking on the DLQ and skipping");
+            if let Some(dlq) = &dlq {
+                dlq.publish(&msg, "record has no payload").await;
+            }
+            if work.send((None, offsets)).await.is_err() {
+                tracing::info!("scheduler gone; consumer stopping");
+                return Ok(());
+            }
             continue;
         };
-        let event = match EventEnvelope::from_json_slice(payload) {
-            Ok(envelope) => block_event(envelope),
+        let envelope = match EventEnvelope::from_json_slice(payload) {
+            Ok(envelope) => envelope,
             Err(err) => {
-                tracing::error!(error = %err, "undecodable event; skipping");
+                tracing::error!(error = %err, "undecodable event; parking on the DLQ and skipping");
+                if let Some(dlq) = &dlq {
+                    dlq.publish(&msg, &err.to_string()).await;
+                }
+                if work.send((None, offsets)).await.is_err() {
+                    tracing::info!("scheduler gone; consumer stopping");
+                    return Ok(());
+                }
                 continue;
             }
         };
-        let Some(event) = event else {
+        // Another chain's block on the shared topics (§20 — one detection
+        // instance per chain): not ours, but its offset must still advance, so
+        // it rides the work channel as a commit-only `None` (see
+        // [`Scheduler::run`]) instead of being dropped uncommitted.
+        if envelope.chain != chain {
+            if work.send((None, offsets)).await.is_err() {
+                tracing::info!("scheduler gone; consumer stopping");
+                return Ok(());
+            }
+            continue;
+        }
+        let Some(event) = block_event(envelope) else {
             // A topic we don't act on slipped through — skip without committing.
             continue;
         };
@@ -362,7 +403,7 @@ pub async fn run_consumer(
         // the guard across the await). Continuing the trace through the scheduler
         // task is a follow-up — for now the linkage is logged here.
         span.in_scope(|| tracing::debug!(block_event = ?event, "decoded block event"));
-        if work.send((event, offsets)).await.is_err() {
+        if work.send((Some(event), offsets)).await.is_err() {
             tracing::info!("scheduler gone; consumer stopping");
             return Ok(());
         }
@@ -372,7 +413,10 @@ pub async fn run_consumer(
 /// Commit the offset of each block once the scheduler signals it has been published
 /// — at-least-once: a crash before the commit re-delivers the block. Commits the
 /// *next* offset (`offset + 1`), the Kafka convention for "resume after this one".
-pub async fn run_committer(consumer: Arc<StreamConsumer>, mut done: mpsc::Receiver<Offsets>) {
+pub async fn run_committer(
+    consumer: Arc<StreamConsumer<LagReporting>>,
+    mut done: mpsc::Receiver<Offsets>,
+) {
     while let Some(o) = done.recv().await {
         let mut tpl = TopicPartitionList::new();
         // `add_partition_offset` only fails on an invalid partition/offset, which
@@ -533,13 +577,13 @@ mod tests {
             CancellationToken::new(),
         );
 
-        let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, u64)>(4);
         let (done_tx, mut done_rx) = mpsc::channel::<u64>(4);
         let handle = tokio::spawn(s.run(work_rx, done_tx));
 
         // Two blocks through the bounded channel, then close it to end the loop.
-        work_tx.send((assembled(1), 1)).await.unwrap();
-        work_tx.send((assembled(2), 2)).await.unwrap();
+        work_tx.send((Some(assembled(1)), 1)).await.unwrap();
+        work_tx.send((Some(assembled(2)), 2)).await.unwrap();
         drop(work_tx);
         handle.await.unwrap();
 
@@ -562,6 +606,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_foreign_chain_record_commits_in_order_and_publishes_nothing() {
+        let sink = Arc::new(RecordingSink::default());
+        let s = Scheduler::new(
+            Chain::ETHEREUM,
+            Arc::new(plan_with_one_detector()),
+            CrossBlockStates::new(),
+            sink.clone(),
+            CancellationToken::new(),
+        );
+
+        let (work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, u64)>(4);
+        let (done_tx, mut done_rx) = mpsc::channel::<u64>(4);
+        let handle = tokio::spawn(s.run(work_rx, done_tx));
+
+        // Ours, another chain's (the commit-only `None`), ours again.
+        work_tx.send((Some(assembled(1)), 1)).await.unwrap();
+        work_tx.send((None, 2)).await.unwrap();
+        work_tx.send((Some(assembled(3)), 3)).await.unwrap();
+        drop(work_tx);
+        handle.await.unwrap();
+
+        // The pass-through published nothing (two detected blocks' pairs only)…
+        assert_eq!(
+            sink.types(),
+            vec![
+                "DetectorTriggered",
+                "PreliminaryAlertCreated",
+                "DetectorTriggered",
+                "PreliminaryAlertCreated",
+            ]
+        );
+        // …but its offset token still flowed through `done`, in stream order.
+        let mut tokens = Vec::new();
+        while let Ok(t) = done_rx.try_recv() {
+            tokens.push(t);
+        }
+        assert_eq!(tokens, vec![1, 2, 3], "foreign record committed in order");
+    }
+
+    #[tokio::test]
     async fn run_loop_meters_one_detector_run_fact_per_assembled_block() {
         let sink = Arc::new(RecordingSink::default());
         let s = Scheduler::new(
@@ -572,11 +656,11 @@ mod tests {
             CancellationToken::new(),
         );
 
-        let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, u64)>(4);
         let (done_tx, _done_rx) = mpsc::channel::<u64>(4);
         let handle = tokio::spawn(s.run(work_rx, done_tx));
 
-        work_tx.send((assembled(1), 1)).await.unwrap();
+        work_tx.send((Some(assembled(1)), 1)).await.unwrap();
         drop(work_tx);
         handle.await.unwrap();
 
@@ -609,7 +693,7 @@ mod tests {
             CancellationToken::new(),
         );
 
-        let (work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, u64)>(4);
         let (done_tx, _done_rx) = mpsc::channel::<u64>(4);
         let handle = tokio::spawn(s.run(work_rx, done_tx));
 
@@ -617,7 +701,7 @@ mod tests {
             block: BlockRef::new(1, hash(1)),
             replaced_by: hash(0x11),
         });
-        work_tx.send((reverted, 1)).await.unwrap();
+        work_tx.send((Some(reverted), 1)).await.unwrap();
         drop(work_tx);
         handle.await.unwrap();
 
@@ -637,7 +721,7 @@ mod tests {
             Arc::new(RecordingSink::default()),
             shutdown.clone(),
         );
-        let (_work_tx, work_rx) = mpsc::channel::<(BlockEvent, u64)>(4);
+        let (_work_tx, work_rx) = mpsc::channel::<(Option<BlockEvent>, u64)>(4);
         let (done_tx, _done_rx) = mpsc::channel::<u64>(4);
         let handle = tokio::spawn(s.run(work_rx, done_tx));
 

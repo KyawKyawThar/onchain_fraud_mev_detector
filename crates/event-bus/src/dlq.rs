@@ -44,6 +44,10 @@ pub const DLQ_FAILED_TOTAL: &str = "dlq_failed_total";
 /// parked poison as domain events.
 pub const DLQ_TOPIC_PREFIX: &str = "mev.dlq";
 
+/// Default DLQ retention when `KAFKA_RETENTION_MS` is unset: 7 days — long
+/// enough to investigate and replay after a weekend incident.
+pub const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
 /// How long to wait for the admin round-trips when provisioning the topic.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a DLQ produce may take before it is abandoned (best-effort — see
@@ -61,6 +65,19 @@ impl DeadLetterQueue {
     /// The DLQ topic for `consumer_name`: `mev.dlq.<consumer_name>`.
     pub fn topic_for(consumer_name: &str) -> String {
         format!("{DLQ_TOPIC_PREFIX}.{consumer_name}")
+    }
+
+    /// [`Self::ensure`] with the topology read from the two backbone-wide env
+    /// knobs — `KAFKA_TOPIC_REPLICATION` (default 1) and `KAFKA_RETENTION_MS`
+    /// (default 7 days), the same names event-store provisions the backbone
+    /// with. A deliberate, narrow exception to services-read-their-own-env:
+    /// these knobs describe the *cluster*, not the service, so every consumer
+    /// resolving them here keeps the DLQ topology uniform (§20) without seven
+    /// configs growing the same two fields.
+    pub async fn ensure_from_env(brokers: &str, consumer_name: &str) -> Result<Self> {
+        let replication = telemetry::env::parse_or("KAFKA_TOPIC_REPLICATION", 1)?;
+        let retention_ms = telemetry::env::parse_or("KAFKA_RETENTION_MS", DEFAULT_RETENTION_MS)?;
+        Self::ensure(brokers, consumer_name, replication, retention_ms).await
     }
 
     /// Provision the consumer's DLQ topic (idempotent — an existing topic is

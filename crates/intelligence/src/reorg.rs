@@ -54,9 +54,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience};
 use events::intelligence::{AttributionRetracted, EntitySplit};
 use events::primitives::Chain;
@@ -80,14 +82,8 @@ pub fn consumed_topics() -> Vec<String> {
 /// idempotent); `earliest` means a fresh group processes retained retractions
 /// from the start, the same discipline every other consumer on this backbone
 /// follows.
-pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
-    rdkafka::ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("group.id", group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, "reorg")
 }
 
 /// A failure rolling back one incident. Wraps the store seam's error and
@@ -136,8 +132,9 @@ impl ReorgConsumer {
     /// error, via the shared [`run_consumer`] loop.
     pub async fn run(
         self,
-        consumer: StreamConsumer,
+        consumer: StreamConsumer<LagReporting>,
         retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let topics = consumed_topics();
@@ -147,6 +144,7 @@ impl ReorgConsumer {
             &topic_refs,
             "reorg",
             retry_backoff,
+            dlq,
             self,
             shutdown,
         )

@@ -46,6 +46,12 @@ pub struct Config {
 /// Settings for the `block-production` consumer (§10, Sprint 11 t1).
 #[derive(Debug, Clone)]
 pub struct BlockProductionConfig {
+    /// The one chain this pipeline attributes (`INTEL_PRODUCTION_CHAIN_ID`,
+    /// default 1 = Ethereum). PBS/MEV-Boost is an Ethereum-mainnet mechanism
+    /// and `rpc_url` reads exactly one chain, so events from any other chain
+    /// on the shared topics (Sprint 13 t2 — e.g. Base) are commit-skipped
+    /// rather than wedging the consumer on an unknown block hash.
+    pub chain: events::primitives::Chain,
     /// HTTP RPC endpoint for full-block reads (`INTEL_ETH_RPC_URL`). Optional
     /// at parse time — required (checked) only when the `block-production`
     /// subcommand actually runs, so every other run mode boots without it.
@@ -156,6 +162,7 @@ impl Config {
                     ),
                     Err(_) => None,
                 },
+                chain: events::primitives::Chain(env_parse("INTEL_PRODUCTION_CHAIN_ID", 1u64)?),
                 relays: parse_relay_endpoints(
                     &std::env::var("MEV_RELAY_ENDPOINTS").unwrap_or_default(),
                 )?,

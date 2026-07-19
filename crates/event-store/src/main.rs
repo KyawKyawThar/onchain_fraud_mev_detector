@@ -69,6 +69,12 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
 
     let store = store::EventStore::new(client);
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
 
     // Translate OS signals into a cancel.
     tokio::spawn({
@@ -92,11 +98,16 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
     // and the orchestrator restarts it (fail fast) rather than silently running
     // HTTP-only with no ingest.
     let consumer = kafka::build_consumer(&cfg.kafka)?;
+    // The uniform poison policy (§20): parked-not-lost. Provisioned at boot,
+    // fail-fast, like the backbone topics above.
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "event-store")
+        .await
+        .context("provisioning the event-store DLQ topic")?;
     let consumer_task = tokio::spawn({
         let store = store.clone();
         let shutdown = shutdown.clone();
         async move {
-            let result = kafka::run(consumer, store, shutdown.clone()).await;
+            let result = kafka::run(consumer, store, Some(&dlq), shutdown.clone()).await;
             if let Err(ref err) = result {
                 tracing::error!(error = %err, "Kafka consumer failed; initiating shutdown");
                 shutdown.cancel();
@@ -114,6 +125,7 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {}", cfg.http_addr))?;
     tracing::info!(addr = %cfg.http_addr, "event-store HTTP API listening");
+    health.set_ready(true);
 
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown({

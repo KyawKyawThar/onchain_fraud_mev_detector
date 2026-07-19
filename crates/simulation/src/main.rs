@@ -62,6 +62,12 @@ async fn run(cfg: Config) -> Result<()> {
         .context("building Kafka BlockReverted consumer")?;
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -75,12 +81,26 @@ async fn run(cfg: Config) -> Result<()> {
     // shutdown. If either loop exits (graceful stop or a fatal subscribe error), cancel
     // the other so a single failure drains the whole process rather than leaving a half-
     // dead service.
-    let mut dispatcher =
-        tokio::spawn(Dispatcher::new(job_sink, event_sink.clone(), shutdown.clone()).run(consumer));
-    let mut retractor = tokio::spawn(
-        ReorgConsumer::new(Arc::new(EmptyIncidentIndex), event_sink, shutdown.clone())
-            .run(reorg_consumer),
-    );
+    // The uniform poison policy (§20): parked-not-lost, provisioned fail-fast.
+    // Each consumer owns its DLQ inside its spawned future.
+    let dispatcher_dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "sim-dispatcher")
+            .await
+            .context("provisioning the dispatcher DLQ topic")?;
+    let retractor_dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "sim-reorg-retractor")
+            .await
+            .context("provisioning the reorg-retractor DLQ topic")?;
+
+    let mut dispatcher = tokio::spawn({
+        let d = Dispatcher::new(job_sink, event_sink.clone(), shutdown.clone());
+        async move { d.run(consumer, Some(&dispatcher_dlq)).await }
+    });
+    let mut retractor = tokio::spawn({
+        let r = ReorgConsumer::new(Arc::new(EmptyIncidentIndex), event_sink, shutdown.clone());
+        async move { r.run(reorg_consumer, Some(&retractor_dlq)).await }
+    });
+    health.set_ready(true);
 
     // Whichever loop finishes first, cancel the peer and await *only* it (re-awaiting
     // the already-finished handle would panic), so both drain before we exit.

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use event_bus::dlq::DeadLetterQueue;
+use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{run_consumer, EventHandler, Handled, Transience};
 use events::{EventEnvelope, TOPIC_PREFIX};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
@@ -149,17 +151,11 @@ pub async fn ensure_topics(cfg: &KafkaConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build the consumer. Manual offset commit (`enable.auto.commit=false`) is what
-/// lets us tie the commit to a successful append; `earliest` means a fresh group
-/// back-fills the store from the start of retained history.
-pub fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer> {
-    ClientConfig::new()
-        .set("bootstrap.servers", &cfg.brokers)
-        .set("group.id", &cfg.group_id)
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .context("creating Kafka consumer")
+/// Build the consumer through the shared lag-reporting constructor (§19) —
+/// manual offset commit ties the commit to a successful append; `earliest`
+/// means a fresh group back-fills the store from the start of retained history.
+pub fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(&cfg.brokers, &cfg.group_id, "event-store")
 }
 
 /// Subscribe to the per-event-type topics and append every event until
@@ -173,8 +169,9 @@ pub fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer> {
 /// matching nothing; the boot path provisions the topics first, so they exist by
 /// the time we subscribe.
 pub async fn run(
-    consumer: StreamConsumer,
+    consumer: StreamConsumer<LagReporting>,
     store: EventStore,
+    dlq: Option<&DeadLetterQueue>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let topics: Vec<String> = events::all_topics().collect();
@@ -188,6 +185,7 @@ pub async fn run(
         &topic_refs,
         "event-store",
         RETRY_BACKOFF,
+        dlq,
         Ingest { store },
         &shutdown,
     )

@@ -242,8 +242,13 @@ async fn in_memory_toggle_delete_and_evaluation_set() {
 // ── Real Postgres (`just test-integration`) ──────────────────────
 
 /// Start a Postgres container, apply the workspace migrations, hand back the
-/// store (plus the container guard — dropping it kills the database).
-async fn pg_store() -> (PgRuleStore, testcontainers::ContainerAsync<Postgres>) {
+/// store (plus the pool, for outbox-table assertions, and the container guard
+/// — dropping it kills the database).
+async fn pg_store() -> (
+    PgRuleStore,
+    sqlx::PgPool,
+    testcontainers::ContainerAsync<Postgres>,
+) {
     let container = Postgres::default()
         .start()
         .await
@@ -260,13 +265,13 @@ async fn pg_store() -> (PgRuleStore, testcontainers::ContainerAsync<Postgres>) {
         .run(&pool)
         .await
         .expect("apply migrations");
-    (PgRuleStore::new(pool), container)
+    (PgRuleStore::new(pool.clone()), pool, container)
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn pg_create_and_read_back() {
-    let (store, _pg) = pg_store().await;
+    let (store, _pool, _pg) = pg_store().await;
     store.ping().await.expect("schema applied");
     contract_create_and_read_back(&store).await;
 }
@@ -274,27 +279,165 @@ async fn pg_create_and_read_back() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn pg_invalid_rule_rejected() {
-    let (store, _pg) = pg_store().await;
+    let (store, _pool, _pg) = pg_store().await;
     contract_invalid_rule_rejected(&store).await;
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn pg_name_unique_per_owner() {
-    let (store, _pg) = pg_store().await;
+    let (store, _pool, _pg) = pg_store().await;
     contract_name_unique_per_owner(&store).await;
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn pg_customer_isolation() {
-    let (store, _pg) = pg_store().await;
+    let (store, _pool, _pg) = pg_store().await;
     contract_customer_isolation(&store).await;
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn pg_toggle_delete_and_evaluation_set() {
-    let (store, _pg) = pg_store().await;
+    let (store, _pool, _pg) = pg_store().await;
     contract_toggle_delete_and_evaluation_set(&store).await;
+}
+
+// ── The transactional outbox (§20) ───────────────────────────────
+
+/// A `RuleCreated` announcement in wire-envelope form, as `POST /v1/rules`
+/// composes it.
+fn announcement(rule: &Rule) -> serde_json::Value {
+    let event = events::DomainEvent::RuleCreated(events::rule_engine::RuleCreated {
+        rule_id: rule.id,
+        owner: rule.owner,
+        definition: serde_json::to_value(rule).expect("rule encodes"),
+    });
+    serde_json::to_value(events::EventEnvelope::new(Chain::ETHEREUM, event))
+        .expect("envelope encodes")
+}
+
+/// `create_rule_announced` enqueues exactly one announcement per *created*
+/// rule — a redelivered create (AlreadyExists) and a name conflict enqueue
+/// nothing, mirroring what actually got stored.
+#[tokio::test]
+async fn in_memory_announced_create_enqueues_only_on_created() {
+    let store = InMemoryRuleStore::new();
+    let owner = CustomerId::new();
+    let r = rule(owner, "compliance");
+    let ann = announcement(&r);
+
+    assert_eq!(
+        store
+            .create_rule_announced(&r, &ann, at(100))
+            .await
+            .expect("create"),
+        CreateRuleOutcome::Created
+    );
+    // Redelivery: no second announcement.
+    assert_eq!(
+        store
+            .create_rule_announced(&r, &ann, at(101))
+            .await
+            .expect("redeliver"),
+        CreateRuleOutcome::AlreadyExists
+    );
+    assert_eq!(store.announcements().len(), 1);
+    assert_eq!(store.announcements()[0], ann);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn pg_announced_create_is_transactional_and_flushes_to_the_sink() {
+    use event_bus::test_util::RecordingSink;
+
+    let (store, pool, _pg) = pg_store().await;
+    let owner = CustomerId::new();
+    let r = rule(owner, "compliance");
+    let ann = announcement(&r);
+
+    assert_eq!(
+        store
+            .create_rule_announced(&r, &ann, at(100))
+            .await
+            .expect("create"),
+        CreateRuleOutcome::Created
+    );
+    // Redelivery enqueues nothing.
+    assert_eq!(
+        store
+            .create_rule_announced(&r, &ann, at(101))
+            .await
+            .expect("redeliver"),
+        CreateRuleOutcome::AlreadyExists
+    );
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rule_outbox WHERE published_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count pending");
+    assert_eq!(pending, 1, "exactly one announcement pending");
+
+    // The flusher publishes it and stamps it published.
+    let sink = RecordingSink::default();
+    let published = rule_engine::outbox::flush_once(&pool, &sink)
+        .await
+        .expect("flush");
+    assert_eq!(published, 1);
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], events::DomainEvent::RuleCreated(_)));
+
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rule_outbox WHERE published_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count pending");
+    assert_eq!(pending, 0, "flushed row is stamped, not re-published");
+
+    // A second flush is a no-op — the outbox drains exactly once per row.
+    let published = rule_engine::outbox::flush_once(&pool, &sink)
+        .await
+        .expect("flush again");
+    assert_eq!(published, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn pg_outbox_row_stays_pending_when_the_sink_fails() {
+    use async_trait::async_trait;
+    use event_bus::{EventSink, PublishError};
+    use events::EventEnvelope;
+
+    /// A sink whose broker is down: every publish fails retriably.
+    struct DownSink;
+    #[async_trait]
+    impl EventSink for DownSink {
+        async fn publish(&self, _envelope: EventEnvelope) -> Result<(), PublishError> {
+            Err(PublishError::Delivery("broker down".into()))
+        }
+    }
+
+    let (store, pool, _pg) = pg_store().await;
+    let owner = CustomerId::new();
+    let r = rule(owner, "compliance");
+    store
+        .create_rule_announced(&r, &announcement(&r), at(100))
+        .await
+        .expect("create");
+
+    let published = rule_engine::outbox::flush_once(&pool, &DownSink)
+        .await
+        .expect("flush survives a publish failure");
+    assert_eq!(published, 0);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rule_outbox WHERE published_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count pending");
+    assert_eq!(
+        pending, 1,
+        "the failed row is still pending for the next tick"
+    );
 }

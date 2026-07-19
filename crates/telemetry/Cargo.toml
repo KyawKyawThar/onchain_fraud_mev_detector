@@ -23,6 +23,12 @@ opentelemetry_sdk.workspace = true
 # Prometheus exporter (§19): `telemetry::metrics::init` installs the global
 # recorder + `/metrics` HTTP listener — the metrics counterpart to `init`.
 metrics-exporter-prometheus.workspace = true
+# Health endpoints (§20): `telemetry::health` serves /livez + /readyz over a
+# plain Tokio listener — no HTTP framework for two fixed probe paths.
+# `io-util` is stated explicitly (AsyncRead/WriteExt) rather than inherited
+# from whatever else happens to unify it in.
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

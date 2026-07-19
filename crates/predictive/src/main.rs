@@ -34,7 +34,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
-    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+    // Every series this per-chain instance exports carries its chain (§19).
+    telemetry::metrics::init_labeled(cfg.metrics_addr, &[("chain", cfg.chain.metrics_label())])
+        .context("starting the metrics exporter")?;
 
     tracing::info!(
         chain = cfg.chain.id(),
@@ -52,6 +54,12 @@ async fn run(cfg: Config) -> Result<()> {
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -80,6 +88,7 @@ async fn run(cfg: Config) -> Result<()> {
         cfg.dedup_capacity,
         shutdown.clone(),
     ));
+    health.set_ready(true);
 
     poller_task.await.context("mempool poller task panicked")?;
     consumer_task.await.context("consumer task panicked")?;

@@ -63,6 +63,12 @@ async fn run(cfg: Config) -> Result<()> {
     let orphaned = SharedOrphanedBlocks::new();
 
     let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
+    // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -110,6 +116,7 @@ async fn run(cfg: Config) -> Result<()> {
         let worker = worker.clone();
         handles.push(tokio::spawn(async move { worker.run(source).await }));
     }
+    health.set_ready(true);
 
     // Drain: wait for every consumer to finish (each returns when shutdown fires or
     // its source closes). The tasks run concurrently; awaiting them in turn just

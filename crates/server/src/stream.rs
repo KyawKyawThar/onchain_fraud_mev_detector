@@ -85,6 +85,9 @@ pub async fn run(
         &topic_refs,
         "server-ws-stream",
         RETRY_BACKOFF,
+        // Live-tail fan-out: no DLQ — the handler only maps + broadcasts, and
+        // every record is already durably owned by the event store.
+        None,
         Broadcaster { sender },
         &shutdown,
     )
