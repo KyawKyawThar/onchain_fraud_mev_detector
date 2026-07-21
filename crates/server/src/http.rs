@@ -1,6 +1,7 @@
 //! The public §11 API service: `GET /v1/address/{addr}/risk` and `/labels`
-//! (gRPC into `intelligence`), `GET /v1/audit/incident/{id}` (proxies
-//! event-store), `GET /v1/incidents` (proxies simulation-projection), and
+//! plus the synchronous `POST /v1/address/{addr}/screen` decision (gRPC into
+//! `intelligence`), `GET /v1/audit/incident/{id}` (proxies event-store),
+//! `GET /v1/incidents` (proxies simulation-projection), and
 //! `WS /v1/stream` (the provisional/confirmed/retracted alert lifecycle,
 //! fed by [`crate::stream`]) — all behind [`crate::auth::require_jwt`].
 //! `/healthz` is the only open route.
@@ -58,7 +59,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenResponse, SanctionMatchResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -119,6 +120,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
+        .routes(routes!(screen_address))
         .routes(routes!(builders))
         .routes(routes!(entity_graph))
         .routes(routes!(entity_timeline))
@@ -276,6 +278,104 @@ async fn address_labels(
     Ok(Json(LabelsResponse {
         address: address_key(&address),
         labels: labels.into_iter().map(LabelResponse::from).collect(),
+    }))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct SanctionMatchResponse {
+    /// Which list designated it (`ofac_sdn`, `eu_consolidated`, …).
+    list: String,
+    /// The list's own entry (SDN name / programme).
+    entry: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct ScreenResponse {
+    address: String,
+    /// The §11 outcome: `allow` | `review` | `block`.
+    decision: crate::screen::Decision,
+    /// Which rule produced it: `sanctions_hard_block` | `score_thresholds`.
+    decision_basis: crate::screen::DecisionBasis,
+    /// The address is on at least one sanctions list (§8.5) — always a
+    /// `block`, regardless of score.
+    sanctioned: bool,
+    /// The sanctions-list matches behind a `sanctions_hard_block`.
+    sanctions: Vec<SanctionMatchResponse>,
+    /// 0-100, "how risky" (§8.3).
+    score: u32,
+    /// 0-1, "how sure".
+    confidence: f64,
+    model_version: String,
+    computed_at_unix_millis: i64,
+    /// The address's active labels — context for the compliance record.
+    labels: Vec<LabelResponse>,
+    /// The address's resolved entity, if clustered.
+    entity_id: Option<String>,
+    /// Member count of that entity (0 when unclustered).
+    entity_size: u32,
+}
+
+/// `POST /v1/address/{address}/screen` — the **synchronous** counterparty
+/// screening decision (§11): pre-transaction `allow`/`review`/`block` over
+/// the intelligence service's cached risk score, confidence, labels, entity
+/// and sanctions status (one `GetScreeningFacts` gRPC round-trip; Redis hot
+/// path, §8.3), mapped through the decision policy in [`crate::screen`]. A
+/// sanctions match hard-blocks regardless of score (§8.5). The one
+/// latency-critical blocking surface in the API.
+///
+/// POST, not GET: a screening decision is a billable, legally-weighty event
+/// (each call will meter a `ScreeningCall` and be recorded for the access
+/// audit, t3/t4), not a cacheable read. Takes no body today; t2's named
+/// policy selection will ride one.
+#[utoipa::path(
+    post,
+    path = "/v1/address/{address}/screen",
+    tag = "api-service",
+    params(("address" = String, Path, description = "On-chain address, 0x-prefixed hex (any case)")),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The screening decision with its driving facts", body = ScreenResponse),
+        (status = 400, description = "Address is not valid hex"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn screen_address(
+    State(state): State<AppState>,
+    Path(address): Path<AccountAddress>,
+) -> Result<Json<ScreenResponse>, ApiError> {
+    let facts = state
+        .intelligence
+        .screening_facts(address)
+        .await
+        .map_err(intelligence_client::to_api_error)?;
+
+    // Wire → domain → policy: the prost reply is distilled once at the
+    // transport edge's `From` impl; the decision layer only ever sees the
+    // typed input.
+    let input = crate::screen::ScreeningInput::from(&facts);
+    let verdict = crate::screen::decide(input);
+
+    Ok(Json(ScreenResponse {
+        address: address_key(&address),
+        decision: verdict.decision,
+        decision_basis: verdict.basis,
+        sanctioned: input.sanctioned,
+        sanctions: facts
+            .sanctions
+            .into_iter()
+            .map(|s| SanctionMatchResponse {
+                list: s.list,
+                entry: s.entry,
+            })
+            .collect(),
+        score: facts.score,
+        confidence: facts.confidence,
+        model_version: facts.model_version,
+        computed_at_unix_millis: facts.computed_at_unix_millis,
+        labels: facts.labels.into_iter().map(LabelResponse::from).collect(),
+        entity_id: facts.entity_id,
+        entity_size: facts.entity_size,
     }))
 }
 
@@ -897,6 +997,10 @@ mod tests {
             "RiskResponse",
             "LabelResponse",
             "LabelsResponse",
+            "ScreenResponse",
+            "SanctionMatchResponse",
+            "Decision",
+            "DecisionBasis",
             "CreateRuleRequest",
             "CreateRuleResponse",
             "BuildersResponse",
@@ -920,6 +1024,7 @@ mod tests {
             ("/healthz", "get"),
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
+            ("/v1/address/{address}/screen", "post"),
             ("/v1/builders", "get"),
             ("/v1/entity/{entity_id}/graph", "get"),
             ("/v1/entity/{entity_id}/timeline", "get"),
@@ -1011,6 +1116,56 @@ mod tests {
         let response = router
             .oneshot(
                 Request::get("/v1/entity/not-a-uuid/timeline")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The screen endpoint sits behind the same JWT gate as every /v1 route,
+    /// parses its address, and proxies intelligence (502 when unreachable —
+    /// the same posture as /risk and /labels).
+    #[tokio::test]
+    async fn screen_is_bearer_gated_validates_the_address_and_proxies_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let path = format!("/v1/address/{:#x}/screen", alloy_primitives::Address::ZERO);
+
+        // No token → rejected by the JWT gate before the handler.
+        let response = router
+            .clone()
+            .oneshot(Request::post(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Authenticated, but the lazy intelligence channel has no server
+        // here, so the gRPC call fails → 502 (reached the handler, tried the
+        // read). Screening degrades loudly, never silently "allows".
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // A non-hex address is a 400 from path parsing, before any RPC.
+        let response = router
+            .oneshot(
+                Request::post("/v1/address/not-an-address/screen")
                     .header(header::AUTHORIZATION, &bearer)
                     .body(Body::empty())
                     .unwrap(),

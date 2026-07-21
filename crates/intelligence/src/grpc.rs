@@ -1,7 +1,8 @@
 //! The `IntelligenceRead` gRPC service (§11): the synchronous read lookups a
 //! caller reaches in-network — an address's current risk score, its active
-//! labels, and the §10 builder/relay leaderboard (`GetBuilderLeaderboard`,
-//! Sprint 11 t2).
+//! labels, the single-round-trip screening bundle behind
+//! `POST /v1/address/{addr}/screen` (`GetScreeningFacts`, Sprint 14 t1), and
+//! the §10 builder/relay leaderboard (`GetBuilderLeaderboard`, Sprint 11 t2).
 //!
 //! The risk/labels lookups are cache-aside over the exact seams already built
 //! for this: a
@@ -17,19 +18,21 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use events::intelligence::RiskScoreUpdated;
 use events::primitives::{AccountAddress, Chain, EntityId};
 use tonic::{Request, Response, Status};
 
 use crate::adjacency::AdjacencyStore;
-use crate::cache::{CachedScore, HotCache};
+use crate::cache::{CacheError, CachedScore, CachedScreeningFacts, HotCache};
 use crate::graph::{self, GraphLimits, GraphSeams};
 use crate::leaderboard::{self, LeaderboardQuery, LeaderboardStore, Limit};
-use crate::model::{self, LabelRecord};
+use crate::model::{self, LabelRecord, SanctionEntry};
 use crate::pb::intelligence_read_server::IntelligenceRead;
 use crate::pb::{
     BuilderLeaderboardReply, BuilderLeaderboardRequest, BuilderStats, EntityGraphReply,
     EntityGraphRequest, EntityTimelineReply, EntityTimelineRequest, GraphEdge, GraphNode, Label,
-    LabelsReply, LabelsRequest, RelayStats, RiskScoreReply, RiskScoreRequest, TimelineMilestone,
+    LabelsReply, LabelsRequest, RelayStats, RiskScoreReply, RiskScoreRequest, SanctionMatch,
+    ScreeningFactsReply, ScreeningFactsRequest, TimelineMilestone,
 };
 use crate::risk::{self, MODEL_VERSION};
 use crate::risk_scorer;
@@ -65,6 +68,66 @@ impl IntelligenceReadService {
             graph,
             graph_limits,
         }
+    }
+
+    /// The shared cache-miss path: fetch every input, run the pure kernel,
+    /// record the recompute histogram. Both `get_risk_score` and
+    /// `get_screening_facts` answer their misses through this one method so
+    /// the load-inputs → score → metrics sequence can never drift between
+    /// them (which caches each repopulates from the result stays their own
+    /// decision).
+    async fn recompute_risk(&self, address: &AccountAddress) -> Result<Recomputed, Status> {
+        let as_of = Utc::now();
+        let recompute_started = std::time::Instant::now();
+        let (entity_id, inputs) = risk_scorer::load_risk_inputs(&self.stores, address, as_of)
+            .await
+            .map_err(status_for)?;
+        let result = risk::score(*address, entity_id, &inputs, as_of);
+        metrics::histogram!(SCORE_RECOMPUTE_DURATION_SECONDS)
+            .record(recompute_started.elapsed().as_secs_f64());
+        Ok(Recomputed {
+            as_of,
+            entity_id,
+            inputs,
+            result,
+        })
+    }
+}
+
+/// The product of one live risk recompute — the scored result plus the raw
+/// inputs it was computed from (the screening path caches those too).
+struct Recomputed {
+    as_of: DateTime<Utc>,
+    entity_id: Option<EntityId>,
+    inputs: risk::RiskInputs,
+    result: RiskScoreUpdated,
+}
+
+/// The score-cache entry for a freshly computed result.
+fn cached_score(result: &RiskScoreUpdated, computed_at: DateTime<Utc>) -> CachedScore {
+    CachedScore {
+        score: result.score,
+        confidence: result.confidence,
+        model_version: result.model_version.clone(),
+        computed_at,
+    }
+}
+
+/// Best-effort cache repopulation after a live compute: a failed write never
+/// fails the read, but it is an ops-visible Redis fault, not something to
+/// swallow silently.
+fn warn_on_cache_fault(
+    result: Result<(), CacheError>,
+    cache: &'static str,
+    address: &AccountAddress,
+) {
+    if let Err(err) = result {
+        tracing::warn!(
+            error = %err,
+            cache,
+            address = %model::address_key(address),
+            "failed to populate a hot cache after a live compute"
+        );
     }
 }
 
@@ -165,6 +228,26 @@ fn to_pb_label(label: &LabelRecord) -> Label {
     }
 }
 
+fn to_pb_sanction(entry: &SanctionEntry) -> SanctionMatch {
+    SanctionMatch {
+        list: entry.list_name.clone(),
+        entry: entry.entry.clone(),
+    }
+}
+
+fn to_pb_screening(facts: &CachedScreeningFacts) -> ScreeningFactsReply {
+    ScreeningFactsReply {
+        score: u32::from(facts.score),
+        confidence: facts.confidence.get(),
+        model_version: facts.model_version.clone(),
+        computed_at_unix_millis: millis(facts.computed_at),
+        sanctions: facts.sanctions.iter().map(to_pb_sanction).collect(),
+        labels: facts.labels.iter().map(to_pb_label).collect(),
+        entity_id: facts.entity_id.map(|id| id.to_string()),
+        entity_size: facts.entity_size,
+    }
+}
+
 #[tonic::async_trait]
 impl IntelligenceRead for IntelligenceReadService {
     async fn get_risk_score(
@@ -186,42 +269,23 @@ impl IntelligenceRead for IntelligenceReadService {
         metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "risk_score", "outcome" => "miss")
             .increment(1);
 
-        let as_of = Utc::now();
-        let recompute_started = std::time::Instant::now();
-        let (entity_id, inputs) = risk_scorer::load_risk_inputs(&self.stores, &address, as_of)
-            .await
-            .map_err(status_for)?;
-        let result = risk::score(address, entity_id, &inputs, as_of);
-        metrics::histogram!(SCORE_RECOMPUTE_DURATION_SECONDS)
-            .record(recompute_started.elapsed().as_secs_f64());
-
-        // Best-effort repopulate — a failed cache write never fails the read,
-        // but it's worth knowing about (an ops-visible Redis blip), not silent.
-        if let Err(err) = self
-            .cache
-            .put_score(
-                &address,
-                &CachedScore {
-                    score: result.score,
-                    confidence: result.confidence,
-                    model_version: result.model_version.clone(),
-                    computed_at: as_of,
-                },
-            )
-            .await
-        {
-            tracing::warn!(
-                error = %err,
-                address = %model::address_key(&address),
-                "failed to populate the risk-score cache after a live compute"
-            );
-        }
+        let recomputed = self.recompute_risk(&address).await?;
+        warn_on_cache_fault(
+            self.cache
+                .put_score(
+                    &address,
+                    &cached_score(&recomputed.result, recomputed.as_of),
+                )
+                .await,
+            "risk_score",
+            &address,
+        );
 
         Ok(Response::new(RiskScoreReply {
-            score: u32::from(result.score),
-            confidence: result.confidence.get(),
-            model_version: result.model_version,
-            computed_at_unix_millis: millis(as_of),
+            score: u32::from(recomputed.result.score),
+            confidence: recomputed.result.confidence.get(),
+            model_version: recomputed.result.model_version,
+            computed_at_unix_millis: millis(recomputed.as_of),
         }))
     }
 
@@ -259,6 +323,67 @@ impl IntelligenceRead for IntelligenceReadService {
         Ok(Response::new(LabelsReply {
             labels: labels.iter().map(to_pb_label).collect(),
         }))
+    }
+
+    /// The §11 screening lookup: every decision input for one address in a
+    /// single round-trip. A [`HotCache::screening_facts`] hit answers from
+    /// one Redis `GET` (the p50 < 100ms path); a miss runs the same
+    /// [`risk_scorer::load_risk_inputs`] → [`risk::score`] pass as
+    /// `get_risk_score` — which fetches the labels/sanctions/entity anyway —
+    /// and repopulates both the bundle and the plain score cache from that
+    /// one store pass. Facts only: the allow/review/block decision (and the
+    /// §8.5 hard-block override) belongs to the caller's policy layer.
+    async fn get_screening_facts(
+        &self,
+        request: Request<ScreeningFactsRequest>,
+    ) -> Result<Response<ScreeningFactsReply>, Status> {
+        let address = parse_address(&request.into_inner().address)?;
+
+        if let Ok(Some(cached)) = self.cache.screening_facts(&address).await {
+            metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "screening_facts", "outcome" => "hit")
+                .increment(1);
+            return Ok(Response::new(to_pb_screening(&cached)));
+        }
+        metrics::counter!(CACHE_REQUESTS_TOTAL, "cache" => "screening_facts", "outcome" => "miss")
+            .increment(1);
+
+        let recomputed = self.recompute_risk(&address).await?;
+        let facts = CachedScreeningFacts {
+            score: recomputed.result.score,
+            confidence: recomputed.result.confidence,
+            model_version: recomputed.result.model_version.clone(),
+            computed_at: recomputed.as_of,
+            entity_id: recomputed.entity_id,
+            entity_size: recomputed
+                .inputs
+                .entity
+                .as_ref()
+                .map(|e| e.addresses.len() as u32)
+                .unwrap_or(0),
+            sanctions: recomputed.inputs.sanctions,
+            labels: recomputed.inputs.labels,
+        };
+
+        // Best-effort repopulate of the bundle *and* the plain score cache —
+        // the miss just computed a fresh score, so `get_risk_score` may as
+        // well benefit.
+        warn_on_cache_fault(
+            self.cache.put_screening_facts(&address, &facts).await,
+            "screening_facts",
+            &address,
+        );
+        warn_on_cache_fault(
+            self.cache
+                .put_score(
+                    &address,
+                    &cached_score(&recomputed.result, recomputed.as_of),
+                )
+                .await,
+            "risk_score",
+            &address,
+        );
+
+        Ok(Response::new(to_pb_screening(&facts)))
     }
 
     async fn get_builder_leaderboard(
@@ -574,6 +699,138 @@ mod tests {
     #[test]
     fn invalid_address_is_rejected() {
         assert!(parse_address("not-an-address").is_err());
+    }
+
+    // ── GetScreeningFacts (§11, Sprint 14 t1) ────────────────────────
+
+    /// A cached bundle answers without touching the stores, mapping every
+    /// field onto the wire.
+    #[tokio::test]
+    async fn screening_facts_cache_hit_skips_the_store() {
+        use crate::cache::CachedScreeningFacts;
+        use crate::model::SanctionEntry;
+
+        let (service, _store, cache) = service();
+        let address = Address::repeat_byte(0xAB);
+        let entity_id = EntityId::new();
+        cache
+            .put_screening_facts(
+                &address,
+                &CachedScreeningFacts {
+                    score: 87,
+                    confidence: events::primitives::Confidence::new(0.91),
+                    model_version: MODEL_VERSION.to_owned(),
+                    computed_at: Utc::now(),
+                    sanctions: vec![SanctionEntry {
+                        address,
+                        list_name: "ofac_sdn".into(),
+                        entry: "Evil Corp".into(),
+                        listed_at: None,
+                    }],
+                    labels: vec![],
+                    entity_id: Some(entity_id),
+                    entity_size: 4,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reply = service
+            .get_screening_facts(Request::new(ScreeningFactsRequest {
+                address: format!("{address:#x}"),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(reply.score, 87);
+        assert_eq!(reply.model_version, MODEL_VERSION);
+        assert_eq!(reply.sanctions.len(), 1);
+        assert_eq!(reply.sanctions[0].list, "ofac_sdn");
+        assert_eq!(reply.sanctions[0].entry, "Evil Corp");
+        assert_eq!(reply.entity_id, Some(entity_id.to_string()));
+        assert_eq!(reply.entity_size, 4);
+    }
+
+    /// A miss computes live from the stores — sanctions, labels and entity
+    /// all land in the reply — and repopulates both the bundle and the plain
+    /// score cache from the one store pass.
+    #[tokio::test]
+    async fn screening_facts_cache_miss_computes_live_and_populates_both_caches() {
+        use crate::model::SanctionEntry;
+        use crate::store::SanctionsStore;
+
+        let (service, store, cache) = service();
+        let address = Address::repeat_byte(0xCD);
+
+        store
+            .seed_sanctions(&[SanctionEntry {
+                address,
+                list_name: "ofac_sdn".into(),
+                entry: "Evil Corp".into(),
+                listed_at: None,
+            }])
+            .await
+            .unwrap();
+        let label = LabelRecord::new(
+            address,
+            LabelKind::KnownScammer,
+            "drainer",
+            LabelSource::Manual,
+            "operator:test",
+            Utc::now(),
+        );
+        store.add_label(&label).await.unwrap();
+        let entity_id = EntityId::new();
+        store
+            .create_entity(entity_id, &address, "seed", Utc::now())
+            .await
+            .unwrap();
+
+        let reply = service
+            .get_screening_facts(Request::new(ScreeningFactsRequest {
+                address: format!("{address:#x}"),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // sanction (45) + KnownScammer manual label (40); a singleton entity
+        // adds no cluster factor but is still reported as membership.
+        assert_eq!(reply.score, 85);
+        assert_eq!(reply.sanctions.len(), 1);
+        assert_eq!(reply.labels.len(), 1);
+        assert_eq!(reply.labels[0].value, "drainer");
+        assert_eq!(reply.entity_id, Some(entity_id.to_string()));
+        assert_eq!(reply.entity_size, 1);
+
+        let bundle = cache.screening_facts(&address).await.unwrap();
+        assert!(bundle.is_some(), "the miss should populate the bundle");
+        let score = cache.score(&address, MODEL_VERSION).await.unwrap();
+        assert_eq!(
+            score.map(|s| s.score),
+            Some(85),
+            "the same pass should populate the plain score cache"
+        );
+    }
+
+    /// A clean address screens as 0/100 at confidence 0.0 with no sanctions —
+    /// the kernel's documented "no evidence" answer, never an error.
+    #[tokio::test]
+    async fn screening_facts_for_an_unknown_address_are_clean() {
+        let (service, _store, _cache) = service();
+        let reply = service
+            .get_screening_facts(Request::new(ScreeningFactsRequest {
+                address: format!("{:#x}", Address::repeat_byte(0x77)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.score, 0);
+        assert_eq!(reply.confidence, 0.0);
+        assert!(reply.sanctions.is_empty());
+        assert!(reply.labels.is_empty());
+        assert_eq!(reply.entity_id, None);
     }
 
     #[test]

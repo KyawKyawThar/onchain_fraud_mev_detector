@@ -658,10 +658,44 @@ async fn hot_cache_round_trips_expires_and_evicts() {
     );
     assert_eq!(cache.score(&wallet, "9.9.9").await.expect("unknown"), None);
 
+    // The screening bundle (§11) round-trips whole.
+    assert_eq!(
+        cache.screening_facts(&wallet).await.expect("cold read"),
+        None
+    );
+    let facts = intelligence::cache::CachedScreeningFacts {
+        score: 87,
+        confidence: events::primitives::Confidence::new(0.91),
+        model_version: "1.4.2".into(),
+        computed_at: at(500),
+        sanctions: vec![intelligence::model::SanctionEntry {
+            address: wallet,
+            list_name: "ofac_sdn".into(),
+            entry: "Evil Corp".into(),
+            listed_at: None,
+        }],
+        labels: cache.labels(&wallet).await.expect("labels").unwrap(),
+        entity_id: Some(events::primitives::EntityId::new()),
+        entity_size: 3,
+    };
+    cache
+        .put_screening_facts(&wallet, &facts)
+        .await
+        .expect("put screening facts");
+    assert_eq!(
+        cache.screening_facts(&wallet).await.expect("warm read"),
+        Some(facts)
+    );
+
     // Evict drops *everything* for the address — the on-update semantics.
     cache.evict(&wallet).await.expect("evict");
     assert_eq!(cache.labels(&wallet).await.expect("evicted"), None);
     assert_eq!(cache.score(&wallet, "2.0.0").await.expect("evicted"), None);
+    assert_eq!(
+        cache.screening_facts(&wallet).await.expect("evicted"),
+        None,
+        "evict clears the screening bundle too"
+    );
 
     // The TTL backstop: a 1s-TTL entry expires on its own.
     let brief = RedisHotCache::connect(&url, std::time::Duration::from_secs(1))

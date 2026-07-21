@@ -4,6 +4,7 @@
 //! rest of the service stays pure and testable.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
@@ -47,6 +48,13 @@ pub struct Config {
     /// ones are dropped with a `warn` rather than stalling customer calls.
     /// Defaults to [`DEFAULT_USAGE_CHANNEL_CAPACITY`].
     pub usage_channel_capacity: usize,
+    /// Client-side deadline on the screening gRPC read (§11), from
+    /// `SCREENING_DEADLINE_MS` (default
+    /// [`crate::intelligence_client::DEFAULT_SCREENING_DEADLINE`]). `/screen`
+    /// carries its own p50 < 100ms SLO (§19), so a stalled intelligence node
+    /// must fail fast to the endpoint's 502 rather than queue behind the
+    /// router-wide 30s timeout.
+    pub screening_deadline: Duration,
     /// Address the Prometheus `/metrics` endpoint binds to (§19). Exposes this
     /// service's counters — including `usage_events_recorded_total` /
     /// `usage_events_dropped_total` (§13, `src/usage.rs`) and the request
@@ -118,12 +126,27 @@ impl Config {
                 "USAGE_CHANNEL_CAPACITY",
                 DEFAULT_USAGE_CHANNEL_CAPACITY,
             )?,
+            screening_deadline: screening_deadline()?,
             metrics_addr: env_parse(
                 "SERVER_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9112)),
             )?,
         })
     }
+}
+
+/// Resolve `SCREENING_DEADLINE_MS`. Zero would time every screening call out
+/// before it started — caught here with the same fail-fast-at-boot contract
+/// as [`channel_capacity`].
+fn screening_deadline() -> Result<Duration> {
+    let millis: u64 = env_parse(
+        "SCREENING_DEADLINE_MS",
+        crate::intelligence_client::DEFAULT_SCREENING_DEADLINE.as_millis() as u64,
+    )?;
+    if millis == 0 {
+        bail!("SCREENING_DEADLINE_MS must be >= 1, got 0");
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 /// Resolve and validate a channel-capacity env var. A non-positive value

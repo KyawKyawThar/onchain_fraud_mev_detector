@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use events::primitives::{AccountAddress, Chain, EntityId, IncidentId, LabelId};
 
 use crate::adjacency::{AdjacencyStore, GraphError};
-use crate::cache::{CacheError, CachedScore, HotCache};
+use crate::cache::{CacheError, CachedScore, CachedScreeningFacts, HotCache};
 use crate::model::{
     plan_reversal, AdjacencyEdge, AttributionRecord, EntityRecord, EntityStatus, LabelRecord,
     MergeId, MergeLogEntry, Neighborhood, ReversalPlan, SanctionEntry,
@@ -515,6 +515,7 @@ pub struct InMemoryHotCache {
 struct CacheState {
     labels: HashMap<AccountAddress, Vec<LabelRecord>>,
     scores: HashMap<(AccountAddress, String), CachedScore>,
+    screening: HashMap<AccountAddress, CachedScreeningFacts>,
 }
 
 impl InMemoryHotCache {
@@ -567,10 +568,29 @@ impl HotCache for InMemoryHotCache {
         Ok(())
     }
 
+    async fn screening_facts(
+        &self,
+        address: &AccountAddress,
+    ) -> Result<Option<CachedScreeningFacts>, CacheError> {
+        let state = self.inner.lock().expect("cache lock");
+        Ok(state.screening.get(address).cloned())
+    }
+
+    async fn put_screening_facts(
+        &self,
+        address: &AccountAddress,
+        facts: &CachedScreeningFacts,
+    ) -> Result<(), CacheError> {
+        let mut state = self.inner.lock().expect("cache lock");
+        state.screening.insert(*address, facts.clone());
+        Ok(())
+    }
+
     async fn evict(&self, address: &AccountAddress) -> Result<(), CacheError> {
         let mut state = self.inner.lock().expect("cache lock");
         state.labels.remove(address);
         state.scores.retain(|(addr, _), _| addr != address);
+        state.screening.remove(address);
         Ok(())
     }
 }

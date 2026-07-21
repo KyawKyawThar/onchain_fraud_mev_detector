@@ -1,9 +1,10 @@
-// The intelligence service's read contract (§8, §11): the two synchronous
-// screening lookups the public API service (and any other in-network caller)
-// needs — an address's current risk score and its active labels. Nothing here
-// is a command; every RPC is read-only, mirroring the store/cache seams behind
-// it (`crate::store`, `crate::cache`) — this is a wire-level view onto them, not
-// a second source of truth.
+// The intelligence service's read contract (§8, §11): the synchronous
+// lookups the public API service (and any other in-network caller) needs —
+// an address's current risk score, its active labels, and the one-round-trip
+// counterparty-screening bundle behind `POST /v1/address/{addr}/screen`.
+// Nothing here is a command; every RPC is read-only, mirroring the
+// store/cache seams behind it (`crate::store`, `crate::cache`) — this is a
+// wire-level view onto them, not a second source of truth.
 syntax = "proto3";
 
 package intelligence.v1;
@@ -16,6 +17,15 @@ service IntelligenceRead {
   // An address's active labels (§8.1), most-authoritative-first. Same
   // cache-aside behavior as GetRiskScore.
   rpc GetLabels(LabelsRequest) returns (LabelsReply);
+
+  // Every decision input the synchronous counterparty-screening endpoint
+  // (§11) needs for one address — score, confidence, labels, sanctions
+  // matches and entity membership — in a single round-trip, because the
+  // caller is the one latency-critical blocking surface in the API
+  // (p50 < 100ms, §19). Facts only: the allow/review/block *decision* is the
+  // API service's policy layer, not this service's. Cache-aside over one
+  // Redis bundle (§8.3 hot path); a miss computes live and repopulates.
+  rpc GetScreeningFacts(ScreeningFactsRequest) returns (ScreeningFactsReply);
 
   // The builder/relay leaderboard (§10, Sprint 11 t2): top builders by
   // confirmed sandwich volume, and each configured relay's market share by
@@ -72,6 +82,38 @@ message Label {
 
 message LabelsReply {
   repeated Label labels = 1;
+}
+
+message ScreeningFactsRequest {
+  // 0x-prefixed hex address, any case.
+  string address = 1;
+}
+
+// One sanctions-list designation for the address (§8.5). Any entry at all is
+// the hard-block signal that bypasses the caller's score thresholds.
+message SanctionMatch {
+  // Which list designated it (`ofac_sdn`, `eu_consolidated`, …).
+  string list = 1;
+  // The list's own entry (SDN name / programme).
+  string entry = 2;
+}
+
+message ScreeningFactsReply {
+  // 0-100, "how risky" (§8.3).
+  uint32 score = 1;
+  // 0-1, "how sure" — never conflated with `score` (§8.3).
+  double confidence = 2;
+  string model_version = 3;
+  // Unix milliseconds.
+  int64 computed_at_unix_millis = 4;
+  // Sanctions-list matches; non-empty means sanctioned (§8.5 hard block).
+  repeated SanctionMatch sanctions = 5;
+  // The address's active labels (§8.1) — context for the decision record.
+  repeated Label labels = 6;
+  // The address's resolved entity (UUID string), absent when unclustered.
+  optional string entity_id = 7;
+  // Member count of that entity (0 when unclustered).
+  uint32 entity_size = 8;
 }
 
 message BuilderLeaderboardRequest {
