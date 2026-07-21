@@ -12,19 +12,22 @@
 //! Layout: labels live at `intel:labels:{address}` as one JSON array (read and
 //! replaced whole); scores live in a hash `intel:scores:{address}` keyed by
 //! `model_version` (§8.3: score cache entries are keyed
-//! `(address, model_version)`), so evicting an address is two key deletes — no
-//! `SCAN` over the keyspace.
+//! `(address, model_version)`); the synchronous screening decision's full
+//! input bundle lives at `intel:screen:{address}` as one JSON document (§11 —
+//! one `GET` answers the one latency-critical surface in the API, rather than
+//! three round-trips composed on the hot path). Evicting an address is three
+//! key deletes — no `SCAN` over the keyspace.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, Confidence};
+use events::primitives::{AccountAddress, Confidence, EntityId};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{address_key, LabelRecord};
+use crate::model::{address_key, LabelRecord, SanctionEntry};
 
 /// A failure talking to (or decoding from) the cache. Carries the same
 /// retry-vs-permanent split as the stores; most callers instead treat any
@@ -65,6 +68,31 @@ pub struct CachedScore {
     pub computed_at: DateTime<Utc>,
 }
 
+/// Every decision input the synchronous screening endpoint (§11) reads for
+/// one address, cached as a single bundle so the latency-critical path is one
+/// Redis `GET`: the §8.3 score axes plus the sanctions matches (the §8.5
+/// hard-block signal), active labels and entity membership. Deliberately
+/// duplicates what `intel:labels`/`intel:scores` hold — the cache is an
+/// optimization, never the record, and the same [`HotCache::evict`] clears
+/// all three together so they can't drift apart past the TTL backstop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedScreeningFacts {
+    /// 0–100, "how risky".
+    pub score: u8,
+    /// 0–1, "how sure" — never conflated with `score` (§8.3).
+    pub confidence: Confidence,
+    pub model_version: String,
+    pub computed_at: DateTime<Utc>,
+    /// Sanctions-list matches; non-empty means sanctioned (§8.5).
+    pub sanctions: Vec<SanctionEntry>,
+    /// The address's active labels as of `computed_at`.
+    pub labels: Vec<LabelRecord>,
+    /// The address's resolved entity, if any.
+    pub entity_id: Option<EntityId>,
+    /// Member count of that entity (0 when unclustered).
+    pub entity_size: u32,
+}
+
 /// The hot-path cache seam. Object-safe; production is [`RedisHotCache`],
 /// tests use the in-memory double in [`crate::test_util`].
 #[async_trait]
@@ -101,6 +129,22 @@ pub trait HotCache: Send + Sync {
         score: &CachedScore,
     ) -> Result<(), CacheError>;
 
+    /// The cached screening-decision bundle for an address (§11), if present.
+    async fn screening_facts(
+        &self,
+        address: &AccountAddress,
+    ) -> Result<Option<CachedScreeningFacts>, CacheError>;
+
+    /// Cache the screening-decision bundle (replaces whole). Same staleness
+    /// contract as [`put_labels`](Self::put_labels): eviction on input change
+    /// is the correctness path, the TTL is the backstop for the cache-aside
+    /// race.
+    async fn put_screening_facts(
+        &self,
+        address: &AccountAddress,
+        facts: &CachedScreeningFacts,
+    ) -> Result<(), CacheError>;
+
     /// Drop everything cached for an address — called on every update to the
     /// underlying truth (label added/revoked, score recomputed, entity
     /// merged). Eviction, not overwrite, so a concurrent reader can never see
@@ -133,6 +177,11 @@ fn labels_key(address: &AccountAddress) -> String {
 /// `model_version`.
 fn scores_key(address: &AccountAddress) -> String {
     format!("intel:scores:{}", address_key(address))
+}
+
+/// The Redis key holding an address's cached screening-decision bundle (§11).
+fn screen_key(address: &AccountAddress) -> String {
+    format!("intel:screen:{}", address_key(address))
 }
 
 /// Redis-backed [`HotCache`]. Cheap to clone — [`ConnectionManager`] is a
@@ -221,11 +270,44 @@ impl HotCache for RedisHotCache {
         Ok(())
     }
 
+    async fn screening_facts(
+        &self,
+        address: &AccountAddress,
+    ) -> Result<Option<CachedScreeningFacts>, CacheError> {
+        let mut conn = self.conn.clone();
+        let raw: Option<String> = conn.get(screen_key(address)).await?;
+        raw.map(|json| {
+            serde_json::from_str(&json).map_err(|err| CacheError::Malformed {
+                what: format!("screening facts for {}: {err}", address_key(address)),
+            })
+        })
+        .transpose()
+    }
+
+    async fn put_screening_facts(
+        &self,
+        address: &AccountAddress,
+        facts: &CachedScreeningFacts,
+    ) -> Result<(), CacheError> {
+        let json = serde_json::to_string(facts).map_err(|err| CacheError::Malformed {
+            what: format!("encoding screening facts: {err}"),
+        })?;
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(screen_key(address), json, self.ttl_secs())
+            .await?;
+        Ok(())
+    }
+
     async fn evict(&self, address: &AccountAddress) -> Result<(), CacheError> {
         let mut conn = self.conn.clone();
         // UNLINK: reclaim off-thread, same semantics as DEL for the reader.
         let _: () = conn
-            .unlink(&[labels_key(address), scores_key(address)])
+            .unlink(&[
+                labels_key(address),
+                scores_key(address),
+                screen_key(address),
+            ])
             .await?;
         Ok(())
     }
@@ -235,8 +317,12 @@ impl HotCache for RedisHotCache {
         for chunk in addresses.chunks(EVICT_PIPELINE_CHUNK) {
             let mut pipe = redis::pipe();
             for address in chunk {
-                pipe.unlink(&[labels_key(address), scores_key(address)])
-                    .ignore();
+                pipe.unlink(&[
+                    labels_key(address),
+                    scores_key(address),
+                    screen_key(address),
+                ])
+                .ignore();
             }
             let _: () = pipe.query_async(&mut conn).await?;
         }
@@ -250,7 +336,7 @@ mod tests {
     use alloy_primitives::Address;
     use event_bus::Transience;
 
-    /// The two keys per address are the whole eviction surface — pin their
+    /// The three keys per address are the whole eviction surface — pin their
     /// shape so evict() and the writers can never disagree.
     #[test]
     fn cache_keys_are_prefixed_and_lowercase() {
@@ -262,6 +348,10 @@ mod tests {
         assert_eq!(
             scores_key(&addr),
             "intel:scores:0xabababababababababababababababababababab"
+        );
+        assert_eq!(
+            screen_key(&addr),
+            "intel:screen:0xabababababababababababababababababababab"
         );
     }
 
@@ -286,5 +376,37 @@ mod tests {
         let json = serde_json::to_string(&score).unwrap();
         let back: CachedScore = serde_json::from_str(&json).unwrap();
         assert_eq!(back, score);
+    }
+
+    #[test]
+    fn cached_screening_facts_round_trip_through_json() {
+        use crate::model::{LabelKind, LabelSource};
+
+        let addr = Address::repeat_byte(0xAB);
+        let facts = CachedScreeningFacts {
+            score: 87,
+            confidence: Confidence::new(0.91),
+            model_version: "risk-v1".into(),
+            computed_at: DateTime::<Utc>::from_timestamp(1_000, 0).unwrap(),
+            sanctions: vec![SanctionEntry {
+                address: addr,
+                list_name: "ofac_sdn".into(),
+                entry: "Evil Corp".into(),
+                listed_at: None,
+            }],
+            labels: vec![LabelRecord::new(
+                addr,
+                LabelKind::KnownScammer,
+                "drainer",
+                LabelSource::Manual,
+                "operator:test",
+                DateTime::<Utc>::from_timestamp(500, 0).unwrap(),
+            )],
+            entity_id: Some(EntityId::new()),
+            entity_size: 3,
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        let back: CachedScreeningFacts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, facts);
     }
 }

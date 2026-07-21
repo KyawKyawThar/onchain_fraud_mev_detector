@@ -370,6 +370,55 @@ build:
 build-server:
     cargo build --release -p server
 
+# ── Clean (target/ disk usage) ────────────────────────────────────
+# `target/` is pure build cache (gitignored, safe to delete any time — the
+# only cost is recompiling). It's never pruned automatically, so it grows
+# without bound across every crate × profile × incremental cache; a
+# workspace this size (revm, reth-adjacent deps, per-crate test binaries)
+# can reach hundreds of GB. Prefer `clean-crate` over a blanket `clean` day
+# to day — a full clean forces a slow full rebuild of everything, `clean-crate`
+# only forces a rebuild of the one crate (and whatever depends on it).
+
+# Show target/'s total size and its biggest subdirectories, so you know
+# what a clean would actually reclaim before running one.
+target-size:
+    @echo "── total ──"
+    @du -sh target 2>/dev/null || echo "(no target/ yet)"
+    @echo "── target/* ──"
+    @du -sh target/*/ 2>/dev/null | sort -rh
+    @echo "── target/debug/* (usually the bulk) ──"
+    @du -sh target/debug/*/ 2>/dev/null | sort -rh
+
+# Clean one crate's build artifacts (and anything depending on it) — the
+# targeted alternative to a full `clean`. Usage: `just clean-crate detection`.
+clean-crate crate:
+    cargo clean -p {{crate}}
+
+# Wipe target/debug/incremental/ only — usually the single biggest reclaim
+# for the lowest cost. This is purely a compile-*speed* cache (not the
+# compiled artifacts themselves, which live in deps/): deleting it just means
+# the next build of whatever crate you touch recompiles that one crate from
+# scratch instead of incrementally, not a full workspace rebuild. Cargo
+# recreates the directory on its own.
+clean-incremental:
+    rm -rf target/debug/incremental target/release/incremental
+    @echo "✅ incremental cache cleared — the next touched crate rebuilds non-incrementally, nothing else changes"
+
+# Full clean — every crate, every profile. Reclaims the most disk but the
+# next build recompiles the whole workspace from scratch (revm/reth-adjacent
+# deps included — expect tens of minutes, not seconds).
+clean:
+    cargo clean
+
+# Prune build artifacts untouched in 14+ days, keep everything still active —
+# the standing habit that replaces manually reaching for `clean`/`clean-crate`.
+# Safe to run any time (idempotent, only ever deletes stale artifacts); wire
+# it into a weekly cron/reminder rather than running it ad hoc. Needs
+# `cargo-sweep` (`just tools`, or `cargo install cargo-sweep`).
+sweep:
+    cargo sweep --time 14
+    @echo "✅ pruned artifacts untouched in 14+ days"
+
 # ── Format ───────────────────────────────────────────────────────
 
 # Format code
@@ -504,11 +553,11 @@ hooks:
 
 # ── Install / Setup ──────────────────────────────────────────────
 
-# Install dev tools (sqlx-cli, cargo-watch, bacon, nextest, audit, deny, machete)
+# Install dev tools (sqlx-cli, cargo-watch, bacon, nextest, audit, deny, machete, sweep)
 tools:
     cargo install sqlx-cli --no-default-features --features rustls,postgres
     # nextest refuses to install without --locked, so it's a separate line.
     cargo install cargo-nextest --locked
-    cargo install cargo-watch bacon cargo-audit cargo-deny cargo-machete
+    cargo install cargo-watch bacon cargo-audit cargo-deny cargo-machete cargo-sweep
     @echo "ℹ️  Also install lefthook for git hooks: brew install lefthook && just hooks"
     @echo "ℹ️  The event-store crate builds librdkafka from source — needs a C toolchain + make (Xcode CLT on macOS; build-essential on Linux)"

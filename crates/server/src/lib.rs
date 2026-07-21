@@ -6,7 +6,9 @@
 //! internal read endpoints, [`stream`] is the Kafka consumer feeding
 //! `WS /v1/stream`'s alert lifecycle, [`usage`] meters every authenticated
 //! call as a `UsageRecorded` event (§13), [`metrics`] records the request
-//! p50/p99 panel (§19), and [`http`] assembles the whole router.
+//! p50/p99 panel (§19), [`screen`] is the counterparty-screening decision
+//! layer behind `POST /v1/address/{addr}/screen` (§11, Sprint 14), and
+//! [`http`] assembles the whole router.
 //!
 //! Keeping this in a library (mirrors `event-store`) is what lets the router/
 //! auth tests exercise the real types without a running process.
@@ -16,6 +18,7 @@ pub mod config;
 pub mod http;
 pub mod intelligence_client;
 pub mod metrics;
+pub mod screen;
 pub mod stream;
 pub mod upstream;
 pub mod usage;

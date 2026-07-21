@@ -14,6 +14,7 @@
 //! service stops rather than silently running HTTP-only with a dead stream.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
@@ -25,6 +26,10 @@ use server::intelligence_client::IntelligenceClient;
 use server::stream;
 use server::usage::{self, UsageRecorder};
 use tokio_util::sync::CancellationToken;
+
+/// How long boot waits for the eager intelligence dial before falling back
+/// to a lazy channel — bounds startup, never blocks it on a peer.
+const INTELLIGENCE_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,8 +43,17 @@ async fn main() -> Result<()> {
 
     tracing::info!(schema_version = events::SCHEMA_VERSION, "server starting");
 
-    let intelligence = IntelligenceClient::connect_lazy(cfg.intelligence_grpc_addr.clone())
-        .context("building the intelligence gRPC channel")?;
+    // Warm (bounded) rather than lazy: the first screening call after boot
+    // shouldn't pay the connection handshake out of its p50 < 100ms budget.
+    // A dial failure falls back to lazy with a warn — never a boot-order
+    // coupling on intelligence being up first.
+    let intelligence = IntelligenceClient::connect_warm(
+        cfg.intelligence_grpc_addr.clone(),
+        INTELLIGENCE_DIAL_TIMEOUT,
+    )
+    .await
+    .context("building the intelligence gRPC channel")?
+    .with_screening_deadline(cfg.screening_deadline);
     let http_client = reqwest::Client::builder()
         .build()
         .context("building the outbound HTTP client")?;
