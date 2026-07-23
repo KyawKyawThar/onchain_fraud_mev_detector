@@ -1,6 +1,8 @@
 //! The public §11 API service: `GET /v1/address/{addr}/risk` and `/labels`
 //! plus the synchronous `POST /v1/address/{addr}/screen` decision (gRPC into
-//! `intelligence`), `GET /v1/audit/incident/{id}` (proxies event-store),
+//! `intelligence`, decided through a named policy — `GET /v1/policies` lists
+//! them, `PUT /v1/policies/{name}` authors a customer's own, §11 Sprint 14
+//! t2), `GET /v1/audit/incident/{id}` (proxies event-store),
 //! `GET /v1/incidents` (proxies simulation-projection), and
 //! `WS /v1/stream` (the provisional/confirmed/retracted alert lifecycle,
 //! fed by [`crate::stream`]) — all behind [`crate::auth::require_jwt`].
@@ -43,6 +45,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
 use crate::intelligence_client::{self, IntelligenceClient};
+use crate::policy_store::{self, PolicyStore};
 use crate::stream::{self, WsMessage};
 use crate::upstream;
 use crate::usage::{self, UsageRecorder};
@@ -59,7 +62,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenResponse, SanctionMatchResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -101,6 +104,11 @@ pub struct AppState {
     /// The backbone producer `POST /v1/rules` announces `RuleCreated` on
     /// (§2) — shares the binary's one `KafkaEventSink` with usage metering.
     pub events: Arc<dyn EventSink>,
+    /// The customer-authored decision-policy store `POST /v1/address/{addr}/screen`
+    /// and `PUT /v1/policies/{name}` read/write (§11, Sprint 14 t2) —
+    /// `PgPolicyStore` in production, keyed by the JWT's `CustomerId` the
+    /// same way `rules` is.
+    pub policies: Arc<dyn PolicyStore>,
 }
 
 fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
@@ -121,6 +129,8 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
         .routes(routes!(screen_address))
+        .routes(routes!(list_policies))
+        .routes(routes!(upsert_policy))
         .routes(routes!(builders))
         .routes(routes!(entity_graph))
         .routes(routes!(entity_timeline))
@@ -289,15 +299,30 @@ struct SanctionMatchResponse {
     entry: String,
 }
 
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+struct ScreenRequest {
+    /// Named policy to decide through: a built-in
+    /// (`default`/`strict`/`monitor-only`) or one of the caller's own
+    /// (`PUT /v1/policies/{name}`). Defaults to `default` when omitted —
+    /// including when the request carries no body at all.
+    #[serde(default)]
+    policy: Option<String>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ScreenResponse {
     address: String,
-    /// The §11 outcome: `allow` | `review` | `block`.
+    /// The outcome: `allow` | `review` | `block`.
     decision: crate::screen::Decision,
     /// Which rule produced it: `sanctions_hard_block` | `score_thresholds`.
     decision_basis: crate::screen::DecisionBasis,
+    /// The named policy that decided this call (§11, Sprint 14 t2) — pinned
+    /// alongside `decision_basis` so a past verdict is always reconstructible
+    /// even after the customer retunes the policy's thresholds.
+    policy_name: String,
+    policy_version: i32,
     /// The address is on at least one sanctions list (§8.5) — always a
-    /// `block`, regardless of score.
+    /// `block`, regardless of policy.
     sanctioned: bool,
     /// The sanctions-list matches behind a `sanctions_hard_block`.
     sanctions: Vec<SanctionMatchResponse>,
@@ -319,31 +344,54 @@ struct ScreenResponse {
 /// screening decision (§11): pre-transaction `allow`/`review`/`block` over
 /// the intelligence service's cached risk score, confidence, labels, entity
 /// and sanctions status (one `GetScreeningFacts` gRPC round-trip; Redis hot
-/// path, §8.3), mapped through the decision policy in [`crate::screen`]. A
-/// sanctions match hard-blocks regardless of score (§8.5). The one
+/// path, §8.3), mapped through the named decision policy the body selects
+/// (§11, Sprint 14 t2 — `crate::screen`, `crate::policy_store`). A sanctions
+/// match hard-blocks regardless of score or policy (§8.5). The one
 /// latency-critical blocking surface in the API.
 ///
 /// POST, not GET: a screening decision is a billable, legally-weighty event
 /// (each call will meter a `ScreeningCall` and be recorded for the access
-/// audit, t3/t4), not a cacheable read. Takes no body today; t2's named
-/// policy selection will ride one.
+/// audit, t3/t4), not a cacheable read. The body is optional — an absent or
+/// empty body, or one naming no `policy`, uses `default`.
 #[utoipa::path(
     post,
     path = "/v1/address/{address}/screen",
     tag = "api-service",
     params(("address" = String, Path, description = "On-chain address, 0x-prefixed hex (any case)")),
+    request_body(content = ScreenRequest, description = "Optional. Selects the named policy; omit (or an empty body) uses `default`."),
     security(("bearer_token" = [])),
     responses(
         (status = 200, description = "The screening decision with its driving facts", body = ScreenResponse),
-        (status = 400, description = "Address is not valid hex"),
+        (status = 400, description = "Address is not valid hex, the body isn't valid JSON, or `policy` names nothing this customer can see"),
         (status = 401, description = "Missing or invalid bearer token"),
-        (status = 502, description = "intelligence is unreachable"),
+        (status = 502, description = "intelligence or the policy store is unreachable"),
     ),
 )]
 async fn screen_address(
     State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
     Path(address): Path<AccountAddress>,
+    body: axum::body::Bytes,
 ) -> Result<Json<ScreenResponse>, ApiError> {
+    // The body is optional (see the handler docs): an empty one is
+    // indistinguishable from "no policy named" rather than a JSON parse
+    // failure, so it's checked before ever calling `serde_json`.
+    let policy_name = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<ScreenRequest>(&body)
+            .map_err(|err| ApiError::bad_request(format!("invalid request body: {err}")))?
+            .policy
+    }
+    .unwrap_or_else(|| crate::screen::DEFAULT_POLICY_NAME.to_owned());
+
+    let policy = state
+        .policies
+        .resolve(customer, &policy_name)
+        .await
+        .map_err(policy_store::to_api_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("no such policy: {policy_name:?}")))?;
+
     let facts = state
         .intelligence
         .screening_facts(address)
@@ -354,12 +402,14 @@ async fn screen_address(
     // transport edge's `From` impl; the decision layer only ever sees the
     // typed input.
     let input = crate::screen::ScreeningInput::from(&facts);
-    let verdict = crate::screen::decide(input);
+    let verdict = crate::screen::decide(input, &policy);
 
     Ok(Json(ScreenResponse {
         address: address_key(&address),
         decision: verdict.decision,
         decision_basis: verdict.basis,
+        policy_name: verdict.policy_name,
+        policy_version: verdict.policy_version,
         sanctioned: input.sanctioned,
         sanctions: facts
             .sanctions
@@ -377,6 +427,118 @@ async fn screen_address(
         entity_id: facts.entity_id,
         entity_size: facts.entity_size,
     }))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct PolicyResponse {
+    name: String,
+    version: i32,
+    /// Score at/above which an otherwise-clean address holds for review.
+    review_at: u8,
+    /// Score at/above which an otherwise-clean address blocks outright.
+    /// Absent means monitor-only: score can never block, only review.
+    block_at: Option<u8>,
+}
+
+impl From<crate::screen::Policy> for PolicyResponse {
+    fn from(policy: crate::screen::Policy) -> Self {
+        Self {
+            name: policy.name,
+            version: policy.version,
+            review_at: policy.thresholds.review_at(),
+            block_at: policy.thresholds.block_at(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct PoliciesResponse {
+    /// The free catalog every customer gets before authoring anything of
+    /// their own — always exactly `default`/`strict`/`monitor-only`.
+    builtin: Vec<PolicyResponse>,
+    /// This customer's own named policies, each at its latest version.
+    custom: Vec<PolicyResponse>,
+}
+
+/// `GET /v1/policies` — the full set of policy names this customer can pass
+/// as `POST /v1/address/{addr}/screen`'s `policy` field: the built-in
+/// catalog plus their own custom ones, each at its latest version (§11,
+/// Sprint 14 t2).
+#[utoipa::path(
+    get,
+    path = "/v1/policies",
+    tag = "api-service",
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The built-in catalog plus this customer's own policies", body = PoliciesResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "The policy store is unreachable"),
+    ),
+)]
+async fn list_policies(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+) -> Result<Json<PoliciesResponse>, ApiError> {
+    let custom = state
+        .policies
+        .policies_for_owner(customer)
+        .await
+        .map_err(policy_store::to_api_error)?;
+
+    Ok(Json(PoliciesResponse {
+        builtin: crate::screen::builtin_catalog()
+            .into_iter()
+            .map(PolicyResponse::from)
+            .collect(),
+        custom: custom.into_iter().map(PolicyResponse::from).collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+struct UpsertPolicyRequest {
+    /// Score (0-100) at/above which an otherwise-clean address holds for
+    /// review.
+    review_at: u8,
+    /// Score (0-100) at/above which an otherwise-clean address blocks
+    /// outright. Omit (or `null`) for monitor-only: score can never block,
+    /// only review — a sanctions match still hard-blocks regardless (§8.5).
+    #[serde(default)]
+    block_at: Option<u8>,
+}
+
+/// `PUT /v1/policies/{name}` — create or retune one of this customer's named
+/// decision policies (§11, Sprint 14 t2). Every call writes a **new**
+/// version: thresholds are never edited in place, so a screening verdict
+/// minted under an earlier version stays reconstructible after this customer
+/// changes their mind. `name` may not be one of the built-in catalog
+/// (`default`/`strict`/`monitor-only`) — those are read-only.
+#[utoipa::path(
+    put,
+    path = "/v1/policies/{name}",
+    tag = "api-service",
+    params(("name" = String, Path, description = "Policy name (must not be a built-in name)")),
+    request_body = UpsertPolicyRequest,
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The policy version just written", body = PolicyResponse),
+        (status = 400, description = "The name is reserved for a built-in policy, or block_at < review_at"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "The policy store is unreachable"),
+    ),
+)]
+async fn upsert_policy(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertPolicyRequest>,
+) -> Result<Json<PolicyResponse>, ApiError> {
+    let policy = state
+        .policies
+        .upsert_policy(customer, &name, body.review_at, body.block_at, Utc::now())
+        .await
+        .map_err(policy_store::to_api_error)?;
+
+    Ok(Json(policy.into()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -938,6 +1100,8 @@ mod tests {
     use super::{build_router, AppState};
     use crate::config::JwtConfig;
     use crate::intelligence_client::IntelligenceClient;
+    use crate::policy_store::test_util::InMemoryPolicyStore;
+    use crate::policy_store::PolicyStore;
     use crate::usage::UsageRecorder;
     use event_bus::test_util::RecordingSink;
     use events::system::UsageRecorded;
@@ -953,6 +1117,7 @@ mod tests {
         usage_rx: mpsc::Receiver<UsageRecorded>,
         rules: Arc<InMemoryRuleStore>,
         events: Arc<RecordingSink>,
+        policies: Arc<InMemoryPolicyStore>,
     }
 
     /// A throwaway state — `connect_lazy` does no I/O (the channel dials on
@@ -961,6 +1126,7 @@ mod tests {
         let (usage, usage_rx) = UsageRecorder::channel(16);
         let rules = Arc::new(InMemoryRuleStore::new());
         let events = Arc::new(RecordingSink::default());
+        let policies = Arc::new(InMemoryPolicyStore::new());
         let state = AppState {
             intelligence: IntelligenceClient::connect_lazy("http://127.0.0.1:50051".to_owned())
                 .expect("lazy channel never fails to construct"),
@@ -975,12 +1141,14 @@ mod tests {
             usage,
             rules: rules.clone(),
             events: events.clone(),
+            policies: policies.clone(),
         };
         TestState {
             state,
             usage_rx,
             rules,
             events,
+            policies,
         }
     }
 
@@ -997,6 +1165,7 @@ mod tests {
             "RiskResponse",
             "LabelResponse",
             "LabelsResponse",
+            "ScreenRequest",
             "ScreenResponse",
             "SanctionMatchResponse",
             "Decision",
@@ -1011,6 +1180,9 @@ mod tests {
             "GraphEdgeResponse",
             "EntityTimelineResponse",
             "TimelineMilestoneResponse",
+            "UpsertPolicyRequest",
+            "PolicyResponse",
+            "PoliciesResponse",
         ] {
             assert!(
                 spec["components"]["schemas"].get(name).is_some(),
@@ -1025,6 +1197,8 @@ mod tests {
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
             ("/v1/address/{address}/screen", "post"),
+            ("/v1/policies", "get"),
+            ("/v1/policies/{name}", "put"),
             ("/v1/builders", "get"),
             ("/v1/entity/{entity_id}/graph", "get"),
             ("/v1/entity/{entity_id}/timeline", "get"),
@@ -1173,6 +1347,213 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An unknown `policy` name is a 400, resolved (and rejected) before the
+    /// endpoint ever calls the unreachable intelligence channel — a bad
+    /// request never spends the screening deadline budget on a doomed RPC.
+    #[tokio::test]
+    async fn screen_rejects_an_unknown_policy_name_before_calling_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let path = format!("/v1/address/{:#x}/screen", alloy_primitives::Address::ZERO);
+
+        let response = router
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"policy":"nonexistent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The §11/Sprint 14 t2 policy surface end to end: `PUT /v1/policies/{name}`
+    /// writes a customer's own policy, `GET /v1/policies` lists the built-in
+    /// catalog alongside it, and `POST /v1/address/{addr}/screen` resolves it
+    /// by name from the request body (proved by the 502 the lazy intelligence
+    /// channel produces once the *policy* half of the handler has accepted the
+    /// name — an unknown-policy 400 never gets that far, per the test above).
+    #[tokio::test]
+    async fn policies_can_be_authored_listed_and_selected_for_screening() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let policies = ts.policies.clone();
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state);
+
+        // A built-in name is reserved — 400, nothing written.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/v1/policies/strict")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"review_at":10,"block_at":50}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // An invalid threshold pair (block below review) — 400, nothing written.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/v1/policies/acme")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"review_at":80,"block_at":40}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A valid custom policy — 200, version 1.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/v1/policies/acme")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"review_at":10,"block_at":60}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["name"], "acme");
+        assert_eq!(body["version"], 1);
+
+        // Retuning writes version 2, never overwrites version 1.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/v1/policies/acme")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"review_at":15,"block_at":65}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["version"], 2);
+
+        // Straight against the double: version 1's thresholds are still
+        // there (append-only, never overwritten) even though `resolve`/
+        // `custom_policy` now read version 2.
+        let owner = events::primitives::CustomerId(uuid::Uuid::parse_str(customer).unwrap());
+        let latest = policies.custom_policy(owner, "acme").await.unwrap().unwrap();
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.thresholds.review_at(), 15);
+
+        // GET /v1/policies: the built-in catalog plus this customer's own,
+        // at its latest version only.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/v1/policies")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let builtin_names: Vec<&str> = body["builtin"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(builtin_names, vec!["default", "strict", "monitor-only"]);
+        assert_eq!(body["custom"].as_array().unwrap().len(), 1);
+        assert_eq!(body["custom"][0]["name"], "acme");
+        assert_eq!(body["custom"][0]["version"], 2);
+
+        // POST /v1/address/{addr}/screen naming the custom policy: it
+        // resolves (no 400), then fails on the unreachable intelligence
+        // channel exactly like every other screen test here — proving the
+        // *policy* half accepted the name before the RPC ever ran.
+        let path = format!("/v1/address/{:#x}/screen", alloy_primitives::Address::ZERO);
+        let response = router
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"policy":"acme"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// `PUT /v1/policies/{name}` is idempotent (HTTP `PUT` semantics): a
+    /// re-submit with unchanged thresholds returns the same version and
+    /// appends nothing to the audit history — only a real change climbs.
+    #[tokio::test]
+    async fn put_policy_is_idempotent_on_unchanged_thresholds() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        let put = |body: &'static str| {
+            let router = router.clone();
+            let bearer = bearer.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        Request::put("/v1/policies/acme")
+                            .header(header::AUTHORIZATION, &bearer)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        assert_eq!(put(r#"{"review_at":10,"block_at":60}"#).await["version"], 1);
+        // Same thresholds again → still version 1 (idempotent, nothing appended).
+        assert_eq!(put(r#"{"review_at":10,"block_at":60}"#).await["version"], 1);
+        // A genuine change climbs to version 2.
+        assert_eq!(put(r#"{"review_at":10,"block_at":55}"#).await["version"], 2);
     }
 
     #[tokio::test]

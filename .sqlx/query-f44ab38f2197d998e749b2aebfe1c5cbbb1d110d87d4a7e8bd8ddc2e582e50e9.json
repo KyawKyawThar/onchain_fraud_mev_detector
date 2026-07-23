@@ -1,0 +1,69 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO screening_policies (owner, name, version, review_at, block_at, created_at)\n               VALUES ($1, $2, $3, $4, $5, $6)\n               RETURNING name, version, review_at, block_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "review_at",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "review_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "block_at",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "block_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int4",
+        "Int2",
+        "Int2",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "f44ab38f2197d998e749b2aebfe1c5cbbb1d110d87d4a7e8bd8ddc2e582e50e9"
+}

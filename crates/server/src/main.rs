@@ -23,6 +23,7 @@ use secrecy::ExposeSecret;
 use server::config::Config;
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
+use server::policy_store::PgPolicyStore;
 use server::stream;
 use server::usage::{self, UsageRecorder};
 use tokio_util::sync::CancellationToken;
@@ -66,11 +67,21 @@ async fn main() -> Result<()> {
     let pg_pool = db::connect(cfg.database_url.expose_secret())
         .await
         .context("connecting Postgres for the rule store")?;
-    let rule_store = PgRuleStore::new(pg_pool);
+    let rule_store = PgRuleStore::new(pg_pool.clone());
     rule_store
         .ping()
         .await
         .context("rules schema not reachable — run `just migrate-up`?")?;
+
+    // ── Decision-policy store (§11, Sprint 14 t2) ──────────────────────
+    // `POST /v1/address/{addr}/screen` resolves a named policy through this
+    // (customer-authored ones only — the built-in catalog is server code,
+    // never a row); shares the same pool, same fail-fast-at-boot posture.
+    let policy_store = PgPolicyStore::new(pg_pool);
+    policy_store
+        .ping()
+        .await
+        .context("screening_policies schema not reachable — run `just migrate-up`?")?;
 
     // The one Kafka producer this service holds: usage metering (§13) and the
     // `RuleCreated` announcement (§9) share it.
@@ -87,6 +98,7 @@ async fn main() -> Result<()> {
         usage: usage_recorder,
         rules: Arc::new(rule_store),
         events: sink.clone(),
+        policies: Arc::new(policy_store),
     };
 
     let shutdown = CancellationToken::new();
