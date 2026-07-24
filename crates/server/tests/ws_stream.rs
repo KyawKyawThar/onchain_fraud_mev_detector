@@ -60,9 +60,11 @@ fn valid_bearer() -> String {
 /// `crate::stream::run` would feed from Kafka in production).
 async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage>) {
     let (alerts_tx, _) = tokio::sync::broadcast::channel(16);
-    // Metering sink for this test: the receiver is dropped, so records are
-    // discarded — `src/http.rs`'s tests cover what gets metered.
+    // Metering/audit sinks for this test: the receivers are dropped, so
+    // records are discarded — `src/http.rs`'s tests cover what gets metered
+    // and what gets audit-recorded.
     let (usage, _) = server::usage::UsageRecorder::channel(16);
+    let (audit, _) = server::audit::AuditRecorder::channel(16);
 
     let state = AppState {
         intelligence: IntelligenceClient::connect_lazy("http://127.0.0.1:50051".to_owned())
@@ -73,6 +75,7 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
         jwt: jwt_config(),
         alerts: alerts_tx.clone(),
         usage,
+        audit,
         // This file exercises the WS transport only; rules/events/policies
         // get inert doubles (`src/http.rs`'s tests cover `POST /v1/rules`
         // and the policy surface).

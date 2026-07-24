@@ -24,14 +24,15 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use event_bus::EventSink;
 use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
-use events::system::UsageEventType;
+use events::system::{ScreeningDecisionRecorded, UsageEventType};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::model::address_key;
+use intelligence::pb::ScreeningFactsReply;
 use rule_engine::model::{Action, Condition, LogicOp, Rule, TemporalConstraint};
 use rule_engine::store::{CreateRuleOutcome, RuleStore};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::audit::AuditRecorder;
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
 use crate::intelligence_client::{self, IntelligenceClient};
@@ -64,7 +66,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -99,6 +101,11 @@ pub struct AppState {
     /// `api_call_made` here; [`crate::usage::run`] publishes the queue as
     /// `UsageRecorded` events.
     pub usage: UsageRecorder,
+    /// §11 Sprint 14 t3: every `POST /v1/address/{addr}/screen` call records
+    /// its outcome here; [`crate::audit::run`] publishes the queue as
+    /// `ScreeningDecisionRecorded` — the access-audit trail, independent of
+    /// the `usage` metering fact above.
+    pub audit: AuditRecorder,
     /// The customer-isolated rule-definition store behind `POST /v1/rules`
     /// (§9, Sprint 9 t4) — `PgRuleStore` in production, keyed by the JWT's
     /// `CustomerId` so a body can never write another customer's rules.
@@ -319,6 +326,28 @@ struct SanctionMatchResponse {
     entry: String,
 }
 
+/// One factor behind a screening decision's `score` (§8.3), with its
+/// evidence pointer — the explainability contract §11 requires on a
+/// `review`/`block` (Sprint 14 t3): mirrors `events::intelligence::RiskFactor`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct FactorResponse {
+    name: String,
+    /// Signed contribution to the score for this factor.
+    delta: f64,
+    /// Pointer to the evidence (incident id, label id, …) behind this factor.
+    evidence_ref: String,
+}
+
+impl From<&events::intelligence::RiskFactor> for FactorResponse {
+    fn from(factor: &events::intelligence::RiskFactor) -> Self {
+        Self {
+            name: factor.name.clone(),
+            delta: factor.delta,
+            evidence_ref: factor.evidence_ref.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct ScreenRequest {
     /// Named policy to decide through: a built-in
@@ -358,6 +387,13 @@ struct ScreenResponse {
     entity_id: Option<String>,
     /// Member count of that entity (0 when unclustered).
     entity_size: u32,
+    /// The full per-factor breakdown behind `score`, each with its
+    /// `evidence_ref` (§11 Sprint 14 t3) — present on a `review`/`block` so
+    /// the decision is explainable and auditable; omitted on `allow` to keep
+    /// the common-case response lean (the audit trail still records the
+    /// factors for every decision regardless, see `crate::audit`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    factors: Vec<FactorResponse>,
 }
 
 /// `POST /v1/address/{address}/screen` — the **synchronous** counterparty
@@ -370,9 +406,10 @@ struct ScreenResponse {
 /// latency-critical blocking surface in the API.
 ///
 /// POST, not GET: a screening decision is a billable, legally-weighty event
-/// (each call will meter a `ScreeningCall` and be recorded for the access
-/// audit, t3/t4), not a cacheable read. The body is optional — an absent or
-/// empty body, or one naming no `policy`, uses `default`.
+/// — every call is recorded onto the backbone as `ScreeningDecisionRecorded`
+/// (§11, Sprint 14 t3, `crate::audit`) and will meter a `ScreeningCall` (t4)
+/// — not a cacheable read. The body is optional — an absent or empty body,
+/// or one naming no `policy`, uses `default`.
 #[utoipa::path(
     post,
     path = "/v1/address/{address}/screen",
@@ -423,6 +460,7 @@ async fn screen_address(
     // transport edge's `From` impl; the decision layer only ever sees the
     // typed input.
     let input = crate::screen::ScreeningInput::from(&facts);
+    let sanctioned = input.sanctioned;
     let verdict = crate::screen::decide(input, &policy);
 
     // §13 per-call metering: only on the success path — a call that 502'd
@@ -433,13 +471,74 @@ async fn screen_address(
     // events, never gated here (see `crate::rate_limit`'s module docs).
     state.usage.record(customer, UsageEventType::ScreeningCall);
 
-    Ok(Json(ScreenResponse {
+    // The access-audit trail (§11 Sprint 14 t3): recorded for *every* decision,
+    // not just a block/review — a borderline `allow` is just as much a fact a
+    // compliance reviewer may need to reconstruct later. Non-blocking (see
+    // `crate::audit`), so it can never add to the response's latency. The
+    // record's shape is a pure mapping (`screening_audit_record`), so what the
+    // legal trail captures is unit-testable without a broker.
+    state.audit.record(screening_audit_record(
+        customer,
+        address,
+        &facts,
+        &verdict,
+        sanctioned,
+        Utc::now(),
+    ));
+
+    Ok(Json(screen_response(address, facts, verdict, sanctioned)))
+}
+
+/// Pure mapping (§1 — I/O shell / pure core): the §11 access-audit fact for one
+/// screening decision. Carries the full per-factor breakdown regardless of
+/// outcome, so a later compliance review can reconstruct *why* even a
+/// borderline `allow` landed where it did.
+fn screening_audit_record(
+    customer: CustomerId,
+    address: AccountAddress,
+    facts: &ScreeningFactsReply,
+    verdict: &crate::screen::Verdict,
+    sanctioned: bool,
+    at: DateTime<Utc>,
+) -> ScreeningDecisionRecorded {
+    ScreeningDecisionRecorded {
+        customer_id: customer,
+        address,
+        decision: verdict.decision,
+        decision_basis: verdict.basis,
+        policy_name: verdict.policy_name.clone(),
+        policy_version: verdict.policy_version,
+        score: facts.score,
+        confidence: facts.confidence,
+        sanctioned,
+        model_version: facts.model_version.clone(),
+        factors: verdict.factors.clone(),
+        timestamp: at,
+    }
+}
+
+/// Pure mapping (§1): the `POST /v1/address/{addr}/screen` response body.
+/// Consumes `facts` and `verdict` (no defensive clones on the SLO path). The
+/// factor breakdown is scoped to `review`/`block` — an `allow` stays lean on
+/// the wire while the audit record above always carries it.
+fn screen_response(
+    address: AccountAddress,
+    facts: ScreeningFactsReply,
+    verdict: crate::screen::Verdict,
+    sanctioned: bool,
+) -> ScreenResponse {
+    let factors = if verdict.decision == crate::screen::Decision::Allow {
+        Vec::new()
+    } else {
+        verdict.factors.iter().map(FactorResponse::from).collect()
+    };
+    ScreenResponse {
         address: address_key(&address),
         decision: verdict.decision,
         decision_basis: verdict.basis,
         policy_name: verdict.policy_name,
         policy_version: verdict.policy_version,
-        sanctioned: input.sanctioned,
+        sanctioned,
         sanctions: facts
             .sanctions
             .into_iter()
@@ -455,7 +554,8 @@ async fn screen_address(
         labels: facts.labels.into_iter().map(LabelResponse::from).collect(),
         entity_id: facts.entity_id,
         entity_size: facts.entity_size,
-    }))
+        factors,
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1127,6 +1227,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{build_router, AppState};
+    use crate::audit::AuditRecorder;
     use crate::config::JwtConfig;
     use crate::intelligence_client::IntelligenceClient;
     use crate::policy_store::test_util::InMemoryPolicyStore;
@@ -1134,7 +1235,9 @@ mod tests {
     use crate::rate_limit::test_util::InMemoryRateLimiter;
     use crate::usage::UsageRecorder;
     use event_bus::test_util::RecordingSink;
-    use events::system::UsageRecorded;
+    use events::system::{
+        ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
+    };
     use rule_engine::test_util::InMemoryRuleStore;
     use secrecy::SecretString;
     use tokio::sync::mpsc;
@@ -1145,6 +1248,7 @@ mod tests {
     struct TestState {
         state: AppState,
         usage_rx: mpsc::Receiver<UsageRecorded>,
+        audit_rx: mpsc::Receiver<ScreeningDecisionRecorded>,
         rules: Arc<InMemoryRuleStore>,
         events: Arc<RecordingSink>,
         policies: Arc<InMemoryPolicyStore>,
@@ -1154,6 +1258,7 @@ mod tests {
     /// first RPC), so the router/spec can be built with no live intelligence.
     fn test_state() -> TestState {
         let (usage, usage_rx) = UsageRecorder::channel(16);
+        let (audit, audit_rx) = AuditRecorder::channel(16);
         let rules = Arc::new(InMemoryRuleStore::new());
         let events = Arc::new(RecordingSink::default());
         let policies = Arc::new(InMemoryPolicyStore::new());
@@ -1169,6 +1274,7 @@ mod tests {
             },
             alerts: tokio::sync::broadcast::channel(16).0,
             usage,
+            audit,
             rules: rules.clone(),
             events: events.clone(),
             policies: policies.clone(),
@@ -1177,6 +1283,7 @@ mod tests {
         TestState {
             state,
             usage_rx,
+            audit_rx,
             rules,
             events,
             policies,
@@ -1199,8 +1306,8 @@ mod tests {
             "ScreenRequest",
             "ScreenResponse",
             "SanctionMatchResponse",
-            "Decision",
-            "DecisionBasis",
+            "ScreeningDecision",
+            "ScreeningDecisionBasis",
             "CreateRuleRequest",
             "CreateRuleResponse",
             "BuildersResponse",
@@ -1507,6 +1614,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// End to end (§11, Sprint 14 t3): a real `IntelligenceReadService`
+    /// (in-memory stores) behind the gRPC client, seeded with a sanctions
+    /// match — the response carries the full factor breakdown with
+    /// `evidence_ref`s (a `block` decision, so `factors` is populated, unlike
+    /// the lean `allow` case), and the access-audit record published through
+    /// `state.audit` mirrors the decision exactly.
+    #[tokio::test]
+    async fn screen_response_and_audit_record_carry_the_factor_breakdown_on_a_block() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use intelligence::model::SanctionEntry;
+        use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
+        use intelligence::store::SanctionsStore;
+        use intelligence::test_util::{
+            store_seams, FixedLeaderboard, InMemoryAdjacency, InMemoryHotCache,
+            InMemoryIntelligenceStore,
+        };
+        use tower::ServiceExt;
+
+        let address = alloy_primitives::Address::repeat_byte(0xEE);
+
+        // Boot a real intelligence gRPC service on an ephemeral port, seeded
+        // with one sanctions match — the same in-memory doubles `grpc.rs`'s
+        // own tests use.
+        let store = std::sync::Arc::new(InMemoryIntelligenceStore::new());
+        store
+            .seed_sanctions(&[SanctionEntry {
+                address,
+                list_name: "ofac_sdn".into(),
+                entry: "Evil Corp".into(),
+                listed_at: None,
+            }])
+            .await
+            .unwrap();
+        let intelligence_service = intelligence::grpc::IntelligenceReadService::new(
+            store_seams(&store),
+            std::sync::Arc::new(InMemoryHotCache::new()),
+            std::sync::Arc::new(FixedLeaderboard::new(Default::default())),
+            std::sync::Arc::new(InMemoryAdjacency::new()),
+            Default::default(),
+        );
+        // Reserve an ephemeral port, then hand its address (not the listener
+        // itself — `tonic::transport::Server::serve` binds its own) to the
+        // gRPC server, the same "find a free port" trick used elsewhere in
+        // this workspace's tests.
+        let grpc_addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(IntelligenceReadServer::new(intelligence_service))
+                .serve(grpc_addr)
+                .await
+                .unwrap();
+        });
+        // Poll until the server is accepting connections rather than sleeping a
+        // fixed guess (a fixed sleep flakes under CI load). Bounded to ~1s.
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(grpc_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut ts = test_state();
+        ts.state.intelligence =
+            IntelligenceClient::connect_lazy(format!("http://{grpc_addr}")).unwrap();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let path = format!("/v1/address/{address:#x}/screen");
+
+        let response = router
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["decision_basis"], "sanctions_hard_block");
+        let factors = json["factors"]
+            .as_array()
+            .expect("factors present on a block");
+        assert!(!factors.is_empty(), "a block must carry its evidence");
+        assert!(factors[0]["evidence_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("sanction:"));
+
+        // The access-audit record mirrors the response exactly — typed, so a
+        // compliance consumer matches the enum, never re-parses a string.
+        let recorded = ts
+            .audit_rx
+            .try_recv()
+            .expect("the screening decision was recorded for the access-audit trail");
+        assert_eq!(recorded.decision, ScreeningDecision::Block);
+        assert_eq!(
+            recorded.decision_basis,
+            ScreeningDecisionBasis::SanctionsHardBlock
+        );
+        assert!(recorded.sanctioned);
+        assert!(!recorded.factors.is_empty());
     }
 
     /// The §11/Sprint 14 t2 policy surface end to end: `PUT /v1/policies/{name}`

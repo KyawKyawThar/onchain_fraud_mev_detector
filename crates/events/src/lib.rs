@@ -215,6 +215,7 @@ pub enum DomainEvent {
 
     // System (§13)
     UsageRecorded(system::UsageRecorded),
+    ScreeningDecisionRecorded(system::ScreeningDecisionRecorded),
 
     // Predictive (§16)
     PredictedAlert(predictive::PredictedAlert),
@@ -286,7 +287,7 @@ impl DomainEvent {
             | RiskScoreUpdated(_)
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
-            UsageRecorded(_) => EventFamily::System,
+            UsageRecorded(_) | ScreeningDecisionRecorded(_) => EventFamily::System,
             PredictedAlert(_) => EventFamily::Predictive,
         }
     }
@@ -330,6 +331,7 @@ impl DomainEvent {
             | RuleTriggered(_)
             | RuleAlertCreated(_)
             | UsageRecorded(_)
+            | ScreeningDecisionRecorded(_)
             | PredictedAlert(_) => None,
         }
     }
@@ -377,6 +379,7 @@ impl DomainEvent {
             IncidentRetracted(e) => Some(PartitionKey::Incident(e.incident_id)),
             IncidentFinalized(e) => Some(PartitionKey::Incident(e.incident_id)),
             UsageRecorded(e) => e.customer_id.map(PartitionKey::Customer),
+            ScreeningDecisionRecorded(e) => Some(PartitionKey::Customer(e.customer_id)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -422,6 +425,7 @@ impl DomainEvent {
             EntityCreated(e) => vec![e.seed_address],
             RiskScoreUpdated(e) => vec![e.address],
             SanctionHit(e) => vec![e.address],
+            ScreeningDecisionRecorded(e) => vec![e.address],
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)

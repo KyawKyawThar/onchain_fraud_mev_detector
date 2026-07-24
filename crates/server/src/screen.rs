@@ -23,7 +23,17 @@
 //! is already a hard alert) — [`decide`] checks it before ever looking at the
 //! policy's thresholds.
 
-use serde::Serialize;
+use events::intelligence::RiskFactor;
+
+/// The screening outcome and its basis are the shared §11 domain vocabulary,
+/// so their canonical types live on the schema crate (they ride the
+/// `ScreeningDecisionRecorded` audit event, §2). The decision kernel here
+/// produces those exact types rather than a server-local copy + a 1:1
+/// conversion — so the API response, the audit event, and this kernel can
+/// never disagree on the wire form (`allow`/`review`/`block`,
+/// `sanctions_hard_block`/`score_thresholds`). This is also why there is no
+/// hand-written `as_wire_str`: one type, one serde form, no drift.
+pub use events::system::{ScreeningDecision as Decision, ScreeningDecisionBasis as DecisionBasis};
 
 /// Policy names reserved for the built-in catalog — a customer cannot create
 /// or overwrite a policy under one of these (`crate::policy_store::PolicyStore`
@@ -225,57 +235,40 @@ pub fn builtin_catalog() -> Vec<Policy> {
 /// `POST /v1/address/{addr}/screen`'s implicit default.
 pub const DEFAULT_POLICY_NAME: &str = "default";
 
-/// The three screening outcomes (§11). Serialized lowercase — the wire
-/// vocabulary the spec names (`allow` / `review` / `block`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Decision {
-    /// No blocking signals (score below the policy's `review_at`).
-    Allow,
-    /// Hold for manual compliance (`review_at` <= score, and either the
-    /// policy is `monitor-only` or score < `block_at`).
-    Review,
-    /// Reject the counterparty (score >= the policy's `block_at`, or a
-    /// sanctions match — regardless of policy).
-    Block,
-}
-
-/// Which rule produced the decision — the first line of the explainability
-/// contract (§11: a block/review must be auditable). Snake_case on the wire;
-/// t3 adds the full per-factor breakdown alongside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionBasis {
-    /// A sanctions-list match hard-blocked, bypassing the policy's
-    /// thresholds entirely (§8.5).
-    SanctionsHardBlock,
-    /// The score fell through the policy's thresholds.
-    ScoreThresholds,
-}
-
 /// The two decision-driving facts, distilled from the intelligence reply at
 /// the transport edge (`crate::intelligence_client`'s `From` impl — the only
 /// place the wire type is read for a decision). `score` is already clamped
 /// into `0..=100` there, so this layer never sees an out-of-range value and
 /// needs no defensive checks of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScreeningInput {
     /// 0–100, "how risky" (§8.3).
     pub score: u8,
     /// The address matched at least one sanctions list (§8.5).
     pub sanctioned: bool,
+    /// The full per-factor breakdown behind `score`, each with its
+    /// `evidence_ref` — carried through to [`Verdict::factors`] untouched;
+    /// this layer decides through the score, never re-derives it from the
+    /// factors (§8.3's score/confidence pass already did that).
+    pub factors: Vec<RiskFactor>,
 }
 
 /// The outcome of one screening decision, plus the exact policy that
 /// produced it — `name`/`version` are what makes a `block`/`review` from six
 /// months ago reconstructible even after the customer has since retuned the
 /// policy's thresholds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
     pub decision: Decision,
     pub basis: DecisionBasis,
     pub policy_name: String,
     pub policy_version: i32,
+    /// The full per-factor breakdown behind the score that produced
+    /// `decision` (§11 Sprint 14 t3) — carried on every verdict regardless of
+    /// outcome (the access-audit record wants it even for a borderline
+    /// `allow`), though `POST /v1/address/{addr}/screen`'s response only
+    /// serializes it on a `review`/`block` (see `crate::http::screen_address`).
+    pub factors: Vec<RiskFactor>,
 }
 
 /// Map the decision-driving facts through `policy` to the §11 outcome.
@@ -285,19 +278,23 @@ pub struct Verdict {
 /// policy — `monitor-only` softens score-driven blocking, never the
 /// sanctions override.
 pub fn decide(input: ScreeningInput, policy: &Policy) -> Verdict {
-    if input.sanctioned {
-        return Verdict {
-            decision: Decision::Block,
-            basis: DecisionBasis::SanctionsHardBlock,
-            policy_name: policy.name.clone(),
-            policy_version: policy.version,
-        };
-    }
+    // Taken by value so the factor breakdown *moves* into the verdict (and on
+    // into the audit event) with no clone on the p50 < 100ms path; the caller
+    // captures the Copy `sanctioned` flag before deciding if it still needs it.
+    let (decision, basis) = if input.sanctioned {
+        (Decision::Block, DecisionBasis::SanctionsHardBlock)
+    } else {
+        (
+            policy.thresholds.classify(input.score),
+            DecisionBasis::ScoreThresholds,
+        )
+    };
     Verdict {
-        decision: policy.thresholds.classify(input.score),
-        basis: DecisionBasis::ScoreThresholds,
+        decision,
+        basis,
         policy_name: policy.name.clone(),
         policy_version: policy.version,
+        factors: input.factors,
     }
 }
 
@@ -306,7 +303,11 @@ mod tests {
     use super::*;
 
     fn input(score: u8, sanctioned: bool) -> ScreeningInput {
-        ScreeningInput { score, sanctioned }
+        ScreeningInput {
+            score,
+            sanctioned,
+            factors: vec![],
+        }
     }
 
     /// The `default` built-in policy's boundaries, pinned exactly: 39 allows,

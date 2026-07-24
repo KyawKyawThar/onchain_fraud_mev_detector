@@ -22,6 +22,10 @@ const DEFAULT_USAGE_CHANNEL_CAPACITY: usize = 1024;
 /// `deploy/prometheus-rules.yml`'s provisional SLO thresholds document).
 const DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE: u32 = 120;
 
+/// Screening access-audit queue capacity when `AUDIT_CHANNEL_CAPACITY` is
+/// unset (§11, Sprint 14 t3).
+const DEFAULT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
+
 /// All runtime configuration for the public §11 API service: where to bind,
 /// where to reach the three internal services it fronts, and the JWT
 /// verification settings that gate every `/v1` route.
@@ -58,6 +62,12 @@ pub struct Config {
     /// ones are dropped with a `warn` rather than stalling customer calls.
     /// Defaults to [`DEFAULT_USAGE_CHANNEL_CAPACITY`].
     pub usage_channel_capacity: usize,
+    /// Capacity of the screening access-audit queue between the request path
+    /// and the `ScreeningDecisionRecorded` Kafka publisher (§11, Sprint 14
+    /// t3, see `src/audit.rs`) — the same non-blocking-request-path shape as
+    /// `usage_channel_capacity`, for the same p50 < 100ms SLO reason.
+    /// Defaults to [`DEFAULT_AUDIT_CHANNEL_CAPACITY`].
+    pub audit_channel_capacity: usize,
     /// Client-side deadline on the screening gRPC read (§11), from
     /// `SCREENING_DEADLINE_MS` (default
     /// [`crate::intelligence_client::DEFAULT_SCREENING_DEADLINE`]). `/screen`
@@ -142,6 +152,10 @@ impl Config {
             usage_channel_capacity: channel_capacity(
                 "USAGE_CHANNEL_CAPACITY",
                 DEFAULT_USAGE_CHANNEL_CAPACITY,
+            )?,
+            audit_channel_capacity: channel_capacity(
+                "AUDIT_CHANNEL_CAPACITY",
+                DEFAULT_AUDIT_CHANNEL_CAPACITY,
             )?,
             screening_deadline: screening_deadline()?,
             screening_rate_limit_per_minute: screening_rate_limit_per_minute()?,

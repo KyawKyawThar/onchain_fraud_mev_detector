@@ -45,7 +45,9 @@ use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
     IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted, SimulationRequested,
 };
-use events::system::UsageRecorded;
+use events::system::{
+    ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
+};
 use events::{DomainEvent, EventEnvelope};
 use serde_json::json;
 use strum::{EnumCount, VariantNames};
@@ -260,6 +262,24 @@ fn sample_events() -> Vec<DomainEvent> {
             quantity: 1,
             timestamp: ts(),
         }),
+        DomainEvent::ScreeningDecisionRecorded(ScreeningDecisionRecorded {
+            customer_id: customer_id(),
+            address: addr(),
+            decision: ScreeningDecision::Block,
+            decision_basis: ScreeningDecisionBasis::SanctionsHardBlock,
+            policy_name: "default".into(),
+            policy_version: 1,
+            score: 87,
+            confidence: 0.7,
+            sanctioned: true,
+            model_version: "risk-v1".into(),
+            factors: vec![RiskFactor {
+                name: "sanctions-match".into(),
+                delta: 45.0,
+                evidence_ref: "sanctions:ofac_sdn".into(),
+            }],
+            timestamp: ts(),
+        }),
         // Predictive (§16)
         DomainEvent::PredictedAlert(PredictedAlert {
             prediction_id: prediction_id(),
@@ -379,6 +399,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "UsageRecorded",
         r#"{"type":"UsageRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","event_type":"api_query","quantity":1,"timestamp":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "ScreeningDecisionRecorded",
+        r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z"}}"#,
     ),
     (
         "PredictedAlert",

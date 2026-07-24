@@ -18,6 +18,7 @@
 //! Keeping this in a library (mirrors `event-store`) is what lets the router/
 //! auth tests exercise the real types without a running process.
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod http;
