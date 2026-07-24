@@ -32,7 +32,7 @@ set of types that drift freely.
 | **Simulation** (§7) | `SimulationRequested`, `SimulationCompleted`, `IncidentCreated`, `IncidentRetracted`, `IncidentFinalized` | simulation |
 | **Intelligence** (§8) | `LabelAdded`, `LabelUpdated`, `LabelRevoked`, `EntityCreated`, `EntityMerged`, `EntitySplit`, `AttributionUpdated`, `RiskScoreUpdated`, `SanctionHit` | intelligence |
 | **Rule engine** (§9) | `RuleCreated`, `RuleTriggered`, `RuleAlertCreated` | rule-engine |
-| **System** (§13) | `UsageRecorded` | api |
+| **System** (§13) | `UsageRecorded`, `ScreeningDecisionRecorded` | api |
 | **Predictive** (§16) | `PredictedAlert` | predictive |
 
 ### Not in the contract: commands

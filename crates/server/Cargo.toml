@@ -21,7 +21,12 @@ workspace = true
 test-util = []
 
 [dependencies]
-events = { workspace = true }
+# `openapi` on: the §11 screening decision/basis vocabulary
+# (`events::system::ScreeningDecision`/`ScreeningDecisionBasis`) is the shared
+# domain type this service re-exports as `screen::Decision`/`DecisionBasis` and
+# serves in the `POST /v1/address/{addr}/screen` OpenAPI schema, so it needs the
+# `utoipa::ToSchema` derive the feature turns on.
+events = { workspace = true, features = ["openapi"] }
 telemetry = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -89,6 +94,11 @@ chrono = { workspace = true }
 [dev-dependencies]
 # Shared recording `EventSink` for the usage-publisher tests (§13).
 event-bus = { workspace = true, features = ["test-util"] }
+# A real `IntelligenceReadService` (in-memory stores) for the end-to-end
+# `/screen` test — proves the factor breakdown and the access-audit record
+# survive the whole wire→domain→policy chain, not just each layer in
+# isolation (§11, Sprint 14 t3).
+intelligence = { workspace = true, features = ["test-util"] }
 # The in-memory `RuleStore` double for the `POST /v1/rules` handler tests.
 rule-engine = { workspace = true, features = ["test-util"] }
 # Self-dependency with `test-util` on, so `tests/ws_stream.rs` sees the

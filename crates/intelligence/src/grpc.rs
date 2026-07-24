@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use events::intelligence::RiskScoreUpdated;
+use events::intelligence::{RiskFactor, RiskScoreUpdated};
 use events::primitives::{AccountAddress, Chain, EntityId};
 use tonic::{Request, Response, Status};
 
@@ -31,8 +31,8 @@ use crate::pb::intelligence_read_server::IntelligenceRead;
 use crate::pb::{
     BuilderLeaderboardReply, BuilderLeaderboardRequest, BuilderStats, EntityGraphReply,
     EntityGraphRequest, EntityTimelineReply, EntityTimelineRequest, GraphEdge, GraphNode, Label,
-    LabelsReply, LabelsRequest, RelayStats, RiskScoreReply, RiskScoreRequest, SanctionMatch,
-    ScreeningFactsReply, ScreeningFactsRequest, TimelineMilestone,
+    LabelsReply, LabelsRequest, RelayStats, RiskFactor as PbRiskFactor, RiskScoreReply,
+    RiskScoreRequest, SanctionMatch, ScreeningFactsReply, ScreeningFactsRequest, TimelineMilestone,
 };
 use crate::risk::{self, MODEL_VERSION};
 use crate::risk_scorer;
@@ -235,6 +235,14 @@ fn to_pb_sanction(entry: &SanctionEntry) -> SanctionMatch {
     }
 }
 
+fn to_pb_risk_factor(factor: &RiskFactor) -> PbRiskFactor {
+    PbRiskFactor {
+        name: factor.name.clone(),
+        delta: factor.delta,
+        evidence_ref: factor.evidence_ref.clone(),
+    }
+}
+
 fn to_pb_screening(facts: &CachedScreeningFacts) -> ScreeningFactsReply {
     ScreeningFactsReply {
         score: u32::from(facts.score),
@@ -245,6 +253,7 @@ fn to_pb_screening(facts: &CachedScreeningFacts) -> ScreeningFactsReply {
         labels: facts.labels.iter().map(to_pb_label).collect(),
         entity_id: facts.entity_id.map(|id| id.to_string()),
         entity_size: facts.entity_size,
+        factors: facts.factors.iter().map(to_pb_risk_factor).collect(),
     }
 }
 
@@ -362,6 +371,7 @@ impl IntelligenceRead for IntelligenceReadService {
                 .unwrap_or(0),
             sanctions: recomputed.inputs.sanctions,
             labels: recomputed.inputs.labels,
+            factors: recomputed.result.factors.clone(),
         };
 
         // Best-effort repopulate of the bundle *and* the plain score cache —
@@ -730,6 +740,11 @@ mod tests {
                     labels: vec![],
                     entity_id: Some(entity_id),
                     entity_size: 4,
+                    factors: vec![RiskFactor {
+                        name: "sanctions-match".into(),
+                        delta: 45.0,
+                        evidence_ref: "sanctions:ofac_sdn".into(),
+                    }],
                 },
             )
             .await
@@ -750,6 +765,9 @@ mod tests {
         assert_eq!(reply.sanctions[0].entry, "Evil Corp");
         assert_eq!(reply.entity_id, Some(entity_id.to_string()));
         assert_eq!(reply.entity_size, 4);
+        assert_eq!(reply.factors.len(), 1);
+        assert_eq!(reply.factors[0].name, "sanctions-match");
+        assert_eq!(reply.factors[0].evidence_ref, "sanctions:ofac_sdn");
     }
 
     /// A miss computes live from the stores — sanctions, labels and entity
@@ -803,9 +821,18 @@ mod tests {
         assert_eq!(reply.labels[0].value, "drainer");
         assert_eq!(reply.entity_id, Some(entity_id.to_string()));
         assert_eq!(reply.entity_size, 1);
+        // Two factors (sanction + label), each carrying the evidence_ref the
+        // explainability contract requires (§11 Sprint 14 t3).
+        assert_eq!(reply.factors.len(), 2);
+        assert!(reply.factors.iter().all(|f| !f.evidence_ref.is_empty()));
 
         let bundle = cache.screening_facts(&address).await.unwrap();
         assert!(bundle.is_some(), "the miss should populate the bundle");
+        assert_eq!(
+            bundle.unwrap().factors.len(),
+            2,
+            "the cached bundle carries the same factor breakdown as the reply"
+        );
         let score = cache.score(&address, MODEL_VERSION).await.unwrap();
         assert_eq!(
             score.map(|s| s.score),
@@ -831,6 +858,7 @@ mod tests {
         assert!(reply.sanctions.is_empty());
         assert!(reply.labels.is_empty());
         assert_eq!(reply.entity_id, None);
+        assert!(reply.factors.is_empty());
     }
 
     #[test]

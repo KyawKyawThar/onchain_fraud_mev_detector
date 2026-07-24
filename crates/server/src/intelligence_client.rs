@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use api_error::ApiError;
+use events::intelligence::RiskFactor;
 use events::primitives::AccountAddress;
 use intelligence::model::address_key;
 use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
@@ -71,6 +72,15 @@ impl From<&ScreeningFactsReply> for ScreeningInput {
             // The wire is u32 for proto ergonomics; the domain is 0..=100.
             score: facts.score.min(100) as u8,
             sanctioned: !facts.sanctions.is_empty(),
+            factors: facts
+                .factors
+                .iter()
+                .map(|f| RiskFactor {
+                    name: f.name.clone(),
+                    delta: f.delta,
+                    evidence_ref: f.evidence_ref.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -241,10 +251,11 @@ impl IntelligenceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intelligence::pb::SanctionMatch;
+    use intelligence::pb::{RiskFactor as PbRiskFactor, SanctionMatch};
 
     /// The wire→domain distillation: the u32 score clamps saturating into
-    /// the domain's 0..=100, and "sanctioned" is any non-empty match list.
+    /// the domain's 0..=100, "sanctioned" is any non-empty match list, and
+    /// every factor's `evidence_ref` survives untouched (§11 Sprint 14 t3).
     #[test]
     fn screening_reply_distills_into_the_decision_input() {
         let sanctioned = ScreeningFactsReply {
@@ -253,11 +264,18 @@ mod tests {
                 list: "ofac_sdn".into(),
                 entry: "Evil Corp".into(),
             }],
+            factors: vec![PbRiskFactor {
+                name: "sanctions-match".into(),
+                delta: 45.0,
+                evidence_ref: "sanctions:ofac_sdn".into(),
+            }],
             ..Default::default()
         };
         let input = ScreeningInput::from(&sanctioned);
         assert_eq!(input.score, 100);
         assert!(input.sanctioned);
+        assert_eq!(input.factors.len(), 1);
+        assert_eq!(input.factors[0].evidence_ref, "sanctions:ofac_sdn");
 
         let clean = ScreeningFactsReply {
             score: 39,

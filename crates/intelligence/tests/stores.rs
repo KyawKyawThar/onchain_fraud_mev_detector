@@ -677,6 +677,11 @@ async fn hot_cache_round_trips_expires_and_evicts() {
         labels: cache.labels(&wallet).await.expect("labels").unwrap(),
         entity_id: Some(events::primitives::EntityId::new()),
         entity_size: 3,
+        factors: vec![events::intelligence::RiskFactor {
+            name: "sanctions-match".into(),
+            delta: 45.0,
+            evidence_ref: "sanction:ofac_sdn:Evil Corp".into(),
+        }],
     };
     cache
         .put_screening_facts(&wallet, &facts)
