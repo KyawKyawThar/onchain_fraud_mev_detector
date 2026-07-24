@@ -1,7 +1,9 @@
 //! System events (§2). Cross-cutting facts not owned by a single domain
-//! service — currently just metered usage, which feeds billing (§13).
+//! service — metered usage (feeds billing, §13) and the counterparty-
+//! screening access-audit trail (§11).
 
-use crate::primitives::CustomerId;
+use crate::intelligence::RiskFactor;
+use crate::primitives::{AccountAddress, CustomerId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,76 @@ impl UsageEventType {
     pub fn as_wire_str(self) -> &'static str {
         self.into()
     }
+}
+
+/// The synchronous counterparty-screening outcome (§11): the closed,
+/// spec-defined `allow`/`review`/`block` vocabulary. A *typed* field on the
+/// wire (like [`crate::primitives::AlertKind`]/[`crate::primitives::Severity`],
+/// not the open-ended `String` [`UsageRecorded::event_type`] uses) — the set
+/// is fixed by §11, so a compliance consumer of [`ScreeningDecisionRecorded`]
+/// matches an enum rather than re-parsing a raw string. The API service's
+/// decision kernel produces this same type (`server::screen::Decision` is a
+/// re-export), so the response, the event, and the kernel can never disagree
+/// on the wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ScreeningDecision {
+    /// No blocking signals (score below the policy's review threshold).
+    Allow,
+    /// Hold for manual compliance review.
+    Review,
+    /// Reject the counterparty (score at/above the block threshold, or a
+    /// sanctions match — regardless of policy).
+    Block,
+}
+
+/// Which rule produced a [`ScreeningDecision`] — the first line of the §11
+/// explainability contract, alongside [`ScreeningDecisionRecorded::factors`].
+/// Typed on the wire for the same reason as [`ScreeningDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ScreeningDecisionBasis {
+    /// A sanctions-list match hard-blocked, bypassing the policy's thresholds
+    /// entirely (§8.5).
+    SanctionsHardBlock,
+    /// The score fell through the policy's thresholds.
+    ScoreThresholds,
+}
+
+/// One synchronous counterparty-screening decision (§11, Sprint 14 t3): the
+/// access-audit record `POST /v1/address/{addr}/screen` writes onto the
+/// backbone the moment it answers. Independent of [`UsageRecorded`] —
+/// `ScreeningCall` (t4) meters *that* the call happened, this event records
+/// *what it decided*, so a `block`/`review` (or `allow`) is reconstructible
+/// after the fact without a second round-trip to intelligence: `factors`
+/// carries the full per-factor breakdown with `evidence_ref`s that produced
+/// `score`, the same explainability discipline as `RiskScoreUpdated` (§8.3),
+/// and `policy_name`/`policy_version` pin the exact thresholds that decided
+/// it even after the customer retunes the policy later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ScreeningDecisionRecorded {
+    pub customer_id: CustomerId,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub address: AccountAddress,
+    pub decision: ScreeningDecision,
+    pub decision_basis: ScreeningDecisionBasis,
+    pub policy_name: String,
+    pub policy_version: i32,
+    /// 0-100, "how risky" (§8.3).
+    pub score: u32,
+    /// 0-1, "how sure".
+    pub confidence: f64,
+    /// The address matched at least one sanctions list (§8.5).
+    pub sanctioned: bool,
+    pub model_version: String,
+    /// The full per-factor breakdown behind `score`, each with its
+    /// `evidence_ref` — present regardless of `decision` so an `allow` that
+    /// was close to the line is just as reconstructible as a `block`.
+    pub factors: Vec<RiskFactor>,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use events::intelligence::RiskFactor;
 use events::primitives::{AccountAddress, Confidence, EntityId};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -71,10 +72,12 @@ pub struct CachedScore {
 /// Every decision input the synchronous screening endpoint (§11) reads for
 /// one address, cached as a single bundle so the latency-critical path is one
 /// Redis `GET`: the §8.3 score axes plus the sanctions matches (the §8.5
-/// hard-block signal), active labels and entity membership. Deliberately
-/// duplicates what `intel:labels`/`intel:scores` hold — the cache is an
-/// optimization, never the record, and the same [`HotCache::evict`] clears
-/// all three together so they can't drift apart past the TTL backstop.
+/// hard-block signal), active labels, entity membership, and the full
+/// per-factor breakdown behind the score (§11 Sprint 14 t3 — the caller's
+/// explainability contract on a block/review). Deliberately duplicates what
+/// `intel:labels`/`intel:scores` hold — the cache is an optimization, never
+/// the record, and the same [`HotCache::evict`] clears all three together so
+/// they can't drift apart past the TTL backstop.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedScreeningFacts {
     /// 0–100, "how risky".
@@ -91,6 +94,10 @@ pub struct CachedScreeningFacts {
     pub entity_id: Option<EntityId>,
     /// Member count of that entity (0 when unclustered).
     pub entity_size: u32,
+    /// The factors behind `score`, already bounded by `risk::score`'s
+    /// visible-factor cap — the same capped set `RiskScoreUpdated` carries,
+    /// reused rather than recomputed.
+    pub factors: Vec<RiskFactor>,
 }
 
 /// The hot-path cache seam. Object-safe; production is [`RedisHotCache`],
@@ -404,6 +411,11 @@ mod tests {
             )],
             entity_id: Some(EntityId::new()),
             entity_size: 3,
+            factors: vec![RiskFactor {
+                name: "known-scammer-label".into(),
+                delta: 40.0,
+                evidence_ref: "label:drainer".into(),
+            }],
         };
         let json = serde_json::to_string(&facts).unwrap();
         let back: CachedScreeningFacts = serde_json::from_str(&json).unwrap();

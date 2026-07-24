@@ -98,6 +98,19 @@ message SanctionMatch {
   string entry = 2;
 }
 
+// One risk-score factor (§8.3): a signed contribution plus the evidence
+// reference behind it. Mirrors `events::intelligence::RiskFactor` — the
+// same explainability discipline carried onto the screening decision (§11,
+// Sprint 14 t3), so a `block`/`review` is reconstructible without a second
+// round trip to intelligence.
+message RiskFactor {
+  string name = 1;
+  // Signed contribution to the score for this factor.
+  double delta = 2;
+  // Pointer to the evidence (incident id, label id, …) behind this factor.
+  string evidence_ref = 3;
+}
+
 message ScreeningFactsReply {
   // 0-100, "how risky" (§8.3).
   uint32 score = 1;
@@ -114,6 +127,10 @@ message ScreeningFactsReply {
   optional string entity_id = 7;
   // Member count of that entity (0 when unclustered).
   uint32 entity_size = 8;
+  // The full per-factor breakdown behind `score`, bounded the same way
+  // `RiskScoreUpdated.factors` is (§8.3) — the explainability contract
+  // `POST /v1/address/{addr}/screen` surfaces on a block/review (§11).
+  repeated RiskFactor factors = 9;
 }
 
 message BuilderLeaderboardRequest {

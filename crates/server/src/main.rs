@@ -7,7 +7,9 @@
 //! Boot: observability, resolve config, build the outbound clients (a lazy
 //! gRPC channel to intelligence, a `reqwest::Client` for the two HTTP
 //! proxies, a broadcast channel + Kafka consumer for the WS stream, and a
-//! Kafka producer publishing every metered call as `UsageRecorded`, §13), then
+//! Kafka producer publishing every metered call as `UsageRecorded` (§13) and
+//! every screening decision as `ScreeningDecisionRecorded` (§11, Sprint 14
+//! t3)), then
 //! serve until a shutdown signal — the same `CancellationToken` +
 //! graceful-drain shape every other service in this workspace uses. A fatal
 //! consumer error cancels the token too (mirrors event-store), so the whole
@@ -20,6 +22,7 @@ use anyhow::{Context, Result};
 use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
 use rule_engine::store::PgRuleStore;
 use secrecy::ExposeSecret;
+use server::audit::{self, AuditRecorder};
 use server::config::Config;
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
@@ -60,6 +63,7 @@ async fn main() -> Result<()> {
         .context("building the outbound HTTP client")?;
     let (alerts_tx, _) = tokio::sync::broadcast::channel(cfg.alert_channel_capacity);
     let (usage_recorder, usage_rx) = UsageRecorder::channel(cfg.usage_channel_capacity);
+    let (audit_recorder, audit_rx) = AuditRecorder::channel(cfg.audit_channel_capacity);
 
     // ── Rule store (§9, Sprint 9 t4) ───────────────────────────────────
     // `POST /v1/rules` writes through the rule-engine crate's customer-
@@ -96,6 +100,7 @@ async fn main() -> Result<()> {
         jwt: cfg.jwt.clone(),
         alerts: alerts_tx.clone(),
         usage: usage_recorder,
+        audit: audit_recorder,
         rules: Arc::new(rule_store),
         events: sink.clone(),
         policies: Arc::new(policy_store),
@@ -121,8 +126,17 @@ async fn main() -> Result<()> {
     // The topic is provisioned by event-store's `ensure_topics` like every
     // other.
     let usage_task = tokio::spawn(usage::run(
-        sink,
+        sink.clone(),
         usage_rx,
+        PUBLISH_BACKOFF,
+        shutdown.clone(),
+    ));
+
+    // ── ScreeningDecisionRecorded publisher (§11 Sprint 14 t3, background
+    // task) — the access-audit trail, sharing the same Kafka producer.
+    let audit_task = tokio::spawn(audit::run(
+        sink,
+        audit_rx,
         PUBLISH_BACKOFF,
         shutdown.clone(),
     ));
@@ -159,6 +173,9 @@ async fn main() -> Result<()> {
     // The server has drained — wait for the background tasks to finish and
     // surface a fatal error as a non-zero exit.
     usage_task.await.context("usage publisher task panicked")?;
+    audit_task
+        .await
+        .context("screening audit publisher task panicked")?;
     let stream_result = stream_task
         .await
         .context("/v1/stream consumer task panicked")?;

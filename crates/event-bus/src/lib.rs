@@ -50,6 +50,7 @@ pub mod usage;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -60,6 +61,7 @@ use rdkafka::message::{BorrowedMessage, Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
 use telemetry::propagation::{self, HeaderCarrier};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -225,6 +227,117 @@ pub async fn publish_resilient(
             }
         }
     }
+}
+
+/// Default post-shutdown flush window for a [`drain_to_backbone`] producer —
+/// bounds how long a graceful shutdown keeps draining a backlog before
+/// abandoning the rest, so a broker that's down *at* shutdown can't hang exit.
+/// A healthy shutdown drains fully in well under this.
+pub const BACKBONE_FLUSH_GRACE: Duration = Duration::from_secs(5);
+
+/// The per-producer configuration for [`drain_to_backbone`] — the caller's
+/// item-specific behavior and identity, kept apart from the loop's runtime
+/// handles (sink, channel, shutdown). `T` is the queued item (e.g.
+/// `UsageRecorded`, `ScreeningDecisionRecorded`).
+pub struct BackboneProducer<ToEnvelope, OnDropped> {
+    /// Map a queued item to the envelope published on the backbone — the chain
+    /// stamp and `DomainEvent` variant stay the producer's decision, not the
+    /// loop's, so partition keying (§20) is owned where it's understood.
+    pub to_envelope: ToEnvelope,
+    /// Called for each item the shutdown-flush deadline drops — a metric bump
+    /// with the producer's own labels, so the loss is observable, never silent.
+    pub on_dropped: OnDropped,
+    /// Post-shutdown flush window (normally [`BACKBONE_FLUSH_GRACE`]; tests
+    /// shrink it).
+    pub flush_grace: Duration,
+    /// Names the stream in the structured log lines (`"usage"`, …).
+    pub name: &'static str,
+}
+
+/// The graceful-drain discipline for a **non-blocking backbone producer**: the
+/// request path records items through a bounded channel with a cheap,
+/// never-blocking `try_send` (so latency-critical work — usage metering (§13),
+/// the screening access-audit (§11) — can't stall the caller), and this loop
+/// drains that channel onto `sink` in the background. It is the sibling of
+/// [`publish_resilient`]: one tested place the two-phase flush lives, so every
+/// SLO-sensitive producer shares it instead of re-hand-rolling the shutdown
+/// bookkeeping (which is exactly where a "lost a billable/legal event on the
+/// way down" bug hides).
+///
+/// Two phases:
+/// 1. **Normal** — map each item to its envelope
+///    ([`BackboneProducer::to_envelope`]) and publish it through
+///    [`publish_resilient`] (at-least-once over `backoff`) until `shutdown`
+///    fires or the channel closes on its own (every sender dropped — which,
+///    when the sender lives in the server state, happens only *after* an
+///    in-flight request has finished recording).
+/// 2. **Shutdown flush** — keep draining what's still queued, hard-bounded by
+///    [`BackboneProducer::flush_grace`]; the `timeout` cancels mid-publish if
+///    the deadline hits, so the bound holds even against a single stuck send.
+///    Anything the deadline cuts off is handed to
+///    [`BackboneProducer::on_dropped`] so the loss is observable, never silent.
+pub async fn drain_to_backbone<T, ToEnvelope, OnDropped>(
+    sink: Arc<dyn EventSink>,
+    mut rx: mpsc::Receiver<T>,
+    backoff: Duration,
+    shutdown: CancellationToken,
+    producer: BackboneProducer<ToEnvelope, OnDropped>,
+) where
+    T: Send,
+    ToEnvelope: Fn(T) -> EventEnvelope,
+    OnDropped: Fn(&T),
+{
+    let BackboneProducer {
+        to_envelope,
+        on_dropped,
+        flush_grace,
+        name,
+    } = producer;
+
+    // Phase 1 — normal operation: publish each item until shutdown is signalled,
+    // or the channel closes on its own (all senders gone).
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            maybe = rx.recv() => match maybe {
+                Some(item) => {
+                    publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown).await
+                }
+                None => {
+                    tracing::info!(producer = name, "backbone producer stopped; channel drained");
+                    return;
+                }
+            },
+        }
+    }
+
+    // Phase 2 — shutdown signalled: keep flushing what's queued (the server may
+    // still be draining in-flight requests that record), hard-bounded by
+    // `flush_grace` so a broker down at shutdown can't hang exit.
+    let flushed = tokio::time::timeout(flush_grace, async {
+        while let Some(item) = rx.recv().await {
+            publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown).await;
+        }
+    })
+    .await;
+
+    if flushed.is_err() {
+        // The deadline cut the drain off — whatever is still queued is lost.
+        // Hand each to `on_dropped` (metric + caller labels) so the gap has a
+        // cause, then log the count.
+        let mut lost = 0u64;
+        while let Ok(item) = rx.try_recv() {
+            lost += 1;
+            on_dropped(&item);
+        }
+        tracing::warn!(
+            producer = name,
+            lost,
+            "backbone flush deadline exceeded at shutdown; queued items not published"
+        );
+    }
+    tracing::info!(producer = name, "backbone producer stopped");
 }
 
 // ── Consume seam (the symmetric half of EventSink) ───────────────────────────
@@ -580,5 +693,130 @@ mod tests {
         shutdown.cancel(); // already cancelled → the retry select takes this arm
         publish_resilient(&sink, an_envelope(), Duration::from_secs(3600), &shutdown).await;
         assert!(sink.delivered.lock().unwrap().is_empty());
+    }
+
+    // ── drain_to_backbone (the shared non-blocking producer discipline) ──────
+
+    /// A sink whose publish never resolves — models a broker that hangs at
+    /// shutdown, to prove the flush is bounded rather than open-ended.
+    struct HangingSink;
+
+    #[async_trait]
+    impl EventSink for HangingSink {
+        async fn publish(&self, _envelope: EventEnvelope) -> Result<(), PublishError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Drive the loop with plain envelopes (identity mapping), a given flush
+    /// grace, and a no-op drop hook — the config the two "happy path" tests
+    /// below use. Built inline (not returned from a helper) because a
+    /// return-position `impl Fn(&EventEnvelope)` can't carry the higher-ranked
+    /// lifetime the loop needs.
+    macro_rules! identity_producer {
+        ($grace:expr) => {
+            BackboneProducer {
+                to_envelope: |e| e,
+                on_dropped: |_: &EventEnvelope| {},
+                flush_grace: $grace,
+                name: "test",
+            }
+        };
+    }
+
+    /// A queued item is published, and the loop returns when the channel closes
+    /// (every sender dropped) — the normal, non-shutdown exit.
+    #[tokio::test]
+    async fn drain_publishes_until_the_channel_closes() {
+        let sink = Arc::new(crate::test_util::RecordingSink::default());
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(an_envelope()).unwrap();
+        drop(tx); // close the channel so the loop drains and returns
+
+        drain_to_backbone(
+            sink.clone(),
+            rx,
+            Duration::from_millis(1),
+            CancellationToken::new(),
+            identity_producer!(BACKBONE_FLUSH_GRACE),
+        )
+        .await;
+
+        assert_eq!(sink.envelopes().len(), 1);
+    }
+
+    /// An item queued when shutdown fires is still flushed on the way out —
+    /// the production win over "drop everything on shutdown".
+    #[tokio::test]
+    async fn drain_flushes_what_is_queued_at_shutdown() {
+        let sink = Arc::new(crate::test_util::RecordingSink::default());
+        let (tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        tx.try_send(an_envelope()).unwrap();
+        drop(tx);
+
+        drain_to_backbone(
+            sink.clone(),
+            rx,
+            Duration::from_millis(1),
+            shutdown,
+            identity_producer!(BACKBONE_FLUSH_GRACE),
+        )
+        .await;
+
+        assert_eq!(sink.envelopes().len(), 1, "a queued item must be flushed");
+    }
+
+    /// Broker down at shutdown with the channel still open: only the flush
+    /// deadline can end the drain. It must return within its grace, and every
+    /// item the deadline cuts off is handed to `on_dropped`.
+    #[tokio::test]
+    async fn drain_flush_is_bounded_and_reports_the_dropped_items() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        tx.try_send(an_envelope()).unwrap();
+        tx.try_send(an_envelope()).unwrap();
+        shutdown.cancel();
+        // Keep `tx` alive so only the flush deadline (not a closed channel) can
+        // end the drain.
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped_in = dropped.clone();
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_to_backbone(
+                Arc::new(HangingSink),
+                rx,
+                Duration::from_millis(1),
+                shutdown,
+                BackboneProducer {
+                    to_envelope: |e| e,
+                    on_dropped: move |_: &EventEnvelope| {
+                        dropped_in.fetch_add(1, Ordering::SeqCst);
+                    },
+                    flush_grace: Duration::from_millis(50), // tiny grace so the test is fast
+                    name: "test",
+                },
+            ),
+        )
+        .await
+        .expect("drain must return within its flush grace, not hang on a stuck broker");
+
+        drop(tx);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "flush must be bounded by its grace window"
+        );
+        // The first item is stuck mid-publish in the hanging sink; the second is
+        // still queued when the deadline fires and is reported dropped.
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "the item still queued at the deadline is reported to on_dropped"
+        );
     }
 }

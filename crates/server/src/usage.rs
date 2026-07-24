@@ -22,9 +22,10 @@
 //! - **Graceful shutdown flushes, it doesn't discard.** The sender lives in the
 //!   HTTP state, so the channel only closes *after* the server has drained —
 //!   [`run`] keeps publishing until then, so a call metered during shutdown is
-//!   still delivered. A [`FLUSH_GRACE`]-bounded window caps that drain so a
-//!   broker that's down *at* shutdown can't hang the process; anything the
-//!   deadline cuts off is counted (metric + log), never silently dropped.
+//!   still delivered. The shared [`event_bus::BACKBONE_FLUSH_GRACE`] window
+//!   caps that drain so a broker that's down *at* shutdown can't hang the
+//!   process; anything the deadline cuts off is counted (metric + log), never
+//!   silently dropped.
 //!
 //! The honest residual: at-least-once holds from the moment [`run`] picks an
 //! event up. Exact reconciliation across a hard crash (SIGKILL, OOM) is the
@@ -39,7 +40,7 @@ use axum::response::Response;
 use axum::Extension;
 use chrono::Utc;
 use event_bus::usage::USAGE_RECORDED_TOTAL;
-use event_bus::{publish_resilient, EventSink};
+use event_bus::{drain_to_backbone, BackboneProducer, EventSink, BACKBONE_FLUSH_GRACE};
 use events::primitives::{Chain, CustomerId};
 use events::system::{UsageEventType, UsageRecorded};
 use events::{DomainEvent, EventEnvelope};
@@ -48,19 +49,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Counter (labeled by `event_type`): usage events *lost* — dropped because the
 /// publish queue was full (broker backlog) or still queued at shutdown past
-/// [`FLUSH_GRACE`]. Any non-zero rate is a billing gap; alert on it (§13).
+/// the flush grace. Any non-zero rate is a billing gap; alert on it (§13).
 ///
 /// No background-producer counterpart: `event_bus::usage::UsageFact::record`
 /// blocks and retries instead of dropping (see its module docs) — "dropped"
 /// is a concept unique to this bounded-queue, never-block-the-request path.
 pub const USAGE_DROPPED_TOTAL: &str = "usage_events_dropped_total";
-
-/// How long, after shutdown is signalled, [`run`] keeps draining its queue
-/// before abandoning the remainder. Bounds shutdown when the broker is down
-/// *at* shutdown (often the very reason a backlog exists) so it can't hang the
-/// process — a healthy shutdown drains fully in well under this. Anything still
-/// queued when it expires is counted as dropped, not silently lost.
-const FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// The non-blocking handle the request path records usage through. Cloned into
 /// `AppState`/middleware; the paired receiver is drained by [`run`].
@@ -136,111 +130,49 @@ pub async fn record_usage(
     response
 }
 
-/// Drain the recorder's channel onto the Kafka backbone. Publishes until the
-/// channel closes — every [`UsageRecorder`] dropped — which, because the sender
-/// lives in the HTTP state, happens only *after* the server has gracefully
-/// drained; so a call metered during shutdown is still published, not lost.
+/// Drain the recorder's channel onto the Kafka backbone via the shared
+/// [`drain_to_backbone`] discipline (the same two-phase graceful flush the
+/// screening access-audit producer uses, §11). Publishes until the channel
+/// closes — every [`UsageRecorder`] dropped — which, because the sender lives
+/// in the HTTP state, happens only *after* the server has gracefully drained;
+/// so a call metered during shutdown is still published, not lost.
 ///
-/// See [`FLUSH_GRACE`] for the post-shutdown bound. Each event ships as its own
-/// [`EventEnvelope`] through [`publish_resilient`], so a broker blip retries
-/// (over `backoff`) while running rather than losing a billable fact.
+/// Usage is not chain-scoped, but the envelope's partition key is (§20) —
+/// events are stamped [`Chain::ETHEREUM`], the same single-chain-MVP posture
+/// the intelligence consumers take; §13 aggregates by `customer_id`, never by
+/// chain, so the stamp only decides partition placement. Anything the flush
+/// deadline cuts off bumps [`USAGE_DROPPED_TOTAL`] (labeled by `event_type`)
+/// so a §13 discrepancy has a cause.
 pub async fn run(
     sink: Arc<dyn EventSink>,
     rx: mpsc::Receiver<UsageRecorded>,
     backoff: Duration,
     shutdown: CancellationToken,
 ) {
-    drain(sink, rx, backoff, shutdown, FLUSH_GRACE).await
-}
-
-/// The body of [`run`], with the flush window as a parameter so tests can drive
-/// it without waiting the production [`FLUSH_GRACE`].
-///
-/// Usage is not chain-scoped, but the envelope's partition key is (§20) —
-/// events are stamped [`Chain::ETHEREUM`], the same single-chain-MVP posture the
-/// intelligence consumers take; §13 aggregates by `customer_id`, never by chain,
-/// so the stamp only decides partition placement.
-async fn drain(
-    sink: Arc<dyn EventSink>,
-    mut rx: mpsc::Receiver<UsageRecorded>,
-    backoff: Duration,
-    shutdown: CancellationToken,
-    flush_grace: Duration,
-) {
-    // Phase 1 — normal operation: publish each event until shutdown is
-    // signalled, or the channel closes on its own (all senders gone).
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            maybe = rx.recv() => match maybe {
-                Some(usage) => publish_one(sink.as_ref(), usage, backoff, &shutdown).await,
-                None => {
-                    tracing::info!("usage publisher stopped; channel drained");
-                    return;
-                }
+    drain_to_backbone(
+        sink,
+        rx,
+        backoff,
+        shutdown,
+        BackboneProducer {
+            to_envelope: |usage| {
+                EventEnvelope::new(Chain::ETHEREUM, DomainEvent::UsageRecorded(usage))
             },
-        }
-    }
-
-    // Phase 2 — shutdown signalled: keep flushing what's queued (the server may
-    // still be draining in-flight requests that meter), but hard-bound the whole
-    // drain by `flush_grace` so a broker that's down at shutdown can't hang exit.
-    // `timeout` cancels the drain mid-publish if the deadline hits, so the bound
-    // holds even against a single stuck send.
-    let flushed = tokio::time::timeout(flush_grace, async {
-        while let Some(usage) = rx.recv().await {
-            publish_one(sink.as_ref(), usage, backoff, &shutdown).await;
-        }
-    })
-    .await;
-
-    if flushed.is_err() {
-        // Deadline cut the drain off — whatever is still queued is a billable
-        // loss. Count it (metric + log) so a §13 discrepancy has a cause.
-        let mut lost = 0u64;
-        while let Ok(usage) = rx.try_recv() {
-            lost += 1;
-            metrics::counter!(USAGE_DROPPED_TOTAL, "event_type" => usage.event_type).increment(1);
-        }
-        tracing::warn!(
-            lost,
-            "usage flush deadline exceeded at shutdown; queued events not published"
-        );
-    }
-    tracing::info!("usage publisher stopped");
-}
-
-/// Publish one metered event as its own envelope. Split out so [`drain`]'s two
-/// phases share exactly one produce path.
-async fn publish_one(
-    sink: &dyn EventSink,
-    usage: UsageRecorded,
-    backoff: Duration,
-    shutdown: &CancellationToken,
-) {
-    let envelope = EventEnvelope::new(Chain::ETHEREUM, DomainEvent::UsageRecorded(usage));
-    publish_resilient(sink, envelope, backoff, shutdown).await;
+            on_dropped: |usage: &UsageRecorded| {
+                metrics::counter!(USAGE_DROPPED_TOTAL, "event_type" => usage.event_type.clone())
+                    .increment(1);
+            },
+            flush_grace: BACKBONE_FLUSH_GRACE,
+            name: "usage",
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use event_bus::test_util::RecordingSink;
-    use event_bus::PublishError;
-    use std::time::Instant;
-
-    /// A sink whose publish never resolves — models a broker that hangs at
-    /// shutdown, to prove the flush is bounded rather than open-ended.
-    struct HangingSink;
-
-    #[async_trait]
-    impl EventSink for HangingSink {
-        async fn publish(&self, _envelope: EventEnvelope) -> Result<(), PublishError> {
-            std::future::pending().await
-        }
-    }
 
     fn customer() -> CustomerId {
         CustomerId(uuid::Uuid::from_u128(0xc0))
@@ -305,34 +237,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn shutdown_flush_is_bounded_even_if_publishing_hangs() {
-        // Broker down at shutdown with the channel still open: only the flush
-        // deadline can end the drain. It must return within its grace, not hang.
-        let (recorder, rx) = UsageRecorder::channel(8);
-        let shutdown = CancellationToken::new();
-        recorder.record(customer(), UsageEventType::ApiCallMade);
-        shutdown.cancel();
-
-        let start = Instant::now();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            drain(
-                Arc::new(HangingSink),
-                rx,
-                Duration::from_millis(1),
-                shutdown,
-                Duration::from_millis(50), // tiny grace so the test is fast
-            ),
-        )
-        .await
-        .expect("drain must return within its flush grace, not hang on a stuck broker");
-
-        // Proves the bound came from the deadline, not the channel closing.
-        drop(recorder);
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "flush must be bounded by its grace window"
-        );
-    }
+    // The shutdown-flush *bound* (broker hangs at shutdown → drain still returns
+    // within its grace) is a property of the shared `event_bus::drain_to_backbone`
+    // and is tested there, not re-proven per producer.
 }
