@@ -179,6 +179,28 @@ pub enum Severity {
     Critical,
 }
 
+/// The operator-facing next step a [`Severity`] band recommends for a
+/// provisional alert (§6) — a closed set so a consumer can render/route on it
+/// without inventing its own bucketing. Derived purely from `severity`
+/// (`detection::emit::suggested_action`); it carries no attribution opinion,
+/// only "how urgently should a human look at this."
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr, strum::EnumIter,
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SuggestedAction {
+    /// Low severity — log it, no operator action expected.
+    Monitor,
+    /// Medium severity — worth a human look, not urgent.
+    Investigate,
+    /// High severity — an operator should act on this alert.
+    Escalate,
+    /// Critical severity — page/act now.
+    EscalateImmediately,
+}
+
 // ── Strongly-typed ids ───────────────────────────────────────────
 // Newtypes over UUID so an `AlertId` can never be passed where an
 // `IncidentId` is expected. `#[serde(transparent)]` keeps the wire form a
@@ -308,6 +330,95 @@ impl TryFrom<f64> for Confidence {
     }
 }
 
+/// A `UsdAmount` was constructed from a value that isn't a finite, non-negative
+/// number.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("usd amount {value} is not a finite, non-negative number")]
+pub struct InvalidUsdAmount {
+    pub value: f64,
+}
+
+/// A non-negative USD quantity in *whole dollars* — a coarse, lossy estimate
+/// fit for banding/thresholding, never exact accounting (see
+/// `detector_api::TokenMeta::to_whole`).
+///
+/// A validated newtype rather than a bare `f64`, the same discipline as
+/// [`Confidence`] and `detector_api::UsdPrice`: a plain float silently admits a
+/// negative (nonsense for a magnitude) or a `NaN` (which poisons every `>`
+/// comparison a severity gate makes). Distinct from `UsdPrice` — that is a
+/// *price per token*; this is a *total value*. Two constructors, by intent:
+/// [`UsdAmount::new`] sanitizes and is for trusted in-code values already known
+/// finite and non-negative (a summed enrichment figure); [`UsdAmount::try_new`]
+/// validates and is for values crossing the process edge (deserialized input),
+/// where a bad value is a defect to surface, not mask.
+///
+/// This is *impact scale* only — how much value moved — and carries no opinion
+/// on *who* moved it; attribution stays off this path (§6/§8).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(value_type = f64))]
+pub struct UsdAmount(f64);
+
+impl UsdAmount {
+    /// Sanitize a trusted, in-code `value` into a non-negative, finite amount:
+    /// a `NaN` or negative collapses to `0.0`. Use for figures the process
+    /// itself produced and already knows are well-formed (a summed USD total);
+    /// the clamp is a defensive no-op there, and a belt-and-braces guard against
+    /// a stray non-finite reaching a threshold comparison. Mirrors
+    /// [`Confidence::new`].
+    pub fn new(value: f64) -> Self {
+        // `NaN.max(0.0) == 0.0` in Rust, so this rejects NaN too.
+        Self(if value.is_finite() {
+            value.max(0.0)
+        } else {
+            0.0
+        })
+    }
+
+    /// Validate `value` is finite and `>= 0.0`, erroring otherwise. Use for
+    /// values from outside the process (deserialized input, a feed) where
+    /// clamping would hide a defect. Mirrors `UsdPrice::try_new`.
+    pub fn try_new(value: f64) -> Result<Self, InvalidUsdAmount> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(InvalidUsdAmount { value })
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for UsdAmount {
+    type Error = InvalidUsdAmount;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+// Serde routes through `try_new` on the way *in*, so a `UsdAmount` deserialized
+// from an event on the wire is validated at the edge — a NaN or negative can't
+// slip in and silently poison a severity `>` comparison later. The wire form is
+// a bare JSON number (identical bytes to an `f64`), so this is a
+// backwards-compatible representation of the previously-raw field. Mirrors
+// `UsdPrice`'s validated (de)serialize.
+impl Serialize for UsdAmount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsdAmount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = f64::deserialize(deserializer)?;
+        Self::try_new(value).map_err(D::Error::custom)
+    }
+}
+
 /// Convenience alias for an on-chain account address.
 pub type AccountAddress = Address;
 
@@ -343,5 +454,48 @@ mod tests {
         assert_eq!(Chain::ETHEREUM.metrics_label(), "ethereum");
         assert_eq!(Chain::BASE.metrics_label(), "base");
         assert_eq!(Chain(424242).metrics_label(), "chain-424242");
+    }
+
+    #[test]
+    fn usd_amount_new_sanitizes_negative_and_non_finite_to_zero() {
+        assert_eq!(UsdAmount::new(1234.5).get(), 1234.5);
+        assert_eq!(UsdAmount::new(0.0).get(), 0.0);
+        assert_eq!(
+            UsdAmount::new(-1.0).get(),
+            0.0,
+            "a magnitude can't be negative"
+        );
+        assert_eq!(
+            UsdAmount::new(f64::NAN).get(),
+            0.0,
+            "NaN must never reach a gate"
+        );
+        assert_eq!(UsdAmount::new(f64::INFINITY).get(), 0.0);
+    }
+
+    #[test]
+    fn usd_amount_try_new_rejects_ill_formed_values() {
+        assert_eq!(UsdAmount::try_new(0.0).unwrap().get(), 0.0);
+        assert_eq!(UsdAmount::try_new(9_999.99).unwrap().get(), 9_999.99);
+        assert!(
+            UsdAmount::try_new(-0.01).is_err(),
+            "negative is a defect at the edge"
+        );
+        assert!(UsdAmount::try_new(f64::NAN).is_err());
+        assert!(UsdAmount::try_new(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn usd_amount_wire_form_is_a_bare_number_that_validates_on_read() {
+        // Serializes as a plain JSON number (same bytes as the previously-raw
+        // f64 field), so the change is wire-compatible.
+        let amount = UsdAmount::new(150_000.0);
+        assert_eq!(serde_json::to_string(&amount).unwrap(), "150000.0");
+        assert_eq!(
+            serde_json::from_str::<UsdAmount>("150000.0").unwrap(),
+            amount
+        );
+        // A negative/NaN on the wire is rejected at the deserialize edge.
+        assert!(serde_json::from_str::<UsdAmount>("-5.0").is_err());
     }
 }

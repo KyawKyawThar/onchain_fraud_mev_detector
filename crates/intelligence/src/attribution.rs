@@ -653,7 +653,7 @@ mod tests {
     };
     use alloy_primitives::Address;
     use events::detection::PreliminaryAlertCreated;
-    use events::primitives::{AlertKind, DetectorRef, Severity};
+    use events::primitives::{AlertKind, DetectorRef, Severity, SuggestedAction};
     use uuid::Uuid;
 
     fn addr(byte: u8) -> AccountAddress {
@@ -681,6 +681,9 @@ mod tests {
             kind: AlertKind::Sandwich,
             confidence: Confidence::new(0.9),
             provisional: true,
+            impact_usd: None,
+            severity: Severity::Low,
+            suggested_action: SuggestedAction::Monitor,
         }
     }
 

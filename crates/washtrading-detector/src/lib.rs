@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use detector_api::{
     Bps, CrossBlockDetector, DetectionCtx, DetectorId, Evidence, ModelKind, SemVer,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// Default trailing window, in blocks (matches `[detectors.wash_trading]
 /// window_blocks = 100`, §6).
@@ -357,12 +357,11 @@ impl WashTradingDetector {
             volume_usd,
             window_blocks: self.config.window_blocks,
         };
-        Some(Evidence::from_detail(
-            AlertKind::WashTrading,
-            agg.txs.clone(),
-            confidence,
-            &detail,
-        ))
+        Some(
+            Evidence::from_detail(AlertKind::WashTrading, agg.txs.clone(), confidence, &detail)
+                // Impact is the wash volume — the fabricated turnover.
+                .with_impact_usd(volume_usd.map(UsdAmount::new)),
+        )
     }
 }
 

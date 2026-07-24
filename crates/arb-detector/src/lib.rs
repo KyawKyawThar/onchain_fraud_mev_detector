@@ -38,7 +38,7 @@ use detector_api::{
     DetectionCtx, DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, TxActions,
     UsdPrice,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// Reference profit gate, matching the sandwich detector's default (§6).
 const DEFAULT_MIN_PROFIT_USD: f64 = 10.0;
@@ -212,12 +212,11 @@ impl ArbDetector {
             pools: tx.swaps.iter().map(|s| s.pool).collect(),
             hops,
         };
-        Some(Evidence::from_detail(
-            AlertKind::Arbitrage,
-            vec![tx.hash],
-            confidence,
-            &detail,
-        ))
+        Some(
+            Evidence::from_detail(AlertKind::Arbitrage, vec![tx.hash], confidence, &detail)
+                // Impact is the cycle's realised profit — the value extracted.
+                .with_impact_usd(profit_usd.map(UsdAmount::new)),
+        )
     }
 }
 

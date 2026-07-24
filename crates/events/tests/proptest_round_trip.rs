@@ -42,7 +42,7 @@ use events::intelligence::{
 };
 use events::primitives::{
     AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef, EntityId, IncidentId,
-    LabelId, RuleId, Severity,
+    LabelId, RuleId, Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -101,6 +101,15 @@ fn stable_fixed_point(f: f64) -> Option<f64> {
     (round_trip(r) == r).then_some(r)
 }
 
+/// A non-negative `UsdAmount`, restricted to codec-stable floats for the same
+/// reason as [`finite_f64`]; `new` is a no-op sanitize here since the input is
+/// already finite and `>= 0.0`.
+fn usd_amount() -> impl Strategy<Value = UsdAmount> {
+    (0.0f64..1e12).prop_filter_map("JSON round-trip fixed point", |f| {
+        stable_fixed_point(f).map(UsdAmount::new)
+    })
+}
+
 /// A `Confidence` over its whole valid range, restricted to codec-stable floats
 /// for the same reason as [`finite_f64`]; `new` is a no-op clamp here since the
 /// input is already in `[0.0, 1.0]`.
@@ -149,6 +158,15 @@ fn severity() -> impl Strategy<Value = Severity> {
         Just(Severity::Medium),
         Just(Severity::High),
         Just(Severity::Critical),
+    ]
+}
+
+fn suggested_action() -> impl Strategy<Value = SuggestedAction> {
+    prop_oneof![
+        Just(SuggestedAction::Monitor),
+        Just(SuggestedAction::Investigate),
+        Just(SuggestedAction::Escalate),
+        Just(SuggestedAction::EscalateImmediately),
     ]
 }
 
@@ -256,9 +274,22 @@ fn detection_event() -> impl Strategy<Value = DomainEvent> {
             alert_kind(),
             confidence(),
             any::<bool>(),
+            proptest::option::of(usd_amount()),
+            severity(),
+            suggested_action(),
         )
             .prop_map(
-                |(alert_id, detector, addresses, kind, confidence, provisional)| {
+                |(
+                    alert_id,
+                    detector,
+                    addresses,
+                    kind,
+                    confidence,
+                    provisional,
+                    impact_usd,
+                    severity,
+                    suggested_action,
+                )| {
                     DomainEvent::PreliminaryAlertCreated(PreliminaryAlertCreated {
                         alert_id,
                         detector,
@@ -266,6 +297,9 @@ fn detection_event() -> impl Strategy<Value = DomainEvent> {
                         kind,
                         confidence,
                         provisional,
+                        impact_usd,
+                        severity,
+                        suggested_action,
                     })
                 }
             ),

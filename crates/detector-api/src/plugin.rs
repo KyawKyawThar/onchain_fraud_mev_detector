@@ -14,7 +14,7 @@
 //! service (§8).
 
 use alloy_primitives::B256;
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::DetectionCtx;
@@ -170,16 +170,31 @@ pub struct Evidence {
     /// …). Opaque here; each detector defines its own shape and serializes it
     /// through this field, matching `DetectorTriggered.evidence`.
     pub detail: serde_json::Value,
+    /// The detector's own **priced impact** for this finding — its single
+    /// best USD figure for "how big is this" (arb/sandwich profit, flashloan
+    /// notional, rugpull drained, wash volume, liquidation debt), the same
+    /// number it puts in `detail`, promoted to a typed field so the emit path
+    /// (§6) can band severity on it directly.
+    ///
+    /// `None` when the detector couldn't price the finding (an unknown token
+    /// or missing reference price — the "structure reported at reduced
+    /// confidence" case). The emit path then falls back to summing the
+    /// implicated txs' priced transfers, so a detector that leaves this unset
+    /// still gets a coarse estimate. Stays *facts-only*: a value magnitude,
+    /// never anything about the actor (§6/§8).
+    pub impact_usd: Option<UsdAmount>,
 }
 
 impl Evidence {
-    /// Construct a finding with no extra detail payload (`detail` = JSON `null`).
+    /// Construct a finding with no extra detail payload (`detail` = JSON `null`)
+    /// and no priced impact — layer either on with the `with_*` builders.
     pub fn new(kind: AlertKind, txs: Vec<B256>, confidence: Confidence) -> Self {
         Self {
             kind,
             txs,
             confidence,
             detail: serde_json::Value::Null,
+            impact_usd: None,
         }
     }
 
@@ -187,6 +202,18 @@ impl Evidence {
     #[must_use]
     pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
         self.detail = detail;
+        self
+    }
+
+    /// Attach the detector's own priced impact — the typed twin of the USD
+    /// figure it already reports in `detail` (see [`Evidence::impact_usd`]).
+    /// Pass `None` to keep the emit path's transfer-sum fallback; the common
+    /// call is `.with_impact_usd(profit_usd.map(UsdAmount::new))`, carrying the
+    /// detector's "reported at reduced confidence when unpriced" contract
+    /// straight through.
+    #[must_use]
+    pub fn with_impact_usd(mut self, impact_usd: Option<UsdAmount>) -> Self {
+        self.impact_usd = impact_usd;
         self
     }
 

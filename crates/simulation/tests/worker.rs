@@ -15,7 +15,9 @@ use std::time::Duration;
 use lapin::options::BasicGetOptions;
 use lapin::{Channel, Connection, ConnectionProperties};
 
-use events::primitives::{AlertId, AlertKind, Chain, Confidence, DetectorRef};
+use events::primitives::{
+    AlertId, AlertKind, Chain, Confidence, DetectorRef, Severity, SuggestedAction,
+};
 
 use simulation::command::{job_for_alert, Priority, SimulationJob};
 use simulation::config::RabbitConfig;
@@ -85,6 +87,9 @@ fn a_job() -> SimulationJob {
         kind: AlertKind::Sandwich,
         confidence: Confidence::new(0.7),
         provisional: true,
+        impact_usd: None,
+        severity: Severity::Low,
+        suggested_action: SuggestedAction::Monitor,
     };
     job_for_alert(Chain::ETHEREUM, &alert).0
 }

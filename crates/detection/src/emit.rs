@@ -31,7 +31,10 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
-use events::primitives::{AccountAddress, AlertId, AlertKind, BlockRef, Confidence, DetectorRef};
+use events::primitives::{
+    AccountAddress, AlertId, AlertKind, BlockRef, Confidence, DetectorRef, Severity,
+    SuggestedAction, UsdAmount,
+};
 use events::DomainEvent;
 
 use detector_api::{DetectionCtx, DetectorId, DetectorPlugin, Enrichment, Evidence, SemVer};
@@ -69,12 +72,19 @@ pub fn detector_triggered(
 /// **unadjusted by design** — the fast path is attribution-blind (§6), and any
 /// reweighting from attribution/labels happens later in the intelligence service
 /// (§8). Don't "fix" this by folding label signal in here.
+///
+/// `impact_usd` (from [`impact_usd`]) drives `severity` ([`severity_band`]) and,
+/// in turn, `suggested_action` ([`suggested_action`]) — both derived here so
+/// every `PreliminaryAlertCreated` carries a self-consistent triple rather than
+/// leaving each consumer to re-derive severity from confidence alone.
 pub fn preliminary_alert(
     detector: DetectorRef,
     kind: AlertKind,
     addresses: Vec<AccountAddress>,
     confidence: Confidence,
+    impact_usd: Option<UsdAmount>,
 ) -> PreliminaryAlertCreated {
+    let severity = severity_band(impact_usd, confidence);
     PreliminaryAlertCreated {
         alert_id: AlertId::new(),
         detector,
@@ -82,6 +92,55 @@ pub fn preliminary_alert(
         kind,
         confidence,
         provisional: true,
+        impact_usd,
+        severity,
+        suggested_action: suggested_action(severity),
+    }
+}
+
+/// USD-impact thresholds for [`severity_band`] (§6), applied to `impact_usd *
+/// confidence` — a low-confidence high-impact finding and a high-confidence
+/// low-impact one land in the same band once discounted by likelihood. Named
+/// consts rather than inline literals so the bands are one place to retune.
+pub const SEVERITY_CRITICAL_USD: f64 = 1_000_000.0;
+pub const SEVERITY_HIGH_USD: f64 = 100_000.0;
+pub const SEVERITY_MEDIUM_USD: f64 = 10_000.0;
+
+/// Derive a [`Severity`] band from `impact_usd` discounted by `confidence`
+/// (§6) — never from attribution or labels, so a `Critical` band means
+/// "high-harm, well-evidenced," not "involves a known bad actor" (that
+/// reweighting happens later, in the intelligence service, per the module
+/// docs). Pure and total: every input maps to exactly one band.
+///
+/// `impact_usd` of `None` (the detector couldn't price it and no transfer
+/// among the implicated txs could be priced either) is conservative, not
+/// alarming — it reads as [`Severity::Low`] rather than guessing at a dollar
+/// figure that isn't there.
+pub fn severity_band(impact_usd: Option<UsdAmount>, confidence: Confidence) -> Severity {
+    let Some(impact) = impact_usd else {
+        return Severity::Low;
+    };
+    let weighted = impact.get() * confidence.get();
+    if weighted >= SEVERITY_CRITICAL_USD {
+        Severity::Critical
+    } else if weighted >= SEVERITY_HIGH_USD {
+        Severity::High
+    } else if weighted >= SEVERITY_MEDIUM_USD {
+        Severity::Medium
+    } else {
+        Severity::Low
+    }
+}
+
+/// The operator-facing next step for a [`Severity`] band (§6) — a closed,
+/// total mapping so every alert carries an actionable recommendation rather
+/// than leaving each consumer to interpret the band ad hoc.
+pub fn suggested_action(severity: Severity) -> SuggestedAction {
+    match severity {
+        Severity::Low => SuggestedAction::Monitor,
+        Severity::Medium => SuggestedAction::Investigate,
+        Severity::High => SuggestedAction::Escalate,
+        Severity::Critical => SuggestedAction::EscalateImmediately,
     }
 }
 
@@ -107,6 +166,63 @@ pub fn implicated_addresses(enrichment: &Enrichment, txs: &[B256]) -> Vec<Accoun
         }
     }
     addresses
+}
+
+/// The USD-scale impact for a finding, resolving the two sources in priority
+/// order (§6): the detector's own priced figure ([`Evidence::impact_usd`]) when
+/// it set one, else a coarse fallback summed from the block's enrichment
+/// ([`impact_from_transfers`]).
+///
+/// Preferring the detector's number is the point of the [`Evidence`] seam: a
+/// sandwich reports *attacker profit*, a rugpull *value drained*, a flashloan
+/// *notional* — each its correct headline figure, which a blind transfer-sum
+/// can't distinguish (and would over-count for multi-hop flows). The fallback
+/// exists only so a detector that can't price a finding still yields *some*
+/// estimate rather than nothing. Stays attribution-blind either way — both
+/// inputs are value magnitudes, never actor identity.
+///
+/// [`Evidence::impact_usd`]: detector_api::Evidence::impact_usd
+pub fn impact_usd(evidence: &Evidence, enrichment: &Enrichment) -> Option<UsdAmount> {
+    evidence
+        .impact_usd
+        .or_else(|| impact_from_transfers(enrichment, &evidence.txs))
+}
+
+/// Fallback USD estimate: the sum of every priced [`TokenTransfer`] value among
+/// the implicated txs' decoded actions, valued via [`Enrichment::usd_value`]
+/// (§6). Used only when a detector didn't report its own [`Evidence::impact_usd`].
+///
+/// Like [`implicated_addresses`], this reads only on-chain facts — decoded
+/// transfers and reference prices — never attribution, so it stays
+/// attribution-blind end to end. `None` when nothing could be priced (no
+/// enriched tx, no transfers, or an unknown token/price) — an honest
+/// "unknown," not a `0.0` that would misread as "no impact." A transfer that
+/// can't be priced is skipped rather than discarding the whole estimate, so a
+/// partially-priced pattern (one known token among several) still yields a
+/// (partial, undercounted) figure instead of nothing. It is a deliberately
+/// coarse gross-flow proxy that can over-count — the authoritative harm figure
+/// comes later from simulation (§7).
+///
+/// [`TokenTransfer`]: detector_api::TokenTransfer
+/// [`Evidence::impact_usd`]: detector_api::Evidence::impact_usd
+pub fn impact_from_transfers(enrichment: &Enrichment, txs: &[B256]) -> Option<UsdAmount> {
+    let mut total = 0.0;
+    let mut priced_any = false;
+    for hash in txs {
+        let Some(actions) = enrichment.tx(*hash) else {
+            continue;
+        };
+        for transfer in &actions.transfers {
+            if let Some(value) = enrichment.usd_value(transfer.token, transfer.amount) {
+                total += value;
+                priced_any = true;
+            }
+        }
+    }
+    // The summed transfers are each finite and non-negative, so `new` is a
+    // no-op sanitize here — but it keeps a stray non-finite from ever reaching
+    // a severity gate.
+    priced_any.then(|| UsdAmount::new(total))
 }
 
 /// Map one detector's [`Evidence`] onto the events it emits: the raw
@@ -139,11 +255,13 @@ pub(crate) fn evidence_events(
 
     if status == LifecycleStatus::Active {
         let addresses = implicated_addresses(enrichment, &evidence.txs);
+        let impact = impact_usd(evidence, enrichment);
         events.push(DomainEvent::PreliminaryAlertCreated(preliminary_alert(
             detector_ref.clone(),
             evidence.kind,
             addresses,
             evidence.confidence,
+            impact,
         )));
     }
 
@@ -320,7 +438,9 @@ mod tests {
     use chrono::Utc;
 
     use detector_api::test_util::MockDetector;
-    use detector_api::{BlockBundle, EnrichmentBuilder, SemVer, TokenTransfer, TxActions};
+    use detector_api::{
+        BlockBundle, EnrichmentBuilder, SemVer, TokenMeta, TokenTransfer, TxActions, UsdPrice,
+    };
     use events::primitives::{BlockRef, Chain};
 
     use crate::model::{ConfigHash, ModelCard, ModelRegistry};
@@ -375,14 +495,218 @@ mod tests {
             AlertKind::Arbitrage,
             vec![addr(1)],
             Confidence::new(0.6),
+            None,
         );
-        let b = preliminary_alert(a_ref(), AlertKind::Arbitrage, vec![], Confidence::new(0.6));
+        let b = preliminary_alert(
+            a_ref(),
+            AlertKind::Arbitrage,
+            vec![],
+            Confidence::new(0.6),
+            None,
+        );
 
         assert!(a.provisional, "always provisional on creation");
         assert_eq!(a.kind, AlertKind::Arbitrage);
         assert_eq!(a.addresses, vec![addr(1)]);
         assert_eq!(a.confidence, Confidence::new(0.6));
         assert_ne!(a.alert_id, b.alert_id, "each alert gets a fresh id");
+    }
+
+    #[test]
+    fn preliminary_alert_carries_impact_and_its_derived_severity_and_action() {
+        // impact 150_000 * confidence 0.8 = 120_000 ⇒ High ⇒ Escalate.
+        let a = preliminary_alert(
+            a_ref(),
+            AlertKind::Sandwich,
+            vec![],
+            Confidence::new(0.8),
+            Some(UsdAmount::new(150_000.0)),
+        );
+        assert_eq!(a.impact_usd, Some(UsdAmount::new(150_000.0)));
+        assert_eq!(a.severity, Severity::High);
+        assert_eq!(a.suggested_action, SuggestedAction::Escalate);
+    }
+
+    // ── severity_band / suggested_action ──────────────────────────────
+
+    #[test]
+    fn severity_band_is_conservative_when_impact_is_unknown() {
+        assert_eq!(
+            severity_band(None, Confidence::new(1.0)),
+            Severity::Low,
+            "no priced impact reads as Low, not an alarming guess"
+        );
+    }
+
+    #[test]
+    fn severity_band_discounts_impact_by_confidence() {
+        // At full confidence, thresholds apply directly.
+        assert_eq!(
+            severity_band(
+                Some(UsdAmount::new(SEVERITY_CRITICAL_USD)),
+                Confidence::new(1.0)
+            ),
+            Severity::Critical
+        );
+        assert_eq!(
+            severity_band(
+                Some(UsdAmount::new(SEVERITY_HIGH_USD)),
+                Confidence::new(1.0)
+            ),
+            Severity::High
+        );
+        assert_eq!(
+            severity_band(
+                Some(UsdAmount::new(SEVERITY_MEDIUM_USD)),
+                Confidence::new(1.0)
+            ),
+            Severity::Medium
+        );
+        assert_eq!(
+            severity_band(Some(UsdAmount::new(1.0)), Confidence::new(1.0)),
+            Severity::Low
+        );
+
+        // Same raw impact, halved confidence, drops a band.
+        assert_eq!(
+            severity_band(
+                Some(UsdAmount::new(SEVERITY_CRITICAL_USD)),
+                Confidence::new(0.5)
+            ),
+            Severity::High,
+            "1_000_000 * 0.5 = 500_000, still >= HIGH but < CRITICAL"
+        );
+    }
+
+    #[test]
+    fn suggested_action_is_a_total_one_to_one_mapping_from_severity() {
+        assert_eq!(suggested_action(Severity::Low), SuggestedAction::Monitor);
+        assert_eq!(
+            suggested_action(Severity::Medium),
+            SuggestedAction::Investigate
+        );
+        assert_eq!(suggested_action(Severity::High), SuggestedAction::Escalate);
+        assert_eq!(
+            suggested_action(Severity::Critical),
+            SuggestedAction::EscalateImmediately
+        );
+    }
+
+    // ── impact_usd (resolver) / impact_from_transfers (fallback) ──────
+
+    /// An enrichment pricing one 18-decimal token `0xee` at $2, with two txs
+    /// transferring `whole0`/`whole1` whole tokens respectively.
+    fn priced_ctx(whole0: u64, whole1: u64) -> Enrichment {
+        let unit = U256::from(10u64).pow(U256::from(18u64));
+        let mut b = EnrichmentBuilder::default();
+        b.add_token(TokenMeta::new(addr(0xee), None, 18));
+        b.set_price(addr(0xee), UsdPrice::try_new(2.0).unwrap());
+        b.add_tx(
+            TxActions::new(hash(1), addr(1), Some(addr(9))).with_transfers(vec![TokenTransfer {
+                token: addr(0xee),
+                from: addr(1),
+                to: addr(9),
+                amount: U256::from(whole0) * unit,
+            }]),
+        );
+        b.add_tx(
+            TxActions::new(hash(2), addr(2), Some(addr(8))).with_transfers(vec![TokenTransfer {
+                token: addr(0xee),
+                from: addr(2),
+                to: addr(8),
+                amount: U256::from(whole1) * unit,
+            }]),
+        );
+        b.build()
+    }
+
+    #[test]
+    fn impact_from_transfers_sums_priced_transfers_across_implicated_txs() {
+        // 3 tokens @ $2 + 1 token @ $2 = $8.
+        assert_eq!(
+            impact_from_transfers(&priced_ctx(3, 1), &[hash(1), hash(2)]),
+            Some(UsdAmount::new(8.0))
+        );
+    }
+
+    #[test]
+    fn impact_from_transfers_is_none_without_any_priced_transfer() {
+        let enr = Enrichment::default();
+        assert_eq!(
+            impact_from_transfers(&enr, &[hash(1)]),
+            None,
+            "no enrichment at all"
+        );
+
+        // Enriched tx, but the token has no known price — still unknown, not zero.
+        let mut b = EnrichmentBuilder::default();
+        b.add_token(TokenMeta::new(addr(0xee), None, 18));
+        b.add_tx(
+            TxActions::new(hash(1), addr(1), Some(addr(9))).with_transfers(vec![TokenTransfer {
+                token: addr(0xee),
+                from: addr(1),
+                to: addr(9),
+                amount: U256::from(1u64),
+            }]),
+        );
+        assert_eq!(impact_from_transfers(&b.build(), &[hash(1)]), None);
+    }
+
+    #[test]
+    fn impact_from_transfers_skips_unpriceable_transfers_but_keeps_the_rest() {
+        let mut b = EnrichmentBuilder::default();
+        b.add_token(TokenMeta::new(addr(0xee), None, 18));
+        b.set_price(addr(0xee), UsdPrice::try_new(2.0).unwrap());
+        // addr(0xff) is never registered — its transfer can't be priced.
+        b.add_tx(
+            TxActions::new(hash(1), addr(1), Some(addr(9))).with_transfers(vec![
+                TokenTransfer {
+                    token: addr(0xee),
+                    from: addr(1),
+                    to: addr(9),
+                    amount: U256::from(10u64).pow(U256::from(18u64)),
+                },
+                TokenTransfer {
+                    token: addr(0xff),
+                    from: addr(1),
+                    to: addr(9),
+                    amount: U256::from(1u64),
+                },
+            ]),
+        );
+
+        assert_eq!(
+            impact_from_transfers(&b.build(), &[hash(1)]),
+            Some(UsdAmount::new(2.0)),
+            "the unpriceable transfer is skipped, not fatal to the whole estimate"
+        );
+    }
+
+    #[test]
+    fn impact_usd_prefers_the_detectors_own_figure_over_the_transfer_sum() {
+        // The enrichment's transfers price to $8, but the detector reported
+        // its own $50 (e.g. attacker profit, not gross flow) — the detector's
+        // figure wins; the blind sum is a fallback only.
+        let enr = priced_ctx(3, 1);
+        let evidence = Evidence::new(
+            AlertKind::Sandwich,
+            vec![hash(1), hash(2)],
+            Confidence::new(0.9),
+        )
+        .with_impact_usd(Some(UsdAmount::new(50.0)));
+        assert_eq!(impact_usd(&evidence, &enr), Some(UsdAmount::new(50.0)));
+    }
+
+    #[test]
+    fn impact_usd_falls_back_to_the_transfer_sum_when_the_detector_is_silent() {
+        let enr = priced_ctx(3, 1);
+        // Detector didn't price it (impact_usd left None) — resolve to the sum.
+        let evidence = Evidence::new(
+            AlertKind::Sandwich,
+            vec![hash(1), hash(2)],
+            Confidence::new(0.9),
+        );
+        assert_eq!(impact_usd(&evidence, &enr), Some(UsdAmount::new(8.0)));
     }
 
     // ── implicated_addresses ──────────────────────────────────────────

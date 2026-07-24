@@ -186,7 +186,9 @@ mod tests {
 
     use async_trait::async_trait;
     use event_bus::PublishError;
-    use events::primitives::{AlertId, AlertKind, Confidence, DetectorRef};
+    use events::primitives::{
+        AlertId, AlertKind, Confidence, DetectorRef, Severity, SuggestedAction,
+    };
 
     use crate::command::SimulationJob;
     use crate::queue::JobError;
@@ -233,6 +235,9 @@ mod tests {
             kind: AlertKind::Sandwich,
             confidence: Confidence::new(0.8),
             provisional: true,
+            impact_usd: None,
+            severity: Severity::Low,
+            suggested_action: SuggestedAction::Monitor,
         }
     }
 

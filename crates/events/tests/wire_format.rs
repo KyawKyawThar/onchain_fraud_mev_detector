@@ -39,7 +39,7 @@ use events::intelligence::{
 use events::predictive::PredictedAlert;
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
-    EntityId, IncidentId, LabelId, PredictionId, RuleId, Severity,
+    EntityId, IncidentId, LabelId, PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -144,6 +144,9 @@ fn sample_events() -> Vec<DomainEvent> {
             kind: AlertKind::Sandwich,
             confidence: Confidence::new(0.8),
             provisional: true,
+            impact_usd: Some(UsdAmount::new(150_000.0)),
+            severity: Severity::High,
+            suggested_action: SuggestedAction::Escalate,
         }),
         // Simulation (§7)
         DomainEvent::SimulationRequested(SimulationRequested {
@@ -322,7 +325,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "PreliminaryAlertCreated",
-        r#"{"type":"PreliminaryAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.8,"provisional":true}}"#,
+        r#"{"type":"PreliminaryAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.8,"provisional":true,"impact_usd":150000.0,"severity":"high","suggested_action":"escalate"}}"#,
     ),
     (
         "SimulationRequested",
@@ -483,6 +486,30 @@ fn locked_wire_form_round_trips_back_to_value() {
             "golden for {name} did not round-trip back to its sample value",
         );
     }
+}
+
+/// Backwards-compatibility lock for the §6 scoring fields (SCHEMA.md's
+/// additive-field policy). A `PreliminaryAlertCreated` serialized *before*
+/// `impact_usd`/`severity`/`suggested_action` existed — i.e. this exact
+/// pre-scoring byte string, which is a real shape sitting in the event store —
+/// must still deserialize under the current struct, falling back to the
+/// conservative "unknown impact" triple rather than failing with a
+/// `missing field` error. Without the `#[serde(default …)]` attributes this
+/// test fails, which is the whole point: it is the guard the round-trip goldens
+/// (new shape only) can't provide.
+#[test]
+fn legacy_preliminary_alert_reads_with_defaulted_scoring_fields() {
+    let legacy = r#"{"type":"PreliminaryAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.8,"provisional":true}}"#;
+
+    let event: DomainEvent =
+        serde_json::from_str(legacy).expect("a pre-scoring event must still deserialize");
+    let DomainEvent::PreliminaryAlertCreated(alert) = event else {
+        panic!("expected PreliminaryAlertCreated");
+    };
+
+    assert_eq!(alert.impact_usd, None, "unscored ⇒ unknown impact, not 0.0");
+    assert_eq!(alert.severity, Severity::Low);
+    assert_eq!(alert.suggested_action, SuggestedAction::Monitor);
 }
 
 // ── Envelope wire form ───────────────────────────────────────────

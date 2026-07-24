@@ -278,7 +278,7 @@ pub struct AlertRetracted {
 mod tests {
     use super::*;
     use events::detection::PreliminaryAlertCreated;
-    use events::primitives::{Chain, Confidence, DetectorRef};
+    use events::primitives::{Chain, Confidence, DetectorRef, SuggestedAction};
     use events::simulation::{IncidentCreated, IncidentRetracted};
     use serde_json::json;
 
@@ -302,6 +302,9 @@ mod tests {
                 kind: AlertKind::Sandwich,
                 confidence: Confidence::new(0.8),
                 provisional: true,
+                impact_usd: None,
+                severity: Severity::Low,
+                suggested_action: SuggestedAction::Monitor,
             }),
         );
 
