@@ -3,10 +3,11 @@
 # `rule_files`, evaluated by Prometheus, routed through Alertmanager
 # (deploy/alertmanager.yml).
 #
-# Thresholds are PROVISIONAL. Only `FastPathLatencyHigh` is seeded from a hard
-# number the source doc actually states (§6: fast path < 1s p99); every other
-# threshold below is a conservative placeholder picked with no production
-# traffic to calibrate against — tune them once real load/latency data exists,
+# Thresholds are PROVISIONAL. `FastPathLatencyHigh` and `ScreeningLatencyP50High`
+# are seeded from hard numbers the source doc actually states (§6: fast path
+# < 1s p99; §19: screening p50 < 100ms) — every other threshold below is a
+# conservative placeholder picked with no production traffic to calibrate
+# against — tune them once real load/latency data exists,
 # per production_readiness.md's own framing of this as an open, iterative
 # task, not a one-shot. `severity: page` alerts are the ones with load-bearing
 # numbers; `severity: informational` alerts have no numeric baseline yet and
@@ -32,6 +33,18 @@ groups:
         annotations:
           summary: "api-service p99 request latency is high"
           description: "http_request_duration_seconds p99 has been above 1s for 5m. Threshold is a placeholder pending a real SLA — tune once load-test/production numbers exist."
+
+      - alert: ScreeningLatencyP50High
+        expr: |
+          histogram_quantile(0.5,
+            sum(rate(http_request_duration_seconds_bucket{route="/v1/address/{address}/screen"}[5m])) by (le)
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Screening endpoint p50 latency exceeds the §19 <100ms SLO"
+          description: "http_request_duration_seconds{route=\"/v1/address/{address}/screen\"} p50 has been above 100ms for 5m — this is the headline synchronous-screening SLO (§19), not a placeholder. Check the screening rate limiter (§rate_limit's SCREENING_RATE_LIMIT_ERRORS_TOTAL — a failing-open Redis adds no latency itself, but a saturated/slow Redis can) and the intelligence gRPC deadline/cache hit rate first."
 
       - alert: KafkaConsumerLagHigh
         expr: max(kafka_consumer_lag) by (consumer) > 10000

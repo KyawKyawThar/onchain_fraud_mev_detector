@@ -16,6 +16,12 @@ const DEFAULT_ALERT_CHANNEL_CAPACITY: usize = 1024;
 /// Usage-metering queue capacity when `USAGE_CHANNEL_CAPACITY` is unset (§13).
 const DEFAULT_USAGE_CHANNEL_CAPACITY: usize = 1024;
 
+/// Screening endpoint's dedicated rate-limit ceiling (§19) when
+/// `SCREENING_RATE_LIMIT_PER_MINUTE` is unset — a conservative placeholder
+/// (no production traffic to calibrate against yet, same posture
+/// `deploy/prometheus-rules.yml`'s provisional SLO thresholds document).
+const DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE: u32 = 120;
+
 /// Screening access-audit queue capacity when `AUDIT_CHANNEL_CAPACITY` is
 /// unset (§11, Sprint 14 t3).
 const DEFAULT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
@@ -36,6 +42,10 @@ pub struct Config {
     /// Postgres — `POST /v1/rules` writes the customer's rule definitions
     /// through the rule-engine crate's `PgRuleStore` (§9/§14).
     pub database_url: SecretString,
+    /// Redis, for the screening endpoint's dedicated rate limiter (§19,
+    /// `src/rate_limit.rs`) — the same instance `intelligence`'s hot-path
+    /// cache uses, a different key prefix (`screen_rl:`).
+    pub redis_url: SecretString,
     pub jwt: JwtConfig,
     /// Kafka settings for the `/v1/stream` WebSocket's consumer (§11).
     pub kafka: KafkaConfig,
@@ -65,6 +75,12 @@ pub struct Config {
     /// must fail fast to the endpoint's 502 rather than queue behind the
     /// router-wide 30s timeout.
     pub screening_deadline: Duration,
+    /// The screening endpoint's own rate-limit ceiling (§19,
+    /// `src/rate_limit.rs`) — kept separate from any future general `/v1`
+    /// limit so this SLO-critical route can never be starved by traffic
+    /// elsewhere. From `SCREENING_RATE_LIMIT_PER_MINUTE`, defaulting to
+    /// [`DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE`].
+    pub screening_rate_limit_per_minute: u32,
     /// Address the Prometheus `/metrics` endpoint binds to (§19). Exposes this
     /// service's counters — including `usage_events_recorded_total` /
     /// `usage_events_dropped_total` (§13, `src/usage.rs`) and the request
@@ -120,6 +136,7 @@ impl Config {
             simulation_url: env("SIMULATION_URL")?,
             intelligence_grpc_addr: env("INTELLIGENCE_GRPC_ADDR")?,
             database_url: SecretString::from(env("DATABASE_URL")?),
+            redis_url: SecretString::from(env("REDIS_URL")?),
             jwt: JwtConfig {
                 secret: SecretString::from(env("JWT_SECRET")?),
                 issuer: env("JWT_ISSUER")?,
@@ -141,6 +158,7 @@ impl Config {
                 DEFAULT_AUDIT_CHANNEL_CAPACITY,
             )?,
             screening_deadline: screening_deadline()?,
+            screening_rate_limit_per_minute: screening_rate_limit_per_minute()?,
             metrics_addr: env_parse(
                 "SERVER_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9112)),
@@ -161,6 +179,20 @@ fn screening_deadline() -> Result<Duration> {
         bail!("SCREENING_DEADLINE_MS must be >= 1, got 0");
     }
     Ok(Duration::from_millis(millis))
+}
+
+/// Resolve `SCREENING_RATE_LIMIT_PER_MINUTE`. Zero would reject every
+/// screening call unconditionally — caught here with the same
+/// fail-fast-at-boot contract as [`screening_deadline`].
+fn screening_rate_limit_per_minute() -> Result<u32> {
+    let limit: u32 = env_parse(
+        "SCREENING_RATE_LIMIT_PER_MINUTE",
+        DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE,
+    )?;
+    if limit == 0 {
+        bail!("SCREENING_RATE_LIMIT_PER_MINUTE must be >= 1, got 0");
+    }
+    Ok(limit)
 }
 
 /// Resolve and validate a channel-capacity env var. A non-positive value

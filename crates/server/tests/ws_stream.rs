@@ -82,6 +82,9 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
         rules: std::sync::Arc::new(rule_engine::test_util::InMemoryRuleStore::new()),
         events: std::sync::Arc::new(event_bus::test_util::RecordingSink::default()),
         policies: std::sync::Arc::new(server::policy_store::test_util::InMemoryPolicyStore::new()),
+        screening_rate_limit: std::sync::Arc::new(
+            server::rate_limit::test_util::InMemoryRateLimiter::unbounded(),
+        ),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
