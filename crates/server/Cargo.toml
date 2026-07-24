@@ -14,6 +14,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `server::policy_store::test_util` (the in-memory `PolicyStore`
+# double) to this crate's own integration tests (mirrors `rule_engine`'s
+# `test-util` feature).
+test-util = []
+
 [dependencies]
 events = { workspace = true }
 telemetry = { workspace = true }
@@ -50,6 +56,11 @@ jsonwebtoken = { workspace = true }
 # stored form — no translation layer here); `db` supplies the Postgres pool.
 rule-engine = { workspace = true }
 db = { workspace = true }
+# `PgPolicyStore` (§11, Sprint 14 t2): the customer-authored decision-policy
+# table lives in this crate (it's this service's own concern, unlike rules),
+# so unlike `rule-engine` it needs `sqlx` directly rather than through a
+# store-owning crate.
+sqlx = { workspace = true }
 
 # `WS /v1/stream` (§11): the shared Kafka-backbone consume seam (`run_consumer`/
 # `EventHandler`, same as event-store's ingest) feeds the provisional/confirmed/
@@ -80,6 +91,9 @@ chrono = { workspace = true }
 event-bus = { workspace = true, features = ["test-util"] }
 # The in-memory `RuleStore` double for the `POST /v1/rules` handler tests.
 rule-engine = { workspace = true, features = ["test-util"] }
+# Self-dependency with `test-util` on, so `tests/ws_stream.rs` sees the
+# in-memory `PolicyStore` double.
+server = { path = ".", features = ["test-util"] }
 # Mint tokens in the JWT middleware tests.
 jsonwebtoken = { workspace = true }
 # Drive the router directly (`ServiceExt::oneshot`) without binding a listener.

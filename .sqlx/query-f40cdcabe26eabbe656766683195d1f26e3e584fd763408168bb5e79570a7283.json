@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (name) name, version, review_at, block_at\n               FROM screening_policies\n               WHERE owner = $1\n               ORDER BY name, version DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "review_at",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "review_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "block_at",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "block_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "f40cdcabe26eabbe656766683195d1f26e3e584fd763408168bb5e79570a7283"
+}

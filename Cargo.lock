@@ -6784,6 +6784,8 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "server",
+ "sqlx",
  "telemetry",
  "thiserror 2.0.18",
  "tokio",
