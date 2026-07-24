@@ -91,9 +91,13 @@ impl event_bus::Transience for StoreError {
 pub fn to_api_error(err: StoreError) -> api_error::ApiError {
     use event_bus::Transience;
     match err {
-        StoreError::Invalid(_) | StoreError::ReservedName(_) => api_error::ApiError::bad_request(err),
+        StoreError::Invalid(_) | StoreError::ReservedName(_) => {
+            api_error::ApiError::bad_request(err)
+        }
         StoreError::Postgres(_) if err.is_transient() => api_error::ApiError::bad_gateway(err),
-        StoreError::Postgres(_) | StoreError::Malformed { .. } => api_error::ApiError::internal(err),
+        StoreError::Postgres(_) | StoreError::Malformed { .. } => {
+            api_error::ApiError::internal(err)
+        }
     }
 }
 
@@ -133,8 +137,11 @@ pub trait PolicyStore: Send + Sync {
     /// when they've never defined one by that name. Implementers only need
     /// to know their own table; [`resolve`](Self::resolve)'s default method
     /// is what checks the built-in catalog first.
-    async fn custom_policy(&self, owner: CustomerId, name: &str)
-        -> Result<Option<Policy>, StoreError>;
+    async fn custom_policy(
+        &self,
+        owner: CustomerId,
+        name: &str,
+    ) -> Result<Option<Policy>, StoreError>;
 
     /// Create or retune one of `owner`'s custom policies.
     ///
@@ -539,11 +546,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .policies_for_owner(owner(2))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(store.policies_for_owner(owner(2)).await.unwrap().is_empty());
         assert!(store.resolve(owner(2), "acme").await.unwrap().is_none());
         assert_eq!(store.policies_for_owner(owner(1)).await.unwrap().len(), 1);
     }

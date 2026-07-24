@@ -53,10 +53,7 @@ pub enum InvalidPolicy {
     /// A threshold above [`MAX_SCORE`] — dead by construction (score never
     /// reaches it), so rejected rather than silently stored as inert.
     #[error("thresholds must be within 0..={MAX_SCORE}, got review_at={review_at}, block_at={block_at:?}")]
-    ThresholdOutOfRange {
-        review_at: u8,
-        block_at: Option<u8>,
-    },
+    ThresholdOutOfRange { review_at: u8, block_at: Option<u8> },
     /// `block_at`, when present, must be at/above `review_at` — a policy
     /// where the block threshold is *more* lenient than the review threshold
     /// would let a block-worthy score sail through as merely "review".
@@ -320,19 +317,10 @@ mod tests {
         let policy = builtin_policy("default").unwrap();
         assert_eq!(decide(input(0, false), &policy).decision, Decision::Allow);
         assert_eq!(decide(input(39, false), &policy).decision, Decision::Allow);
-        assert_eq!(
-            decide(input(40, false), &policy).decision,
-            Decision::Review
-        );
-        assert_eq!(
-            decide(input(79, false), &policy).decision,
-            Decision::Review
-        );
+        assert_eq!(decide(input(40, false), &policy).decision, Decision::Review);
+        assert_eq!(decide(input(79, false), &policy).decision, Decision::Review);
         assert_eq!(decide(input(80, false), &policy).decision, Decision::Block);
-        assert_eq!(
-            decide(input(100, false), &policy).decision,
-            Decision::Block
-        );
+        assert_eq!(decide(input(100, false), &policy).decision, Decision::Block);
     }
 
     /// `strict` holds and blocks at lower scores than `default`.
@@ -340,10 +328,7 @@ mod tests {
     fn strict_policy_is_stricter_than_default() {
         let policy = builtin_policy("strict").unwrap();
         assert_eq!(decide(input(19, false), &policy).decision, Decision::Allow);
-        assert_eq!(
-            decide(input(20, false), &policy).decision,
-            Decision::Review
-        );
+        assert_eq!(decide(input(20, false), &policy).decision, Decision::Review);
         assert_eq!(decide(input(50, false), &policy).decision, Decision::Block);
     }
 
@@ -353,10 +338,7 @@ mod tests {
     fn monitor_only_never_blocks_on_score() {
         let policy = builtin_policy("monitor-only").unwrap();
         assert_eq!(decide(input(39, false), &policy).decision, Decision::Allow);
-        assert_eq!(
-            decide(input(40, false), &policy).decision,
-            Decision::Review
-        );
+        assert_eq!(decide(input(40, false), &policy).decision, Decision::Review);
         assert_eq!(
             decide(input(100, false), &policy).decision,
             Decision::Review,

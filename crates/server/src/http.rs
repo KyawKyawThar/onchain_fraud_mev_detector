@@ -1464,7 +1464,11 @@ mod tests {
         // there (append-only, never overwritten) even though `resolve`/
         // `custom_policy` now read version 2.
         let owner = events::primitives::CustomerId(uuid::Uuid::parse_str(customer).unwrap());
-        let latest = policies.custom_policy(owner, "acme").await.unwrap().unwrap();
+        let latest = policies
+            .custom_policy(owner, "acme")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.version, 2);
         assert_eq!(latest.thresholds.review_at(), 15);
 
