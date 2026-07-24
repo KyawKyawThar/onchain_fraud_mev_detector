@@ -1065,6 +1065,7 @@ mod tests {
     use events::intelligence::{EntityMerged, RiskScoreUpdated, SanctionHit};
     use events::primitives::{
         AlertKind, BlockRef, CustomerId, DetectorRef, EntityId, LabelKind, Severity,
+        SuggestedAction,
     };
     use events::rule_engine::RuleCreated;
     use uuid::Uuid;
@@ -1125,6 +1126,9 @@ mod tests {
             kind: AlertKind::Sandwich,
             confidence: Confidence::new(0.9),
             provisional: true,
+            impact_usd: None,
+            severity: Severity::Low,
+            suggested_action: SuggestedAction::Monitor,
         })
     }
 

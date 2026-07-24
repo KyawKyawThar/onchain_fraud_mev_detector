@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use events::detection::PreliminaryAlertCreated;
 use events::intelligence::SanctionHit;
 use events::primitives::{
-    AccountAddress, AlertId, AlertKind, Chain, Confidence, CustomerId, IncidentId, Severity,
+    AccountAddress, AlertId, AlertKind, Chain, CustomerId, IncidentId, Severity,
 };
 use events::rule_engine::RuleAlertCreated;
 use events::simulation::IncidentCreated;
@@ -47,29 +47,19 @@ pub struct Notice {
     pub occurred_at: DateTime<Utc>,
 }
 
-/// Confidence → coarse severity, for events that carry a [`Confidence`] but
-/// no native [`Severity`] (only `PreliminaryAlertCreated`, today). A
-/// deliberate, documented approximation — not the same measurement as
-/// simulation's confirmed [`Severity`], but the closest signal available
-/// before confirmation, and the thresholds are conservative (a merely
-/// `Medium`-confidence provisional alert still routes as `Low`, so a
-/// subscriber gated on severity isn't over-notified pre-confirmation).
-pub fn confidence_bucket(confidence: Confidence) -> Severity {
-    let value = confidence.get();
-    if value >= 0.9 {
-        Severity::High
-    } else if value >= 0.75 {
-        Severity::Medium
-    } else {
-        Severity::Low
-    }
-}
-
 impl Notice {
     /// `PreliminaryAlertCreated` (§6, fast path) → the Provisional stage.
-    /// Severity is approximated from confidence (see
-    /// [`confidence_bucket`]); `dedup_key` is the `alert_id` this incident's
-    /// eventual confirm/retract shares (see [`Self::from_incident_created`]).
+    ///
+    /// Severity is the band the **detection service already scored** onto the
+    /// event (`impact_usd × confidence`, §6) — carried through verbatim, not
+    /// re-derived here. That is the whole point of the on-wire `severity`
+    /// field: one attribution-blind scoring policy, owned by detection, so
+    /// routing can't drift from a second local heuristic. (It supersedes the
+    /// old confidence-only `confidence_bucket`, which measured a strictly
+    /// weaker signal — confidence alone, blind to blast radius.) It is still a
+    /// *provisional* band, distinct from simulation's confirmed [`Severity`]
+    /// (§7); `dedup_key` is the `alert_id` this incident's eventual
+    /// confirm/retract shares (see [`Self::from_incident_created`]).
     pub fn from_preliminary_alert(
         event: &PreliminaryAlertCreated,
         chain: Chain,
@@ -79,7 +69,7 @@ impl Notice {
             dedup_key: event.alert_id.to_string(),
             stage: LifecycleStage::Provisional,
             kind: Some(event.kind),
-            severity: Some(confidence_bucket(event.confidence)),
+            severity: Some(event.severity),
             chain,
             addresses: event.addresses.clone(),
             owner: None,
@@ -242,25 +232,14 @@ pub fn incident_alert_link(event: &IncidentCreated) -> (IncidentId, AlertId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use events::primitives::DetectorRef;
+    use events::primitives::{Confidence, DetectorRef, SuggestedAction};
 
     fn addr(byte: u8) -> AccountAddress {
         AccountAddress::repeat_byte(byte)
     }
 
-    #[test]
-    fn confidence_buckets_are_conservative() {
-        assert_eq!(confidence_bucket(Confidence::new(0.95)), Severity::High);
-        assert_eq!(confidence_bucket(Confidence::new(0.9)), Severity::High);
-        assert_eq!(confidence_bucket(Confidence::new(0.89)), Severity::Medium);
-        assert_eq!(confidence_bucket(Confidence::new(0.75)), Severity::Medium);
-        assert_eq!(confidence_bucket(Confidence::new(0.74)), Severity::Low);
-        assert_eq!(confidence_bucket(Confidence::new(0.0)), Severity::Low);
-    }
-
-    #[test]
-    fn preliminary_alert_is_provisional_with_derived_severity() {
-        let event = PreliminaryAlertCreated {
+    fn preliminary_alert(confidence: f64, severity: Severity) -> PreliminaryAlertCreated {
+        PreliminaryAlertCreated {
             alert_id: AlertId::new(),
             detector: DetectorRef {
                 id: "sandwich".into(),
@@ -269,15 +248,38 @@ mod tests {
             },
             addresses: vec![addr(1)],
             kind: AlertKind::Sandwich,
-            confidence: Confidence::new(0.95),
+            confidence: Confidence::new(confidence),
             provisional: true,
-        };
+            impact_usd: None,
+            severity,
+            suggested_action: SuggestedAction::Monitor,
+        }
+    }
+
+    #[test]
+    fn preliminary_alert_carries_the_events_scored_severity_through() {
+        let event = preliminary_alert(0.95, Severity::High);
         let notice = Notice::from_preliminary_alert(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Provisional);
-        assert_eq!(notice.severity, Some(Severity::High));
+        assert_eq!(
+            notice.severity,
+            Some(Severity::High),
+            "severity is the band detection scored onto the event, carried through"
+        );
         assert_eq!(notice.kind, Some(AlertKind::Sandwich));
         assert_eq!(notice.owner, None, "platform-wide, not customer-scoped");
         assert_eq!(notice.dedup_key, event.alert_id.to_string());
+    }
+
+    #[test]
+    fn provisional_severity_follows_the_event_not_confidence() {
+        // High confidence but a Low scored band (e.g. unpriced impact): routing
+        // must honour the event's severity, not re-derive from confidence — the
+        // regression the old confidence-only bucket would have made (routing it
+        // High) is exactly what consolidating onto `event.severity` prevents.
+        let event = preliminary_alert(0.95, Severity::Low);
+        let notice = Notice::from_preliminary_alert(&event, Chain::ETHEREUM, Utc::now());
+        assert_eq!(notice.severity, Some(Severity::Low));
     }
 
     #[test]

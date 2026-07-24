@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use detector_api::{
     DetectionCtx, DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, Swap, UsdPrice,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// The spec's reference profit gate (§6, `[detectors.sandwich] min_profit_usd = 10.0`).
 const DEFAULT_MIN_PROFIT_USD: f64 = 10.0;
@@ -302,6 +302,8 @@ fn build_evidence(
         profit_usd,
     };
     Evidence::from_detail(AlertKind::Sandwich, txs, confidence, &detail)
+        // Impact is the attacker's extracted profit (not gross swap volume).
+        .with_impact_usd(profit_usd.map(UsdAmount::new))
 }
 
 #[cfg(test)]

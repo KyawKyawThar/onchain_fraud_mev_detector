@@ -148,6 +148,7 @@ fn request_evidence(job: &SimulationJob) -> serde_json::Value {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
+    use events::primitives::{Severity, SuggestedAction};
 
     fn an_alert() -> PreliminaryAlertCreated {
         PreliminaryAlertCreated {
@@ -161,6 +162,9 @@ mod tests {
             kind: AlertKind::Sandwich,
             confidence: Confidence::new(0.8),
             provisional: true,
+            impact_usd: None,
+            severity: Severity::Low,
+            suggested_action: SuggestedAction::Monitor,
         }
     }
 

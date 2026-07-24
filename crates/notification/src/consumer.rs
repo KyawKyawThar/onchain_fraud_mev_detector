@@ -494,6 +494,7 @@ mod tests {
     use events::intelligence::SanctionHit;
     use events::primitives::{
         AccountAddress, AlertKind, Confidence, CustomerId, DetectorRef, RuleId, Severity,
+        SuggestedAction,
     };
     use events::rule_engine::RuleAlertCreated;
     use events::simulation::{IncidentCreated, IncidentFinalized, IncidentRetracted};
@@ -579,6 +580,9 @@ mod tests {
             kind,
             confidence: Confidence::new(confidence),
             provisional: true,
+            impact_usd: None,
+            severity: Severity::Low,
+            suggested_action: SuggestedAction::Monitor,
         })
     }
 

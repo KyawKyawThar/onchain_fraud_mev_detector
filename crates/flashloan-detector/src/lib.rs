@@ -40,7 +40,7 @@ use detector_api::{
     DetectionCtx, DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, TxActions,
     UsdPrice,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// Default notional gate: flash loans are large by construction, so a `$1,000`
 /// floor filters dust round trips without touching real ones (§6).
@@ -237,6 +237,8 @@ fn build_evidence(
         borrowed_usd,
     };
     Evidence::from_detail(AlertKind::Flashloan, vec![tx], confidence, &detail)
+        // Impact is the borrowed notional — the capital the round trip moved.
+        .with_impact_usd(borrowed_usd.map(UsdAmount::new))
 }
 
 #[cfg(test)]

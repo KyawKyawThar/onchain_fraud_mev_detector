@@ -32,7 +32,7 @@ use detector_api::{
     Bps, DetectionCtx, DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, TxActions,
     UsdPrice,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// Default gate: ignore liquidations repaying less than `$100` of debt (dust).
 const DEFAULT_MIN_DEBT_USD: f64 = 100.0;
@@ -270,6 +270,9 @@ fn build_evidence(
         bonus_bps,
     };
     Evidence::from_detail(AlertKind::Liquidation, vec![tx], confidence, &detail)
+        // Impact is the collateral seized — always priced here (the detector
+        // gates on a valued debt), so the emit path never falls back.
+        .with_impact_usd(Some(UsdAmount::new(collateral.usd)))
 }
 
 #[cfg(test)]

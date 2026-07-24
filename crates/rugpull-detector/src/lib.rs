@@ -37,7 +37,7 @@ use detector_api::{
     Bps, DetectionCtx, DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, TxActions,
     UsdPrice,
 };
-use events::primitives::{AlertKind, Confidence};
+use events::primitives::{AlertKind, Confidence, UsdAmount};
 
 /// Default drain floor: pulling ≥ 50% of a reserve in one tx is the signal.
 const DEFAULT_MIN_DRAIN_BPS: u32 = 5_000;
@@ -258,6 +258,8 @@ fn build_evidence(
         drained_usd,
     };
     Evidence::from_detail(AlertKind::Rugpull, vec![tx], confidence, &detail)
+        // Impact is the value drained from the pool — the victims' loss.
+        .with_impact_usd(drained_usd.map(UsdAmount::new))
 }
 
 #[cfg(test)]
