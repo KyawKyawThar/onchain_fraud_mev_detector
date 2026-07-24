@@ -29,6 +29,7 @@ use event_bus::EventSink;
 use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
+use events::system::UsageEventType;
 use events::{DomainEvent, EventEnvelope};
 use intelligence::model::address_key;
 use rule_engine::model::{Action, Condition, LogicOp, Rule, TemporalConstraint};
@@ -46,6 +47,7 @@ use crate::auth::require_jwt;
 use crate::config::JwtConfig;
 use crate::intelligence_client::{self, IntelligenceClient};
 use crate::policy_store::{self, PolicyStore};
+use crate::rate_limit::{self, ScreeningRateLimiter};
 use crate::stream::{self, WsMessage};
 use crate::upstream;
 use crate::usage::{self, UsageRecorder};
@@ -109,6 +111,11 @@ pub struct AppState {
     /// `PgPolicyStore` in production, keyed by the JWT's `CustomerId` the
     /// same way `rules` is.
     pub policies: Arc<dyn PolicyStore>,
+    /// The dedicated rate-limit ceiling `POST /v1/address/{addr}/screen`
+    /// checks before doing any work (§19, Sprint 14 t4) — `RedisScreeningRateLimiter`
+    /// in production, keyed by the JWT's `CustomerId` the same way `policies`/
+    /// `rules` are.
+    pub screening_rate_limit: Arc<dyn ScreeningRateLimiter>,
 }
 
 fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
@@ -125,10 +132,23 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     // (added last, outermost) runs first and inserts the `CustomerId`
     // extension the usage layer reads — an unauthenticated request is
     // rejected before it can be metered (§13).
+    // Its own sub-router so the rate-limit layer applies ONLY to this route
+    // (§19) — every other `/v1` route stays unaffected by the screening
+    // ceiling. Layered inside the JWT gate below (it reads the `CustomerId`
+    // extension), and runs before the usage-metering layer reaches this
+    // route's handler, so a rejected call never pays the intelligence/
+    // policy-store round-trip.
+    let screening = OpenApiRouter::new()
+        .routes(routes!(screen_address))
+        .route_layer(middleware::from_fn_with_state(
+            state.screening_rate_limit.clone(),
+            rate_limit::enforce_screening_rate_limit,
+        ));
+
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
-        .routes(routes!(screen_address))
+        .merge(screening)
         .routes(routes!(list_policies))
         .routes(routes!(upsert_policy))
         .routes(routes!(builders))
@@ -364,6 +384,7 @@ struct ScreenResponse {
         (status = 200, description = "The screening decision with its driving facts", body = ScreenResponse),
         (status = 400, description = "Address is not valid hex, the body isn't valid JSON, or `policy` names nothing this customer can see"),
         (status = 401, description = "Missing or invalid bearer token"),
+        (status = 429, description = "This endpoint's dedicated rate limit was exceeded (§19)"),
         (status = 502, description = "intelligence or the policy store is unreachable"),
     ),
 )]
@@ -403,6 +424,14 @@ async fn screen_address(
     // typed input.
     let input = crate::screen::ScreeningInput::from(&facts);
     let verdict = crate::screen::decide(input, &policy);
+
+    // §13 per-call metering: only on the success path — a call that 502'd
+    // before a verdict was ever rendered isn't a billable screening call,
+    // unlike `ApiCallMade` (which meters every authenticated request
+    // regardless of outcome). Quantity is always 1; §13's Developer/Growth/
+    // Scale/Enterprise volume tiers are computed downstream from these raw
+    // events, never gated here (see `crate::rate_limit`'s module docs).
+    state.usage.record(customer, UsageEventType::ScreeningCall);
 
     Ok(Json(ScreenResponse {
         address: address_key(&address),
@@ -1102,6 +1131,7 @@ mod tests {
     use crate::intelligence_client::IntelligenceClient;
     use crate::policy_store::test_util::InMemoryPolicyStore;
     use crate::policy_store::PolicyStore;
+    use crate::rate_limit::test_util::InMemoryRateLimiter;
     use crate::usage::UsageRecorder;
     use event_bus::test_util::RecordingSink;
     use events::system::UsageRecorded;
@@ -1142,6 +1172,7 @@ mod tests {
             rules: rules.clone(),
             events: events.clone(),
             policies: policies.clone(),
+            screening_rate_limit: Arc::new(InMemoryRateLimiter::unbounded()),
         };
         TestState {
             state,
@@ -1374,6 +1405,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// §13/Sprint 14 t4: `ScreeningCall` is billable metering, distinct from
+    /// the always-fires `ApiCallMade` — a call that never produced a verdict
+    /// (here, the lazy intelligence channel 502s before `decide` runs) must
+    /// not bill one. Only the generic per-request meter fires.
+    #[tokio::test]
+    async fn a_failed_screening_call_meters_api_call_made_but_not_screening_call() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let mut usage_rx = ts.usage_rx;
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state);
+        let path = format!("/v1/address/{:#x}/screen", alloy_primitives::Address::ZERO);
+
+        let response = router
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let usage = usage_rx.try_recv().expect("ApiCallMade always fires");
+        assert_eq!(
+            usage.event_type,
+            events::system::UsageEventType::ApiCallMade.as_wire_str()
+        );
+        assert!(
+            usage_rx.try_recv().is_err(),
+            "no ScreeningCall — the call 502'd before a verdict was rendered"
+        );
+    }
+
+    /// §19/Sprint 14 t4: the screening endpoint's rate limit is its own
+    /// dedicated bucket — exhausting it 429s further `/screen` calls but
+    /// leaves every other `/v1` route unaffected.
+    #[tokio::test]
+    async fn screening_endpoint_enforces_its_own_dedicated_rate_limit() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let mut ts = test_state();
+        ts.state.screening_rate_limit =
+            std::sync::Arc::new(crate::rate_limit::test_util::InMemoryRateLimiter::new(1));
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state);
+        let path = format!("/v1/address/{:#x}/screen", alloy_primitives::Address::ZERO);
+
+        // First call within budget: reaches the handler (502 — no live
+        // intelligence here), proving the limiter didn't block it.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // Second call exceeds the limit of 1 — rejected before the handler.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // A 429 must tell the client when to retry (production SDK contract).
+        assert!(
+            response.headers().contains_key(header::RETRY_AFTER),
+            "429 must carry a Retry-After header"
+        );
+
+        // A different `/v1` route is untouched — the limit is dedicated to
+        // `/screen`, not a router-wide ceiling.
+        let response = router
+            .oneshot(
+                Request::get("/v1/incidents")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// The §11/Sprint 14 t2 policy surface end to end: `PUT /v1/policies/{name}`

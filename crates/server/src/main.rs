@@ -6,7 +6,8 @@
 //!
 //! Boot: observability, resolve config, build the outbound clients (a lazy
 //! gRPC channel to intelligence, a `reqwest::Client` for the two HTTP
-//! proxies, a broadcast channel + Kafka consumer for the WS stream, and a
+//! proxies, a broadcast channel + Kafka consumer for the WS stream, a Redis
+//! connection for the screening endpoint's dedicated rate limiter (§19), and a
 //! Kafka producer publishing every metered call as `UsageRecorded`, §13), then
 //! serve until a shutdown signal — the same `CancellationToken` +
 //! graceful-drain shape every other service in this workspace uses. A fatal
@@ -24,6 +25,7 @@ use server::config::Config;
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
 use server::policy_store::PgPolicyStore;
+use server::rate_limit::{RedisScreeningRateLimiter, SCREENING_RATE_LIMIT_WINDOW};
 use server::stream;
 use server::usage::{self, UsageRecorder};
 use tokio_util::sync::CancellationToken;
@@ -83,6 +85,19 @@ async fn main() -> Result<()> {
         .await
         .context("screening_policies schema not reachable — run `just migrate-up`?")?;
 
+    // ── Screening rate limiter (§19, Sprint 14 t4) ─────────────────────
+    // Fail-fast dial like every other dependency at boot; the limiter itself
+    // fails *open* on a live Redis fault (see `rate_limit` module docs) —
+    // this is only about not serving traffic at all with a dead Redis.
+    let redis_conn = db::redis::connect(cfg.redis_url.expose_secret())
+        .await
+        .context("connecting Redis for the screening rate limiter")?;
+    let screening_rate_limit = Arc::new(RedisScreeningRateLimiter::new(
+        redis_conn,
+        cfg.screening_rate_limit_per_minute,
+        SCREENING_RATE_LIMIT_WINDOW,
+    ));
+
     // The one Kafka producer this service holds: usage metering (§13) and the
     // `RuleCreated` announcement (§9) share it.
     let sink: Arc<dyn EventSink> =
@@ -99,6 +114,7 @@ async fn main() -> Result<()> {
         rules: Arc::new(rule_store),
         events: sink.clone(),
         policies: Arc::new(policy_store),
+        screening_rate_limit,
     };
 
     let shutdown = CancellationToken::new();

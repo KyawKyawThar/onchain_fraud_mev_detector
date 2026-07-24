@@ -40,6 +40,12 @@ pub enum ApiError {
     #[error("{0}")]
     PayloadTooLarge(String),
 
+    /// 429 — the caller exceeded a dedicated rate limit (e.g. the screening
+    /// endpoint's §19 SLO-protecting bucket). Distinct from a 413/400: the
+    /// request itself is fine, the caller just needs to slow down.
+    #[error("{0}")]
+    TooManyRequests(String),
+
     /// 502 — a downstream service (gRPC or HTTP) this handler depends on
     /// failed or was unreachable. Not this service's fault, but not the
     /// caller's either.
@@ -74,6 +80,12 @@ impl ApiError {
         Self::PayloadTooLarge(message.to_string())
     }
 
+    /// 429 — the caller exceeded a dedicated rate limit. `message` names
+    /// which one; safe and useful to return verbatim.
+    pub fn too_many_requests(message: impl std::fmt::Display) -> Self {
+        Self::TooManyRequests(message.to_string())
+    }
+
     /// 502 — a downstream dependency failed. Takes any `Display` (a
     /// `tonic::Status`, a `reqwest`-backed proxy error, ...) so call sites
     /// don't need their own wrapper per downstream error type.
@@ -92,6 +104,7 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -125,6 +138,10 @@ mod tests {
         assert_eq!(
             ApiError::payload_too_large("x").status(),
             StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            ApiError::too_many_requests("x").status(),
+            StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(ApiError::bad_gateway("x").status(), StatusCode::BAD_GATEWAY);
         assert_eq!(

@@ -56,6 +56,10 @@ jsonwebtoken = { workspace = true }
 # stored form — no translation layer here); `db` supplies the Postgres pool.
 rule-engine = { workspace = true }
 db = { workspace = true }
+# Dedicated screening-endpoint rate limiter (§19) — `db::redis::connect` is the
+# shared connection builder, but the limiter itself uses `redis::Script`/
+# `ConnectionManager` directly (same pattern as `intelligence`/`rule-engine`).
+redis = { workspace = true }
 # `PgPolicyStore` (§11, Sprint 14 t2): the customer-authored decision-policy
 # table lives in this crate (it's this service's own concern, unlike rules),
 # so unlike `rule-engine` it needs `sqlx` directly rather than through a
@@ -101,3 +105,8 @@ tower = { workspace = true }
 # Drive a real client connection against a bound listener for the `/v1/stream`
 # lifecycle test — `ServiceExt::oneshot` can't exercise a WS upgrade.
 tokio-tungstenite = { workspace = true }
+# Real Redis for `RedisScreeningRateLimiter`'s `#[ignore]`d contract test
+# (§19, Sprint 14 t4) — mirrors `intelligence`/`rule-engine`'s Redis-backed
+# store tests.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["redis"] }

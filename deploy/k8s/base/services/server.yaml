@@ -72,6 +72,13 @@ spec:
                 secretKeyRef:
                   name: postgres-credentials
                   key: DATABASE_URL
+            # Screening endpoint's dedicated rate limiter (§19, Sprint 14 t4)
+            # — same secret intelligence/rule-engine already read Redis from.
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
