@@ -25,6 +25,16 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0002_victim_address_business_key.up.sql"),
         down: include_str!("../migrations/0002_victim_address_business_key.down.sql"),
     },
+    Migration {
+        version: "0003_create_incident_timing_rollup",
+        up: include_str!("../migrations/0003_create_incident_timing_rollup.up.sql"),
+        down: include_str!("../migrations/0003_create_incident_timing_rollup.down.sql"),
+    },
+    Migration {
+        version: "0004_create_incident_timing_rollup_mv",
+        up: include_str!("../migrations/0004_create_incident_timing_rollup_mv.up.sql"),
+        down: include_str!("../migrations/0004_create_incident_timing_rollup_mv.down.sql"),
+    },
 ];
 
 /// The simulation service's migrator: applied on the projection consumer's

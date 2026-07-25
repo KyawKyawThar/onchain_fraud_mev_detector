@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, AlertId, AlertKind, Chain, Confidence, DetectorRef};
+use events::primitives::{
+    AccountAddress, AlertId, AlertKind, Chain, Confidence, DetectorRef, Severity,
+};
 use revm::primitives::Address;
 
-use crate::store::{ExposureRow, PersistError, WalletExposureStore};
+use crate::store::{ExposureRow, PersistError, TimingBucketRow, TimingStore, WalletExposureStore};
 
 /// The shared recording [`EventSink`](event_bus::EventSink), re-exported under
 /// this crate's historical name so the worker/dispatcher/reorg tests keep using
@@ -144,6 +146,34 @@ impl WalletExposureStore for InMemoryWalletExposure {
         _victim_address: &AccountAddress,
         _since: Option<DateTime<Utc>>,
     ) -> Result<Vec<ExposureRow>, PersistError> {
+        Ok(self.rows.clone())
+    }
+}
+
+/// An in-memory [`TimingStore`] returning canned rows — lets the HTTP handler
+/// exercise `GET /v1/timing/recommendation` without ClickHouse (same
+/// doubles-not-a-database discipline as [`InMemoryWalletExposure`]).
+#[derive(Clone, Default)]
+pub struct InMemoryTimingStore {
+    rows: Vec<TimingBucketRow>,
+}
+
+impl InMemoryTimingStore {
+    /// A store that returns `rows` verbatim for any chain/severity — the pure
+    /// [`crate::timing::rank_windows`] fold and the handler wiring are what
+    /// the tests exercise, not the ClickHouse-side filtering.
+    pub fn new(rows: Vec<TimingBucketRow>) -> Self {
+        Self { rows }
+    }
+}
+
+#[async_trait]
+impl TimingStore for InMemoryTimingStore {
+    async fn timing_buckets(
+        &self,
+        _chain: Chain,
+        _severity: Severity,
+    ) -> Result<Vec<TimingBucketRow>, PersistError> {
         Ok(self.rows.clone())
     }
 }

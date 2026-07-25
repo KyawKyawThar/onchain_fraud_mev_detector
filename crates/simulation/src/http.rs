@@ -14,15 +14,17 @@ use api_error::ApiError;
 use axum::extract::{Path, Query, State};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use events::primitives::AccountAddress;
+use events::primitives::{AccountAddress, Chain, Severity};
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
 use crate::exposure::{self, MevExposureSummary};
 use crate::projection::{IncidentRecord, IncidentStatus};
 use crate::store::{
-    IncidentCursor, IncidentFilters, IncidentStore, PgIncidentStore, WalletExposureStore,
+    IncidentCursor, IncidentFilters, IncidentStore, PgIncidentStore, TimingStore,
+    WalletExposureStore,
 };
+use crate::timing::{self, SizeBand, TimingRecommendation};
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -34,10 +36,12 @@ pub struct AppState {
     pub pg: PgIncidentStore,
     /// Backs `GET /v1/wallet/{addr}/mev-exposure` (§11).
     pub exposure: Arc<dyn WalletExposureStore>,
+    /// Backs `GET /v1/timing/recommendation` (safe-block-timing).
+    pub timing: Arc<dyn TimingStore>,
 }
 
-/// Build the router: `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`, and
-/// `/healthz`, all open (see module docs).
+/// Build the router: `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`,
+/// `/v1/timing/recommendation`, and `/healthz`, all open (see module docs).
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(healthz))
@@ -45,6 +49,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/wallet/{addr}/mev-exposure",
             axum::routing::get(wallet_mev_exposure),
+        )
+        .route(
+            "/v1/timing/recommendation",
+            axum::routing::get(timing_recommendation),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -179,11 +187,62 @@ async fn wallet_mev_exposure(
     Ok(Json(exposure::summarize(rows)))
 }
 
+/// Query string for `GET /v1/timing/recommendation`: which chain, and which
+/// "size" band (severity) to rank windows for. Both optional — an unset
+/// `chain` defaults to Ethereum mainnet (mirrors api-service's
+/// `default_chain` convention), an unset `size` defaults to `medium`.
+#[derive(Debug, Deserialize)]
+struct TimingParams {
+    #[serde(default = "default_chain")]
+    chain: u64,
+    size: Option<String>,
+}
+
+/// Ethereum mainnet — the same default every other unscoped `chain` query
+/// param in this workspace falls back to.
+fn default_chain() -> u64 {
+    Chain::ETHEREUM.id()
+}
+
+/// Parse the `size` query param's wire string into a [`SizeBand`], via the
+/// same `deserialize_wire_str` primitive `store.rs`'s `parse_wire_enum`
+/// builds on (one shared "wrap as `Value::String`, then deserialize" trick,
+/// each layer wrapping the failure into its own error type). An unset `size`
+/// defaults to [`Severity::Medium`]; an unrecognized string is the caller's
+/// mistake, not ours.
+fn parse_size(raw: Option<String>) -> Result<SizeBand, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Severity::Medium);
+    };
+    crate::store::deserialize_wire_str(&raw)
+        .map_err(|_| ApiError::bad_request(format!("invalid size `{raw}`")))
+}
+
+/// `GET /v1/timing/recommendation` — safe-block-timing: historical incident
+/// intensity for `chain`/`size`, ranked into the safest-first low-MEV
+/// windows. A heuristic over historical patterns (see
+/// [`timing::TIMING_CAVEAT`]), never a guarantee.
+async fn timing_recommendation(
+    State(state): State<AppState>,
+    Query(params): Query<TimingParams>,
+) -> Result<Json<TimingRecommendation>, ApiError> {
+    let chain = Chain(params.chain);
+    let severity = parse_size(params.size)?;
+
+    let rows = state
+        .timing
+        .timing_buckets(chain, severity)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(timing::rank_windows(chain, severity, rows)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ExposureRow, IncidentPage, JobUpdate, PersistError};
-    use crate::test_util::InMemoryWalletExposure;
+    use crate::store::{ExposureRow, IncidentPage, JobUpdate, PersistError, TimingBucketRow};
+    use crate::test_util::{InMemoryTimingStore, InMemoryWalletExposure};
     use async_trait::async_trait;
     use uuid::Uuid;
 
@@ -218,11 +277,25 @@ mod tests {
             store: Arc::new(UnusedIncidentStore),
             pg: PgIncidentStore::new(pool),
             exposure: Arc::new(InMemoryWalletExposure::new(rows)),
+            timing: Arc::new(InMemoryTimingStore::default()),
         }
     }
 
     fn row(kind: &str, usd_lost: f64) -> ExposureRow {
         InMemoryWalletExposure::row(Uuid::new_v4(), kind, usd_lost, Utc::now())
+    }
+
+    /// Like [`state`], but for the timing-recommendation handler tests: no
+    /// wallet-exposure rows, canned `TimingBucketRow`s instead.
+    fn timing_state(rows: Vec<TimingBucketRow>) -> AppState {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+            .expect("lazy pool construction does no I/O");
+        AppState {
+            store: Arc::new(UnusedIncidentStore),
+            pg: PgIncidentStore::new(pool),
+            exposure: Arc::new(InMemoryWalletExposure::default()),
+            timing: Arc::new(InMemoryTimingStore::new(rows)),
+        }
     }
 
     #[tokio::test]
@@ -255,5 +328,67 @@ mod tests {
 
         assert_eq!(summary.incident_count, 0);
         assert!(summary.incidents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timing_recommendation_ranks_the_store_rows() {
+        let state = timing_state(vec![TimingBucketRow {
+            slot_of_day: 5,
+            incident_count: 3,
+            total_victim_loss_usd: 900.0,
+        }]);
+        let Json(rec) = timing_recommendation(
+            State(state),
+            Query(TimingParams {
+                chain: default_chain(),
+                size: Some("high".to_owned()),
+            }),
+        )
+        .await
+        .expect("handler succeeds");
+
+        assert_eq!(rec.chain, default_chain());
+        assert_eq!(rec.size, "high");
+        assert_eq!(rec.sample_size, 3);
+        assert_eq!(rec.caveat, timing::TIMING_CAVEAT);
+        // Slot 5 is the only one with any incidents, so every returned
+        // window (the safest ones) must be a zero-incident slot.
+        assert!(rec.windows.iter().all(|w| w.incident_count == 0));
+    }
+
+    #[tokio::test]
+    async fn timing_recommendation_defaults_size_to_medium() {
+        let state = timing_state(vec![]);
+        let Json(rec) = timing_recommendation(
+            State(state),
+            Query(TimingParams {
+                chain: default_chain(),
+                size: None,
+            }),
+        )
+        .await
+        .expect("handler succeeds");
+
+        assert_eq!(rec.size, "medium");
+        assert_eq!(rec.sample_size, 0);
+    }
+
+    #[tokio::test]
+    async fn timing_recommendation_rejects_an_unrecognized_size() {
+        let state = timing_state(vec![]);
+        let err = timing_recommendation(
+            State(state),
+            Query(TimingParams {
+                chain: default_chain(),
+                size: Some("gigantic".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("an unrecognized size band is a 400, not a panic");
+
+        match err {
+            ApiError::BadRequest(detail) => assert!(detail.contains("gigantic"), "{detail}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }
