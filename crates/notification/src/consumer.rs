@@ -84,6 +84,7 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
     "IncidentFinalized",
     "RuleAlertCreated",
     "SanctionHit",
+    "WalletExposureReportReady",
 ];
 
 /// Bound on the in-memory pending-correlation buffer (see the module docs) —
@@ -482,6 +483,11 @@ impl EventHandler for NotificationConsumer {
                 self.verdict(self.route_and_deliver(notice).await)
             }
 
+            DomainEvent::WalletExposureReportReady(event) => {
+                let notice = Notice::from_exposure_report(&event, chain, occurred_at);
+                self.verdict(self.route_and_deliver(notice).await)
+            }
+
             other => {
                 tracing::warn!(
                     event = other.event_type(),
@@ -729,6 +735,37 @@ mod tests {
                 address: addr(5),
                 explanation: "matched".into(),
             })))
+            .await;
+
+        assert_eq!(
+            h.channels.deliveries().len(),
+            1,
+            "only the owner's subscriber"
+        );
+    }
+
+    /// `WalletExposureReportReady` reaches only the wallet's owner, the same
+    /// isolation contract as `RuleAlertCreated` (both scope on `owner`, bypass
+    /// severity/kind).
+    #[tokio::test]
+    async fn wallet_exposure_report_reaches_only_its_owner() {
+        let h = harness();
+        let owner = CustomerId::new();
+        let other = CustomerId::new();
+        h.seed(webhook_subscriber(owner, SubscriptionFilter::default()));
+        h.seed(webhook_subscriber(other, SubscriptionFilter::default()));
+
+        h.consumer
+            .handle(envelope(DomainEvent::WalletExposureReportReady(
+                events::simulation::WalletExposureReportReady {
+                    customer_id: owner,
+                    address: addr(7),
+                    period_start: Utc::now(),
+                    period_end: Utc::now(),
+                    headline: "no MEV exposure this period".into(),
+                    summary: serde_json::json!({}),
+                },
+            )))
             .await;
 
         assert_eq!(

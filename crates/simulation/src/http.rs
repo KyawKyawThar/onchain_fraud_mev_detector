@@ -12,13 +12,16 @@ use std::sync::Arc;
 
 use api_error::ApiError;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, Chain, Severity};
+use events::primitives::{AccountAddress, Chain, CustomerId, Severity};
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
 use crate::exposure::{self, MevExposureSummary};
+use crate::monitored_wallet_store::{AddOutcome, MonitoredWallet, MonitoredWalletStore};
 use crate::projection::{IncidentRecord, IncidentStatus};
 use crate::store::{
     IncidentCursor, IncidentFilters, IncidentStore, PgIncidentStore, TimingStore,
@@ -38,10 +41,15 @@ pub struct AppState {
     pub exposure: Arc<dyn WalletExposureStore>,
     /// Backs `GET /v1/timing/recommendation` (safe-block-timing).
     pub timing: Arc<dyn TimingStore>,
+    /// Backs the `/v1/monitored-wallets` opt-in CRUD (§25, Sprint 15 t5).
+    pub monitored_wallets: Arc<dyn MonitoredWalletStore>,
 }
 
 /// Build the router: `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`,
-/// `/v1/timing/recommendation`, and `/healthz`, all open (see module docs).
+/// `/v1/timing/recommendation`, `/v1/monitored-wallets`, and `/healthz`, all
+/// open (see module docs — this surface is internal-network-only, fronted by
+/// the public API service which owns end-user auth and passes `owner`
+/// itself, never taken from an untrusted caller here).
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(healthz))
@@ -53,6 +61,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/timing/recommendation",
             axum::routing::get(timing_recommendation),
+        )
+        .route(
+            "/v1/monitored-wallets",
+            axum::routing::post(add_monitored_wallet).get(list_monitored_wallets),
+        )
+        .route(
+            "/v1/monitored-wallets/{chain_id}/{address}",
+            axum::routing::delete(remove_monitored_wallet),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -238,11 +254,101 @@ async fn timing_recommendation(
     Ok(Json(timing::rank_windows(chain, severity, rows)))
 }
 
+/// `POST /v1/monitored-wallets` request body — `owner` is composed by the
+/// public API service from the caller's JWT, never taken from an untrusted
+/// caller directly (this surface is internal-network-only, see module docs).
+#[derive(Debug, Deserialize)]
+struct AddMonitoredWalletRequest {
+    owner: CustomerId,
+    chain_id: u64,
+    address: AccountAddress,
+}
+
+/// One monitored wallet on the wire.
+#[derive(Debug, Serialize)]
+struct MonitoredWalletDto {
+    chain_id: u64,
+    address: String,
+    created_at: DateTime<Utc>,
+}
+
+impl From<&MonitoredWallet> for MonitoredWalletDto {
+    fn from(wallet: &MonitoredWallet) -> Self {
+        Self {
+            chain_id: wallet.chain.id(),
+            address: format!("{:#x}", wallet.address),
+            created_at: wallet.created_at,
+        }
+    }
+}
+
+/// `POST /v1/monitored-wallets` — opt `address` in for `owner`'s scheduled §25
+/// exposure-report push. Idempotent: opting the same pair in twice is a 200,
+/// not a duplicate row or an error.
+async fn add_monitored_wallet(
+    State(state): State<AppState>,
+    Json(body): Json<AddMonitoredWalletRequest>,
+) -> Result<Response, ApiError> {
+    let outcome = state
+        .monitored_wallets
+        .add(body.owner, Chain(body.chain_id), body.address, Utc::now())
+        .await
+        .map_err(ApiError::internal)?;
+
+    let status = match outcome {
+        AddOutcome::Added => StatusCode::CREATED,
+        AddOutcome::AlreadyMonitored => StatusCode::OK,
+    };
+    Ok((status, Json(serde_json::json!({ "status": "ok" }))).into_response())
+}
+
+/// Query string for `GET`/`DELETE /v1/monitored-wallets`: the owner the
+/// public API service resolved from the caller's JWT.
+#[derive(Debug, Deserialize)]
+struct OwnerParam {
+    owner: CustomerId,
+}
+
+/// `GET /v1/monitored-wallets?owner=` — `owner`'s own monitored wallets.
+async fn list_monitored_wallets(
+    State(state): State<AppState>,
+    Query(params): Query<OwnerParam>,
+) -> Result<Json<Vec<MonitoredWalletDto>>, ApiError> {
+    let wallets = state
+        .monitored_wallets
+        .list_for_owner(params.owner)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(wallets.iter().map(MonitoredWalletDto::from).collect()))
+}
+
+/// `DELETE /v1/monitored-wallets/{chain_id}/{address}?owner=` — opt out.
+async fn remove_monitored_wallet(
+    State(state): State<AppState>,
+    Path((chain_id, address)): Path<(u64, AccountAddress)>,
+    Query(params): Query<OwnerParam>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state
+        .monitored_wallets
+        .remove(params.owner, Chain(chain_id), address)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(if removed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{ExposureRow, IncidentPage, JobUpdate, PersistError, TimingBucketRow};
-    use crate::test_util::{InMemoryTimingStore, InMemoryWalletExposure};
+    use crate::test_util::{
+        InMemoryMonitoredWalletStore, InMemoryTimingStore, InMemoryWalletExposure,
+    };
     use async_trait::async_trait;
     use uuid::Uuid;
 
@@ -278,6 +384,7 @@ mod tests {
             pg: PgIncidentStore::new(pool),
             exposure: Arc::new(InMemoryWalletExposure::new(rows)),
             timing: Arc::new(InMemoryTimingStore::default()),
+            monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
         }
     }
 
@@ -295,6 +402,22 @@ mod tests {
             pg: PgIncidentStore::new(pool),
             exposure: Arc::new(InMemoryWalletExposure::default()),
             timing: Arc::new(InMemoryTimingStore::new(rows)),
+            monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
+        }
+    }
+
+    /// Like [`state`], but for the monitored-wallets handler tests: no
+    /// wallet-exposure/timing rows, just an in-memory
+    /// [`InMemoryMonitoredWalletStore`] the tests seed directly.
+    fn monitored_wallets_state() -> AppState {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused")
+            .expect("lazy pool construction does no I/O");
+        AppState {
+            store: Arc::new(UnusedIncidentStore),
+            pg: PgIncidentStore::new(pool),
+            exposure: Arc::new(InMemoryWalletExposure::default()),
+            timing: Arc::new(InMemoryTimingStore::default()),
+            monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
         }
     }
 
@@ -390,5 +513,95 @@ mod tests {
             ApiError::BadRequest(detail) => assert!(detail.contains("gigantic"), "{detail}"),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_monitored_wallet_is_created_then_idempotent() {
+        let state = monitored_wallets_state();
+        let owner = CustomerId::new();
+        let body = || AddMonitoredWalletRequest {
+            owner,
+            chain_id: Chain::ETHEREUM.id(),
+            address: AccountAddress::repeat_byte(1),
+        };
+
+        let response = add_monitored_wallet(State(state.clone()), Json(body()))
+            .await
+            .expect("handler succeeds")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Re-opting the same pair in is a 200, not a duplicate or an error.
+        let response = add_monitored_wallet(State(state), Json(body()))
+            .await
+            .expect("handler succeeds")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_monitored_wallets_is_owner_scoped() {
+        let state = monitored_wallets_state();
+        let owner_a = CustomerId::new();
+        let owner_b = CustomerId::new();
+        add_monitored_wallet(
+            State(state.clone()),
+            Json(AddMonitoredWalletRequest {
+                owner: owner_a,
+                chain_id: Chain::ETHEREUM.id(),
+                address: AccountAddress::repeat_byte(1),
+            }),
+        )
+        .await
+        .expect("add for owner_a");
+
+        let Json(a_list) =
+            list_monitored_wallets(State(state.clone()), Query(OwnerParam { owner: owner_a }))
+                .await
+                .expect("list owner_a");
+        assert_eq!(a_list.len(), 1);
+
+        let Json(b_list) =
+            list_monitored_wallets(State(state), Query(OwnerParam { owner: owner_b }))
+                .await
+                .expect("list owner_b");
+        assert!(b_list.is_empty(), "owner_b never opted anything in");
+    }
+
+    #[tokio::test]
+    async fn remove_monitored_wallet_is_204_then_404() {
+        let state = monitored_wallets_state();
+        let owner = CustomerId::new();
+        let address = AccountAddress::repeat_byte(3);
+        add_monitored_wallet(
+            State(state.clone()),
+            Json(AddMonitoredWalletRequest {
+                owner,
+                chain_id: Chain::ETHEREUM.id(),
+                address,
+            }),
+        )
+        .await
+        .expect("add");
+
+        let status = remove_monitored_wallet(
+            State(state.clone()),
+            Path((Chain::ETHEREUM.id(), address)),
+            Query(OwnerParam { owner }),
+        )
+        .await
+        .expect("handler succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // A second removal (or a removal for a pair that was never monitored)
+        // is a 404, indistinguishable from another owner's row.
+        let status = remove_monitored_wallet(
+            State(state),
+            Path((Chain::ETHEREUM.id(), address)),
+            Query(OwnerParam { owner }),
+        )
+        .await
+        .expect("handler succeeds");
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

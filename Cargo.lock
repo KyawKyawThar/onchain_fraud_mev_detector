@@ -6958,6 +6958,7 @@ dependencies = [
  "db",
  "event-bus",
  "events",
+ "futures-util",
  "lapin",
  "metrics",
  "metrics-util",

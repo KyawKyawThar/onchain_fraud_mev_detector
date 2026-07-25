@@ -10,7 +10,7 @@ use events::primitives::{
     AccountAddress, AlertId, AlertKind, Chain, CustomerId, IncidentId, Severity, SuggestedAction,
 };
 use events::rule_engine::RuleAlertCreated;
-use events::simulation::IncidentCreated;
+use events::simulation::{IncidentCreated, WalletExposureReportReady};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -153,6 +153,40 @@ impl Notice {
         }
     }
 
+    /// `WalletExposureReportReady` (§25, Sprint 15 t5) → Standalone, the same
+    /// shape as [`Self::from_rule_alert`]: `severity`/`kind` are `None`
+    /// (bypassing both axes — a scheduled digest isn't confidence-scored or
+    /// kind-tagged, and should reach the owner regardless of how they've set
+    /// those filters), `owner` scopes fan-out to the customer who opted the
+    /// wallet in. `summary` is the pre-rendered `headline` simulation built —
+    /// this constructor deliberately never inspects `event.summary`'s JSON
+    /// shape, keeping this crate decoupled from `simulation::exposure`'s
+    /// internal type.
+    ///
+    /// `dedup_key` is derived deterministically from `(customer_id, address,
+    /// period_start)`, the same SHA-256-preimage recipe
+    /// [`sanction_dedup_key`] uses — so a redelivered/retried publish of the
+    /// same cycle's report dedups instead of double-notifying, without the
+    /// scheduler needing to track its own delivery state.
+    pub fn from_exposure_report(
+        event: &WalletExposureReportReady,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            dedup_key: exposure_report_dedup_key(event).to_string(),
+            stage: LifecycleStage::Standalone,
+            kind: None,
+            severity: None,
+            suggested_action: None,
+            chain,
+            addresses: vec![event.address],
+            owner: Some(event.customer_id),
+            summary: event.headline.clone(),
+            occurred_at,
+        }
+    }
+
     /// `SanctionHit` (§8.5) → Standalone. Hardcoded `Severity::Critical` — a
     /// sanctions match is a hard-block-tier fact by design (§8.5's "hard
     /// alert that bypasses the slow path"), not something confidence-scored.
@@ -230,6 +264,25 @@ fn sanction_dedup_key(event: &SanctionHit) -> Uuid {
     hasher.update(event.list.as_bytes());
     hasher.update([0u8]); // field separator: `list`/`entry` are variable-length strings.
     hasher.update(event.entry.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// The deterministic dedup key for a [`WalletExposureReportReady`] (see
+/// [`Notice::from_exposure_report`]'s docs) — SHA-256 over `(customer_id,
+/// address, period_start)`, stamped as a well-formed UUIDv8 next to the
+/// random v4 ids minted elsewhere. Pinned by the golden test below: changing
+/// this preimage re-mints every in-flight report's delivery identity.
+fn exposure_report_dedup_key(event: &WalletExposureReportReady) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mevwatch.notification.wallet-exposure-report.v1");
+    hasher.update(event.customer_id.0.as_bytes());
+    hasher.update(event.address.as_slice());
+    hasher.update(event.period_start.timestamp().to_be_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -397,5 +450,72 @@ mod tests {
         assert_eq!(notice.severity, None);
         assert_eq!(notice.kind, None);
         assert_eq!(notice.dedup_key, alert_id.to_string());
+    }
+
+    fn exposure_report(
+        customer_id: CustomerId,
+        period_start: DateTime<Utc>,
+    ) -> WalletExposureReportReady {
+        WalletExposureReportReady {
+            customer_id,
+            address: addr(7),
+            period_start,
+            period_end: period_start + chrono::Duration::hours(24),
+            headline: "$250.00 lost across 1 incident this period (worst: $250.00)".into(),
+            summary: serde_json::json!({ "incident_count": 1 }),
+        }
+    }
+
+    #[test]
+    fn wallet_exposure_report_bypasses_severity_and_kind_but_scopes_to_its_owner() {
+        let owner = CustomerId::new();
+        let event = exposure_report(owner, Utc::now());
+        let notice = Notice::from_exposure_report(&event, Chain::ETHEREUM, Utc::now());
+        assert_eq!(notice.severity, None, "bypasses the severity gate");
+        assert_eq!(notice.kind, None, "bypasses the kind gate");
+        assert_eq!(
+            notice.owner,
+            Some(owner),
+            "scoped to the wallet's owner only"
+        );
+        assert_eq!(notice.stage, LifecycleStage::Standalone);
+        assert_eq!(notice.summary, event.headline);
+        assert_eq!(notice.addresses, vec![event.address]);
+    }
+
+    /// The exposure-report dedup-key preimage is a stability contract, same
+    /// discipline as `sanction_dedup_key_is_deterministic_and_pinned`.
+    #[test]
+    fn exposure_report_dedup_key_is_deterministic_and_pinned() {
+        let owner = CustomerId(uuid::Uuid::from_u128(1));
+        let period_start = DateTime::<Utc>::from_timestamp(1_000, 0).unwrap();
+        let event = exposure_report(owner, period_start);
+
+        let key = exposure_report_dedup_key(&event);
+        assert_eq!(key.get_version_num(), 8, "well-formed UUIDv8");
+        assert_eq!(
+            key,
+            exposure_report_dedup_key(&event),
+            "pure: same input, same key"
+        );
+        assert_eq!(key.to_string(), "06ce5978-0a88-83ab-911f-e65a61c91799");
+
+        // A distinct period is a distinct delivery — a later cycle's report
+        // must not collide with (and thus be dedup-suppressed by) an earlier
+        // one for the same wallet.
+        let later_cycle = exposure_report(owner, period_start + chrono::Duration::hours(24));
+        assert_ne!(
+            exposure_report_dedup_key(&later_cycle),
+            key,
+            "a distinct period_start is a distinct dedup key"
+        );
+
+        // A different owner monitoring the same address must not collide either.
+        let other_owner = exposure_report(CustomerId::new(), period_start);
+        assert_ne!(
+            exposure_report_dedup_key(&other_owner),
+            key,
+            "a distinct owner is a distinct dedup key"
+        );
     }
 }

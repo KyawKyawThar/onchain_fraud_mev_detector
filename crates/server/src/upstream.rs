@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use api_error::ApiError;
 use reqwest::StatusCode as UpstreamStatus;
+use serde::Serialize;
 use serde_json::Value;
 
 /// A proxied call's outcome: the upstream's status and, on success, the
@@ -62,6 +63,50 @@ pub async fn get(
 ) -> Result<ProxiedResponse, UpstreamError> {
     let response = client
         .get(format!("{base_url}{path}"))
+        .query(query)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+
+    Ok(ProxiedResponse { status, body })
+}
+
+/// `POST {base_url}{path}`, with `body` sent as the JSON request body — unlike
+/// [`get`], `body` is composed by *this* service (§25's monitored-wallets
+/// write endpoints build it from the caller's JWT `owner` plus their request),
+/// never forwarded verbatim from the caller, so there's no query map to pass
+/// through. Same status/decode handling as [`get`].
+pub async fn post_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &impl Serialize,
+) -> Result<ProxiedResponse, UpstreamError> {
+    let response = client
+        .post(format!("{base_url}{path}"))
+        .json(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+
+    Ok(ProxiedResponse { status, body })
+}
+
+/// `DELETE {base_url}{path}`, with `query` appended — same shape as [`get`],
+/// for the one write verb this workspace has so far only ever needed for
+/// §25's monitored-wallets opt-out.
+pub async fn delete(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    query: &BTreeMap<String, String>,
+) -> Result<ProxiedResponse, UpstreamError> {
+    let response = client
+        .delete(format!("{base_url}{path}"))
         .query(query)
         .send()
         .await?;

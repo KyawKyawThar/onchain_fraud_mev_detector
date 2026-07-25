@@ -43,7 +43,8 @@ use events::primitives::{
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
-    IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted, SimulationRequested,
+    IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted,
+    SimulationRequested, WalletExposureReportReady,
 };
 use events::system::{
     ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
@@ -179,6 +180,14 @@ fn sample_events() -> Vec<DomainEvent> {
         DomainEvent::IncidentFinalized(IncidentFinalized {
             incident_id: incident_id(),
             block_hash: B256::repeat_byte(0x11),
+        }),
+        DomainEvent::WalletExposureReportReady(WalletExposureReportReady {
+            customer_id: customer_id(),
+            address: addr(),
+            period_start: ts(),
+            period_end: ts(),
+            headline: "$250.00 lost across 1 incident this period (worst: $250.00)".into(),
+            summary: json!({ "incident_count": 1 }),
         }),
         // Intelligence (§8)
         DomainEvent::LabelAdded(LabelAdded {
@@ -350,6 +359,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "IncidentFinalized",
         r#"{"type":"IncidentFinalized","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","block_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}}"#,
+    ),
+    (
+        "WalletExposureReportReady",
+        r#"{"type":"WalletExposureReportReady","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","period_start":"2023-11-14T22:13:20Z","period_end":"2023-11-14T22:13:20Z","headline":"$250.00 lost across 1 incident this period (worst: $250.00)","summary":{"incident_count":1}}}"#,
     ),
     (
         "LabelAdded",

@@ -19,12 +19,14 @@
 //!     event-store `migrate` subcommand + the sqlx/Postgres `just migrate-*` recipes.
 
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use clickhouse::Client;
-use event_bus::PUBLISH_BACKOFF;
+use event_bus::{KafkaEventSink, PUBLISH_BACKOFF};
 use secrecy::ExposeSecret;
 use simulation::ch_migrate;
 use simulation::config::ProjectionConfig;
 use simulation::http;
+use simulation::monitored_wallet_store::{MonitoredWalletStore, PgMonitoredWalletStore};
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
 use simulation::store::{
     build_clickhouse_client, ClickhouseAnalytics, PgIncidentStore, TimingStore, WalletExposureStore,
@@ -81,7 +83,7 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
-    let pg_store = PgIncidentStore::new(pool);
+    let pg_store = PgIncidentStore::new(pool.clone());
     let store = Arc::new(pg_store.clone());
     let analytics = ClickhouseAnalytics::new(client);
     analytics
@@ -95,6 +97,12 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     let exposure_store: Arc<dyn WalletExposureStore> = Arc::new(analytics.clone());
     let timing_store: Arc<dyn TimingStore> = Arc::new(analytics.clone());
     let analytics = Arc::new(analytics);
+
+    // The opt-in monitored-wallet list (§25, Sprint 15 t5) — shares the same
+    // pool `pg_store` already connected above; the internal HTTP CRUD and the
+    // scheduled report task below both read/write through this one handle.
+    let monitored_wallets: Arc<dyn MonitoredWalletStore> =
+        Arc::new(PgMonitoredWalletStore::new(pool));
 
     let shutdown = CancellationToken::new();
     // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
@@ -137,13 +145,62 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         }
     });
 
+    // ── Scheduled §25 exposure-report push (Sprint 15 t5, background task) ──
+    // A `KafkaEventSink` is new to this binary — until now it only consumed;
+    // this is its first producer seam. Each cycle publishes
+    // `WalletExposureReportReady` (for notification to deliver) plus one
+    // `WalletMonitored` usage fact per monitored wallet — both through the
+    // same background at-least-once path `publish_resilient`/`UsageFact` give
+    // every other producer, never the HTTP-hot-path `UsageRecorder`.
+    let report_sink: Arc<dyn event_bus::EventSink> =
+        Arc::new(KafkaEventSink::new(&cfg.kafka_brokers).context("building Kafka producer")?);
+    let report_task = tokio::spawn({
+        let monitored_wallets = Arc::clone(&monitored_wallets);
+        let exposure_store = Arc::clone(&exposure_store);
+        let shutdown = shutdown.clone();
+        let interval = cfg.exposure_report_interval;
+        async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(interval) => {}
+                }
+                let period_end = Utc::now();
+                let period_start = period_end - interval;
+                match simulation::exposure_report::run_cycle(
+                    monitored_wallets.as_ref(),
+                    exposure_store.as_ref(),
+                    report_sink.as_ref(),
+                    period_start,
+                    period_end,
+                    PUBLISH_BACKOFF,
+                    &shutdown,
+                )
+                .await
+                {
+                    Ok(stats) => tracing::info!(
+                        published = stats.wallets_published,
+                        failed = stats.wallets_failed,
+                        "exposure-report cycle complete"
+                    ),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "scheduled exposure-report cycle failed; will retry next tick"
+                    ),
+                }
+            }
+        }
+    });
+
     // ── Internal read API (§11 `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`,
-    //    safe-block-timing `/v1/timing/recommendation`) ──
+    //    safe-block-timing `/v1/timing/recommendation`, `/v1/monitored-wallets`) ──
     let http_state = http::AppState {
         store: Arc::new(pg_store.clone()),
         pg: pg_store,
         exposure: exposure_store,
         timing: timing_store,
+        monitored_wallets,
     };
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
@@ -159,6 +216,8 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         .await
         .context("HTTP server error")?;
 
+    shutdown.cancel();
+    let _ = report_task.await;
     let consumer_result = consumer_task.await.context("consumer task panicked")?;
     tracing::info!("simulation projection consumer shut down");
     consumer_result.context("projection consumer exited with error")

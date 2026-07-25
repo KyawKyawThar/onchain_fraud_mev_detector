@@ -66,7 +66,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -165,6 +165,9 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(list_incidents))
         .routes(routes!(wallet_mev_exposure))
         .routes(routes!(timing_recommendation))
+        .routes(routes!(add_monitored_wallet))
+        .routes(routes!(list_monitored_wallets))
+        .routes(routes!(remove_monitored_wallet))
         .routes(routes!(create_rule))
         .route("/v1/stream", get(stream::stream_ws))
         .route_layer(middleware::from_fn_with_state(
@@ -1157,6 +1160,158 @@ async fn timing_recommendation(
     Ok((proxied.status, Json(proxied.body)).into_response())
 }
 
+/// `POST /v1/monitored-wallets` request body: the wallet to opt in for the
+/// caller's scheduled §25 exposure report push.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+struct AddMonitoredWalletRequest {
+    /// Chain id. Defaults to Ethereum mainnet.
+    #[serde(default = "default_chain")]
+    chain_id: u64,
+    #[schema(value_type = String)]
+    address: AccountAddress,
+}
+
+/// What this service proxies to simulation-projection's internal
+/// `POST /v1/monitored-wallets` — `owner` is composed here from the caller's
+/// JWT, never taken from the request body (a body cannot opt in another
+/// customer's wallet).
+#[derive(Serialize)]
+struct MonitoredWalletProxyRequest {
+    owner: CustomerId,
+    chain_id: u64,
+    address: AccountAddress,
+}
+
+/// `POST /v1/monitored-wallets` — opt an address in for the caller's
+/// scheduled MEV-exposure report push (§25), delivered via the notification
+/// service (§12) on a recurring cadence. Idempotent: opting the same pair in
+/// twice is a `200`, not a duplicate.
+///
+/// Meters `ApiCallMade` only (the router-wide middleware). The dedicated
+/// `WalletMonitored` usage fact (§13, "per customer-configured address") is
+/// metered **recurringly** by simulation-projection's scheduler — once per
+/// wallet per report cycle, for as long as it stays opted in — not once here
+/// at opt-in; see `simulation::exposure_report`'s module docs for why.
+#[utoipa::path(
+    post,
+    path = "/v1/monitored-wallets",
+    tag = "api-service",
+    request_body = AddMonitoredWalletRequest,
+    security(("bearer_token" = [])),
+    responses(
+        (status = 201, description = "Wallet opted in"),
+        (status = 200, description = "Already monitored (idempotent retry)"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
+    ),
+)]
+async fn add_monitored_wallet(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Json(body): Json<AddMonitoredWalletRequest>,
+) -> Result<Response, ApiError> {
+    let proxied = upstream::post_json(
+        &state.http_client,
+        &state.simulation_url,
+        "/v1/monitored-wallets",
+        &MonitoredWalletProxyRequest {
+            owner: customer,
+            chain_id: body.chain_id,
+            address: body.address,
+        },
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
+
+    Ok((proxied.status, Json(proxied.body)).into_response())
+}
+
+/// `GET /v1/monitored-wallets` — the caller's own opted-in wallets, proxied
+/// from simulation-projection's internal `GET /v1/monitored-wallets` (`owner`
+/// composed from the caller's JWT, not a client-supplied query param).
+#[utoipa::path(
+    get,
+    path = "/v1/monitored-wallets",
+    tag = "api-service",
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The caller's monitored wallets (proxied from simulation-projection)"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
+    ),
+)]
+async fn list_monitored_wallets(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+) -> Result<Response, ApiError> {
+    let mut query = RawQuery::new();
+    query.insert("owner".to_owned(), customer.to_string());
+
+    let proxied = upstream::get(
+        &state.http_client,
+        &state.simulation_url,
+        "/v1/monitored-wallets",
+        &query,
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
+
+    Ok((proxied.status, Json(proxied.body)).into_response())
+}
+
+/// `DELETE /v1/monitored-wallets/{chain_id}/{address}` — opt out. Proxies
+/// simulation-projection's internal `DELETE /v1/monitored-wallets/{chain_id}/{address}`
+/// (`owner` composed from the caller's JWT, so a caller can only ever remove
+/// their own opt-in).
+#[utoipa::path(
+    delete,
+    path = "/v1/monitored-wallets/{chain_id}/{address}",
+    tag = "api-service",
+    params(
+        ("chain_id" = u64, Path, description = "Chain id"),
+        ("address" = String, Path, description = "Wallet address"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 204, description = "Opted out"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "This address was not monitored for this caller"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
+    ),
+)]
+async fn remove_monitored_wallet(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path((chain_id, address)): Path<(u64, String)>,
+) -> Result<Response, ApiError> {
+    let mut query = RawQuery::new();
+    query.insert("owner".to_owned(), customer.to_string());
+
+    let proxied = upstream::delete(
+        &state.http_client,
+        &state.simulation_url,
+        &format!("/v1/monitored-wallets/{chain_id}/{address}"),
+        &query,
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
+
+    // The upstream's 204/404 carry no body (`remove_monitored_wallet` on the
+    // simulation-projection side answers with a bare `StatusCode`); attaching
+    // an empty-string JSON body to a 204 would violate its "no body" contract,
+    // unlike every other proxy here whose upstream always answers JSON.
+    Ok(
+        if proxied.body.is_string() && proxied.body.as_str() == Some("") {
+            proxied.status.into_response()
+        } else {
+            (proxied.status, Json(proxied.body)).into_response()
+        },
+    )
+}
+
 /// Rule-engine events are not chain-scoped facts, but every envelope must
 /// name a chain — stamped [`Chain::ETHEREUM`], the same single-chain-MVP
 /// posture as `usage.rs`'s `UsageRecorded` emission.
@@ -1412,6 +1567,7 @@ mod tests {
             "UpsertPolicyRequest",
             "PolicyResponse",
             "PoliciesResponse",
+            "AddMonitoredWalletRequest",
         ] {
             assert!(
                 spec["components"]["schemas"].get(name).is_some(),
@@ -1434,6 +1590,9 @@ mod tests {
             ("/v1/audit/incident/{incident_id}", "get"),
             ("/v1/incidents", "get"),
             ("/v1/wallet/{addr}/mev-exposure", "get"),
+            ("/v1/monitored-wallets", "post"),
+            ("/v1/monitored-wallets", "get"),
+            ("/v1/monitored-wallets/{chain_id}/{address}", "delete"),
             ("/v1/rules", "post"),
         ] {
             assert!(
