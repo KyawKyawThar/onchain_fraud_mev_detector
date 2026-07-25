@@ -285,6 +285,10 @@ pub struct SimulationOutcome {
     /// `profit` cleared the confirmation threshold.
     pub confirmed: bool,
     pub txs: Vec<B256>,
+    /// The external wallet `victim_loss` was measured against, if the scenario named
+    /// one. `None` for `Honeypot` — its `prober` is a synthetic, operator-funded
+    /// probing address, not a real victim wallet.
+    pub victim: Option<Address>,
 }
 
 /// Why a simulation could not produce an outcome. Split transient/poison so the
@@ -396,6 +400,9 @@ struct Verdict {
     profit: f64,
     victim_loss: f64,
     confirmed: bool,
+    /// The external wallet `victim_loss` was measured against, if any (§7 "what
+    /// simulation confirms" — mirrors [`SimulationOutcome::victim`]).
+    victim: Option<Address>,
 }
 
 /// One probed account's balance either side of a replay.
@@ -481,17 +488,19 @@ impl RevmSimulator {
             victim_loss: verdict.victim_loss,
             confirmed: verdict.confirmed,
             txs: req.txs.clone(),
+            victim: verdict.victim,
         })
     }
 
     /// Build the verdict for a profit-threshold strategy (value extraction, sandwich):
     /// confirm above `min_profit`. The one home for the "did the money clear the bar"
     /// rule the two balance-diff confirmations share.
-    fn profit_verdict(&self, profit: f64, victim_loss: f64) -> Verdict {
+    fn profit_verdict(&self, profit: f64, victim_loss: f64, victim: Option<Address>) -> Verdict {
         Verdict {
             profit,
             victim_loss,
             confirmed: profit > self.min_profit.get(),
+            victim,
         }
     }
 
@@ -513,7 +522,7 @@ impl RevmSimulator {
 
         let profit = run.gain(attacker);
         let victim_loss = victim.map_or(0.0, |v| run.loss(v));
-        Ok(self.profit_verdict(profit, victim_loss))
+        Ok(self.profit_verdict(profit, victim_loss, victim))
     }
 
     /// Sandwich counterfactual (§7): attacker profit from the full attack, victim loss
@@ -540,7 +549,7 @@ impl RevmSimulator {
         // The harm: how much better off the victim was without the frontrun. Positive
         // when the sandwich cost them; sign-aware so a no-harm case reads exactly 0.
         let victim_loss = signed_eth_delta(cf.balance_after(victim), full.balance_after(victim));
-        Ok(self.profit_verdict(profit, victim_loss))
+        Ok(self.profit_verdict(profit, victim_loss, Some(victim)))
     }
 
     /// Honeypot probe (§7): buy then sell from the fresh prober. The honeypot
@@ -567,6 +576,9 @@ impl RevmSimulator {
             profit: 0.0, // the probe measures a trap, not an attacker's balance gain
             victim_loss,
             confirmed,
+            // The prober is a synthetic, operator-funded probing address, not a real
+            // external wallet — no victim to attribute the trapped ETH to.
+            victim: None,
         })
     }
 

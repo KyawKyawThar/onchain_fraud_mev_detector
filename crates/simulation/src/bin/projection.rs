@@ -26,7 +26,9 @@ use simulation::ch_migrate;
 use simulation::config::ProjectionConfig;
 use simulation::http;
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
-use simulation::store::{build_clickhouse_client, ClickhouseAnalytics, PgIncidentStore};
+use simulation::store::{
+    build_clickhouse_client, ClickhouseAnalytics, PgIncidentStore, WalletExposureStore,
+};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +88,10 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         .ping()
         .await
         .context("probing ClickHouse analytics store")?;
+    // Cheap to clone (the client is `Arc`-cheap, per `ClickhouseAnalytics`'s doc):
+    // the consumer owns one handle for writes, the HTTP read API (§11 wallet
+    // exposure) another for reads, both backed by the same connection.
+    let exposure_store: Arc<dyn WalletExposureStore> = Arc::new(analytics.clone());
     let analytics = Arc::new(analytics);
 
     let shutdown = CancellationToken::new();
@@ -129,10 +135,11 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         }
     });
 
-    // ── Internal read API (§11 `/v1/incidents`) ───────────────────────
+    // ── Internal read API (§11 `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`) ──
     let http_state = http::AppState {
         store: Arc::new(pg_store.clone()),
         pg: pg_store,
+        exposure: exposure_store,
     };
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await

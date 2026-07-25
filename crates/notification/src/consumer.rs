@@ -608,6 +608,8 @@ mod tests {
             impact_usd: None,
             severity,
             suggested_action: events::scoring::suggested_action(severity),
+            victim_address: None,
+            victim_loss_usd: None,
         })
     }
 

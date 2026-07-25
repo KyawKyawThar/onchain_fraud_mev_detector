@@ -109,6 +109,9 @@ pub fn events_for_outcome(
     if outcome.confirmed {
         let impact_usd = confirmed_impact_usd(outcome, eth_usd_price);
         let severity = severity_band(Some(impact_usd), CONFIRMED_CONFIDENCE);
+        let victim_loss_usd = outcome
+            .victim
+            .map(|_| UsdAmount::new(outcome.victim_loss * eth_usd_price.get()));
         events.push(DomainEvent::IncidentCreated(IncidentCreated {
             incident_id: IncidentId::new(),
             alert_id: outcome.alert_id,
@@ -119,6 +122,8 @@ pub fn events_for_outcome(
             impact_usd: Some(impact_usd),
             severity,
             suggested_action: suggested_action(severity),
+            victim_address: outcome.victim,
+            victim_loss_usd,
         }));
     }
     events
@@ -146,6 +151,19 @@ mod tests {
     }
 
     fn outcome(confirmed: bool, profit: f64, victim_loss: f64) -> SimulationOutcome {
+        outcome_with_victim(confirmed, profit, victim_loss, Some(victim_address()))
+    }
+
+    fn victim_address() -> events::primitives::AccountAddress {
+        events::primitives::AccountAddress::repeat_byte(0x55)
+    }
+
+    fn outcome_with_victim(
+        confirmed: bool,
+        profit: f64,
+        victim_loss: f64,
+        victim: Option<events::primitives::AccountAddress>,
+    ) -> SimulationOutcome {
         SimulationOutcome {
             alert_id: AlertId::new(),
             kind: AlertKind::Sandwich,
@@ -153,6 +171,7 @@ mod tests {
             victim_loss,
             confirmed,
             txs: vec![B256::repeat_byte(0x01)],
+            victim,
         }
     }
 
@@ -245,6 +264,41 @@ mod tests {
         assert_eq!(i.impact_usd, Some(UsdAmount::new(0.0)));
         assert_eq!(i.severity, Severity::Low);
         assert_eq!(i.suggested_action, SuggestedAction::Monitor);
+    }
+
+    /// A named victim is stamped onto the incident with its own USD-valued loss —
+    /// distinct from `impact_usd`, which here is profit-driven (60 ETH > 10 ETH).
+    #[test]
+    fn a_named_victim_is_stamped_with_its_usd_loss() {
+        let out = outcome(true, 60.0, 10.0);
+        let events = events_for_outcome(&out, price());
+        let DomainEvent::IncidentCreated(i) = &events[1] else {
+            panic!("expected an incident");
+        };
+        assert_eq!(i.victim_address, Some(victim_address()));
+        assert_eq!(i.victim_loss_usd, Some(UsdAmount::new(20_000.0)));
+        assert_ne!(
+            i.victim_loss_usd, i.impact_usd,
+            "victim_loss_usd is the victim's own loss, not the profit-driven headline"
+        );
+    }
+
+    /// A scenario with no named victim (e.g. `Honeypot`'s synthetic prober) stamps
+    /// neither field — `None`, not a guessed `$0`.
+    #[test]
+    fn no_named_victim_leaves_both_fields_unset() {
+        let out = outcome_with_victim(true, 0.0, 8.0, None);
+        let events = events_for_outcome(&out, price());
+        let DomainEvent::IncidentCreated(i) = &events[1] else {
+            panic!("expected an incident");
+        };
+        assert_eq!(i.victim_address, None);
+        assert_eq!(i.victim_loss_usd, None);
+        assert_eq!(
+            i.impact_usd,
+            Some(UsdAmount::new(16_000.0)),
+            "the headline impact is unaffected by there being no named victim"
+        );
     }
 
     #[test]

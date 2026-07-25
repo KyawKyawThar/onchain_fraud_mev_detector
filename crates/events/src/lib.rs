@@ -427,6 +427,7 @@ impl DomainEvent {
             RiskScoreUpdated(e) => vec![e.address],
             SanctionHit(e) => vec![e.address],
             ScreeningDecisionRecorded(e) => vec![e.address],
+            IncidentCreated(e) => e.victim_address.into_iter().collect(),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -435,7 +436,6 @@ impl DomainEvent {
             | DetectorTriggered(_)
             | SimulationRequested(_)
             | SimulationCompleted(_)
-            | IncidentCreated(_)
             | IncidentRetracted(_)
             | IncidentFinalized(_)
             | AttributionUpdated(_)
@@ -749,6 +749,8 @@ mod tests {
             impact_usd: None,
             severity: Severity::High,
             suggested_action: crate::primitives::SuggestedAction::Escalate,
+            victim_address: None,
+            victim_loss_usd: None,
         });
         // Keyed by the *alert*, not the incident — co-partitioned with its
         // SimulationCompleted so the two dedup/order together.

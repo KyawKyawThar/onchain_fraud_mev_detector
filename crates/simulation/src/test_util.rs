@@ -7,8 +7,11 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use events::primitives::{AlertId, AlertKind, Chain, Confidence, DetectorRef};
+use chrono::{DateTime, Utc};
+use events::primitives::{AccountAddress, AlertId, AlertKind, Chain, Confidence, DetectorRef};
 use revm::primitives::Address;
+
+use crate::store::{ExposureRow, PersistError, WalletExposureStore};
 
 /// The shared recording [`EventSink`](event_bus::EventSink), re-exported under
 /// this crate's historical name so the worker/dispatcher/reorg tests keep using
@@ -97,5 +100,50 @@ impl DeliveryAck for AckRecorder {
     async fn settle(&self, disposition: Disposition) -> anyhow::Result<()> {
         *self.settled.lock().unwrap() = Some(disposition);
         Ok(())
+    }
+}
+
+/// An in-memory [`WalletExposureStore`] returning canned rows — lets the HTTP
+/// handler and integration tests exercise `GET /v1/wallet/{addr}/mev-exposure`
+/// without ClickHouse, the same doubles-not-a-database discipline the rest of the
+/// store seams follow.
+#[derive(Clone, Default)]
+pub struct InMemoryWalletExposure {
+    rows: Vec<ExposureRow>,
+}
+
+impl InMemoryWalletExposure {
+    /// A store that returns `rows` verbatim for any address/`since` (the pure
+    /// [`crate::exposure::summarize`] fold and the handler wiring are what the
+    /// tests exercise, not the ClickHouse-side filtering).
+    pub fn new(rows: Vec<ExposureRow>) -> Self {
+        Self { rows }
+    }
+
+    /// A canned confirmed-incident row (`incident_id`/`victim_loss_usd` present),
+    /// so a test doesn't hand-build the ClickHouse-shaped struct.
+    pub fn row(
+        incident_id: uuid::Uuid,
+        kind: &str,
+        usd_lost: f64,
+        at: DateTime<Utc>,
+    ) -> ExposureRow {
+        ExposureRow {
+            incident_id: Some(incident_id),
+            kind: kind.to_owned(),
+            victim_loss_usd: Some(usd_lost),
+            occurred_at: at,
+        }
+    }
+}
+
+#[async_trait]
+impl WalletExposureStore for InMemoryWalletExposure {
+    async fn mev_exposure(
+        &self,
+        _victim_address: &AccountAddress,
+        _since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ExposureRow>, PersistError> {
+        Ok(self.rows.clone())
     }
 }

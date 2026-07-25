@@ -2,7 +2,9 @@
 //! alert; only the *result* re-enters the event model (the `SimulationJob`
 //! command itself never does — it lives on RabbitMQ, §2/§7).
 
-use crate::primitives::{AlertId, AlertKind, IncidentId, Severity, SuggestedAction, UsdAmount};
+use crate::primitives::{
+    AccountAddress, AlertId, AlertKind, IncidentId, Severity, SuggestedAction, UsdAmount,
+};
 use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +63,22 @@ pub struct IncidentCreated {
     /// [`default_suggested_action`]).
     #[serde(default = "default_suggested_action")]
     pub suggested_action: SuggestedAction,
+    /// The external wallet the engine named as the sandwiched/drained party, if the
+    /// scenario named one (`crate::simulator::Scenario::{ValueExtraction,Sandwich}`).
+    /// `None` for a scenario with no external victim — e.g. `Honeypot`, whose "victim"
+    /// is a synthetic, operator-funded probing address rather than a real wallet.
+    /// `#[serde(default)]` so a pre-exposure incident still reads back (additive-field
+    /// policy, SCHEMA.md).
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
+    pub victim_address: Option<AccountAddress>,
+    /// The victim's own USD loss (`crate::result::events_for_outcome`'s
+    /// `victim_loss` × the operator-configured ETH/USD reference), distinct from the
+    /// headline `impact_usd` (which can instead be attacker-profit-driven). `None`
+    /// when there's no named victim to attribute a loss to. `#[serde(default)]`, same
+    /// backwards-compat reasoning as `victim_address`.
+    #[serde(default)]
+    pub victim_loss_usd: Option<UsdAmount>,
 }
 
 /// Serde fallback for [`IncidentCreated::suggested_action`], applied when an

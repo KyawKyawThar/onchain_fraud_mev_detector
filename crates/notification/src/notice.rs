@@ -311,6 +311,8 @@ mod tests {
             impact_usd: None,
             severity: Severity::Critical,
             suggested_action: SuggestedAction::EscalateImmediately,
+            victim_address: None,
+            victim_loss_usd: None,
         };
         let notice = Notice::from_incident_created(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Confirmed);

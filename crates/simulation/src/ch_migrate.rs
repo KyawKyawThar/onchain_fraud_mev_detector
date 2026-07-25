@@ -14,11 +14,18 @@ use ch_migrate::{Migration, Migrator};
 
 /// The ordered migration set. Versions sort lexically, so zero-pad the numeric
 /// prefix.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: "0001_create_incident_analytics",
-    up: include_str!("../migrations/0001_create_incident_analytics.up.sql"),
-    down: include_str!("../migrations/0001_create_incident_analytics.down.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "0001_create_incident_analytics",
+        up: include_str!("../migrations/0001_create_incident_analytics.up.sql"),
+        down: include_str!("../migrations/0001_create_incident_analytics.down.sql"),
+    },
+    Migration {
+        version: "0002_victim_address_business_key",
+        up: include_str!("../migrations/0002_victim_address_business_key.up.sql"),
+        down: include_str!("../migrations/0002_victim_address_business_key.down.sql"),
+    },
+];
 
 /// The simulation service's migrator: applied on the projection consumer's
 /// boot via [`run`](Migrator::run), or driven explicitly through the
