@@ -341,7 +341,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "IncidentCreated",
-        r#"{"type":"IncidentCreated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","alert_id":"00000000-0000-0000-0000-0000000000a1","kind":"sandwich","txs":["0x2222222222222222222222222222222222222222222222222222222222222222"],"profit":1234.5,"victim_loss":678.9,"impact_usd":120000.0,"severity":"high","suggested_action":"escalate"}}"#,
+        r#"{"type":"IncidentCreated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","alert_id":"00000000-0000-0000-0000-0000000000a1","kind":"sandwich","txs":["0x2222222222222222222222222222222222222222222222222222222222222222"],"profit":1234.5,"victim_loss":678.9,"impact_usd":120000.0,"severity":"high","suggested_action":"escalate","victim_address":"0x3333333333333333333333333333333333333333","victim_loss_usd":678.9}}"#,
     ),
     (
         "IncidentRetracted",
