@@ -16,14 +16,18 @@
 //! database or `.sqlx` cache entry.
 
 use chrono::{DateTime, Utc};
-use events::primitives::{AlertId, AlertKind, Chain, IncidentId, Severity};
-use events::simulation::{IncidentCreated, SimulationCompleted};
+use events::primitives::{
+    AccountAddress, AlertId, AlertKind, Chain, IncidentId, Severity, UsdAmount,
+};
+use events::simulation::{
+    IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted,
+};
 use events::{DomainEvent, EventEnvelope};
 use revm::primitives::B256;
 use simulation::projection::{IncidentProjection, IncidentStatus};
 use simulation::store::{
     AnalyticsRow, ClickhouseAnalytics, IncidentAnalytics, IncidentFilters, IncidentStore, JobState,
-    JobUpdate, PgIncidentStore,
+    JobUpdate, PgIncidentStore, WalletExposureStore,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
@@ -58,6 +62,8 @@ fn created(alert: AlertId, incident: IncidentId) -> DomainEvent {
         impact_usd: None,
         severity: Severity::High,
         suggested_action: events::primitives::SuggestedAction::Escalate,
+        victim_address: None,
+        victim_loss_usd: None,
     })
 }
 
@@ -201,6 +207,8 @@ async fn analytics_rows_append_and_aggregate_by_kind() {
                 impact_usd: None,
                 severity: Severity::High,
                 suggested_action: events::primitives::SuggestedAction::Escalate,
+                victim_address: None,
+                victim_loss_usd: None,
             }),
             at(100),
         );
@@ -327,4 +335,199 @@ async fn list_incidents_filters_by_status_and_paginates() {
         first_page.incidents[0].alert_id,
         second_page.incidents[0].alert_id
     );
+}
+
+/// A confirmed incident naming `victim` as its victim, valued at `usd_lost`.
+fn created_with_victim(
+    alert: AlertId,
+    incident: IncidentId,
+    kind: AlertKind,
+    usd_lost: f64,
+    victim: AccountAddress,
+) -> DomainEvent {
+    DomainEvent::IncidentCreated(IncidentCreated {
+        incident_id: incident,
+        alert_id: alert,
+        kind,
+        txs: vec![B256::repeat_byte(0x01)],
+        profit: usd_lost,
+        victim_loss: usd_lost,
+        impact_usd: Some(UsdAmount::new(usd_lost)),
+        severity: Severity::High,
+        suggested_action: events::primitives::SuggestedAction::Escalate,
+        victim_address: Some(victim),
+        victim_loss_usd: Some(UsdAmount::new(usd_lost)),
+    })
+}
+
+/// Fold one event through the projection and append the resulting snapshot to the
+/// analytics table exactly as the production consumer does (append per real change,
+/// with the triggering event's `event_type`). The snapshot carries the victim
+/// business key once `IncidentCreated` has stamped it — including on a later
+/// retraction row, which is what the exposure query must learn to exclude.
+async fn fold_and_append(
+    proj: &mut IncidentProjection,
+    analytics: &ClickhouseAnalytics,
+    alert: AlertId,
+    envelope: EventEnvelope,
+) {
+    proj.apply(&envelope);
+    let row = {
+        let record = proj.record(&alert).expect("row after fold");
+        AnalyticsRow::from_event(&envelope, record)
+    };
+    analytics.append(&row).await.expect("append analytics");
+}
+
+/// The §11 wallet MEV-exposure read against real ClickHouse: a created-then-
+/// **retracted** incident (its retraction snapshot still carries the victim key)
+/// must be excluded from the wallet's losses, while a created-then-finalized one
+/// stays counted. Exercises the `argMax`-latest-confirmed dedup that no unit test
+/// can reach, end to end through [`WalletExposureStore::mev_exposure`].
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn mev_exposure_excludes_retracted_incidents_and_totals_by_kind() {
+    let container = ClickHouse::default()
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+    simulation::ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .expect("apply ClickHouse migrations");
+    let analytics = ClickhouseAnalytics::new(client);
+
+    let victim = AccountAddress::repeat_byte(0x55);
+    let other_victim = AccountAddress::repeat_byte(0x66);
+    let mut proj = IncidentProjection::new();
+
+    // Incident A — created only (sandwich, $100), created at t=1000. Counted.
+    let a_alert = AlertId::new();
+    let a_incident = IncidentId::new();
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        a_alert,
+        env(
+            created_with_victim(a_alert, a_incident, AlertKind::Sandwich, 100.0, victim),
+            at(1_000),
+        ),
+    )
+    .await;
+
+    // Incident B — created (arbitrage, $200) then finalized. Still confirmed → counted.
+    let b_alert = AlertId::new();
+    let b_incident = IncidentId::new();
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        b_alert,
+        env(
+            created_with_victim(b_alert, b_incident, AlertKind::Arbitrage, 200.0, victim),
+            at(2_000),
+        ),
+    )
+    .await;
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        b_alert,
+        env(
+            DomainEvent::IncidentFinalized(IncidentFinalized {
+                incident_id: b_incident,
+                block_hash: B256::repeat_byte(0xbb),
+            }),
+            at(2_500),
+        ),
+    )
+    .await;
+
+    // Incident C — created (liquidation, $999) then retracted. Excluded: the money
+    // never moved, even though the retraction snapshot still carries the victim key.
+    let c_alert = AlertId::new();
+    let c_incident = IncidentId::new();
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        c_alert,
+        env(
+            created_with_victim(c_alert, c_incident, AlertKind::Liquidation, 999.0, victim),
+            at(3_000),
+        ),
+    )
+    .await;
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        c_alert,
+        env(
+            DomainEvent::IncidentRetracted(IncidentRetracted {
+                incident_id: c_incident,
+                reason: "block reverted".to_owned(),
+            }),
+            at(3_500),
+        ),
+    )
+    .await;
+
+    // A different wallet's incident must never leak into this wallet's exposure.
+    let d_alert = AlertId::new();
+    let d_incident = IncidentId::new();
+    fold_and_append(
+        &mut proj,
+        &analytics,
+        d_alert,
+        env(
+            created_with_victim(
+                d_alert,
+                d_incident,
+                AlertKind::Sandwich,
+                500.0,
+                other_victim,
+            ),
+            at(2_100),
+        ),
+    )
+    .await;
+
+    // Unfiltered: A + B only — C retracted, D is another wallet's.
+    let summary = simulation::exposure::summarize(
+        analytics
+            .mev_exposure(&victim, None)
+            .await
+            .expect("exposure query"),
+    );
+    assert_eq!(summary.incident_count, 2, "retracted C is excluded");
+    assert_eq!(summary.total_usd_lost, 300.0, "$100 + $200, not C's $999");
+    assert_eq!(summary.worst_usd_lost, 200.0);
+    assert!(
+        summary.by_kind.iter().all(|k| k.kind != "liquidation"),
+        "the retracted liquidation must not appear in any breakdown"
+    );
+    // The finalized incident reports its *creation* time, not its finalization time.
+    let b = summary
+        .incidents
+        .iter()
+        .find(|i| i.incident_id == b_incident.0)
+        .expect("finalized incident B is present");
+    assert_eq!(b.occurred_at, at(2_000));
+
+    // `since` = t=1500 drops A (created t=1000), keeps B (created t=2000).
+    let since = simulation::exposure::summarize(
+        analytics
+            .mev_exposure(&victim, Some(at(1_500)))
+            .await
+            .expect("exposure query with since"),
+    );
+    assert_eq!(since.incident_count, 1);
+    assert_eq!(since.incidents[0].incident_id, b_incident.0);
 }

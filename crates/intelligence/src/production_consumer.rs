@@ -590,6 +590,8 @@ mod tests {
                 impact_usd: None,
                 severity: Severity::High,
                 suggested_action: events::primitives::SuggestedAction::Escalate,
+                victim_address: None,
+                victim_loss_usd: None,
             }),
             secs,
         )

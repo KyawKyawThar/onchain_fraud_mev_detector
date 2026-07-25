@@ -84,7 +84,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
-use events::primitives::{AlertId, AlertKind, IncidentId, Severity};
+use events::primitives::{AccountAddress, AlertId, AlertKind, IncidentId, Severity, UsdAmount};
 use events::simulation::{
     IncidentCreated, IncidentFinalized, IncidentRetracted, SimulationCompleted,
 };
@@ -181,6 +181,12 @@ pub struct IncidentRecord {
     pub victim_loss: f64,
     /// The implicated transactions, from `IncidentCreated`.
     pub txs: Vec<B256>,
+    /// The external wallet harmed, from `IncidentCreated`. `None` when the
+    /// confirming scenario named no victim (e.g. `Honeypot`).
+    pub victim_address: Option<AccountAddress>,
+    /// The victim's own USD-valued loss, from `IncidentCreated`. `None` alongside
+    /// `victim_address` — never set independently of it.
+    pub victim_loss_usd: Option<UsdAmount>,
     /// Why the incident was retracted, if it was.
     pub retraction_reason: Option<String>,
     /// The block that finalized the incident, if it was finalized.
@@ -211,6 +217,8 @@ impl IncidentRecord {
         profit: f64,
         victim_loss: f64,
         txs: Vec<B256>,
+        victim_address: Option<AccountAddress>,
+        victim_loss_usd: Option<UsdAmount>,
         retraction_reason: Option<String>,
         finalized_block: Option<B256>,
         figures_at: DateTime<Utc>,
@@ -226,6 +234,8 @@ impl IncidentRecord {
             profit,
             victim_loss,
             txs,
+            victim_address,
+            victim_loss_usd,
             retraction_reason,
             finalized_block,
             figures_at,
@@ -281,12 +291,15 @@ impl IncidentRecord {
     /// Stamp the incident identity from `IncidentCreated` — **set once**. A duplicate
     /// `IncidentCreated` finds identity already present and is a no-op. Returns whether
     /// the identity was newly set.
+    #[allow(clippy::too_many_arguments)]
     fn set_identity(
         &mut self,
         incident_id: IncidentId,
         kind: AlertKind,
         severity: Severity,
         txs: &[B256],
+        victim_address: Option<AccountAddress>,
+        victim_loss_usd: Option<UsdAmount>,
     ) -> bool {
         if self.incident_id.is_some() {
             return false;
@@ -295,6 +308,8 @@ impl IncidentRecord {
         self.kind = Some(kind);
         self.severity = Some(severity);
         self.txs = txs.to_vec();
+        self.victim_address = victim_address;
+        self.victim_loss_usd = victim_loss_usd;
         true
     }
 
@@ -550,6 +565,8 @@ impl IncidentProjection {
                     profit: completed.profit,
                     victim_loss: completed.victim_loss,
                     txs: Vec::new(),
+                    victim_address: None,
+                    victim_loss_usd: None,
                     retraction_reason: None,
                     finalized_block: None,
                     figures_at: at,
@@ -582,6 +599,8 @@ impl IncidentProjection {
                     profit: created.profit,
                     victim_loss: created.victim_loss,
                     txs: created.txs.clone(),
+                    victim_address: created.victim_address,
+                    victim_loss_usd: created.victim_loss_usd,
                     retraction_reason: None,
                     finalized_block: None,
                     figures_at: at,
@@ -597,6 +616,8 @@ impl IncidentProjection {
                     created.kind,
                     created.severity,
                     &created.txs,
+                    created.victim_address,
+                    created.victim_loss_usd,
                 );
                 changed |= record.advance_status(IncidentStatus::Confirmed);
                 changed |= record.set_figures(created.profit, created.victim_loss, at);
@@ -714,6 +735,8 @@ mod tests {
             impact_usd: None,
             severity: Severity::High,
             suggested_action: events::primitives::SuggestedAction::Escalate,
+            victim_address: None,
+            victim_loss_usd: None,
         })
     }
 

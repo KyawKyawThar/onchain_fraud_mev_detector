@@ -29,7 +29,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use events::primitives::{AlertId, Chain, IncidentId};
+use events::primitives::{AccountAddress, AlertId, Chain, IncidentId, UsdAmount};
 use events::{DomainEvent, EventEnvelope};
 use revm::primitives::B256;
 use secrecy::ExposeSecret;
@@ -218,6 +218,37 @@ pub trait IncidentAnalytics: Send + Sync {
     async fn append(&self, row: &AnalyticsRow) -> Result<(), PersistError>;
 }
 
+/// Hard ceiling on one [`WalletExposureStore::mev_exposure`] result — a guard
+/// against an unbounded scan for a heavily-targeted address (mirrors
+/// [`MAX_INCIDENTS_LIMIT`]). A wallet with more confirmed incidents than this has
+/// its exposure summary computed over the most-recent `MAX_EXPOSURE_INCIDENTS`;
+/// realistic per-wallet cardinality sits far below the cap, and the newest-first
+/// order keeps the truncated view the most relevant one.
+pub const MAX_EXPOSURE_INCIDENTS: u64 = 10_000;
+
+/// A wallet's confirmed-incident rows, as folded by [`ExposureRow`] (§11 wallet
+/// MEV-exposure). Its own seam, sibling to [`IncidentAnalytics`] rather than a
+/// method on it — a read concern over the same table, not part of the append-only
+/// firehose's contract (mirrors `intelligence::adjacency::AdjacencyStore` sitting
+/// beside `intelligence::store`'s write seams).
+#[async_trait]
+pub trait WalletExposureStore: Send + Sync {
+    /// The confirmed incidents that named `victim_address` as their victim,
+    /// newest first, optionally narrowed to a created-time lower bound `since`.
+    ///
+    /// **One row per incident, reflecting its *current* lifecycle state** — the
+    /// append-only analytics table holds a snapshot row per lifecycle event
+    /// (created/finalized/retracted), so the read folds each incident to its
+    /// latest snapshot and keeps only the still-confirmed ones. An incident that
+    /// was created then **retracted** (a §15 reorg withdrew it) is therefore
+    /// excluded: the money never actually moved, so it must not show as a loss.
+    async fn mev_exposure(
+        &self,
+        victim_address: &AccountAddress,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ExposureRow>, PersistError>;
+}
+
 /// Postgres-backed [`IncidentStore`]. Cheap to clone (the pool is an `Arc` internally).
 #[derive(Clone)]
 pub struct PgIncidentStore {
@@ -253,14 +284,16 @@ impl IncidentStore for PgIncidentStore {
         let severity: Option<&str> = record.severity.map(<&'static str>::from);
         let txs: Vec<String> = record.txs.iter().map(|tx| format!("{tx:#x}")).collect();
         let finalized_block: Option<String> = record.finalized_block.map(|b| format!("{b:#x}"));
+        let victim_address: Option<String> = record.victim_address.map(|a| normalized_address(&a));
+        let victim_loss_usd: Option<f64> = record.victim_loss_usd.map(UsdAmount::get);
 
         sqlx::query!(
             "INSERT INTO incidents (
                  alert_id, incident_id, status, kind, severity, profit, victim_loss,
-                 txs, retraction_reason, finalized_block, figures_at, retracted_at,
-                 finalized_at, updated_at
+                 txs, victim_address, victim_loss_usd, retraction_reason, finalized_block,
+                 figures_at, retracted_at, finalized_at, updated_at
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
              ON CONFLICT (alert_id) DO UPDATE SET
                  incident_id       = EXCLUDED.incident_id,
                  status            = EXCLUDED.status,
@@ -269,6 +302,8 @@ impl IncidentStore for PgIncidentStore {
                  profit            = EXCLUDED.profit,
                  victim_loss       = EXCLUDED.victim_loss,
                  txs               = EXCLUDED.txs,
+                 victim_address    = EXCLUDED.victim_address,
+                 victim_loss_usd   = EXCLUDED.victim_loss_usd,
                  retraction_reason = EXCLUDED.retraction_reason,
                  finalized_block   = EXCLUDED.finalized_block,
                  figures_at        = EXCLUDED.figures_at,
@@ -283,6 +318,8 @@ impl IncidentStore for PgIncidentStore {
             record.profit,
             record.victim_loss,
             &txs,
+            victim_address.as_deref(),
+            victim_loss_usd,
             record.retraction_reason.as_deref(),
             finalized_block.as_deref(),
             record.figures_at(),
@@ -342,8 +379,8 @@ impl IncidentStore for PgIncidentStore {
 
         let mut rows = sqlx::query!(
             "SELECT alert_id, incident_id, status, kind, severity, profit, victim_loss,
-                    txs, retraction_reason, finalized_block, figures_at, retracted_at,
-                    finalized_at, updated_at
+                    txs, victim_address, victim_loss_usd, retraction_reason, finalized_block,
+                    figures_at, retracted_at, finalized_at, updated_at
              FROM incidents
              WHERE ($1::text IS NULL OR status = $1)
                AND ($2::timestamptz IS NULL OR $3::uuid IS NULL
@@ -392,6 +429,12 @@ impl IncidentStore for PgIncidentStore {
                     .as_deref()
                     .map(|raw| parse_hex_column("finalized_block", raw))
                     .transpose()?;
+                let victim_address = row
+                    .victim_address
+                    .as_deref()
+                    .map(|raw| parse_address_column("victim_address", raw))
+                    .transpose()?;
+                let victim_loss_usd = row.victim_loss_usd.map(UsdAmount::new);
 
                 Ok(IncidentRecord::from_stored(
                     AlertId(row.alert_id),
@@ -402,6 +445,8 @@ impl IncidentStore for PgIncidentStore {
                     row.profit,
                     row.victim_loss,
                     txs,
+                    victim_address,
+                    victim_loss_usd,
                     row.retraction_reason,
                     finalized_block,
                     row.figures_at,
@@ -441,6 +486,24 @@ fn parse_hex_column(column: &'static str, raw: &str) -> Result<B256, PersistErro
     })
 }
 
+/// Parse a stored `0x`-hex column value back into an [`AccountAddress`].
+fn parse_address_column(column: &'static str, raw: &str) -> Result<AccountAddress, PersistError> {
+    raw.parse().map_err(|err| {
+        PersistError::Postgres(sqlx::Error::ColumnDecode {
+            index: column.to_owned(),
+            source: format!("{raw:?} is not a 0x-hex address: {err}").into(),
+        })
+    })
+}
+
+/// Canonicalize an address to lowercase `0x`-hex before it's written to or matched
+/// against a stored column — mirrors [`event-store`'s
+/// `normalized_address`](../../event-store/src/store.rs) so the same wallet always
+/// compares equal regardless of the casing it arrived with.
+fn normalized_address(address: &AccountAddress) -> String {
+    format!("{address:#x}")
+}
+
 /// ClickHouse-backed [`IncidentAnalytics`]. Cheap to clone (the client is `Arc`-cheap).
 #[derive(Clone)]
 pub struct ClickhouseAnalytics {
@@ -471,6 +534,58 @@ impl IncidentAnalytics for ClickhouseAnalytics {
         insert.write(row).await?;
         insert.end().await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl WalletExposureStore for ClickhouseAnalytics {
+    async fn mev_exposure(
+        &self,
+        victim_address: &AccountAddress,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ExposureRow>, PersistError> {
+        let address = normalized_address(victim_address);
+        // Fold each incident's snapshot rows (created/finalized/retracted, all
+        // carrying `victim_address` once stamped) to its *latest* state in the
+        // inner query, then keep only the still-confirmed ones — `confirmed = 1`
+        // on the latest snapshot excludes a created-then-retracted incident, which
+        // never really cost the wallet anything. `created_at` is the incident's
+        // creation time (`minIf` on the created row), so `since` and the ordering
+        // mean "incidents *created* at/after", not "last touched at/after". The
+        // fold is a subquery — aliasing the `minIf` as the raw column name
+        // `occurred_at` would read as an aggregate-inside-`argMax`, so the inner
+        // query keeps `created_at` distinct and the outer renames it back to the
+        // `ExposureRow` field. Grouping is pruned to this one wallet by the
+        // `victim_address` bloom-filter index, so there is no global scan. Bind
+        // order — address, [since], limit — matches the `?` order; keep them in
+        // lockstep if this grows (the general form is event-store's
+        // `query::Conditions`).
+        let mut sql = String::from(
+            "SELECT incident_id, kind, victim_loss_usd, created_at AS occurred_at \
+             FROM ( \
+                 SELECT \
+                     incident_id, \
+                     argMax(kind, occurred_at)            AS kind, \
+                     argMax(victim_loss_usd, occurred_at) AS victim_loss_usd, \
+                     argMax(confirmed, occurred_at)       AS confirmed, \
+                     minIf(occurred_at, event_type = 'IncidentCreated') AS created_at \
+                 FROM incident_analytics \
+                 WHERE victim_address = ? AND incident_id IS NOT NULL \
+                 GROUP BY incident_id \
+             ) \
+             WHERE confirmed = 1",
+        );
+        if since.is_some() {
+            sql.push_str(" AND created_at >= fromUnixTimestamp64Milli(?)");
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+
+        let mut query = self.client.query(&sql).bind(&address);
+        if let Some(since) = since {
+            query = query.bind(since.timestamp_millis());
+        }
+        query = query.bind(MAX_EXPOSURE_INCIDENTS);
+        Ok(query.fetch_all().await?)
     }
 }
 
@@ -513,6 +628,12 @@ pub struct AnalyticsRow {
     pub confirmed: u8,
     pub profit: f64,
     pub victim_loss: f64,
+    /// The victim wallet named by `IncidentCreated`, normalized lowercase `0x`-hex
+    /// (mirrors [`normalized_address`]); `None` before that event or when it named
+    /// no victim (e.g. `Honeypot`).
+    pub victim_address: Option<String>,
+    /// The victim's own USD-valued loss; `None` alongside `victim_address`.
+    pub victim_loss_usd: Option<f64>,
 }
 
 impl AnalyticsRow {
@@ -544,8 +665,25 @@ impl AnalyticsRow {
             )),
             profit: record.profit,
             victim_loss: record.victim_loss,
+            victim_address: record.victim_address.map(|a| normalized_address(&a)),
+            victim_loss_usd: record.victim_loss_usd.map(UsdAmount::get),
         }
     }
+}
+
+/// One confirmed incident from a [`WalletExposureStore::mev_exposure`] read — the
+/// raw shape [`crate::exposure::summarize`] folds into the wallet's exposure
+/// summary. `victim_loss_usd` is a plain `f64` here (not `UsdAmount`): the column
+/// is only populated for rows the write path already validated, so re-validating
+/// on every read would be redundant work for no additional safety.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, serde::Deserialize)]
+pub struct ExposureRow {
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub incident_id: Option<Uuid>,
+    pub kind: String,
+    pub victim_loss_usd: Option<f64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub occurred_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -610,6 +748,8 @@ mod tests {
                 impact_usd: None,
                 severity: Severity::High,
                 suggested_action: events::primitives::SuggestedAction::Escalate,
+                victim_address: None,
+                victim_loss_usd: None,
             }),
             at(11),
         );

@@ -335,6 +335,7 @@ mod tests {
                     victim_loss: 0.0,
                     confirmed,
                     txs: vec![],
+                    victim: None,
                 }),
                 Err(true) => Err(SimError::Transient("blip".into())),
                 Err(false) => Err(SimError::Poison("hostile".into())),

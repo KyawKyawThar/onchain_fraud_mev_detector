@@ -61,6 +61,12 @@
 //! - [`projection_consumer`] — the [`ProjectionConsumer`](projection_consumer::ProjectionConsumer):
 //!   consume the result path, fold, and write through to both stores, at-least-once.
 //!
+//! **Wallet MEV-exposure read path (§11):**
+//! - [`store::WalletExposureStore`] — reads a wallet's confirmed incidents back out
+//!   of the ClickHouse analytics table by its `victim_address` business-key column.
+//! - [`exposure`] — the pure `Vec<ExposureRow> → MevExposureSummary` fold
+//!   ([`exposure::summarize`]) behind `GET /v1/wallet/{addr}/mev-exposure`.
+//!
 //! **Reorg handling (§15, Sprint 6 t4):**
 //! - [`reorg`] — the two `BlockReverted` reactions: the worker-side generation check
 //!   ([`OrphanedBlocks`](reorg::OrphanedBlocks) + [`OrphanGuard`](reorg::OrphanGuard))
@@ -77,6 +83,7 @@ pub mod command;
 pub mod config;
 pub mod consumer;
 pub mod dispatcher;
+pub mod exposure;
 pub mod http;
 pub mod metrics;
 pub mod projection;

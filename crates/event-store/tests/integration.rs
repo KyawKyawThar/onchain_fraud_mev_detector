@@ -198,6 +198,8 @@ async fn query_api_finds_events_by_incident_address_and_window() {
                 impact_usd: None,
                 severity: Severity::High,
                 suggested_action: events::primitives::SuggestedAction::Escalate,
+                victim_address: None,
+                victim_loss_usd: None,
             }),
         ),
         EventEnvelope::with_metadata(

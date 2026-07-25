@@ -169,6 +169,8 @@ fn sample_events() -> Vec<DomainEvent> {
             impact_usd: Some(UsdAmount::new(120_000.0)),
             severity: Severity::High,
             suggested_action: SuggestedAction::Escalate,
+            victim_address: Some(addr()),
+            victim_loss_usd: Some(UsdAmount::new(678.9)),
         }),
         DomainEvent::IncidentRetracted(IncidentRetracted {
             incident_id: incident_id(),
@@ -545,6 +547,14 @@ fn legacy_incident_reads_with_defaulted_scoring_fields() {
         incident.suggested_action,
         SuggestedAction::Monitor,
         "defaulted conservatively on read"
+    );
+    assert_eq!(
+        incident.victim_address, None,
+        "un-restamped ⇒ unknown victim, not a guess"
+    );
+    assert_eq!(
+        incident.victim_loss_usd, None,
+        "un-restamped ⇒ unknown victim loss in USD"
     );
 }
 

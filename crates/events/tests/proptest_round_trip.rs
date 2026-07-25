@@ -331,6 +331,8 @@ fn simulation_event() -> impl Strategy<Value = DomainEvent> {
             prop::option::of(usd_amount()),
             severity(),
             suggested_action(),
+            prop::option::of(address()),
+            prop::option::of(usd_amount()),
         )
             .prop_map(
                 |(
@@ -343,6 +345,8 @@ fn simulation_event() -> impl Strategy<Value = DomainEvent> {
                     impact_usd,
                     severity,
                     suggested_action,
+                    victim_address,
+                    victim_loss_usd,
                 )| {
                     DomainEvent::IncidentCreated(IncidentCreated {
                         incident_id,
@@ -354,6 +358,8 @@ fn simulation_event() -> impl Strategy<Value = DomainEvent> {
                         impact_usd,
                         severity,
                         suggested_action,
+                        victim_address,
+                        victim_loss_usd,
                     })
                 }
             ),

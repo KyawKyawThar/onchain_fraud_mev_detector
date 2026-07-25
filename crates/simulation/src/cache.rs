@@ -184,6 +184,7 @@ mod tests {
                 victim_loss: 0.0,
                 confirmed: true,
                 txs: req.txs.clone(),
+                victim: None,
             })
         }
     }

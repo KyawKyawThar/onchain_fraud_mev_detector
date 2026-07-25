@@ -163,6 +163,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(entity_timeline))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
+        .routes(routes!(wallet_mev_exposure))
         .routes(routes!(create_rule))
         .route("/v1/stream", get(stream::stream_ws))
         .route_layer(middleware::from_fn_with_state(
@@ -1066,6 +1067,50 @@ async fn list_incidents(
     Ok((proxied.status, Json(proxied.body)).into_response())
 }
 
+/// `GET /v1/wallet/{addr}/mev-exposure?since=` — proxies simulation-projection's
+/// internal `GET /v1/wallet/{addr}/mev-exposure` verbatim (§11): counts and USD
+/// totals by kind for every confirmed incident that named `addr` as its victim,
+/// each linked to its `/v1/audit/incident/{incident_id}` audit trail via
+/// `incident_id`.
+#[utoipa::path(
+    get,
+    path = "/v1/wallet/{addr}/mev-exposure",
+    tag = "api-service",
+    params(
+        ("addr" = String, Path, description = "Wallet address"),
+        ("since" = Option<String>, Query, description = "Only incidents at/after this RFC 3339 timestamp"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "The wallet's MEV-exposure summary (proxied from simulation-projection)"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
+    ),
+)]
+async fn wallet_mev_exposure(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path(addr): Path<String>,
+    Query(params): Query<RawQuery>,
+) -> Result<Response, ApiError> {
+    let proxied = upstream::get(
+        &state.http_client,
+        &state.simulation_url,
+        &format!("/v1/wallet/{addr}/mev-exposure"),
+        &params,
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
+
+    state.usage.record(
+        customer,
+        events::system::UsageEventType::WalletMevExposureQueried,
+    );
+
+    Ok((proxied.status, Json(proxied.body)).into_response())
+}
+
 /// Rule-engine events are not chain-scoped facts, but every envelope must
 /// name a chain — stamped [`Chain::ETHEREUM`], the same single-chain-MVP
 /// posture as `usage.rs`'s `UsageRecorded` emission.
@@ -1342,6 +1387,7 @@ mod tests {
             ("/v1/entity/{entity_id}/timeline", "get"),
             ("/v1/audit/incident/{incident_id}", "get"),
             ("/v1/incidents", "get"),
+            ("/v1/wallet/{addr}/mev-exposure", "get"),
             ("/v1/rules", "post"),
         ] {
             assert!(
