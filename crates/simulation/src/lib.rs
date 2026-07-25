@@ -94,6 +94,7 @@ pub mod resolver;
 pub mod result;
 pub mod simulator;
 pub mod store;
+pub mod timing;
 pub mod topology;
 pub mod worker;
 

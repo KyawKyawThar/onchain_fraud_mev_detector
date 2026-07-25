@@ -60,6 +60,7 @@ pub enum UsageEventType {
     WalletMonitored,
     EntityQueried,
     WalletMevExposureQueried,
+    TimingRecommendationQueried,
 }
 
 impl UsageEventType {

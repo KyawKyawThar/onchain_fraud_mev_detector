@@ -164,6 +164,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
         .routes(routes!(wallet_mev_exposure))
+        .routes(routes!(timing_recommendation))
         .routes(routes!(create_rule))
         .route("/v1/stream", get(stream::stream_ws))
         .route_layer(middleware::from_fn_with_state(
@@ -1106,6 +1107,51 @@ async fn wallet_mev_exposure(
     state.usage.record(
         customer,
         events::system::UsageEventType::WalletMevExposureQueried,
+    );
+
+    Ok((proxied.status, Json(proxied.body)).into_response())
+}
+
+/// `GET /v1/timing/recommendation?chain=&size=` — proxies simulation-projection's
+/// internal `GET /v1/timing/recommendation` verbatim (safe-block-timing):
+/// historical incident intensity ranked into the safest-first low-MEV
+/// windows for the given chain and "size" (severity) band. A heuristic over
+/// historical patterns — the response always carries a `caveat` field, never
+/// a guarantee.
+#[utoipa::path(
+    get,
+    path = "/v1/timing/recommendation",
+    tag = "api-service",
+    params(
+        ("chain" = Option<u64>, Query, description = "Chain id (defaults to Ethereum mainnet)"),
+        ("size" = Option<String>, Query, description = "low | medium | high | critical (defaults to medium)"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Ranked low-MEV time windows for the chain/size, with sample size and caveat (proxied from simulation-projection)"),
+        (status = 400, description = "Unrecognized `size` value"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "simulation-projection is unreachable or answered 5xx"),
+    ),
+)]
+async fn timing_recommendation(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Query(params): Query<RawQuery>,
+) -> Result<Response, ApiError> {
+    let proxied = upstream::get(
+        &state.http_client,
+        &state.simulation_url,
+        "/v1/timing/recommendation",
+        &params,
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?
+    .client_visible("simulation-projection")?;
+
+    state.usage.record(
+        customer,
+        events::system::UsageEventType::TimingRecommendationQueried,
     );
 
     Ok((proxied.status, Json(proxied.body)).into_response())

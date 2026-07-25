@@ -249,6 +249,35 @@ pub trait WalletExposureStore: Send + Sync {
     ) -> Result<Vec<ExposureRow>, PersistError>;
 }
 
+/// One `incident_timing_rollup` bucket for a `(chain, severity)` pair, after
+/// re-aggregating the SummingMergeTree's per-part sums (see
+/// [`TimingStore::timing_buckets`]). Sparse: a `slot_of_day` with no
+/// confirmed incidents simply has no row — the caller (`crate::timing`) fills
+/// the gaps.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, serde::Deserialize)]
+pub struct TimingBucketRow {
+    pub slot_of_day: u16,
+    pub incident_count: u64,
+    pub total_victim_loss_usd: f64,
+}
+
+/// The read behind `GET /v1/timing/recommendation` (safe-block-timing):
+/// historical incident intensity by 10-minute UTC time-of-day slot, for one
+/// chain and one severity ("size") band. Its own seam, sibling to
+/// [`WalletExposureStore`] rather than a method on it — a read concern over
+/// the `incident_timing_rollup` rollup, not the append-only
+/// `incident_analytics` firehose.
+#[async_trait]
+pub trait TimingStore: Send + Sync {
+    /// Every bucket recorded for `chain`/`severity`, in no particular order —
+    /// [`crate::timing::rank_windows`] does the ranking.
+    async fn timing_buckets(
+        &self,
+        chain: Chain,
+        severity: crate::timing::SizeBand,
+    ) -> Result<Vec<TimingBucketRow>, PersistError>;
+}
+
 /// Postgres-backed [`IncidentStore`]. Cheap to clone (the pool is an `Arc` internally).
 #[derive(Clone)]
 pub struct PgIncidentStore {
@@ -463,12 +492,22 @@ impl IncidentStore for PgIncidentStore {
     }
 }
 
+/// The `serde_json::from_value(Value::String(...))` trick every wire-string
+/// parser in this crate builds on: reuse a `#[serde(rename_all = "snake_case")]`
+/// enum's own mapping (e.g. [`AlertKind`]/[`Severity`]) rather than hand-rolling
+/// a second one that could drift. Callers wrap the raw `serde_json::Error` into
+/// whatever domain error fits their layer — this stays layer-agnostic so an
+/// HTTP query-param parser isn't forced through a Postgres-flavored error.
+pub(crate) fn deserialize_wire_str<T: serde::de::DeserializeOwned>(
+    raw: &str,
+) -> Result<T, serde_json::Error> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned()))
+}
+
 /// Parse a snake_case wire string (e.g. `"sandwich"`) back into a derive-driven
-/// `Serialize`/`Deserialize` enum like [`AlertKind`]/[`Severity`], reusing their
-/// existing `serde(rename_all = "snake_case")` mapping rather than hand-rolling a
-/// second one that could drift.
+/// `Serialize`/`Deserialize` enum like [`AlertKind`]/[`Severity`].
 fn parse_wire_enum<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, PersistError> {
-    serde_json::from_value(serde_json::Value::String(raw.to_owned())).map_err(|err| {
+    deserialize_wire_str(raw).map_err(|err| {
         PersistError::Postgres(sqlx::Error::ColumnDecode {
             index: "kind/severity".to_owned(),
             source: format!("unrecognized value {raw:?}: {err}").into(),
@@ -586,6 +625,34 @@ impl WalletExposureStore for ClickhouseAnalytics {
         }
         query = query.bind(MAX_EXPOSURE_INCIDENTS);
         Ok(query.fetch_all().await?)
+    }
+}
+
+#[async_trait]
+impl TimingStore for ClickhouseAnalytics {
+    async fn timing_buckets(
+        &self,
+        chain: Chain,
+        severity: crate::timing::SizeBand,
+    ) -> Result<Vec<TimingBucketRow>, PersistError> {
+        // The rollup is a SummingMergeTree: merges are eventual, so every read
+        // re-aggregates rather than trusting a bare per-part row (mirrors
+        // `usage_rollup_daily`'s documented contract). Bind order — chain,
+        // severity — matches the `?` order.
+        let severity_wire = <&'static str>::from(severity);
+        Ok(self
+            .client
+            .query(
+                "SELECT slot_of_day, sum(incident_count) AS incident_count, \
+                     sum(total_victim_loss_usd) AS total_victim_loss_usd \
+                 FROM incident_timing_rollup \
+                 WHERE chain = ? AND severity = ? \
+                 GROUP BY slot_of_day",
+            )
+            .bind(chain.id())
+            .bind(severity_wire)
+            .fetch_all()
+            .await?)
     }
 }
 
