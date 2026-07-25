@@ -218,6 +218,9 @@ impl TryFrom<SubscriberRow> for Subscriber {
             channels,
             filter: SubscriptionFilter {
                 min_severity,
+                // Not persisted yet (no column) — always `None` on load. See the
+                // field's docs in `model::SubscriptionFilter`.
+                min_suggested_action: None,
                 kinds,
                 chains,
             },

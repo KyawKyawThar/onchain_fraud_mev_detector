@@ -345,6 +345,7 @@ mod tests {
             stage: LifecycleStage::Confirmed,
             kind: Some(AlertKind::Sandwich),
             severity: Some(Severity::Critical),
+            suggested_action: Some(events::primitives::SuggestedAction::EscalateImmediately),
             chain: Chain::ETHEREUM,
             addresses: vec![AccountAddress::repeat_byte(0xAB)],
             owner: Some(CustomerId::new()),

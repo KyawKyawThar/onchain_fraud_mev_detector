@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use events::detection::PreliminaryAlertCreated;
 use events::intelligence::SanctionHit;
 use events::primitives::{
-    AccountAddress, AlertId, AlertKind, Chain, CustomerId, IncidentId, Severity,
+    AccountAddress, AlertId, AlertKind, Chain, CustomerId, IncidentId, Severity, SuggestedAction,
 };
 use events::rule_engine::RuleAlertCreated;
 use events::simulation::IncidentCreated;
@@ -30,6 +30,13 @@ pub struct Notice {
     pub stage: LifecycleStage,
     pub kind: Option<AlertKind>,
     pub severity: Option<Severity>,
+    /// The operator-facing urgency the source scored (§6/§7) — a total function
+    /// of `severity`, carried alongside it so a subscriber can route on the
+    /// *action* axis directly (e.g. "only page me for `EscalateImmediately`")
+    /// without re-deriving it. `None` for an event that carries no scoring of its
+    /// own (a `RuleAlertCreated`, a `SanctionHit`, a retraction), which bypasses
+    /// the axis exactly like `severity`/`kind` do.
+    pub suggested_action: Option<SuggestedAction>,
     pub chain: Chain,
     pub addresses: Vec<AccountAddress>,
     /// `Some(_)` restricts fan-out to that customer's own subscribers
@@ -70,6 +77,7 @@ impl Notice {
             stage: LifecycleStage::Provisional,
             kind: Some(event.kind),
             severity: Some(event.severity),
+            suggested_action: Some(event.suggested_action),
             chain,
             addresses: event.addresses.clone(),
             owner: None,
@@ -108,6 +116,7 @@ impl Notice {
             stage: LifecycleStage::Confirmed,
             kind: Some(event.kind),
             severity: Some(event.severity),
+            suggested_action: Some(event.suggested_action),
             chain,
             addresses: Vec::new(),
             owner: None,
@@ -135,6 +144,7 @@ impl Notice {
             stage: LifecycleStage::Standalone,
             kind: None,
             severity: None,
+            suggested_action: None,
             chain,
             addresses: vec![event.address],
             owner: Some(event.owner),
@@ -162,6 +172,11 @@ impl Notice {
             stage: LifecycleStage::Standalone,
             kind: None,
             severity: Some(Severity::Critical),
+            // No suggested_action of its own: a sanctions match is a hard-block
+            // fact, not confidence-scored, so it bypasses the action axis (like
+            // `kind`) rather than being pinned to a band-derived value. The
+            // `Critical` severity already routes it to anyone with a severity floor.
+            suggested_action: None,
             chain,
             addresses: vec![event.address],
             owner: None,
@@ -192,6 +207,7 @@ impl Notice {
             stage: LifecycleStage::Retracted,
             kind: None,
             severity: None,
+            suggested_action: None,
             chain,
             addresses: Vec::new(),
             owner: None,
@@ -252,7 +268,7 @@ mod tests {
             provisional: true,
             impact_usd: None,
             severity,
-            suggested_action: SuggestedAction::Monitor,
+            suggested_action: events::scoring::suggested_action(severity),
         }
     }
 
@@ -292,7 +308,9 @@ mod tests {
             txs: vec![],
             profit: 5.0,
             victim_loss: 2.0,
+            impact_usd: None,
             severity: Severity::Critical,
+            suggested_action: SuggestedAction::EscalateImmediately,
         };
         let notice = Notice::from_incident_created(&event, Chain::ETHEREUM, Utc::now());
         assert_eq!(notice.stage, LifecycleStage::Confirmed);
@@ -302,6 +320,11 @@ mod tests {
             "same lineage as the provisional"
         );
         assert_eq!(notice.severity, Some(Severity::Critical));
+        assert_eq!(
+            notice.suggested_action,
+            Some(SuggestedAction::EscalateImmediately),
+            "the confirmed action is carried through for routing"
+        );
     }
 
     #[test]

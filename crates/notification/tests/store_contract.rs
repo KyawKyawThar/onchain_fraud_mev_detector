@@ -27,6 +27,7 @@ fn subscriber(owner: CustomerId) -> Subscriber {
         }],
         filter: SubscriptionFilter {
             min_severity: Some(Severity::Low),
+            min_suggested_action: None,
             kinds: None,
             chains: None,
         },

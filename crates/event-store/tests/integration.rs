@@ -195,7 +195,9 @@ async fn query_api_finds_events_by_incident_address_and_window() {
                 txs: vec![B256::repeat_byte(0x01)],
                 profit: 12_400.0,
                 victim_loss: 840.0,
+                impact_usd: None,
                 severity: Severity::High,
+                suggested_action: events::primitives::SuggestedAction::Escalate,
             }),
         ),
         EventEnvelope::with_metadata(

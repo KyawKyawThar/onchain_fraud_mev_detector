@@ -331,7 +331,9 @@ mod tests {
                 txs: vec![B256::repeat_byte(0x22)],
                 profit: 12.5,
                 victim_loss: 9.0,
+                impact_usd: None,
                 severity: Severity::High,
+                suggested_action: events::primitives::SuggestedAction::Escalate,
             }),
         );
 

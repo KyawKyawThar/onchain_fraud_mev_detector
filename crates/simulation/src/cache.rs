@@ -153,7 +153,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use events::primitives::{AlertId, AlertKind, Severity};
+    use events::primitives::{AlertId, AlertKind};
     use revm::primitives::Address;
 
     use super::*;
@@ -183,7 +183,6 @@ mod tests {
                 profit: req.block.number as f64,
                 victim_loss: 0.0,
                 confirmed: true,
-                severity: Severity::Medium,
                 txs: req.txs.clone(),
             })
         }

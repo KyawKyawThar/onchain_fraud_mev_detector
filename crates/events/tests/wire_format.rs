@@ -166,7 +166,9 @@ fn sample_events() -> Vec<DomainEvent> {
             txs: vec![tx()],
             profit: 1234.5,
             victim_loss: 678.9,
+            impact_usd: Some(UsdAmount::new(120_000.0)),
             severity: Severity::High,
+            suggested_action: SuggestedAction::Escalate,
         }),
         DomainEvent::IncidentRetracted(IncidentRetracted {
             incident_id: incident_id(),
@@ -337,7 +339,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "IncidentCreated",
-        r#"{"type":"IncidentCreated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","alert_id":"00000000-0000-0000-0000-0000000000a1","kind":"sandwich","txs":["0x2222222222222222222222222222222222222222222222222222222222222222"],"profit":1234.5,"victim_loss":678.9,"severity":"high"}}"#,
+        r#"{"type":"IncidentCreated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","alert_id":"00000000-0000-0000-0000-0000000000a1","kind":"sandwich","txs":["0x2222222222222222222222222222222222222222222222222222222222222222"],"profit":1234.5,"victim_loss":678.9,"impact_usd":120000.0,"severity":"high","suggested_action":"escalate"}}"#,
     ),
     (
         "IncidentRetracted",
@@ -510,6 +512,40 @@ fn legacy_preliminary_alert_reads_with_defaulted_scoring_fields() {
     assert_eq!(alert.impact_usd, None, "unscored ⇒ unknown impact, not 0.0");
     assert_eq!(alert.severity, Severity::Low);
     assert_eq!(alert.suggested_action, SuggestedAction::Monitor);
+}
+
+/// Backwards-compatibility lock for the §7 restamped scoring fields on
+/// `IncidentCreated` (SCHEMA.md's additive-field policy). An incident serialized
+/// *before* `impact_usd`/`suggested_action` existed — this exact pre-restamp byte
+/// string, a real shape sitting in the event store — must still deserialize under
+/// the current struct, defaulting the two additive fields rather than failing with
+/// a `missing field` error. (`severity` predates the restamp, so it stays a
+/// required field.) Without the `#[serde(default …)]` attributes this test fails,
+/// which is the point: the guard the new-shape round-trip goldens can't provide.
+#[test]
+fn legacy_incident_reads_with_defaulted_scoring_fields() {
+    let legacy = r#"{"type":"IncidentCreated","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","alert_id":"00000000-0000-0000-0000-0000000000a1","kind":"sandwich","txs":["0x2222222222222222222222222222222222222222222222222222222222222222"],"profit":1234.5,"victim_loss":678.9,"severity":"high"}}"#;
+
+    let event: DomainEvent =
+        serde_json::from_str(legacy).expect("a pre-restamp incident must still deserialize");
+    let DomainEvent::IncidentCreated(incident) = event else {
+        panic!("expected IncidentCreated");
+    };
+
+    assert_eq!(
+        incident.impact_usd, None,
+        "un-restamped ⇒ unknown impact, not 0.0"
+    );
+    assert_eq!(
+        incident.severity,
+        Severity::High,
+        "severity predates the restamp"
+    );
+    assert_eq!(
+        incident.suggested_action,
+        SuggestedAction::Monitor,
+        "defaulted conservatively on read"
+    );
 }
 
 // ── Envelope wire form ───────────────────────────────────────────
