@@ -270,7 +270,14 @@ impl NotificationConsumer {
                 snapshot
                     .iter()
                     .filter(|s| notice.owner.is_none_or(|owner| s.owner == owner))
-                    .filter(|s| s.admits(notice.severity, notice.kind, notice.chain))
+                    .filter(|s| {
+                        s.admits(
+                            notice.severity,
+                            notice.suggested_action,
+                            notice.kind,
+                            notice.chain,
+                        )
+                    })
                     .flat_map(|s| {
                         s.channels
                             .iter()
@@ -598,7 +605,9 @@ mod tests {
             txs: vec![],
             profit: 5.0,
             victim_loss: 2.0,
+            impact_usd: None,
             severity,
+            suggested_action: events::scoring::suggested_action(severity),
         })
     }
 
@@ -628,6 +637,7 @@ mod tests {
             owner,
             SubscriptionFilter {
                 min_severity: Some(Severity::Low),
+                min_suggested_action: None,
                 kinds: None,
                 chains: None,
             },
@@ -738,6 +748,7 @@ mod tests {
             CustomerId::new(),
             SubscriptionFilter {
                 min_severity: Some(Severity::High),
+                min_suggested_action: None,
                 kinds: None,
                 chains: None,
             },
@@ -746,6 +757,7 @@ mod tests {
             CustomerId::new(),
             SubscriptionFilter {
                 min_severity: None,
+                min_suggested_action: None,
                 kinds: Some(vec![AlertKind::Sandwich]),
                 chains: None,
             },

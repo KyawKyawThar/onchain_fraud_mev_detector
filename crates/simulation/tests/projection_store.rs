@@ -55,7 +55,9 @@ fn created(alert: AlertId, incident: IncidentId) -> DomainEvent {
         txs: vec![B256::repeat_byte(0x01), B256::repeat_byte(0x02)],
         profit: 5.0,
         victim_loss: 2.5,
+        impact_usd: None,
         severity: Severity::High,
+        suggested_action: events::primitives::SuggestedAction::Escalate,
     })
 }
 
@@ -196,7 +198,9 @@ async fn analytics_rows_append_and_aggregate_by_kind() {
                 txs: vec![B256::repeat_byte(0x01)],
                 profit,
                 victim_loss: profit / 2.0,
+                impact_usd: None,
                 severity: Severity::High,
+                suggested_action: events::primitives::SuggestedAction::Escalate,
             }),
             at(100),
         );

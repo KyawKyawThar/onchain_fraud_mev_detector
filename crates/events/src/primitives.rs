@@ -302,6 +302,11 @@ pub struct ConfidenceOutOfRange {
 pub struct Confidence(f64);
 
 impl Confidence {
+    /// Full certainty — `1.0`. A measured fact rather than an estimate: the slow
+    /// path (§7) restamps its confirmed figures at this confidence, since the
+    /// value is *known* to have moved and nothing should be discounted.
+    pub const CERTAIN: Self = Self(1.0);
+
     /// Clamp `value` into `[0.0, 1.0]`. Use for trusted, in-code values.
     pub fn new(value: f64) -> Self {
         Self(value.clamp(0.0, 1.0))

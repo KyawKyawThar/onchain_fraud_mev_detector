@@ -1140,7 +1140,9 @@ mod tests {
             txs: vec![],
             profit: 5.0,
             victim_loss: 2.0,
+            impact_usd: None,
             severity: Severity::High,
+            suggested_action: events::primitives::SuggestedAction::Escalate,
         })
     }
 

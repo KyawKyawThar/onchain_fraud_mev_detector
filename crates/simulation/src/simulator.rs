@@ -76,7 +76,7 @@
 
 use std::sync::Arc;
 
-use events::primitives::{AlertId, AlertKind, BlockRef, Severity};
+use events::primitives::{AlertId, AlertKind, BlockRef};
 use revm::bytecode::Bytecode;
 use revm::context::{ContextTr, TxEnv};
 use revm::database::{CacheDB, DatabaseRef, EmptyDB};
@@ -87,13 +87,6 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 /// Wei per ether — the divisor turning a balance delta into the ETH-denominated
 /// figure the result events carry.
 const WEI_PER_ETH: f64 = 1e18;
-
-/// Attacker-profit (ETH) band boundaries for incident [`Severity`]. A **placeholder**
-/// banding (see [`severity_for`]); named so the tuning knob is findable, not a magic
-/// number buried in a `match`.
-const CRITICAL_ETH: f64 = 100.0;
-const HIGH_ETH: f64 = 10.0;
-const MEDIUM_ETH: f64 = 1.0;
 
 /// The minimum attacker profit (ETH) for a simulation to **confirm** an alert into an
 /// incident. A validated newtype (mirrors [`UsdPrice`](events) / `Confidence`): a
@@ -273,8 +266,14 @@ pub enum Scenario {
     },
 }
 
-/// What the engine concluded. ETH-denominated; the [`crate::result`] mapping turns
-/// this into the `SimulationCompleted` / `IncidentCreated` events.
+/// What the engine concluded — the *financial verdict* only (profit, victim
+/// loss, confirmed). ETH-denominated; the [`crate::result`] mapping turns this
+/// into the `SimulationCompleted` / `IncidentCreated` events and, for a
+/// confirmed incident, restamps the scoring triple (`impact_usd`/`severity`/
+/// `suggested_action`) from these figures (§7). Scoring deliberately does **not**
+/// live here: the pure engine has no USD reference price, and one banding policy
+/// ([`events::scoring`]) is shared with the fast path — so the outcome carries
+/// the measured numbers, and the result seam does the banding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulationOutcome {
     pub alert_id: AlertId,
@@ -285,7 +284,6 @@ pub struct SimulationOutcome {
     pub victim_loss: f64,
     /// `profit` cleared the confirmation threshold.
     pub confirmed: bool,
-    pub severity: Severity,
     pub txs: Vec<B256>,
 }
 
@@ -398,7 +396,6 @@ struct Verdict {
     profit: f64,
     victim_loss: f64,
     confirmed: bool,
-    severity: Severity,
 }
 
 /// One probed account's balance either side of a replay.
@@ -483,20 +480,18 @@ impl RevmSimulator {
             profit: verdict.profit,
             victim_loss: verdict.victim_loss,
             confirmed: verdict.confirmed,
-            severity: verdict.severity,
             txs: req.txs.clone(),
         })
     }
 
     /// Build the verdict for a profit-threshold strategy (value extraction, sandwich):
-    /// confirm above `min_profit`, severity from the profit band. The one home for the
-    /// "did the money clear the bar" rule the two balance-diff confirmations share.
+    /// confirm above `min_profit`. The one home for the "did the money clear the bar"
+    /// rule the two balance-diff confirmations share.
     fn profit_verdict(&self, profit: f64, victim_loss: f64) -> Verdict {
         Verdict {
             profit,
             victim_loss,
             confirmed: profit > self.min_profit.get(),
-            severity: severity_for(profit),
         }
     }
 
@@ -572,13 +567,6 @@ impl RevmSimulator {
             profit: 0.0, // the probe measures a trap, not an attacker's balance gain
             victim_loss,
             confirmed,
-            // Profit is 0 here so the profit bands don't apply; a confirmed honeypot is
-            // treated High, unconfirmed Low. Placeholder banding, like `severity_for`.
-            severity: if confirmed {
-                Severity::High
-            } else {
-                Severity::Low
-            },
         })
     }
 
@@ -759,18 +747,6 @@ fn wei_to_eth(wei: U256) -> f64 {
     wei.to_string().parse::<f64>().unwrap_or(f64::INFINITY) / WEI_PER_ETH
 }
 
-/// Coarse severity from attacker profit (ETH). A **placeholder** banding, the same
-/// shape as the dispatcher's confidence→priority: real severity weighs victim loss,
-/// tier, and USD value (§7, §13) and is a follow-up.
-fn severity_for(profit_eth: f64) -> Severity {
-    match profit_eth {
-        p if p >= CRITICAL_ETH => Severity::Critical,
-        p if p >= HIGH_ETH => Severity::High,
-        p if p >= MEDIUM_ETH => Severity::Medium,
-        _ => Severity::Low,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,7 +813,6 @@ mod tests {
         assert_eq!(out.profit, 5.0, "attacker gained 5 ETH");
         assert_eq!(out.victim_loss, 5.0, "victim lost 5 ETH");
         assert!(out.confirmed, "5 ETH clears the 1 ETH threshold");
-        assert_eq!(out.severity, Severity::Medium);
         assert_eq!(out.txs, req.txs);
         assert_eq!(out.alert_id, req.alert_id);
     }
@@ -873,7 +848,6 @@ mod tests {
         let out = sim.simulate(&req).expect("simulation runs");
         assert_eq!(out.profit, 0.5);
         assert!(!out.confirmed);
-        assert_eq!(out.severity, Severity::Low);
     }
 
     /// An empty bundle is a valid no-op simulation: nothing moved, nothing confirmed
@@ -1124,7 +1098,6 @@ mod tests {
             "the victim got 5 ETH unsandwiched but 0 with the frontrun ahead of them"
         );
         assert!(out.confirmed, "5 ETH profit clears the 1 ETH bar");
-        assert_eq!(out.severity, Severity::Medium);
     }
 
     /// A frontrun that leaves the victim's swap untouched inflicts no counterfactual
@@ -1261,7 +1234,6 @@ mod tests {
         );
         assert_eq!(out.profit, 0.0, "the probe measures a trap, not a gain");
         assert_eq!(out.victim_loss, 1.0, "1 ETH is trapped in the token");
-        assert_eq!(out.severity, Severity::High);
     }
 
     /// A clean token whose sell also succeeds is **not** flagged — the honeypot

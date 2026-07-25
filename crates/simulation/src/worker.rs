@@ -56,7 +56,7 @@ pub use crate::consumer::Disposition;
 use crate::queue::PUBLISH_BACKOFF;
 use crate::reorg::OrphanGuard;
 use crate::resolver::JobResolver;
-use crate::result::events_for_outcome;
+use crate::result::{events_for_outcome, EthUsdPrice};
 use crate::simulator::{SimError, SimulationOutcome, SimulationRequest, Simulator};
 
 /// Map a failure's transient/permanent classification onto the queue disposition:
@@ -93,6 +93,9 @@ pub struct Worker {
     shutdown: CancellationToken,
     /// Back-off between transient result-publish retries; a field so tests shrink it.
     publish_backoff: Duration,
+    /// ETH→USD reference for restamping a confirmed incident's scoring triple
+    /// from its (ETH) figures (§7 — see [`crate::result::events_for_outcome`]).
+    eth_usd_price: EthUsdPrice,
 }
 
 impl Worker {
@@ -106,6 +109,7 @@ impl Worker {
         pool: Arc<rayon::ThreadPool>,
         event_sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
+        eth_usd_price: EthUsdPrice,
     ) -> Self {
         Self {
             resolver,
@@ -115,6 +119,7 @@ impl Worker {
             event_sink,
             shutdown,
             publish_backoff: PUBLISH_BACKOFF,
+            eth_usd_price,
         }
     }
 
@@ -191,7 +196,7 @@ impl Worker {
 
         // 3. Publish the result(s) back onto Kafka (at-least-once). The command
         //    never re-enters the event store — only its outcome does (§7).
-        let result_events = events_for_outcome(&outcome);
+        let result_events = events_for_outcome(&outcome, self.eth_usd_price);
         let incidents_created = result_events
             .iter()
             .filter(|e| matches!(e, DomainEvent::IncidentCreated(_)))
@@ -288,7 +293,6 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use events::primitives::Severity;
 
     use crate::consumer::JobDelivery;
     use crate::reorg::{NeverOrphaned, SharedOrphanedBlocks};
@@ -330,7 +334,6 @@ mod tests {
                     profit: if confirmed { 5.0 } else { 0.0 },
                     victim_loss: 0.0,
                     confirmed,
-                    severity: Severity::Medium,
                     txs: vec![],
                 }),
                 Err(true) => Err(SimError::Transient("blip".into())),
@@ -351,6 +354,7 @@ mod tests {
             test_pool(),
             events,
             CancellationToken::new(),
+            EthUsdPrice::try_new(2_000.0).unwrap(),
         );
         w.publish_backoff = Duration::from_millis(1);
         w
@@ -530,6 +534,7 @@ mod tests {
             test_pool(),
             events.clone(),
             CancellationToken::new(),
+            EthUsdPrice::try_new(2_000.0).unwrap(),
         );
         w.publish_backoff = Duration::from_millis(1);
 
@@ -557,6 +562,7 @@ mod tests {
             test_pool(),
             events.clone(),
             shutdown.clone(),
+            EthUsdPrice::try_new(2_000.0).unwrap(),
         );
         w.publish_backoff = Duration::from_millis(1);
         shutdown.cancel(); // already cancelled before processing

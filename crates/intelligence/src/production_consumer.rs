@@ -587,7 +587,9 @@ mod tests {
                 txs,
                 profit,
                 victim_loss: 0.0,
+                impact_usd: None,
                 severity: Severity::High,
+                suggested_action: events::primitives::SuggestedAction::Escalate,
             }),
             secs,
         )

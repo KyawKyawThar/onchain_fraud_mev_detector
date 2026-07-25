@@ -24,6 +24,7 @@ pub mod intelligence;
 pub mod predictive;
 pub mod primitives;
 pub mod rule_engine;
+pub mod scoring;
 pub mod simulation;
 pub mod system;
 
@@ -745,7 +746,9 @@ mod tests {
             txs: vec![],
             profit: 1.0,
             victim_loss: 0.0,
+            impact_usd: None,
             severity: Severity::High,
+            suggested_action: crate::primitives::SuggestedAction::Escalate,
         });
         // Keyed by the *alert*, not the incident — co-partitioned with its
         // SimulationCompleted so the two dedup/order together.

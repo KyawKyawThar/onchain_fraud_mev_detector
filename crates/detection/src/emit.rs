@@ -32,8 +32,7 @@ use alloy_primitives::B256;
 
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::primitives::{
-    AccountAddress, AlertId, AlertKind, BlockRef, Confidence, DetectorRef, Severity,
-    SuggestedAction, UsdAmount,
+    AccountAddress, AlertId, AlertKind, BlockRef, Confidence, DetectorRef, UsdAmount,
 };
 use events::DomainEvent;
 
@@ -98,51 +97,14 @@ pub fn preliminary_alert(
     }
 }
 
-/// USD-impact thresholds for [`severity_band`] (§6), applied to `impact_usd *
-/// confidence` — a low-confidence high-impact finding and a high-confidence
-/// low-impact one land in the same band once discounted by likelihood. Named
-/// consts rather than inline literals so the bands are one place to retune.
-pub const SEVERITY_CRITICAL_USD: f64 = 1_000_000.0;
-pub const SEVERITY_HIGH_USD: f64 = 100_000.0;
-pub const SEVERITY_MEDIUM_USD: f64 = 10_000.0;
-
-/// Derive a [`Severity`] band from `impact_usd` discounted by `confidence`
-/// (§6) — never from attribution or labels, so a `Critical` band means
-/// "high-harm, well-evidenced," not "involves a known bad actor" (that
-/// reweighting happens later, in the intelligence service, per the module
-/// docs). Pure and total: every input maps to exactly one band.
-///
-/// `impact_usd` of `None` (the detector couldn't price it and no transfer
-/// among the implicated txs could be priced either) is conservative, not
-/// alarming — it reads as [`Severity::Low`] rather than guessing at a dollar
-/// figure that isn't there.
-pub fn severity_band(impact_usd: Option<UsdAmount>, confidence: Confidence) -> Severity {
-    let Some(impact) = impact_usd else {
-        return Severity::Low;
-    };
-    let weighted = impact.get() * confidence.get();
-    if weighted >= SEVERITY_CRITICAL_USD {
-        Severity::Critical
-    } else if weighted >= SEVERITY_HIGH_USD {
-        Severity::High
-    } else if weighted >= SEVERITY_MEDIUM_USD {
-        Severity::Medium
-    } else {
-        Severity::Low
-    }
-}
-
-/// The operator-facing next step for a [`Severity`] band (§6) — a closed,
-/// total mapping so every alert carries an actionable recommendation rather
-/// than leaving each consumer to interpret the band ad hoc.
-pub fn suggested_action(severity: Severity) -> SuggestedAction {
-    match severity {
-        Severity::Low => SuggestedAction::Monitor,
-        Severity::Medium => SuggestedAction::Investigate,
-        Severity::High => SuggestedAction::Escalate,
-        Severity::Critical => SuggestedAction::EscalateImmediately,
-    }
-}
+// The severity banding and its action map now live in [`events::scoring`], the
+// single scoring policy the fast path (here) and the slow-path restamp
+// (`simulation::result`, §7) share so a provisional alert and the incident it
+// confirms into can't drift onto two banding rules. Re-exported so this crate's
+// call sites and its public API are unchanged.
+pub use events::scoring::{
+    severity_band, suggested_action, SEVERITY_CRITICAL_USD, SEVERITY_HIGH_USD, SEVERITY_MEDIUM_USD,
+};
 
 /// The on-chain addresses an alert is about: the `from`/`to` of every implicated
 /// transaction, looked up in the block's [`Enrichment`], deduplicated in
@@ -441,7 +403,7 @@ mod tests {
     use detector_api::{
         BlockBundle, EnrichmentBuilder, SemVer, TokenMeta, TokenTransfer, TxActions, UsdPrice,
     };
-    use events::primitives::{BlockRef, Chain};
+    use events::primitives::{BlockRef, Chain, Severity, SuggestedAction};
 
     use crate::model::{ConfigHash, ModelCard, ModelRegistry};
     use crate::registry::Registry;
@@ -527,70 +489,10 @@ mod tests {
         assert_eq!(a.suggested_action, SuggestedAction::Escalate);
     }
 
-    // ── severity_band / suggested_action ──────────────────────────────
-
-    #[test]
-    fn severity_band_is_conservative_when_impact_is_unknown() {
-        assert_eq!(
-            severity_band(None, Confidence::new(1.0)),
-            Severity::Low,
-            "no priced impact reads as Low, not an alarming guess"
-        );
-    }
-
-    #[test]
-    fn severity_band_discounts_impact_by_confidence() {
-        // At full confidence, thresholds apply directly.
-        assert_eq!(
-            severity_band(
-                Some(UsdAmount::new(SEVERITY_CRITICAL_USD)),
-                Confidence::new(1.0)
-            ),
-            Severity::Critical
-        );
-        assert_eq!(
-            severity_band(
-                Some(UsdAmount::new(SEVERITY_HIGH_USD)),
-                Confidence::new(1.0)
-            ),
-            Severity::High
-        );
-        assert_eq!(
-            severity_band(
-                Some(UsdAmount::new(SEVERITY_MEDIUM_USD)),
-                Confidence::new(1.0)
-            ),
-            Severity::Medium
-        );
-        assert_eq!(
-            severity_band(Some(UsdAmount::new(1.0)), Confidence::new(1.0)),
-            Severity::Low
-        );
-
-        // Same raw impact, halved confidence, drops a band.
-        assert_eq!(
-            severity_band(
-                Some(UsdAmount::new(SEVERITY_CRITICAL_USD)),
-                Confidence::new(0.5)
-            ),
-            Severity::High,
-            "1_000_000 * 0.5 = 500_000, still >= HIGH but < CRITICAL"
-        );
-    }
-
-    #[test]
-    fn suggested_action_is_a_total_one_to_one_mapping_from_severity() {
-        assert_eq!(suggested_action(Severity::Low), SuggestedAction::Monitor);
-        assert_eq!(
-            suggested_action(Severity::Medium),
-            SuggestedAction::Investigate
-        );
-        assert_eq!(suggested_action(Severity::High), SuggestedAction::Escalate);
-        assert_eq!(
-            suggested_action(Severity::Critical),
-            SuggestedAction::EscalateImmediately
-        );
-    }
+    // The severity-band / suggested-action policy is exercised where it now
+    // lives — see `events::scoring`. This crate's tests below cover how the
+    // emit path *composes* that policy (the provisional scoring triple) and
+    // resolves `impact_usd`.
 
     // ── impact_usd (resolver) / impact_from_transfers (fallback) ──────
 

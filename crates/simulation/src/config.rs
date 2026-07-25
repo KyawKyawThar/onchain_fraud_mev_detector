@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use events::primitives::Chain;
 use secrecy::SecretString;
 
+use crate::result::EthUsdPrice;
 use crate::simulator::{MinProfit, SimLimits};
 
 /// All runtime configuration for the simulation service (§7) — shared by both
@@ -51,6 +52,10 @@ pub struct WorkerConfig {
     /// Minimum attacker profit to *confirm* an alert into an incident; below it the
     /// simulation retracts. A validated newtype so a bad threshold fails at boot.
     pub min_profit: MinProfit,
+    /// ETH→USD reference price for restamping a confirmed incident's scoring
+    /// triple onto the USD bands (§7 — see [`crate::result`]). A coarse operator
+    /// knob (a real price feed is deferred), validated so a bad price fails at boot.
+    pub eth_usd_price: EthUsdPrice,
     /// Gas/step caps bounding hostile honeypot bytecode in the revm engine (§7
     /// hardening).
     pub sim_limits: SimLimits,
@@ -191,6 +196,11 @@ impl Config {
                 pool_threads: env_parse("SIMULATION_POOL_THREADS", 0usize)?,
                 min_profit: MinProfit::try_new(env_parse("SIMULATION_MIN_PROFIT_ETH", 0.05f64)?)
                     .context("SIMULATION_MIN_PROFIT_ETH")?,
+                eth_usd_price: EthUsdPrice::try_new(env_parse(
+                    "SIMULATION_ETH_USD_PRICE",
+                    3_000.0f64,
+                )?)
+                .context("SIMULATION_ETH_USD_PRICE")?,
                 sim_limits: SimLimits {
                     per_tx_gas: env_parse(
                         "SIMULATION_PER_TX_GAS",

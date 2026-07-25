@@ -3,7 +3,7 @@
 //! — what gets sent, derived from the consumed events.
 
 use chrono::{DateTime, Utc};
-use events::primitives::{AlertKind, Chain, CustomerId, Severity};
+use events::primitives::{AlertKind, Chain, CustomerId, Severity, SuggestedAction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -93,6 +93,20 @@ impl ChannelKind {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SubscriptionFilter {
     pub min_severity: Option<Severity>,
+    /// Minimum operator urgency to deliver (§6/§7). A distinct routing axis from
+    /// `min_severity` — a subscriber can gate on the *action* ("only page me for
+    /// `EscalateImmediately`") — even though the scored action is today a total
+    /// function of severity, so the two floors move together. Same
+    /// `None`-means-"no gate" semantics as the other axes.
+    ///
+    /// **Not yet persisted:** the `subscribers` table has no column for it, so a
+    /// store-loaded subscriber always reads `None` here (see
+    /// `store::PgNotificationStore`). The routing *engine* honours it for any
+    /// in-process/seeded filter that sets it; wiring the column (a migration +
+    /// `.sqlx` refresh) is the follow-up. `#[serde(default)]` keeps an older
+    /// serialized filter (no such key) deserializing.
+    #[serde(default)]
+    pub min_suggested_action: Option<SuggestedAction>,
     pub kinds: Option<Vec<AlertKind>>,
     pub chains: Option<Vec<Chain>>,
 }
@@ -104,6 +118,19 @@ impl SubscriptionFilter {
     pub fn admits_severity(&self, severity: Option<Severity>) -> bool {
         match (self.min_severity, severity) {
             (Some(min), Some(actual)) => severity_rank(actual) >= severity_rank(min),
+            _ => true,
+        }
+    }
+
+    /// Whether `suggested_action` clears this filter's urgency floor. `None` on
+    /// either side means "no gate" (see [`Self::admits_severity`]'s doc): a
+    /// notice carrying no action of its own (a `RuleAlertCreated`, `SanctionHit`,
+    /// retraction) always passes, and a subscriber with no floor accepts anything.
+    pub fn admits_suggested_action(&self, suggested_action: Option<SuggestedAction>) -> bool {
+        match (self.min_suggested_action, suggested_action) {
+            (Some(min), Some(actual)) => {
+                suggested_action_rank(actual) >= suggested_action_rank(min)
+            }
             _ => true,
         }
     }
@@ -140,6 +167,18 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
+/// [`SuggestedAction`]'s routing order, least to most urgent. Kept local for the
+/// same reason as [`severity_rank`] — the ordering is notification's routing
+/// concern, not something the cross-service `events` vocabulary should encode.
+fn suggested_action_rank(action: SuggestedAction) -> u8 {
+    match action {
+        SuggestedAction::Monitor => 0,
+        SuggestedAction::Investigate => 1,
+        SuggestedAction::Escalate => 2,
+        SuggestedAction::EscalateImmediately => 3,
+    }
+}
+
 /// A customer's alert subscription: a set of channels, gated by a filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscriber {
@@ -159,11 +198,13 @@ impl Subscriber {
     pub fn admits(
         &self,
         severity: Option<Severity>,
+        suggested_action: Option<SuggestedAction>,
         kind: Option<AlertKind>,
         chain: Chain,
     ) -> bool {
         self.enabled
             && self.filter.admits_severity(severity)
+            && self.filter.admits_suggested_action(suggested_action)
             && self.filter.admits_kind(kind)
             && self.filter.admits_chain(chain)
     }
@@ -239,10 +280,11 @@ mod tests {
         let s = subscriber(SubscriptionFilter::default());
         assert!(s.admits(
             Some(Severity::Low),
+            Some(SuggestedAction::Monitor),
             Some(AlertKind::Sandwich),
             Chain::ETHEREUM
         ));
-        assert!(s.admits(None, None, Chain::ETHEREUM));
+        assert!(s.admits(None, None, None, Chain::ETHEREUM));
     }
 
     #[test]
@@ -251,11 +293,11 @@ mod tests {
             min_severity: Some(Severity::High),
             ..Default::default()
         });
-        assert!(!s.admits(Some(Severity::Low), None, Chain::ETHEREUM));
-        assert!(s.admits(Some(Severity::Critical), None, Chain::ETHEREUM));
+        assert!(!s.admits(Some(Severity::Low), None, None, Chain::ETHEREUM));
+        assert!(s.admits(Some(Severity::Critical), None, None, Chain::ETHEREUM));
         // A notice with no severity of its own (e.g. RuleAlertCreated)
         // bypasses the gate rather than being rejected.
-        assert!(s.admits(None, None, Chain::ETHEREUM));
+        assert!(s.admits(None, None, None, Chain::ETHEREUM));
     }
 
     #[test]
@@ -264,12 +306,36 @@ mod tests {
             kinds: Some(vec![AlertKind::Sandwich]),
             ..Default::default()
         });
-        assert!(s.admits(None, Some(AlertKind::Sandwich), Chain::ETHEREUM));
-        assert!(!s.admits(None, Some(AlertKind::Arbitrage), Chain::ETHEREUM));
+        assert!(s.admits(None, None, Some(AlertKind::Sandwich), Chain::ETHEREUM));
+        assert!(!s.admits(None, None, Some(AlertKind::Arbitrage), Chain::ETHEREUM));
         assert!(
-            s.admits(None, None, Chain::ETHEREUM),
+            s.admits(None, None, None, Chain::ETHEREUM),
             "SanctionHit-style: no kind bypasses"
         );
+    }
+
+    #[test]
+    fn min_suggested_action_gates_only_when_the_notice_carries_one() {
+        let s = subscriber(SubscriptionFilter {
+            min_suggested_action: Some(SuggestedAction::Escalate),
+            ..Default::default()
+        });
+        // Below the urgency floor is rejected; at/above it passes.
+        assert!(!s.admits(
+            None,
+            Some(SuggestedAction::Investigate),
+            None,
+            Chain::ETHEREUM
+        ));
+        assert!(s.admits(
+            None,
+            Some(SuggestedAction::EscalateImmediately),
+            None,
+            Chain::ETHEREUM
+        ));
+        // A notice with no action of its own (e.g. SanctionHit) bypasses the
+        // gate rather than being rejected.
+        assert!(s.admits(None, None, None, Chain::ETHEREUM));
     }
 
     #[test]
@@ -278,15 +344,15 @@ mod tests {
             chains: Some(vec![Chain(2)]),
             ..Default::default()
         });
-        assert!(!s.admits(None, None, Chain::ETHEREUM));
-        assert!(s.admits(None, None, Chain(2)));
+        assert!(!s.admits(None, None, None, Chain::ETHEREUM));
+        assert!(s.admits(None, None, None, Chain(2)));
     }
 
     #[test]
     fn a_disabled_subscriber_admits_nothing() {
         let mut s = subscriber(SubscriptionFilter::default());
         s.enabled = false;
-        assert!(!s.admits(None, None, Chain::ETHEREUM));
+        assert!(!s.admits(None, None, None, Chain::ETHEREUM));
     }
 
     #[test]

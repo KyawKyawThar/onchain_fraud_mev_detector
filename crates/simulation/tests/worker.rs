@@ -24,6 +24,7 @@ use simulation::config::RabbitConfig;
 use simulation::consumer::{JobSource, RabbitJobSource};
 use simulation::queue::{JobSink, RabbitJobSink};
 use simulation::reorg::NeverOrphaned;
+use simulation::result::EthUsdPrice;
 use simulation::resolver::{JobResolver, UnresolvedJobResolver};
 use simulation::simulator::{MinProfit, RevmSimulator, Simulator};
 use simulation::test_util::{test_pool, EmptyScenarioResolver, RecordingEventSink};
@@ -127,6 +128,7 @@ fn worker(
         test_pool(),
         events,
         CancellationToken::new(),
+        EthUsdPrice::try_new(2_000.0).unwrap(),
     )
 }
 

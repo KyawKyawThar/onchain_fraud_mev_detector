@@ -111,6 +111,7 @@ async fn run(cfg: Config) -> Result<()> {
         pool,
         event_sink,
         shutdown.clone(),
+        cfg.worker.eth_usd_price,
     );
 
     // One competing consumer per worker slot: each opens its own consume channel

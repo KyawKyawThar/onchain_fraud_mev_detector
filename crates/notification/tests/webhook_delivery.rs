@@ -67,6 +67,7 @@ fn notice() -> Notice {
         stage: LifecycleStage::Confirmed,
         kind: Some(AlertKind::Sandwich),
         severity: Some(Severity::Critical),
+        suggested_action: Some(events::primitives::SuggestedAction::EscalateImmediately),
         chain: Chain::ETHEREUM,
         addresses: vec![],
         owner: Some(CustomerId::new()),
