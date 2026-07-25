@@ -4,6 +4,7 @@
 //! of the service stays pure and testable.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use events::primitives::Chain;
@@ -125,6 +126,11 @@ pub struct ProjectionConfig {
     /// Address the Prometheus `/metrics` endpoint binds to (§19). Defaults to
     /// `0.0.0.0:9111`.
     pub metrics_addr: SocketAddr,
+    /// How often the scheduled §25 exposure-report push (`crate::exposure_report`,
+    /// Sprint 15 t5) cycles over every opted-in monitored wallet. Defaults to
+    /// 24h — a customer's report cadence, not a tuning knob operators need to
+    /// touch often, so a coarse env override is enough.
+    pub exposure_report_interval: Duration,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base URL plus
@@ -168,6 +174,10 @@ impl ProjectionConfig {
                 "SIMULATION_PROJECTION_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9111)),
             )?,
+            exposure_report_interval: Duration::from_secs(env_parse(
+                "EXPOSURE_REPORT_INTERVAL_SECS",
+                86_400u64,
+            )?),
         })
     }
 }

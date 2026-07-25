@@ -3,9 +3,11 @@
 //! command itself never does — it lives on RabbitMQ, §2/§7).
 
 use crate::primitives::{
-    AccountAddress, AlertId, AlertKind, IncidentId, Severity, SuggestedAction, UsdAmount,
+    AccountAddress, AlertId, AlertKind, CustomerId, IncidentId, Severity, SuggestedAction,
+    UsdAmount,
 };
 use alloy_primitives::B256;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Simulation was requested for a provisional alert. Emitted alongside the
@@ -107,4 +109,31 @@ pub struct IncidentFinalized {
     pub incident_id: IncidentId,
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub block_hash: B256,
+}
+
+/// A scheduled §25 MEV-exposure report for one opted-in monitored wallet is
+/// ready to push (Sprint 15 t5). Published by simulation-projection's
+/// periodic scheduler — never cached, always computed live through the same
+/// `WalletExposureStore::mev_exposure` call the on-demand `GET
+/// /v1/wallet/{addr}/mev-exposure` endpoint uses, so a reorg-retracted
+/// incident is excluded here exactly as it is there (§15) with no separate
+/// retraction machinery.
+///
+/// `summary` is the opaque, already-`Serialize`d `exposure::MevExposureSummary`
+/// (simulation-crate-private) — kept as `serde_json::Value` here so this
+/// schema crate, and every consumer of it (notification), never needs to know
+/// that shape, the same opacity `RuleCreated::definition` gives the rule body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WalletExposureReportReady {
+    pub customer_id: CustomerId,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub address: AccountAddress,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    /// Human-readable one-line summary, rendered by simulation — what
+    /// `Notice::from_exposure_report` uses verbatim as the delivered message.
+    pub headline: String,
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub summary: serde_json::Value,
 }

@@ -9,10 +9,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use events::primitives::{
-    AccountAddress, AlertId, AlertKind, Chain, Confidence, DetectorRef, Severity,
+    AccountAddress, AlertId, AlertKind, Chain, Confidence, CustomerId, DetectorRef, Severity,
 };
 use revm::primitives::Address;
 
+use crate::monitored_wallet_store::{
+    AddOutcome, MonitoredWallet, MonitoredWalletCursor, MonitoredWalletPage, MonitoredWalletStore,
+};
 use crate::store::{ExposureRow, PersistError, TimingBucketRow, TimingStore, WalletExposureStore};
 
 /// The shared recording [`EventSink`](event_bus::EventSink), re-exported under
@@ -175,5 +178,118 @@ impl TimingStore for InMemoryTimingStore {
         _severity: Severity,
     ) -> Result<Vec<TimingBucketRow>, PersistError> {
         Ok(self.rows.clone())
+    }
+}
+
+/// An in-memory [`MonitoredWalletStore`] double — honours the same owner
+/// isolation, idempotent-opt-in, and `(created_at, id)`-keyset-pagination
+/// semantics the Postgres implementation promises, so a test that passes here
+/// means the consumer logic is right (same discipline as
+/// `server::policy_store::test_util::InMemoryPolicyStore`).
+#[derive(Default)]
+pub struct InMemoryMonitoredWalletStore {
+    wallets: Mutex<Vec<MonitoredWallet>>,
+    /// Mirrors the Postgres `BIGSERIAL`: monotonically increasing, never
+    /// reused even after a `remove` — same identity discipline the real
+    /// sequence gives [`MonitoredWalletCursor`].
+    next_id: Mutex<i64>,
+}
+
+impl InMemoryMonitoredWalletStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl MonitoredWalletStore for InMemoryMonitoredWalletStore {
+    async fn add(
+        &self,
+        owner: CustomerId,
+        chain: Chain,
+        address: AccountAddress,
+        at: DateTime<Utc>,
+    ) -> Result<AddOutcome, PersistError> {
+        let mut wallets = self.wallets.lock().unwrap();
+        let already = wallets
+            .iter()
+            .any(|w| w.owner == owner && w.chain == chain && w.address == address);
+        if already {
+            return Ok(AddOutcome::AlreadyMonitored);
+        }
+        let id = {
+            let mut next_id = self.next_id.lock().unwrap();
+            *next_id += 1;
+            *next_id
+        };
+        wallets.push(MonitoredWallet {
+            id,
+            owner,
+            chain,
+            address,
+            created_at: at,
+        });
+        Ok(AddOutcome::Added)
+    }
+
+    async fn remove(
+        &self,
+        owner: CustomerId,
+        chain: Chain,
+        address: AccountAddress,
+    ) -> Result<bool, PersistError> {
+        let mut wallets = self.wallets.lock().unwrap();
+        let before = wallets.len();
+        wallets.retain(|w| !(w.owner == owner && w.chain == chain && w.address == address));
+        Ok(wallets.len() != before)
+    }
+
+    async fn list_for_owner(
+        &self,
+        owner: CustomerId,
+    ) -> Result<Vec<MonitoredWallet>, PersistError> {
+        Ok(self
+            .wallets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.owner == owner)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all(
+        &self,
+        after: Option<MonitoredWalletCursor>,
+        limit: u64,
+    ) -> Result<MonitoredWalletPage, PersistError> {
+        let mut sorted = self.wallets.lock().unwrap().clone();
+        sorted.sort_by_key(|w| (w.created_at, w.id));
+
+        let start = match after {
+            Some(cursor) => sorted
+                .iter()
+                .position(|w| (w.created_at, w.id) > (cursor.created_at, cursor.id))
+                .unwrap_or(sorted.len()),
+            None => 0,
+        };
+        let remaining = &sorted[start..];
+
+        let limit = limit as usize;
+        let has_more = remaining.len() > limit;
+        let wallets: Vec<MonitoredWallet> = remaining.iter().take(limit).cloned().collect();
+        let next_cursor = if has_more {
+            wallets.last().map(|w| MonitoredWalletCursor {
+                created_at: w.created_at,
+                id: w.id,
+            })
+        } else {
+            None
+        };
+
+        Ok(MonitoredWalletPage {
+            wallets,
+            next_cursor,
+        })
     }
 }

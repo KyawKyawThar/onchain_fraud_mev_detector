@@ -196,6 +196,7 @@ pub enum DomainEvent {
     IncidentCreated(simulation::IncidentCreated),
     IncidentRetracted(simulation::IncidentRetracted),
     IncidentFinalized(simulation::IncidentFinalized),
+    WalletExposureReportReady(simulation::WalletExposureReportReady),
 
     // Intelligence (§8)
     LabelAdded(intelligence::LabelAdded),
@@ -276,7 +277,8 @@ impl DomainEvent {
             | SimulationCompleted(_)
             | IncidentCreated(_)
             | IncidentRetracted(_)
-            | IncidentFinalized(_) => EventFamily::Simulation,
+            | IncidentFinalized(_)
+            | WalletExposureReportReady(_) => EventFamily::Simulation,
             LabelAdded(_)
             | LabelUpdated(_)
             | LabelRevoked(_)
@@ -333,6 +335,7 @@ impl DomainEvent {
             | RuleAlertCreated(_)
             | UsageRecorded(_)
             | ScreeningDecisionRecorded(_)
+            | WalletExposureReportReady(_)
             | PredictedAlert(_) => None,
         }
     }
@@ -381,6 +384,7 @@ impl DomainEvent {
             IncidentFinalized(e) => Some(PartitionKey::Incident(e.incident_id)),
             UsageRecorded(e) => e.customer_id.map(PartitionKey::Customer),
             ScreeningDecisionRecorded(e) => Some(PartitionKey::Customer(e.customer_id)),
+            WalletExposureReportReady(e) => Some(PartitionKey::Customer(e.customer_id)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -428,6 +432,7 @@ impl DomainEvent {
             SanctionHit(e) => vec![e.address],
             ScreeningDecisionRecorded(e) => vec![e.address],
             IncidentCreated(e) => e.victim_address.into_iter().collect(),
+            WalletExposureReportReady(e) => vec![e.address],
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)

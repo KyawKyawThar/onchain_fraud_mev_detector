@@ -75,6 +75,12 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 rdkafka = { workspace = true }
 async-trait = { workspace = true }
+# Bounded concurrency for the §25 scheduled exposure-report cycle
+# (`exposure_report::run_cycle`, Sprint 15 t5): `stream::iter(...).buffer_unordered(N)`
+# runs up to N wallets' exposure fetch + publish concurrently instead of one
+# at a time. Already a pinned workspace dependency (`server` uses it to split
+# a WS connection), so this adds no new crate to the dependency tree.
+futures-util = { workspace = true }
 
 # RabbitMQ command broker (§7) — see the workspace note. lapin is handed tokio's
 # executor+reactor so it shares the service's single runtime.
