@@ -10,6 +10,7 @@ use detector_api::Bps;
 use events::primitives::Chain;
 use url::Url;
 
+use crate::cascade::RiskThresholds;
 use crate::position::{LiquidationThresholds, Protocol};
 
 /// Fallback trailing window (in blocks) for the position tracker's reorg
@@ -40,6 +41,7 @@ pub struct Config {
     pub kafka: KafkaConfig,
     pub metrics_addr: SocketAddr,
     pub position_tracker: PositionTrackerConfig,
+    pub cascade: CascadeConfig,
 }
 
 /// How to reach Kafka for *producing* `PredictedAlert` (§16, §20).
@@ -71,6 +73,34 @@ pub struct PositionTrackerConfig {
     pub liquidation_thresholds: LiquidationThresholds,
 }
 
+/// One asset's oracle price feed: the on-chain asset (with its ERC-20
+/// decimals, for base-unit → whole-token conversion) and the Chainlink-style
+/// aggregator contract (with its own `latestRoundData()` decimals) the
+/// cascade engine reads its mark price from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetFeed {
+    pub asset: Address,
+    pub asset_decimals: u8,
+    pub feed: Address,
+    pub feed_decimals: u8,
+}
+
+/// Configuration for the cascade engine (§16.2, Sprint 16 task 2).
+#[derive(Debug, Clone)]
+pub struct CascadeConfig {
+    /// RPC endpoint the price source calls `latestRoundData()` against.
+    /// Defaults to [`Config::mempool_rpc_url`], same fallback discipline as
+    /// `PositionTrackerConfig::rpc_url`.
+    pub rpc_url: Url,
+    /// How often the price source polls every configured feed.
+    pub poll_interval: Duration,
+    /// The feeds to watch. Empty means the cascade engine is wired but inert
+    /// (no feeds configured yet) rather than a boot error — same convention
+    /// as `PositionTrackerConfig::contract_addresses`.
+    pub feeds: Vec<AssetFeed>,
+    pub thresholds: RiskThresholds,
+}
+
 impl Config {
     /// Resolve config from the process environment, erroring on anything
     /// missing or malformed (fail fast at boot rather than at first request).
@@ -81,6 +111,10 @@ impl Config {
 
         let lending_rpc_url = match std::env::var("LENDING_RPC_URL") {
             Ok(raw) => Url::parse(&raw).context("LENDING_RPC_URL is not a valid URL")?,
+            Err(_) => mempool_rpc_url.clone(),
+        };
+        let oracle_rpc_url = match std::env::var("ORACLE_RPC_URL") {
+            Ok(raw) => Url::parse(&raw).context("ORACLE_RPC_URL is not a valid URL")?,
             Err(_) => mempool_rpc_url.clone(),
         };
         let default_window_blocks = chain
@@ -125,6 +159,37 @@ impl Config {
                             .get(),
                     )?),
                 ),
+            },
+            cascade: CascadeConfig {
+                rpc_url: oracle_rpc_url,
+                poll_interval: Duration::from_millis(env_parse(
+                    "ORACLE_POLL_INTERVAL_MS",
+                    2_000u64,
+                )?),
+                feeds: env_asset_feeds("ORACLE_PRICE_FEEDS")?,
+                // Env-var fallbacks are `RiskThresholds::default()`'s own
+                // figures, not re-hardcoded literals — same one-source-of-
+                // truth discipline as the liquidation-threshold fallbacks
+                // above. `try_new` (not a struct literal — the fields are
+                // private) rejects a misconfigured non-descending triple at
+                // boot rather than silently misclassifying severities later.
+                thresholds: {
+                    let warning = env_parse(
+                        "LIQUIDATION_WARNING_DISTANCE_PCT",
+                        RiskThresholds::default().warning_distance_pct(),
+                    )?;
+                    let danger = env_parse(
+                        "LIQUIDATION_DANGER_DISTANCE_PCT",
+                        RiskThresholds::default().danger_distance_pct(),
+                    )?;
+                    let critical = env_parse(
+                        "LIQUIDATION_CRITICAL_DISTANCE_PCT",
+                        RiskThresholds::default().critical_distance_pct(),
+                    )?;
+                    RiskThresholds::try_new(warning, danger, critical).context(
+                        "configured risk thresholds (LIQUIDATION_*_DISTANCE_PCT) are invalid",
+                    )?
+                },
             },
         })
     }
@@ -179,6 +244,49 @@ fn parse_addr_list(raw: &str) -> Result<Vec<Address>> {
         .collect()
 }
 
+/// `ORACLE_PRICE_FEEDS` — a comma-separated list of `asset:decimals:feed:feed_decimals`
+/// quads; unset means no feeds configured (`vec![]`), not an error; see
+/// [`CascadeConfig::feeds`]. Parse kept separate from the env read for the
+/// same testability reason as [`env_addr_list`]/[`parse_addr_list`].
+fn env_asset_feeds(key: &str) -> Result<Vec<AssetFeed>> {
+    match std::env::var(key) {
+        Ok(raw) => parse_asset_feeds(&raw).with_context(|| format!("env var {key} is invalid")),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Parse a comma-separated list of `asset:decimals:feed:feed_decimals` quads,
+/// trimming whitespace and skipping empty entries (so a trailing comma or
+/// stray spaces don't error).
+fn parse_asset_feeds(raw: &str) -> Result<Vec<AssetFeed>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_asset_feed)
+        .collect()
+}
+
+fn parse_asset_feed(entry: &str) -> Result<AssetFeed> {
+    let parts: Vec<&str> = entry.split(':').collect();
+    let [asset, asset_decimals, feed, feed_decimals] = parts.as_slice() else {
+        anyhow::bail!("invalid asset feed {entry:?}: expected asset:decimals:feed:feed_decimals");
+    };
+    Ok(AssetFeed {
+        asset: asset
+            .parse()
+            .with_context(|| format!("invalid asset address in {entry:?}"))?,
+        asset_decimals: asset_decimals
+            .parse()
+            .with_context(|| format!("invalid asset decimals in {entry:?}"))?,
+        feed: feed
+            .parse()
+            .with_context(|| format!("invalid feed address in {entry:?}"))?,
+        feed_decimals: feed_decimals
+            .parse()
+            .with_context(|| format!("invalid feed decimals in {entry:?}"))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +324,53 @@ mod tests {
     #[test]
     fn parse_addr_list_of_an_empty_string_is_empty() {
         assert_eq!(parse_addr_list("").unwrap(), Vec::<Address>::new());
+    }
+
+    #[test]
+    fn env_asset_feeds_is_empty_when_unset() {
+        assert_eq!(
+            env_asset_feeds("PREDICTIVE_TEST_UNSET_ASSET_FEEDS").unwrap(),
+            Vec::<AssetFeed>::new()
+        );
+    }
+
+    #[test]
+    fn parse_asset_feeds_trims_and_skips_empty_entries() {
+        let parsed = parse_asset_feeds(
+            " 0x1111111111111111111111111111111111111111:18:0x2222222222222222222222222222222222222222:8 ,\
+             0x3333333333333333333333333333333333333333:6:0x4444444444444444444444444444444444444444:8,",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                AssetFeed {
+                    asset: Address::repeat_byte(0x11),
+                    asset_decimals: 18,
+                    feed: Address::repeat_byte(0x22),
+                    feed_decimals: 8,
+                },
+                AssetFeed {
+                    asset: Address::repeat_byte(0x33),
+                    asset_decimals: 6,
+                    feed: Address::repeat_byte(0x44),
+                    feed_decimals: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_asset_feeds_rejects_a_malformed_entry() {
+        assert!(parse_asset_feeds("0x1111111111111111111111111111111111111111:18").is_err());
+        assert!(parse_asset_feeds(
+            "not-an-address:18:0x2222222222222222222222222222222222222222:8"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_asset_feeds_of_an_empty_string_is_empty() {
+        assert_eq!(parse_asset_feeds("").unwrap(), Vec::<AssetFeed>::new());
     }
 }

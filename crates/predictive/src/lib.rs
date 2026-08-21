@@ -24,8 +24,19 @@
 //!   `eth_getLogs`.
 //! - [`position_consumer`] — folds `BlockCanonicalized`/`BlockReverted` into the
 //!   tracker over the shared `event_bus::run_consumer` loop.
+//!
+//! Sprint 16 task 2 (§16.2) adds the cascade engine, driven by its own
+//! ticker-based price source rather than block cadence (oracle updates aren't
+//! block-aligned, and this pipeline targets sub-block latency):
+//!
+//! - [`price_source`] — polls configured Chainlink-style feeds and reports
+//!   only genuine `updatedAt` advances as [`price_source::PriceTick`]s.
+//! - [`cascade`] — [`cascade::CascadeEngine`], which recomputes health
+//!   factors off [`position::PositionTracker::current`] on every price tick
+//!   and reports positions whose risk band has worsened.
 
 mod abi_words;
+pub mod cascade;
 pub mod config;
 pub mod decode;
 pub mod intel_client;
@@ -34,4 +45,5 @@ pub mod position;
 pub mod position_consumer;
 pub mod position_source;
 pub mod predict;
+pub mod price_source;
 pub mod source;

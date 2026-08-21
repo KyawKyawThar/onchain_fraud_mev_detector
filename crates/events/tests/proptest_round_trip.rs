@@ -40,9 +40,10 @@ use events::intelligence::{
     AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
     LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
+use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef, EntityId, IncidentId,
-    LabelId, RuleId, Severity, SuggestedAction, UsdAmount,
+    LabelId, LendingProtocol, PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -187,6 +188,13 @@ fn rule_id() -> impl Strategy<Value = RuleId> {
 }
 fn customer_id() -> impl Strategy<Value = CustomerId> {
     uuid().prop_map(CustomerId)
+}
+fn prediction_id() -> impl Strategy<Value = PredictionId> {
+    uuid().prop_map(PredictionId)
+}
+
+fn lending_protocol() -> impl Strategy<Value = LendingProtocol> {
+    prop_oneof![Just(LendingProtocol::Aave), Just(LendingProtocol::Compound),]
 }
 
 /// The opaque `serde_json::Value` payloads (`evidence`, rule `definition`,
@@ -547,7 +555,52 @@ fn system_event() -> impl Strategy<Value = DomainEvent> {
         })
 }
 
-/// Every `DomainEvent` variant, uniformly across the six families.
+/// Predictive (§16): `PredictedAlert` and `LiquidationRiskPredicted`.
+fn predictive_event() -> impl Strategy<Value = DomainEvent> {
+    prop_oneof![
+        (
+            prediction_id(),
+            b256(),
+            prop::collection::vec(address(), 0..4),
+            alert_kind(),
+            confidence(),
+        )
+            .prop_map(|(prediction_id, tx_hash, addresses, kind, confidence)| {
+                DomainEvent::PredictedAlert(PredictedAlert {
+                    prediction_id,
+                    tx_hash,
+                    addresses,
+                    kind,
+                    confidence,
+                    provisional: true,
+                })
+            }),
+        (
+            prediction_id(),
+            lending_protocol(),
+            address(),
+            finite_f64(),
+            finite_f64(),
+            severity(),
+        )
+            .prop_map(
+                |(prediction_id, protocol, account, health_factor, distance_pct, severity)| {
+                    DomainEvent::LiquidationRiskPredicted(LiquidationRiskPredicted {
+                        prediction_id,
+                        protocol,
+                        account,
+                        health_factor,
+                        distance_pct,
+                        severity,
+                        confidence: Confidence::CERTAIN,
+                        provisional: true,
+                    })
+                }
+            ),
+    ]
+}
+
+/// Every `DomainEvent` variant, uniformly across the seven families.
 fn domain_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
         chain_event(),
@@ -556,6 +609,7 @@ fn domain_event() -> impl Strategy<Value = DomainEvent> {
         intelligence_event(),
         rule_engine_event(),
         system_event(),
+        predictive_event(),
     ]
 }
 

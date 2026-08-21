@@ -1,31 +1,41 @@
 //! Predictive pipeline service binary (§16) — `MempoolSource → decode →
 //! predict-engine → PredictedAlert`, plus (§16.1, Sprint 16 task 1) a second,
-//! independent lending position tracker sharing this binary.
+//! independent lending position tracker, plus (§16.2, Sprint 16 task 2) a
+//! third, independent cascade engine — all three sharing this binary.
 //!
 //! Boot: connect the single mempool RPC endpoint, the intelligence gRPC
-//! client, and the Kafka producer, then run three cooperating tasks until a
+//! client, and the Kafka producer, then run five cooperating tasks until a
 //! shutdown signal —
 //!   1. the mempool **poller**, forwarding pending transactions over a
 //!      bounded channel (§17 backpressure),
 //!   2. the mempool **consumer**, deduping by tx hash, decoding, scoring against
-//!      intelligence's cached labels, and publishing `PredictedAlert`, and
+//!      intelligence's cached labels, and publishing `PredictedAlert`,
 //!   3. the **position-tracker consumer**, folding `BlockCanonicalized`/
-//!      `BlockReverted` into the tracked lending position book (§15).
+//!      `BlockReverted` into the tracked lending position book (§15) — its
+//!      tracker is `Arc<Mutex<_>>`-shared with task 5, below,
+//!   4. the oracle **price poller**, forwarding genuine mark-price updates
+//!      over a second bounded channel, and
+//!   5. the **cascade engine**, recomputing health factors off the shared
+//!      position tracker on every price update and publishing
+//!      `LiquidationRiskPredicted` for every worsening risk-band crossing.
 
-use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use anyhow::{Context, Result};
+use detector_api::TokenMeta;
 use event_bus::{publish_resilient, EventSink, KafkaEventSink, PUBLISH_BACKOFF};
-use events::predictive::PredictedAlert;
-use events::primitives::PredictionId;
+use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
+use events::primitives::{Confidence, PredictionId};
 use events::{DomainEvent, EventEnvelope};
+use predictive::cascade::{CascadeEngine, RiskThresholds};
 use predictive::config::Config;
 use predictive::intel_client::{IntelligenceClient, LabelLookup};
 use predictive::position::PositionTracker;
 use predictive::position_consumer::{self, PositionConsumer};
 use predictive::position_source::RpcLendingLogSource;
+use predictive::price_source::{run_price_poller, PriceSource, PriceTick, RpcPriceSource};
 use predictive::source::{run_mempool_poller, MempoolSource, PendingTx, RpcMempoolSource};
 use predictive::{decode, predict};
 use tokio::sync::mpsc;
@@ -58,6 +68,7 @@ async fn run(cfg: Config) -> Result<()> {
     );
     let sink: Arc<dyn EventSink> =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
+    let cascade_sink = Arc::clone(&sink);
 
     let shutdown = CancellationToken::new();
     // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
@@ -108,11 +119,17 @@ async fn run(cfg: Config) -> Result<()> {
         cfg.position_tracker.rpc_url.clone(),
         cfg.position_tracker.contract_addresses.clone(),
     );
-    let position_tracker = PositionTracker::new(
+    // Shared with the cascade engine below — task 2's whole point is reading
+    // this same tracked book (see module docs).
+    let position_tracker = Arc::new(Mutex::new(PositionTracker::new(
         cfg.position_tracker.window_blocks,
         cfg.position_tracker.liquidation_thresholds,
+    )));
+    let position_consumer = PositionConsumer::new(
+        cfg.chain,
+        position_log_source,
+        Arc::clone(&position_tracker),
     );
-    let position_consumer = PositionConsumer::new(cfg.chain, position_log_source, position_tracker);
     let position_shutdown = shutdown.clone();
     let position_task = tokio::spawn(async move {
         position_consumer
@@ -125,6 +142,40 @@ async fn run(cfg: Config) -> Result<()> {
             .await
     });
 
+    // Sprint 16 task 2 (§16.2): the oracle price poller and the cascade
+    // engine it feeds, over their own bounded channel (§17).
+    let price_source: Arc<dyn PriceSource> = Arc::new(RpcPriceSource::new(
+        cfg.cascade.rpc_url.clone(),
+        cfg.cascade.feeds.clone(),
+    ));
+    let assets: HashMap<Address, TokenMeta> = cfg
+        .cascade
+        .feeds
+        .iter()
+        .map(|feed| {
+            (
+                feed.asset,
+                TokenMeta::new(feed.asset, None, feed.asset_decimals),
+            )
+        })
+        .collect();
+    let (price_tx, price_rx) = mpsc::channel::<PriceTick>(1024);
+    let price_poller_task = tokio::spawn(run_price_poller(
+        price_source,
+        cfg.cascade.poll_interval,
+        price_tx,
+        shutdown.clone(),
+    ));
+    let cascade_task = tokio::spawn(run_cascade(
+        price_rx,
+        position_tracker,
+        assets,
+        cfg.cascade.thresholds,
+        cfg.chain,
+        cascade_sink,
+        shutdown.clone(),
+    ));
+
     health.set_ready(true);
 
     poller_task.await.context("mempool poller task panicked")?;
@@ -132,6 +183,10 @@ async fn run(cfg: Config) -> Result<()> {
     position_task
         .await
         .context("position-tracker task panicked")??;
+    price_poller_task
+        .await
+        .context("oracle price poller task panicked")?;
+    cascade_task.await.context("cascade engine task panicked")?;
     tracing::info!("predictive pipeline shut down");
     Ok(())
 }
@@ -184,6 +239,66 @@ async fn run_consumer(
         };
         let envelope = EventEnvelope::new(chain, DomainEvent::PredictedAlert(alert));
         publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+    }
+}
+
+/// Drain oracle price ticks off `rx`: fold each into the cascade engine
+/// against the shared position tracker's current snapshot, and publish a
+/// `LiquidationRiskPredicted` for every worsening risk-band crossing. Returns
+/// when `rx` closes (the price poller stopped) or `shutdown` fires — mirrors
+/// [`run_consumer`]'s shape one channel-driven stage over.
+async fn run_cascade(
+    mut rx: mpsc::Receiver<PriceTick>,
+    tracker: Arc<Mutex<PositionTracker>>,
+    assets: HashMap<Address, TokenMeta>,
+    thresholds: RiskThresholds,
+    chain: events::primitives::Chain,
+    sink: Arc<dyn EventSink>,
+    shutdown: CancellationToken,
+) {
+    let mut engine = CascadeEngine::new(thresholds);
+
+    loop {
+        let tick = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!("cascade engine shutting down");
+                return;
+            }
+            tick = rx.recv() => match tick {
+                Some(tick) => tick,
+                None => {
+                    tracing::info!("oracle price source stopped; cascade engine exiting");
+                    return;
+                }
+            },
+        };
+
+        // Clone the `Arc<PositionState>` snapshot out and drop the lock
+        // immediately, rather than holding it for the O(open positions) cost
+        // of `on_price_tick` below — the position-tracker consumer's writer
+        // (folding the next canonical block) must never stall behind this
+        // reader's valuation pass.
+        let snapshot = tracker.lock().unwrap().snapshot();
+        let worsened = match &snapshot {
+            Some(positions) => engine.on_price_tick(tick, &assets, positions),
+            None => Vec::new(),
+        };
+
+        for (key, assessment) in worsened {
+            let alert = LiquidationRiskPredicted {
+                prediction_id: PredictionId::new(),
+                protocol: key.protocol,
+                account: key.account,
+                health_factor: assessment.health_factor,
+                distance_pct: assessment.distance_pct,
+                severity: assessment.severity,
+                confidence: Confidence::CERTAIN,
+                provisional: true,
+            };
+            let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationRiskPredicted(alert));
+            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+        }
     }
 }
 

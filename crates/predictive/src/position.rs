@@ -45,13 +45,14 @@ use events::primitives::BlockRef;
 
 use crate::lending_decode::LendingEvent;
 
-/// A lending protocol this tracker knows how to decode. `Ord` so it's usable as
-/// (part of) a `BTreeMap` key ([`PositionKey`]) with a stable iteration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Protocol {
-    Aave,
-    Compound,
-}
+/// A lending protocol this tracker knows how to decode. Defined in
+/// `events::primitives` (as `LendingProtocol`) because the Sprint 16 task 2
+/// cascade engine names it on the wire in `LiquidationRiskPredicted` — one
+/// definition shared by the tracker and the event it feeds, not two that
+/// could drift. Re-exported here under its original name so every existing
+/// call site (`Protocol::Aave`, `PositionKey.protocol: Protocol`, …) is
+/// unaffected.
+pub use events::primitives::LendingProtocol as Protocol;
 
 /// Default liquidation threshold assumed for a position on first touch, when no
 /// override is configured — see [`LiquidationThresholds`]. Aave V3's blue-chip
@@ -95,8 +96,10 @@ impl Default for LiquidationThresholds {
 }
 
 /// One account's position on one protocol — the key the task's roster is keyed
-/// by (§16.1: "keyed by `(protocol, account)`").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// by (§16.1: "keyed by `(protocol, account)`"). `Hash` (added for Sprint 16
+/// task 2) so the cascade engine can key its last-observed-band memory by it
+/// in a `HashMap`, alongside the tracker's own `Ord`-keyed `BTreeMap` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PositionKey {
     pub protocol: Protocol,
     pub account: Address,
@@ -294,6 +297,18 @@ impl PositionTracker {
     /// block has been applied.
     pub fn current(&self) -> Option<&PositionState> {
         self.state.current().map(|arc| &**arc)
+    }
+
+    /// A cheap (`Arc` refcount bump, not a deep clone) snapshot of the tracked
+    /// position book as of the current tip. Prefer this over [`current`](Self::current)
+    /// when the tracker sits behind a shared `Mutex` (§16.2's cascade engine,
+    /// `main.rs::run_cascade`) and the caller is about to do more than O(1)
+    /// work with the result: cloning the `Arc` out and dropping the lock
+    /// immediately — rather than holding the lock for the duration of an
+    /// O(open positions) computation — keeps the position-tracker consumer's
+    /// writer from stalling behind the cascade engine's reader.
+    pub fn snapshot(&self) -> Option<Arc<PositionState>> {
+        self.state.current().cloned()
     }
 
     /// The block the current position book is as of.

@@ -9,10 +9,11 @@
 //! every other per-chain consumer on the backbone (`detection::scheduler`,
 //! `intelligence::production_consumer`).
 //!
-//! Publishes nothing: this task's whole job is the tracked *state* task 2's
-//! cascade engine reads off [`PositionTracker::current`] — unlike
-//! `intelligence::reorg::ReorgConsumer`, there is no downstream fact to
-//! announce yet.
+//! Publishes nothing itself: this task's whole job is the tracked *state* the
+//! Sprint 16 task 2 cascade engine reads off [`PositionTracker::current`] —
+//! unlike `intelligence::reorg::ReorgConsumer`, there is no downstream fact to
+//! announce here. The tracker is `Arc<Mutex<_>>`-shared with that cascade
+//! loop (`main.rs`) precisely so it can be read from outside this consumer.
 
 use async_trait::async_trait;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
@@ -21,7 +22,7 @@ use events::chain::{BlockCanonicalized, BlockReverted};
 use events::primitives::Chain;
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::lending_decode::decode_log;
@@ -59,19 +60,22 @@ pub fn build_consumer(
 }
 
 /// The position-tracking consumer: the log source it fetches a block's lending
-/// logs through, and the tracker it folds them into.
+/// logs through, and the tracker it folds them into. The tracker is shared
+/// (`Arc<Mutex<_>>`) rather than owned outright — the Sprint 16 task 2 cascade
+/// engine reads the same instance's [`PositionTracker::current`] snapshot
+/// concurrently (see module docs).
 pub struct PositionConsumer<S> {
     chain: Chain,
     source: S,
-    tracker: Mutex<PositionTracker>,
+    tracker: Arc<Mutex<PositionTracker>>,
 }
 
 impl<S: LendingLogSource> PositionConsumer<S> {
-    pub fn new(chain: Chain, source: S, tracker: PositionTracker) -> Self {
+    pub fn new(chain: Chain, source: S, tracker: Arc<Mutex<PositionTracker>>) -> Self {
         Self {
             chain,
             source,
-            tracker: Mutex::new(tracker),
+            tracker,
         }
     }
 
@@ -256,7 +260,10 @@ mod tests {
         PositionConsumer::new(
             Chain::ETHEREUM,
             source,
-            PositionTracker::new(64, LiquidationThresholds::default()),
+            Arc::new(Mutex::new(PositionTracker::new(
+                64,
+                LiquidationThresholds::default(),
+            ))),
         )
     }
 

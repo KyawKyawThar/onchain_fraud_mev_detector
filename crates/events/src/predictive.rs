@@ -6,7 +6,9 @@
 //! never sim-confirmed — the event they forecast may simply not happen. That
 //! is the point of a warning, not a defect in it (§16).
 
-use crate::primitives::{AccountAddress, AlertKind, Confidence, PredictionId};
+use crate::primitives::{
+    AccountAddress, AlertKind, Confidence, LendingProtocol, PredictionId, Severity,
+};
 use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +29,42 @@ pub struct PredictedAlert {
     #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
     pub addresses: Vec<AccountAddress>,
     pub kind: AlertKind,
+    pub confidence: Confidence,
+    /// Always `true` — a forecast is never sim-confirmed (§16).
+    pub provisional: bool,
+}
+
+/// A forecast raised by the Sprint 16 task 2 cascade engine: an open lending
+/// position's health factor, recomputed at the latest mark prices, has
+/// worsened into a riskier band than it was last observed at (§16.1, §16.2).
+///
+/// Like [`PredictedAlert`], `provisional` is always `true` and stays `true`
+/// forever — a liquidation *forecast* is never upgraded to a confirmed
+/// incident, only superseded by a real, sim-confirmed liquidation if one
+/// actually lands. Only emitted on a *worsening* band crossing (never on
+/// recovery back to a safer band) — a risk warning's job is to warn, not to
+/// announce an all-clear.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LiquidationRiskPredicted {
+    pub prediction_id: PredictionId,
+    pub protocol: LendingProtocol,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub account: AccountAddress,
+    /// Collateral (weighted by the position's liquidation threshold) over
+    /// debt, at current mark prices — below `1.0` is liquidatable.
+    pub health_factor: f64,
+    /// Signed percentage-point distance from the liquidation boundary
+    /// (`(health_factor - 1.0) * 100.0`); negative means already
+    /// liquidatable.
+    pub distance_pct: f64,
+    /// The risk band `distance_pct` crossed into — `Medium`/`High`/`Critical`
+    /// only; a `Low`-banded position never emits this event.
+    pub severity: Severity,
+    /// This is a measured balance/price computation, not a heuristic guess
+    /// (unlike [`PredictedAlert::confidence`]'s label-derived confidence) —
+    /// always [`Confidence::CERTAIN`]. The genuine uncertainty is whether the
+    /// market moves further, which `distance_pct`/`severity` already express.
     pub confidence: Confidence,
     /// Always `true` — a forecast is never sim-confirmed (§16).
     pub provisional: bool,
