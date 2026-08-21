@@ -27,6 +27,7 @@
 
 pub mod bps;
 pub mod cross_block;
+pub mod cross_block_state;
 pub mod ctx;
 pub mod enrichment;
 pub mod plugin;
@@ -38,6 +39,7 @@ pub mod test_util;
 
 pub use bps::Bps;
 pub use cross_block::CrossBlockDetector;
+pub use cross_block_state::CrossBlockState;
 pub use ctx::{BlockBundle, DetectionCtx};
 pub use enrichment::{
     Enrichment, EnrichmentBuilder, InvalidPrice, PoolState, Swap, TokenMeta, TokenTransfer,

@@ -1,13 +1,16 @@
 //! Predictive pipeline service binary (§16) — `MempoolSource → decode →
-//! predict-engine → PredictedAlert`.
+//! predict-engine → PredictedAlert`, plus (§16.1, Sprint 16 task 1) a second,
+//! independent lending position tracker sharing this binary.
 //!
 //! Boot: connect the single mempool RPC endpoint, the intelligence gRPC
-//! client, and the Kafka producer, then run two cooperating tasks until a
+//! client, and the Kafka producer, then run three cooperating tasks until a
 //! shutdown signal —
 //!   1. the mempool **poller**, forwarding pending transactions over a
-//!      bounded channel (§17 backpressure), and
-//!   2. the **consumer**, deduping by tx hash, decoding, scoring against
-//!      intelligence's cached labels, and publishing `PredictedAlert`.
+//!      bounded channel (§17 backpressure),
+//!   2. the mempool **consumer**, deduping by tx hash, decoding, scoring against
+//!      intelligence's cached labels, and publishing `PredictedAlert`, and
+//!   3. the **position-tracker consumer**, folding `BlockCanonicalized`/
+//!      `BlockReverted` into the tracked lending position book (§15).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -20,6 +23,9 @@ use events::primitives::PredictionId;
 use events::{DomainEvent, EventEnvelope};
 use predictive::config::Config;
 use predictive::intel_client::{IntelligenceClient, LabelLookup};
+use predictive::position::PositionTracker;
+use predictive::position_consumer::{self, PositionConsumer};
+use predictive::position_source::RpcLendingLogSource;
 use predictive::source::{run_mempool_poller, MempoolSource, PendingTx, RpcMempoolSource};
 use predictive::{decode, predict};
 use tokio::sync::mpsc;
@@ -88,10 +94,44 @@ async fn run(cfg: Config) -> Result<()> {
         cfg.dedup_capacity,
         shutdown.clone(),
     ));
+
+    let position_dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(
+        &cfg.kafka.brokers,
+        "predictive-position-tracker",
+    )
+    .await
+    .context("provisioning the position-tracker DLQ topic")?;
+    let position_kafka_consumer =
+        position_consumer::build_consumer(&cfg.kafka.brokers, &cfg.position_tracker.consumer_group)
+            .context("building the position-tracker Kafka consumer")?;
+    let position_log_source = RpcLendingLogSource::new(
+        cfg.position_tracker.rpc_url.clone(),
+        cfg.position_tracker.contract_addresses.clone(),
+    );
+    let position_tracker = PositionTracker::new(
+        cfg.position_tracker.window_blocks,
+        cfg.position_tracker.liquidation_thresholds,
+    );
+    let position_consumer = PositionConsumer::new(cfg.chain, position_log_source, position_tracker);
+    let position_shutdown = shutdown.clone();
+    let position_task = tokio::spawn(async move {
+        position_consumer
+            .run(
+                position_kafka_consumer,
+                PUBLISH_BACKOFF,
+                Some(&position_dlq),
+                &position_shutdown,
+            )
+            .await
+    });
+
     health.set_ready(true);
 
     poller_task.await.context("mempool poller task panicked")?;
     consumer_task.await.context("consumer task panicked")?;
+    position_task
+        .await
+        .context("position-tracker task panicked")??;
     tracing::info!("predictive pipeline shut down");
     Ok(())
 }

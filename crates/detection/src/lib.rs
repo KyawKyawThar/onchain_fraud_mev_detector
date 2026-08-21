@@ -38,11 +38,12 @@
 //!   [`metrics::record_detector_run`] every emit path calls per `detect`
 //!   invocation, recording hit rate (`hits / runs`) and latency through the
 //!   `metrics` facade (§19), exported by the binary via [`telemetry::metrics`].
-//! - [`state`] — **reorg-versioned cross-block state** (task 5):
-//!   [`state::CrossBlockState`], the per-block snapshot store a `Scope::CrossBlock`
-//!   detector accumulates into so it can be rewound to a common ancestor on a reorg
-//!   (§15). The container and its rewind primitive land in task 5; the async
-//!   fan-out that feeds it per canonical block is Sprint 4 (task 2).
+//! - [`state`] — **reorg-versioned cross-block state**: re-exports
+//!   [`detector_api::CrossBlockState`], the per-block snapshot store a
+//!   `Scope::CrossBlock` detector accumulates into so it can be rewound to a
+//!   common ancestor on a reorg (§15). Shipped here in Sprint 3 task 5; moved to
+//!   `detector-api` in Sprint 16 so the predictive pipeline's position tracker
+//!   (§16.1) can reuse the same primitive without depending on this crate.
 //! - [`reorg`] — **the event-driven rewind** (Sprint 4 task 1): the object-safe
 //!   [`reorg::Rewindable`] view of a cross-block state, [`reorg::apply_reverts`] to
 //!   replay one detector's tip-first `BlockReverted` stream onto it, and

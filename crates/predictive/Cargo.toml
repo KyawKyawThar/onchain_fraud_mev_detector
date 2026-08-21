@@ -61,6 +61,10 @@ url = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+# The position tracker's `BlockCanonicalized`/`BlockReverted` consumer (§16.1)
+# rides the shared `event_bus::run_consumer` seam, which always pairs rdkafka
+# with event-bus (arch-conformance) rather than hand-rolling the consume loop.
+rdkafka = { workspace = true }
 
 [dev-dependencies]
 event-bus = { workspace = true, features = ["test-util"] }
