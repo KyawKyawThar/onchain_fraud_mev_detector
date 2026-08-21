@@ -59,12 +59,13 @@ pub struct InvalidRiskThresholds {
 /// The configurable band boundaries [`distance_band`] classifies against (the
 /// task's "configurable band"). Private fields + a validating constructor —
 /// same discipline as `server::screen::Thresholds` — because [`distance_band`]'s
-/// cascading `if distance_pct <= X` chain silently relies on `warning > danger
-/// > critical`: an inverted or equal pair (a plausible env-var typo, since
-/// these are independently configurable — see `crate::config::CascadeConfig`)
-/// wouldn't error, it would just misclassify severities at boot with nothing
-/// to catch it. A naked `pub f64` triple made that invariant representable but
-/// not enforced; this makes it unrepresentable.
+/// cascading `if distance_pct <= X` chain silently relies on the three bounds
+/// being strictly descending: an inverted or equal pair (a plausible env-var
+/// typo, since these are independently configurable — see
+/// `crate::config::CascadeConfig`) wouldn't error, it would just misclassify
+/// severities at boot with nothing to catch it. A naked `pub f64` triple made
+/// that invariant representable but not enforced; this makes it
+/// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RiskThresholds {
     warning_distance_pct: f64,
