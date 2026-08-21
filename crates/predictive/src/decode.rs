@@ -20,6 +20,7 @@
 use alloy_primitives::{Address, U256};
 use detector_api::{Swap, TokenTransfer, TxActions};
 
+use crate::abi_words::{addr_at, u256_at, word_at_offset};
 use crate::source::PendingTx;
 
 const ERC20_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -120,24 +121,6 @@ fn decode_swap_exact_tokens_for_x(params: &[u8], tx: &PendingTx) -> Option<Swap>
     })
 }
 
-/// The 32-byte word at `byte_offset` into `params` (the calldata *after* the
-/// 4-byte selector), or `None` if `params` is too short to hold it.
-fn word_at(params: &[u8], byte_offset: usize) -> Option<[u8; 32]> {
-    let end = byte_offset.checked_add(32)?;
-    params.get(byte_offset..end)?.try_into().ok()
-}
-
-/// A right-aligned `address` at head slot `word_index` (a static parameter).
-fn addr_at(params: &[u8], word_index: usize) -> Option<Address> {
-    let word = word_at(params, word_index * 32)?;
-    Some(Address::from_slice(&word[12..32]))
-}
-
-/// A `uint256` at head slot `word_index`.
-fn u256_at(params: &[u8], word_index: usize) -> Option<U256> {
-    word_at(params, word_index * 32).map(U256::from_be_bytes)
-}
-
 /// A dynamic `address[]` whose head slot `offset_word_index` holds a byte
 /// offset (relative to the start of `params`) to its `[length, elem0, elem1,
 /// …]` tail — standard Solidity ABI dynamic-array encoding.
@@ -148,7 +131,7 @@ fn address_array_at(params: &[u8], offset_word_index: usize) -> Option<Vec<Addre
     const MAX_PATH_LEN: usize = 32;
 
     let offset: usize = u256_at(params, offset_word_index)?.try_into().ok()?;
-    let len: usize = U256::from_be_bytes(word_at(params, offset)?)
+    let len: usize = U256::from_be_bytes(word_at_offset(params, offset)?)
         .try_into()
         .ok()?;
     if len == 0 || len > MAX_PATH_LEN {
@@ -158,7 +141,7 @@ fn address_array_at(params: &[u8], offset_word_index: usize) -> Option<Vec<Addre
     let mut path = Vec::with_capacity(len);
     for i in 0..len {
         let elem_offset = offset.checked_add(32)?.checked_add(i.checked_mul(32)?)?;
-        let word = word_at(params, elem_offset)?;
+        let word = word_at_offset(params, elem_offset)?;
         path.push(Address::from_slice(&word[12..32]));
     }
     Some(path)
