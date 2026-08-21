@@ -36,10 +36,11 @@ use events::intelligence::{
     AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
     LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
-use events::predictive::PredictedAlert;
+use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
-    EntityId, IncidentId, LabelId, PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
+    EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId, Severity,
+    SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -305,6 +306,16 @@ fn sample_events() -> Vec<DomainEvent> {
             confidence: Confidence::new(0.65),
             provisional: true,
         }),
+        DomainEvent::LiquidationRiskPredicted(LiquidationRiskPredicted {
+            prediction_id: prediction_id(),
+            protocol: LendingProtocol::Aave,
+            account: addr(),
+            health_factor: 0.97,
+            distance_pct: -3.0,
+            severity: Severity::High,
+            confidence: Confidence::CERTAIN,
+            provisional: true,
+        }),
     ]
 }
 
@@ -427,6 +438,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "PredictedAlert",
         r#"{"type":"PredictedAlert","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222","addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.65,"provisional":true}}"#,
+    ),
+    (
+        "LiquidationRiskPredicted",
+        r#"{"type":"LiquidationRiskPredicted","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","protocol":"aave","account":"0x3333333333333333333333333333333333333333","health_factor":0.97,"distance_pct":-3.0,"severity":"high","confidence":1.0,"provisional":true}}"#,
     ),
 ];
 

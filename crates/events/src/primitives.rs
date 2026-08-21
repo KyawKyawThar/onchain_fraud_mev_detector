@@ -164,6 +164,35 @@ pub enum LabelKind {
     BuilderAddress,
 }
 
+/// A lending protocol the predictive pipeline's position tracker knows how to
+/// decode (§16.1) — `Aave`/`Compound` position events fold into a per-
+/// `(protocol, account)` book, and the Sprint 16 task 2 cascade engine names
+/// this on the wire in `LiquidationRiskPredicted`. Lives here (not in
+/// `predictive`, which depends on `events`) for the same reason `LabelKind`
+/// does: it's the one definition a wire event and its producer both use,
+/// rather than two copies that could drift.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LendingProtocol {
+    Aave,
+    Compound,
+}
+
 /// Coarse incident severity, set when simulation confirms an incident (§7). Carries the
 /// same derive-driven `&'static str` mapping as [`AlertKind`].
 #[derive(
