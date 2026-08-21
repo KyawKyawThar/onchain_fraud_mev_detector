@@ -15,4 +15,16 @@ ignore = [
   # filters this out as feature-inactive; this mirrors the decision for `cargo
   # audit`, which scans the raw lockfile. Revisit if the ark chain ever bumps.
   "RUSTSEC-2025-0055",
+
+  # rkyv 0.7.46 — insufficient archive validation, OOB reads for archives
+  # containing Rc/Arc (RUSTSEC-2026-0235). Fix needs rkyv >=0.8.17, a major
+  # bump not available from our dependents. Pulled in solely as an *optional*
+  # backend of `rust_decimal` (via `rule-engine`/`server`); we only enable
+  # `rust_decimal`'s `serde` feature, never `rkyv`, and `cargo tree --all-features
+  # -i rkyv` shows zero activated dependents — it never compiles into any of our
+  # binaries. `cargo deny check advisories` already passes clean on this exact
+  # reason (graph-aware, unlike `cargo audit`'s raw-lockfile scan); this mirrors
+  # that decision here. Revisit once rust_decimal ships an rkyv-0.8-compatible
+  # release.
+  "RUSTSEC-2026-0235",
 ]
