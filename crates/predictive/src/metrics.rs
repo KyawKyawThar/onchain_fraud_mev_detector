@@ -37,6 +37,56 @@ pub fn record_cascade_walk(outcome: &CascadeOutcome) {
     }
 }
 
+// ── §16.4/§19: prediction rate + lead-time-to-actual-liquidation ──────────
+
+/// Counter (labeled `event_type`): every predictive forecast published —
+/// `main.rs`'s three publish sites (`PredictedAlert`, `LiquidationRiskPredicted`,
+/// `LiquidationCascadeWarned`) each call [`record_prediction`] right where
+/// they build the envelope, mirroring [`record_cascade_walk`]'s "measure at
+/// the seam, not inside the algorithm" discipline. This is the §19
+/// prediction-rate *denominator* — the rate itself is a PromQL
+/// `rate(predictive_predictions_total[5m])`, never stored here (same
+/// discipline `detection`'s per-detector hit rate uses).
+pub const PREDICTIONS_TOTAL: &str = "predictive_predictions_total";
+
+/// Histogram: seconds between a `LiquidationRiskPredicted` forecast and the
+/// real on-chain liquidation it warned about — the §19
+/// lead-time-to-actual-liquidation accuracy signal
+/// ([`crate::lead_time::LeadTimeTracker`]).
+pub const LIQUIDATION_LEAD_TIME_SECONDS: &str = "predictive_liquidation_lead_time_seconds";
+
+/// Counter: a real liquidation the cascade engine never forecast (no prior
+/// `LiquidationRiskPredicted` recorded for that `(protocol, account)`) — the
+/// complementary "missed forecast" signal the lead-time histogram alone
+/// can't show, since a miss has no sample to record into it.
+pub const LIQUIDATIONS_UNPREDICTED_TOTAL: &str = "predictive_liquidations_unpredicted_total";
+
+/// Record one predictive event's publish. `event_type` is the
+/// [`events::DomainEvent::event_type`] wire name, so the series lines up
+/// with the topic it was published on.
+pub fn record_prediction(event_type: &'static str) {
+    metrics::counter!(PREDICTIONS_TOTAL, "event_type" => event_type).increment(1);
+}
+
+/// Record a real liquidation's lead time — `Some(duration)` when
+/// [`crate::lead_time::LeadTimeTracker::take_lead_time`] found a prior
+/// forecast for the liquidated `(protocol, account)`, `None` for a
+/// liquidation the cascade engine never flagged (or one `take_lead_time`
+/// couldn't express as a non-negative `Duration` — see its docs). Takes
+/// `std::time::Duration`, not `chrono::Duration`: the type itself rules out
+/// a negative sample reaching the §19 dashboard, so there is nothing to
+/// clamp here.
+pub fn record_liquidation_lead_time(lead_time: Option<std::time::Duration>) {
+    match lead_time {
+        Some(duration) => {
+            metrics::histogram!(LIQUIDATION_LEAD_TIME_SECONDS).record(duration.as_secs_f64());
+        }
+        None => {
+            metrics::counter!(LIQUIDATIONS_UNPREDICTED_TOTAL).increment(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +211,59 @@ mod tests {
             }
             other => panic!("expected a histogram, got {other:?}"),
         }
+    }
+
+    // ── §16.4/§19: prediction rate + lead-time-to-actual-liquidation ──────
+
+    fn counters(series: &Series, name: &str) -> Vec<u64> {
+        series
+            .iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == name)
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn record_prediction_counts_once_per_call_labeled_by_event_type() {
+        let series = captured(|| {
+            record_prediction("PredictedAlert");
+            record_prediction("LiquidationRiskPredicted");
+            record_prediction("PredictedAlert");
+        });
+        // Two distinct label values -> two series; totals sum to three calls.
+        assert_eq!(counters(&series, PREDICTIONS_TOTAL).iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn a_lead_time_records_a_histogram_sample_in_seconds() {
+        let series = captured(|| {
+            record_liquidation_lead_time(Some(std::time::Duration::from_secs(90)));
+        });
+        match value(&series, LIQUIDATION_LEAD_TIME_SECONDS) {
+            Some(DebugValue::Histogram(samples)) => {
+                assert_eq!(samples.len(), 1);
+                assert!((samples[0] - 90.0).abs() < 1e-6);
+            }
+            other => panic!("expected a histogram, got {other:?}"),
+        }
+        assert_eq!(counter(&series, LIQUIDATIONS_UNPREDICTED_TOTAL), None);
+    }
+
+    /// `None` covers both a genuine miss (no prior forecast) and a
+    /// `take_lead_time` clock-skew edge case that couldn't convert to a
+    /// non-negative `Duration` — either way, this function can't tell the
+    /// difference and shouldn't try to: it counts a "surprise" liquidation,
+    /// never a negative histogram sample (see `record_liquidation_lead_time`'s
+    /// docs and `LeadTimeTracker::take_lead_time`'s).
+    #[test]
+    fn no_prior_prediction_counts_a_surprise_liquidation_not_a_lead_time_sample() {
+        let series = captured(|| {
+            record_liquidation_lead_time(None);
+        });
+        assert_eq!(counter(&series, LIQUIDATIONS_UNPREDICTED_TOTAL), Some(1));
+        assert_eq!(value(&series, LIQUIDATION_LEAD_TIME_SECONDS), None);
     }
 }

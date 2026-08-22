@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use events::detection::PreliminaryAlertCreated;
 use events::intelligence::SanctionHit;
+use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, Chain, CustomerId, IncidentId, Severity, SuggestedAction,
 };
@@ -215,6 +216,109 @@ impl Notice {
             addresses: vec![event.address],
             owner: None,
             summary: format!("sanctions match: {} ({})", event.list, event.entry),
+            occurred_at,
+        }
+    }
+
+    /// `PredictedAlert` (§16, mempool-pending forecast) → Standalone: the
+    /// predictive pipeline's forecasts are never sim-confirmed (`events::predictive`'s
+    /// module docs), so there is no Provisional/Confirmed pairing to mirror —
+    /// same shape as [`Self::from_rule_alert`]/[`Self::from_sanction_hit`].
+    /// `owner` stays `None`: a mempool forecast isn't scoped to a customer's
+    /// own rule, it's a platform-wide signal every subscriber who opted in is
+    /// a candidate for (§16.4, Sprint 16 task 4's opt-in predictive consumer
+    /// — see `crate::consumer::predictive_topics`). No `suggested_action` of
+    /// its own: the predictive pipeline carries only `confidence`, not a
+    /// scored severity band to derive one from (unlike
+    /// [`Self::from_liquidation_risk_predicted`], below).
+    pub fn from_predicted_alert(
+        event: &PredictedAlert,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            dedup_key: event.prediction_id.to_string(),
+            stage: LifecycleStage::Standalone,
+            kind: Some(event.kind),
+            severity: None,
+            suggested_action: None,
+            chain,
+            addresses: event.addresses.clone(),
+            owner: None,
+            summary: format!(
+                "predicted {:?} from a pending transaction ({:.0}% confidence)",
+                event.kind,
+                event.confidence.get() * 100.0
+            ),
+            occurred_at,
+        }
+    }
+
+    /// `LiquidationRiskPredicted` (§16.2, cascade engine) → Standalone,
+    /// tagged `AlertKind::Liquidation` so a risk-desk subscriber can filter
+    /// on that one kind (§16.4, Sprint 16 task 4) without a new routing
+    /// axis — `SubscriptionFilter::kinds` already exists for exactly this.
+    /// `severity`/`suggested_action` are carried straight off the event's
+    /// own measured band via [`events::scoring::suggested_action`], the same
+    /// derivation [`Self::from_incident_created`] uses — this is a computed
+    /// health-factor crossing, not a heuristic guess, so there is a real
+    /// band to route on.
+    pub fn from_liquidation_risk_predicted(
+        event: &LiquidationRiskPredicted,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            dedup_key: event.prediction_id.to_string(),
+            stage: LifecycleStage::Standalone,
+            kind: Some(AlertKind::Liquidation),
+            severity: Some(event.severity),
+            suggested_action: Some(events::scoring::suggested_action(event.severity)),
+            chain,
+            addresses: vec![event.account],
+            owner: None,
+            summary: format!(
+                "{:?} liquidation risk on {:?}: health factor {:.3} ({:.1}% from liquidation)",
+                event.severity, event.protocol, event.health_factor, event.distance_pct
+            ),
+            occurred_at,
+        }
+    }
+
+    /// `LiquidationCascadeWarned` (§16.3, reflexivity walk) → Standalone,
+    /// same `AlertKind::Liquidation` tag as
+    /// [`Self::from_liquidation_risk_predicted`] so both liquidation-forecast
+    /// events reach the same risk-desk filter. Hardcoded `Severity::Critical`:
+    /// unlike a single position's health factor, this event only fires when
+    /// the walk found *reflexive* growth beyond the naive at-risk set
+    /// (`events::predictive`'s module docs) — by definition never the routine
+    /// case, so there is no lower band to compute (mirrors
+    /// [`Self::from_sanction_hit`]'s hardcoded-Critical reasoning).
+    pub fn from_liquidation_cascade_warned(
+        event: &LiquidationCascadeWarned,
+        chain: Chain,
+        occurred_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            dedup_key: event.prediction_id.to_string(),
+            stage: LifecycleStage::Standalone,
+            kind: Some(AlertKind::Liquidation),
+            severity: Some(Severity::Critical),
+            suggested_action: Some(events::scoring::suggested_action(Severity::Critical)),
+            chain,
+            addresses: event.accounts.clone(),
+            owner: None,
+            summary: format!(
+                "liquidation cascade warning: {} account(s), ${:.0} at risk, depth {}{}",
+                event.accounts.len(),
+                event.aggregate_at_risk_usd.get(),
+                event.reflexive_depth,
+                if event.hub_capped {
+                    " (hub-capped)"
+                } else {
+                    ""
+                }
+            ),
             occurred_at,
         }
     }
@@ -517,5 +621,78 @@ mod tests {
             key,
             "a distinct owner is a distinct dedup key"
         );
+    }
+
+    // ── §16.4, Sprint 16 task 4: predictive events ─────────────────────────
+
+    use events::primitives::{LendingProtocol, PredictionId, UsdAmount};
+
+    #[test]
+    fn predicted_alert_bypasses_severity_but_carries_its_own_kind() {
+        let event = PredictedAlert {
+            prediction_id: PredictionId::new(),
+            tx_hash: Default::default(),
+            addresses: vec![addr(1)],
+            kind: AlertKind::Sandwich,
+            confidence: Confidence::new(0.9),
+            provisional: true,
+        };
+        let notice = Notice::from_predicted_alert(&event, Chain::ETHEREUM, Utc::now());
+        assert_eq!(notice.stage, LifecycleStage::Standalone);
+        assert_eq!(notice.kind, Some(AlertKind::Sandwich));
+        assert_eq!(notice.severity, None, "no severity of its own to carry");
+        assert_eq!(notice.owner, None, "platform-wide, not customer-scoped");
+        assert_eq!(notice.dedup_key, event.prediction_id.to_string());
+    }
+
+    #[test]
+    fn liquidation_risk_predicted_carries_its_measured_severity_tagged_liquidation() {
+        let event = LiquidationRiskPredicted {
+            prediction_id: PredictionId::new(),
+            protocol: LendingProtocol::Aave,
+            account: addr(2),
+            health_factor: 0.95,
+            distance_pct: -5.0,
+            severity: Severity::Critical,
+            confidence: Confidence::new(1.0),
+            provisional: true,
+        };
+        let notice = Notice::from_liquidation_risk_predicted(&event, Chain::ETHEREUM, Utc::now());
+        assert_eq!(notice.stage, LifecycleStage::Standalone);
+        assert_eq!(
+            notice.kind,
+            Some(AlertKind::Liquidation),
+            "so a risk-desk subscriber can filter on this one kind"
+        );
+        assert_eq!(notice.severity, Some(Severity::Critical));
+        assert_eq!(
+            notice.suggested_action,
+            Some(events::scoring::suggested_action(Severity::Critical))
+        );
+        assert_eq!(notice.addresses, vec![event.account]);
+        assert_eq!(notice.owner, None, "platform-wide");
+        assert_eq!(notice.dedup_key, event.prediction_id.to_string());
+    }
+
+    #[test]
+    fn liquidation_cascade_warned_is_hardcoded_critical_tagged_liquidation() {
+        let event = LiquidationCascadeWarned {
+            prediction_id: PredictionId::new(),
+            trigger_asset: Default::default(),
+            trigger_price: 1_500.0,
+            reflexive_depth: 2,
+            accounts: vec![addr(3), addr(4)],
+            aggregate_at_risk_usd: UsdAmount::new(40_000_000.0),
+            hub_capped: false,
+            confidence: Confidence::new(1.0),
+            provisional: true,
+        };
+        let notice = Notice::from_liquidation_cascade_warned(&event, Chain::ETHEREUM, Utc::now());
+        assert_eq!(notice.stage, LifecycleStage::Standalone);
+        assert_eq!(notice.kind, Some(AlertKind::Liquidation));
+        assert_eq!(notice.severity, Some(Severity::Critical));
+        assert_eq!(notice.addresses, event.accounts);
+        assert_eq!(notice.owner, None, "platform-wide");
+        assert_eq!(notice.dedup_key, event.prediction_id.to_string());
     }
 }

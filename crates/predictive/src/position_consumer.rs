@@ -14,8 +14,16 @@
 //! unlike `intelligence::reorg::ReorgConsumer`, there is no downstream fact to
 //! announce here. The tracker is `Arc<Mutex<_>>`-shared with that cascade
 //! loop (`main.rs`) precisely so it can be read from outside this consumer.
+//!
+//! Sprint 16 task 4 (§16.4/§19) adds one observation, though still no
+//! publish: every decoded [`LendingEvent::Liquidation`] is a real, on-chain
+//! liquidation, so this is also where the §19
+//! lead-time-to-actual-liquidation accuracy signal is measured —
+//! [`crate::lead_time::LeadTimeTracker`], shared with the cascade engine the
+//! same way the position tracker itself is.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{run_consumer, EventHandler, Handled, Transience};
 use events::chain::{BlockCanonicalized, BlockReverted};
@@ -25,7 +33,9 @@ use rdkafka::consumer::StreamConsumer;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::lending_decode::decode_log;
+use crate::lead_time::LeadTimeTracker;
+use crate::lending_decode::{decode_log, LendingEvent};
+use crate::metrics;
 use crate::position::PositionTracker;
 use crate::position_source::{LendingLogSource, SourceError};
 
@@ -68,20 +78,36 @@ pub struct PositionConsumer<S> {
     chain: Chain,
     source: S,
     tracker: Arc<Mutex<PositionTracker>>,
+    /// Sprint 16 task 4 (§16.4/§19): shared with the cascade engine
+    /// (`main.rs`) so a real `LendingEvent::Liquidation` decoded here can be
+    /// paired with the `LiquidationRiskPredicted` forecast (if any) that
+    /// warned about the same `(protocol, account)`.
+    lead_time: Arc<Mutex<LeadTimeTracker>>,
 }
 
 impl<S: LendingLogSource> PositionConsumer<S> {
-    pub fn new(chain: Chain, source: S, tracker: Arc<Mutex<PositionTracker>>) -> Self {
+    pub fn new(
+        chain: Chain,
+        source: S,
+        tracker: Arc<Mutex<PositionTracker>>,
+        lead_time: Arc<Mutex<LeadTimeTracker>>,
+    ) -> Self {
         Self {
             chain,
             source,
             tracker,
+            lead_time,
         }
     }
 
     /// Fetch `canonicalized`'s lending logs, decode the ones this tracker
     /// recognizes, and fold them into the position book as this block's new
-    /// snapshot.
+    /// snapshot. Also measures the §19 lead-time-to-actual-liquidation
+    /// signal for every decoded [`LendingEvent::Liquidation`] (see the
+    /// module docs) — `Utc::now()` (this consumer's processing time) stands
+    /// in for the liquidation's observed time, since `BlockCanonicalized`
+    /// carries no block timestamp; an accepted approximation, same spirit as
+    /// this crate's other first-cut §16.1 debts.
     async fn on_canonicalized(
         &self,
         canonicalized: &BlockCanonicalized,
@@ -95,11 +121,31 @@ impl<S: LendingLogSource> PositionConsumer<S> {
                 "folding lending events into the tracked position book"
             );
         }
+        self.record_liquidation_lead_times(&events);
         self.tracker
             .lock()
             .unwrap()
             .apply_block(canonicalized.block, &events);
         Ok(())
+    }
+
+    /// For every real liquidation decoded this block, consume the
+    /// forecast (if any) the cascade engine recorded for the same
+    /// `(protocol, account)` and record the §19 lead-time signal.
+    fn record_liquidation_lead_times(&self, events: &[LendingEvent]) {
+        let observed_at = Utc::now();
+        for event in events {
+            if !matches!(event, LendingEvent::Liquidation { .. }) {
+                continue;
+            }
+            let key = event.position_key();
+            let lead_time = self
+                .lead_time
+                .lock()
+                .unwrap()
+                .take_lead_time(&key, observed_at);
+            metrics::record_liquidation_lead_time(lead_time);
+        }
     }
 
     /// Roll back the tracked position book iff `reverted.block` is exactly the
@@ -264,6 +310,7 @@ mod tests {
                 64,
                 LiquidationThresholds::default(),
             ))),
+            Arc::new(Mutex::new(LeadTimeTracker::new())),
         )
     }
 
@@ -426,5 +473,89 @@ mod tests {
             ))
             .await;
         assert_eq!(handled, Handled::Commit);
+    }
+
+    // ── §16.4/§19: lead-time-to-actual-liquidation ─────────────────────────
+
+    fn liquidation(account: Address) -> LendingEvent {
+        LendingEvent::Liquidation {
+            protocol: Protocol::Aave,
+            account,
+            debt_asset: addr(0x22),
+            debt_repaid: U256::from(600u64),
+            collateral_asset: addr(0x11),
+            collateral_seized: U256::from(660u64),
+        }
+    }
+
+    /// A real liquidation decoded for a `(protocol, account)` that a prior
+    /// `LiquidationRiskPredicted` forecast covers consumes that forecast —
+    /// a later liquidation of the same account, with no fresh prediction
+    /// recorded, finds nothing left to pair with.
+    #[tokio::test]
+    async fn a_predicted_liquidation_consumes_its_forecast() {
+        let account = addr(0x33);
+        let key = crate::position::PositionKey {
+            protocol: Protocol::Aave,
+            account,
+        };
+        let c = consumer(FakeSource::empty());
+        c.lead_time
+            .lock()
+            .unwrap()
+            .record_prediction(key, Utc::now());
+
+        c.record_liquidation_lead_times(&[liquidation(account)]);
+
+        assert!(
+            c.lead_time
+                .lock()
+                .unwrap()
+                .take_lead_time(&key, Utc::now())
+                .is_none(),
+            "the forecast was consumed by the liquidation, nothing left to take"
+        );
+    }
+
+    /// A liquidation with no prior forecast is a no-op on the tracker (it
+    /// was never inserted in the first place) — this just proves the
+    /// unpredicted path doesn't panic reaching into an empty tracker.
+    #[tokio::test]
+    async fn an_unforecast_liquidation_is_a_no_op_on_the_tracker() {
+        let account = addr(0x44);
+        let c = consumer(FakeSource::empty());
+        c.record_liquidation_lead_times(&[liquidation(account)]);
+    }
+
+    /// A non-liquidation event (a `Supply`) is ignored by the lead-time pass
+    /// — its forecast, if any, stays intact for the real liquidation later.
+    #[tokio::test]
+    async fn a_non_liquidation_event_leaves_the_forecast_untouched() {
+        let account = addr(0x55);
+        let key = crate::position::PositionKey {
+            protocol: Protocol::Aave,
+            account,
+        };
+        let c = consumer(FakeSource::empty());
+        c.lead_time
+            .lock()
+            .unwrap()
+            .record_prediction(key, Utc::now());
+
+        c.record_liquidation_lead_times(&[LendingEvent::Supply {
+            protocol: Protocol::Aave,
+            account,
+            asset: addr(0x11),
+            amount: U256::from(1_000u64),
+        }]);
+
+        assert!(
+            c.lead_time
+                .lock()
+                .unwrap()
+                .take_lead_time(&key, Utc::now())
+                .is_some(),
+            "a Supply event must not consume an unrelated liquidation forecast"
+        );
     }
 }

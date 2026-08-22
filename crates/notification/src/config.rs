@@ -32,6 +32,10 @@ pub struct Config {
     /// correlation index (§14, this service's own tables).
     pub database_url: SecretString,
     pub kafka: KafkaConfig,
+    /// §16.4 (Sprint 16 task 4): the opt-in predictive-events consumer —
+    /// disabled unless a deployment explicitly turns it on (see
+    /// [`PredictiveConfig`]'s docs).
+    pub predictive: PredictiveConfig,
     /// Shared retry/timeout policy for every HTTP-based channel
     /// (webhook/Slack/PagerDuty) and email.
     pub delivery: DeliveryConfig,
@@ -53,16 +57,37 @@ pub struct KafkaConfig {
     pub group_id: String,
 }
 
+/// §16.4 (Sprint 16 task 4): the predictive-events consumer is opt-in — a
+/// deployment with no risk desk configured runs the incident-stream consumer
+/// only, and `NOTIFICATION_PREDICTIVE_ENABLED` (default `false`) is the one
+/// switch that turns the second task on. Its own [`KafkaConfig::group_id`]
+/// keeps its offsets, lag, and DLQ entirely independent of the incident
+/// stream's consumer group (§16.4's "no coupling to the incident stream") —
+/// `main.rs` only builds/spawns the second consumer task when `enabled`.
+#[derive(Debug, Clone)]
+pub struct PredictiveConfig {
+    pub enabled: bool,
+    pub group_id: String,
+}
+
 impl Config {
     /// Resolve from the environment, erroring on anything missing or
     /// malformed (fail fast at boot rather than at first event).
     pub fn from_env() -> Result<Self> {
         let delivery_defaults = DeliveryConfig::default();
+        let kafka_group_id = env("NOTIFICATION_KAFKA_GROUP")?;
         Ok(Self {
             database_url: SecretString::from(env("DATABASE_URL")?),
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
-                group_id: env("NOTIFICATION_KAFKA_GROUP")?,
+                group_id: kafka_group_id.clone(),
+            },
+            predictive: PredictiveConfig {
+                enabled: env_parse("NOTIFICATION_PREDICTIVE_ENABLED", false)?,
+                group_id: env_parse(
+                    "NOTIFICATION_PREDICTIVE_KAFKA_GROUP",
+                    format!("{kafka_group_id}-predictive"),
+                )?,
             },
             delivery: DeliveryConfig {
                 timeout: Duration::from_secs(env_parse(
