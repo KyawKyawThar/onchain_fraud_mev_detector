@@ -40,7 +40,7 @@ use events::intelligence::{
     AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
     LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
-use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
+use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef, EntityId, IncidentId,
     LabelId, LendingProtocol, PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
@@ -555,7 +555,8 @@ fn system_event() -> impl Strategy<Value = DomainEvent> {
         })
 }
 
-/// Predictive (§16): `PredictedAlert` and `LiquidationRiskPredicted`.
+/// Predictive (§16): `PredictedAlert`, `LiquidationRiskPredicted`, and
+/// `LiquidationCascadeWarned`.
 fn predictive_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
         (
@@ -592,6 +593,38 @@ fn predictive_event() -> impl Strategy<Value = DomainEvent> {
                         health_factor,
                         distance_pct,
                         severity,
+                        confidence: Confidence::CERTAIN,
+                        provisional: true,
+                    })
+                }
+            ),
+        (
+            prediction_id(),
+            address(),
+            finite_f64(),
+            any::<u32>(),
+            prop::collection::vec(address(), 0..4),
+            usd_amount(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    prediction_id,
+                    trigger_asset,
+                    trigger_price,
+                    reflexive_depth,
+                    accounts,
+                    aggregate_at_risk_usd,
+                    hub_capped,
+                )| {
+                    DomainEvent::LiquidationCascadeWarned(LiquidationCascadeWarned {
+                        prediction_id,
+                        trigger_asset,
+                        trigger_price,
+                        reflexive_depth,
+                        accounts,
+                        aggregate_at_risk_usd,
+                        hub_capped,
                         confidence: Confidence::CERTAIN,
                         provisional: true,
                     })

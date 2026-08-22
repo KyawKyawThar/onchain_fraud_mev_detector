@@ -222,6 +222,7 @@ pub enum DomainEvent {
     // Predictive (§16)
     PredictedAlert(predictive::PredictedAlert),
     LiquidationRiskPredicted(predictive::LiquidationRiskPredicted),
+    LiquidationCascadeWarned(predictive::LiquidationCascadeWarned),
 }
 
 /// Which service domain an event belongs to. Used for coarse routing/metrics;
@@ -292,7 +293,9 @@ impl DomainEvent {
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
             UsageRecorded(_) | ScreeningDecisionRecorded(_) => EventFamily::System,
-            PredictedAlert(_) | LiquidationRiskPredicted(_) => EventFamily::Predictive,
+            PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
+                EventFamily::Predictive
+            }
         }
     }
 
@@ -338,7 +341,8 @@ impl DomainEvent {
             | ScreeningDecisionRecorded(_)
             | WalletExposureReportReady(_)
             | PredictedAlert(_)
-            | LiquidationRiskPredicted(_) => None,
+            | LiquidationRiskPredicted(_)
+            | LiquidationCascadeWarned(_) => None,
         }
     }
 
@@ -409,7 +413,8 @@ impl DomainEvent {
             | RuleTriggered(_)
             | RuleAlertCreated(_)
             | PredictedAlert(_)
-            | LiquidationRiskPredicted(_) => None,
+            | LiquidationRiskPredicted(_)
+            | LiquidationCascadeWarned(_) => None,
         }
     }
 
@@ -428,6 +433,7 @@ impl DomainEvent {
             PreliminaryAlertCreated(e) => e.addresses.clone(),
             PredictedAlert(e) => e.addresses.clone(),
             LiquidationRiskPredicted(e) => vec![e.account],
+            LiquidationCascadeWarned(e) => e.accounts.clone(),
             LabelAdded(e) => vec![e.address],
             LabelUpdated(e) => vec![e.address],
             LabelRevoked(e) => vec![e.address],

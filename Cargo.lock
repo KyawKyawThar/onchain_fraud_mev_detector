@@ -5134,6 +5134,7 @@ dependencies = [
  "futures-util",
  "intelligence",
  "metrics",
+ "metrics-util",
  "rdkafka",
  "serde",
  "serde_json",

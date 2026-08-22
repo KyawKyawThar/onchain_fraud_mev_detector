@@ -186,7 +186,11 @@ pub fn assess(
 
 /// Sum `TokenMeta::to_whole(amount) * price.get()` over every nonzero entry in
 /// `book`. `None` if any nonzero-balance asset can't be valued.
-fn valued_total(
+///
+/// `pub(crate)` — [`crate::reflexivity`]'s cascade-size figure
+/// (`aggregate_at_risk_usd`) reuses this rather than re-deriving the
+/// decimal-scaling/finite-check discipline a second time.
+pub(crate) fn valued_total(
     book: &BTreeMap<Address, U256>,
     assets: &HashMap<Address, TokenMeta>,
     prices: &HashMap<Address, UsdPrice>,
@@ -210,7 +214,11 @@ fn valued_total(
 /// Does `position` hold a nonzero *or* zero balance of `asset` at all — i.e.
 /// would repricing `asset` change this position's valuation? Used to skip
 /// positions a price tick can't possibly affect (the common case).
-fn touches(position: &Position, asset: Address) -> bool {
+///
+/// `pub(crate)` — [`crate::reflexivity`] reuses this to find every position a
+/// shocked asset could reprice, the same "who does this asset touch" question
+/// this engine already answers on every real tick.
+pub(crate) fn touches(position: &Position, asset: Address) -> bool {
     position.collateral.contains_key(&asset) || position.debt.contains_key(&asset)
 }
 
@@ -238,6 +246,13 @@ impl CascadeEngine {
             last_severity: HashMap::new(),
             thresholds,
         }
+    }
+
+    /// The engine's current price cache — every asset priced so far, at its
+    /// latest tick. [`crate::reflexivity`]'s walk reads this rather than
+    /// keeping a second cache in sync with this one.
+    pub fn prices(&self) -> &HashMap<Address, UsdPrice> {
+        &self.prices
     }
 
     /// Fold one genuine price update in, recompute every open position that

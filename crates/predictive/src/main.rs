@@ -17,7 +17,10 @@
 //!      over a second bounded channel, and
 //!   5. the **cascade engine**, recomputing health factors off the shared
 //!      position tracker on every price update and publishing
-//!      `LiquidationRiskPredicted` for every worsening risk-band crossing.
+//!      `LiquidationRiskPredicted` for every worsening risk-band crossing,
+//!      then walking the reflexivity model (§16.3) off the same tick and
+//!      publishing `LiquidationCascadeWarned` when liquidating the at-risk
+//!      set would itself pull more positions underwater.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -26,7 +29,7 @@ use alloy_primitives::{Address, B256};
 use anyhow::{Context, Result};
 use detector_api::TokenMeta;
 use event_bus::{publish_resilient, EventSink, KafkaEventSink, PUBLISH_BACKOFF};
-use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
+use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{Confidence, PredictionId};
 use events::{DomainEvent, EventEnvelope};
 use predictive::cascade::{CascadeEngine, RiskThresholds};
@@ -36,8 +39,9 @@ use predictive::position::PositionTracker;
 use predictive::position_consumer::{self, PositionConsumer};
 use predictive::position_source::RpcLendingLogSource;
 use predictive::price_source::{run_price_poller, PriceSource, PriceTick, RpcPriceSource};
+use predictive::reflexivity::{self, ReflexivityLimits, SteppedImpactModel};
 use predictive::source::{run_mempool_poller, MempoolSource, PendingTx, RpcMempoolSource};
-use predictive::{decode, predict};
+use predictive::{decode, metrics as predictive_metrics, predict};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -169,9 +173,13 @@ async fn run(cfg: Config) -> Result<()> {
     let cascade_task = tokio::spawn(run_cascade(
         price_rx,
         position_tracker,
-        assets,
-        cfg.cascade.thresholds,
-        cfg.chain,
+        CascadeParams {
+            assets,
+            thresholds: cfg.cascade.thresholds,
+            reflexivity_limits: cfg.cascade.reflexivity,
+            price_impact_model: cfg.cascade.price_impact,
+            chain: cfg.chain,
+        },
         cascade_sink,
         shutdown.clone(),
     ));
@@ -242,20 +250,39 @@ async fn run_consumer(
     }
 }
 
+/// [`run_cascade`]'s fixed (non-channel, non-shared-state) configuration,
+/// grouped into one struct so the function stays under clippy's argument-count
+/// lint rather than growing a ninth positional parameter.
+struct CascadeParams {
+    assets: HashMap<Address, TokenMeta>,
+    thresholds: RiskThresholds,
+    reflexivity_limits: ReflexivityLimits,
+    price_impact_model: SteppedImpactModel,
+    chain: events::primitives::Chain,
+}
+
 /// Drain oracle price ticks off `rx`: fold each into the cascade engine
-/// against the shared position tracker's current snapshot, and publish a
-/// `LiquidationRiskPredicted` for every worsening risk-band crossing. Returns
-/// when `rx` closes (the price poller stopped) or `shutdown` fires — mirrors
-/// [`run_consumer`]'s shape one channel-driven stage over.
+/// against the shared position tracker's current snapshot, publish a
+/// `LiquidationRiskPredicted` for every worsening risk-band crossing, then
+/// walk the reflexivity model (§16.3, Sprint 16 task 3) off the same tick and
+/// publish a `LiquidationCascadeWarned` if it finds reflexive growth beyond
+/// the plain at-risk set. Returns when `rx` closes (the price poller stopped)
+/// or `shutdown` fires — mirrors [`run_consumer`]'s shape one channel-driven
+/// stage over.
 async fn run_cascade(
     mut rx: mpsc::Receiver<PriceTick>,
     tracker: Arc<Mutex<PositionTracker>>,
-    assets: HashMap<Address, TokenMeta>,
-    thresholds: RiskThresholds,
-    chain: events::primitives::Chain,
+    params: CascadeParams,
     sink: Arc<dyn EventSink>,
     shutdown: CancellationToken,
 ) {
+    let CascadeParams {
+        assets,
+        thresholds,
+        reflexivity_limits,
+        price_impact_model,
+        chain,
+    } = params;
     let mut engine = CascadeEngine::new(thresholds);
 
     loop {
@@ -276,13 +303,29 @@ async fn run_cascade(
 
         // Clone the `Arc<PositionState>` snapshot out and drop the lock
         // immediately, rather than holding it for the O(open positions) cost
-        // of `on_price_tick` below — the position-tracker consumer's writer
-        // (folding the next canonical block) must never stall behind this
-        // reader's valuation pass.
+        // of `on_price_tick`/the reflexivity walk below — the position-tracker
+        // consumer's writer (folding the next canonical block) must never
+        // stall behind this reader's valuation pass.
         let snapshot = tracker.lock().unwrap().snapshot();
-        let worsened = match &snapshot {
-            Some(positions) => engine.on_price_tick(tick, &assets, positions),
-            None => Vec::new(),
+        let (worsened, outcome) = match &snapshot {
+            Some(positions) => {
+                let worsened = engine.on_price_tick(tick, &assets, positions);
+                // Reads the engine's price cache *after* folding this tick in,
+                // so the walk reasons over the same real prices the worsening
+                // pass above just computed against.
+                let outcome = reflexivity::detect_cascade(
+                    tick,
+                    &assets,
+                    engine.prices(),
+                    positions,
+                    &thresholds,
+                    &reflexivity_limits,
+                    &price_impact_model,
+                );
+                predictive_metrics::record_cascade_walk(&outcome);
+                (worsened, outcome)
+            }
+            None => (Vec::new(), reflexivity::CascadeOutcome::default()),
         };
 
         for (key, assessment) in worsened {
@@ -297,6 +340,26 @@ async fn run_cascade(
                 provisional: true,
             };
             let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationRiskPredicted(alert));
+            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+        }
+
+        let reflexivity::CascadeOutcome {
+            warning,
+            hub_capped,
+        } = outcome;
+        if let Some(warning) = warning {
+            let alert = LiquidationCascadeWarned {
+                prediction_id: PredictionId::new(),
+                trigger_asset: warning.trigger_asset,
+                trigger_price: warning.trigger_price,
+                reflexive_depth: warning.reflexive_depth,
+                accounts: warning.accounts,
+                aggregate_at_risk_usd: warning.aggregate_at_risk_usd,
+                hub_capped,
+                confidence: Confidence::CERTAIN,
+                provisional: true,
+            };
+            let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationCascadeWarned(alert));
             publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
         }
     }

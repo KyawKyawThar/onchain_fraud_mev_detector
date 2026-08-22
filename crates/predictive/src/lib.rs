@@ -34,6 +34,16 @@
 //! - [`cascade`] — [`cascade::CascadeEngine`], which recomputes health
 //!   factors off [`position::PositionTracker::current`] on every price tick
 //!   and reports positions whose risk band has worsened.
+//!
+//! Sprint 16 task 3 (§16.3) adds the reflexivity model, driven off the same
+//! price tick as the cascade engine:
+//!
+//! - [`reflexivity`] — [`reflexivity::detect_cascade`], a degree-bounded walk
+//!   over the position graph (§8.2's hub-node cap, mirrored) that reports
+//!   `LiquidationCascadeWarned` when liquidating the at-risk set would itself
+//!   move a mark price into more positions.
+//! - [`metrics`] — [`metrics::record_cascade_walk`], the walk-rate/hub-cap/
+//!   warning-rate counters recorded at `detect_cascade`'s single call site.
 
 mod abi_words;
 pub mod cascade;
@@ -41,9 +51,11 @@ pub mod config;
 pub mod decode;
 pub mod intel_client;
 pub mod lending_decode;
+pub mod metrics;
 pub mod position;
 pub mod position_consumer;
 pub mod position_source;
 pub mod predict;
 pub mod price_source;
+pub mod reflexivity;
 pub mod source;

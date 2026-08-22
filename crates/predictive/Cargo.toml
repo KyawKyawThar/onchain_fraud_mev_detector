@@ -68,6 +68,10 @@ rdkafka = { workspace = true }
 
 [dev-dependencies]
 event-bus = { workspace = true, features = ["test-util"] }
+# In-memory recorder so the reflexivity-walk metrics tests can assert on
+# recorded series (§19) without a global Prometheus install — same seam
+# `detection`'s per-detector metrics tests use.
+metrics-util = { workspace = true }
 
 [lints]
 workspace = true
