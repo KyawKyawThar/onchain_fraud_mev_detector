@@ -12,6 +12,7 @@ use url::Url;
 
 use crate::cascade::RiskThresholds;
 use crate::position::{LiquidationThresholds, Protocol};
+use crate::reflexivity::{ReflexivityLimits, SteppedImpactModel};
 
 /// Fallback trailing window (in blocks) for the position tracker's reorg
 /// snapshot store when the chain has no known [`Chain::default_finalization_depth`]
@@ -99,6 +100,13 @@ pub struct CascadeConfig {
     /// as `PositionTrackerConfig::contract_addresses`.
     pub feeds: Vec<AssetFeed>,
     pub thresholds: RiskThresholds,
+    /// Bounds for the Sprint 16 task 3 reflexivity walk (§16.3) — the
+    /// position-graph mirror of `intelligence::graph::GraphLimits`.
+    pub reflexivity: ReflexivityLimits,
+    /// The reflexivity walk's price-impact model (§16.3) — kept separate from
+    /// `reflexivity` since it varies independently as
+    /// `reflexivity::PriceImpactModel` gains implementations.
+    pub price_impact: SteppedImpactModel,
 }
 
 impl Config {
@@ -189,6 +197,26 @@ impl Config {
                     RiskThresholds::try_new(warning, danger, critical).context(
                         "configured risk thresholds (LIQUIDATION_*_DISTANCE_PCT) are invalid",
                     )?
+                },
+                // Env-var fallbacks are `ReflexivityLimits::default()`'s own
+                // figures — same one-source-of-truth discipline as the risk
+                // thresholds above. No cross-field invariant to validate (unlike
+                // `RiskThresholds`), so a plain struct literal is enough.
+                reflexivity: ReflexivityLimits {
+                    degree_cap: env_parse(
+                        "CASCADE_DEGREE_CAP",
+                        ReflexivityLimits::default().degree_cap,
+                    )?,
+                    max_depth: env_parse(
+                        "CASCADE_MAX_REFLEXIVE_DEPTH",
+                        ReflexivityLimits::default().max_depth,
+                    )?,
+                },
+                price_impact: SteppedImpactModel {
+                    bps_per_hop: env_parse(
+                        "CASCADE_PRICE_IMPACT_BPS_PER_HOP",
+                        SteppedImpactModel::default().bps_per_hop,
+                    )?,
                 },
             },
         })

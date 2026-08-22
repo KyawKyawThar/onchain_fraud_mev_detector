@@ -7,9 +7,9 @@
 //! is the point of a warning, not a defect in it (§16).
 
 use crate::primitives::{
-    AccountAddress, AlertKind, Confidence, LendingProtocol, PredictionId, Severity,
+    AccountAddress, AlertKind, Confidence, LendingProtocol, PredictionId, Severity, UsdAmount,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
 /// A forecast raised from a pending (unconfirmed) mempool transaction (§16):
@@ -65,6 +65,54 @@ pub struct LiquidationRiskPredicted {
     /// (unlike [`PredictedAlert::confidence`]'s label-derived confidence) —
     /// always [`Confidence::CERTAIN`]. The genuine uncertainty is whether the
     /// market moves further, which `distance_pct`/`severity` already express.
+    pub confidence: Confidence,
+    /// Always `true` — a forecast is never sim-confirmed (§16).
+    pub provisional: bool,
+}
+
+/// A forecast raised by the Sprint 16 task 3 reflexivity walk: liquidating the
+/// currently at-risk positions would itself move `trigger_asset`'s mark price
+/// far enough (forced collateral sales) to pull *more* positions underwater —
+/// a degree-bounded walk over the position graph, the same hub-node discipline
+/// §8.2 applies to the entity graph (`intelligence::graph`), applied here to an
+/// asset shared by too many open positions to model its price impact rather
+/// than an address with too many neighbors.
+///
+/// Only emitted when the walk actually finds reflexive growth — a plain
+/// at-risk position with no knock-on effect is already covered by
+/// [`LiquidationRiskPredicted`] and doesn't warrant a cascade warning. Like
+/// that event, `provisional` is always `true` and stays `true` forever, and
+/// `confidence` is always [`Confidence::CERTAIN`] — this is a measured walk
+/// over tracked positions and current prices, not a heuristic guess.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LiquidationCascadeWarned {
+    pub prediction_id: PredictionId,
+    /// The asset whose oracle mark-price tick started the walk — the asset
+    /// named in the warning ("cascade triggers at ETH < $2,180").
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub trigger_asset: Address,
+    /// `trigger_asset`'s USD price at the tick that started the walk.
+    pub trigger_price: f64,
+    /// How many hops the reflexive walk reached before the frontier stopped
+    /// growing — bounded by the engine's configured max depth (§8.2-style
+    /// hop bound).
+    pub reflexive_depth: u32,
+    /// Every account swept into the at-risk set, seed positions and every
+    /// position the walk reflexively pulled in, across every protocol and
+    /// deduplicated.
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub accounts: Vec<AccountAddress>,
+    /// Total collateral-side USD across the whole at-risk set, at real
+    /// (not hypothetically shocked) prices — the headline cascade size
+    /// ("a $40M cascade").
+    pub aggregate_at_risk_usd: UsdAmount,
+    /// The walk reached a degree-capped hub asset (held as collateral by more
+    /// open positions than the configured cap) and stopped propagating a
+    /// price shock through it (§8.2) — `reflexive_depth`/
+    /// `aggregate_at_risk_usd` are a bounded estimate, not necessarily the
+    /// full cascade.
+    pub hub_capped: bool,
     pub confidence: Confidence,
     /// Always `true` — a forecast is never sim-confirmed (§16).
     pub provisional: bool,

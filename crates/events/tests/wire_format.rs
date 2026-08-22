@@ -36,7 +36,7 @@ use events::intelligence::{
     AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
     LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
-use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
+use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
     EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId, Severity,
@@ -316,6 +316,17 @@ fn sample_events() -> Vec<DomainEvent> {
             confidence: Confidence::CERTAIN,
             provisional: true,
         }),
+        DomainEvent::LiquidationCascadeWarned(LiquidationCascadeWarned {
+            prediction_id: prediction_id(),
+            trigger_asset: Address::repeat_byte(0x44),
+            trigger_price: 1_500.0,
+            reflexive_depth: 2,
+            accounts: vec![addr()],
+            aggregate_at_risk_usd: UsdAmount::new(40_000_000.0),
+            hub_capped: false,
+            confidence: Confidence::CERTAIN,
+            provisional: true,
+        }),
     ]
 }
 
@@ -442,6 +453,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "LiquidationRiskPredicted",
         r#"{"type":"LiquidationRiskPredicted","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","protocol":"aave","account":"0x3333333333333333333333333333333333333333","health_factor":0.97,"distance_pct":-3.0,"severity":"high","confidence":1.0,"provisional":true}}"#,
+    ),
+    (
+        "LiquidationCascadeWarned",
+        r#"{"type":"LiquidationCascadeWarned","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","trigger_asset":"0x4444444444444444444444444444444444444444","trigger_price":1500.0,"reflexive_depth":2,"accounts":["0x3333333333333333333333333333333333333333"],"aggregate_at_risk_usd":40000000.0,"hub_capped":false,"confidence":1.0,"provisional":true}}"#,
     ),
 ];
 
