@@ -4,7 +4,7 @@
 //! third, independent cascade engine — all three sharing this binary.
 //!
 //! Boot: connect the single mempool RPC endpoint, the intelligence gRPC
-//! client, and the Kafka producer, then run five cooperating tasks until a
+//! client, and the Kafka producer, then run six cooperating tasks until a
 //! shutdown signal —
 //!   1. the mempool **poller**, forwarding pending transactions over a
 //!      bounded channel (§17 backpressure),
@@ -12,15 +12,19 @@
 //!      intelligence's cached labels, and publishing `PredictedAlert`,
 //!   3. the **position-tracker consumer**, folding `BlockCanonicalized`/
 //!      `BlockReverted` into the tracked lending position book (§15) — its
-//!      tracker is `Arc<Mutex<_>>`-shared with task 5, below,
+//!      tracker is `Arc<Mutex<_>>`-shared with task 5 and task 6, below,
 //!   4. the oracle **price poller**, forwarding genuine mark-price updates
-//!      over a second bounded channel, and
+//!      over a second bounded channel,
 //!   5. the **cascade engine**, recomputing health factors off the shared
 //!      position tracker on every price update and publishing
 //!      `LiquidationRiskPredicted` for every worsening risk-band crossing,
 //!      then walking the reflexivity model (§16.3) off the same tick and
 //!      publishing `LiquidationCascadeWarned` when liquidating the at-risk
-//!      set would itself pull more positions underwater.
+//!      set would itself pull more positions underwater — its engine is also
+//!      `Arc<Mutex<_>>`-shared with task 6, and
+//!   6. the internal read API (§16.4, [`predictive::http`]) — live
+//!      position/risk reads and a cascade what-if simulator over the same
+//!      shared tracker/engine, Swagger-documented for hand testing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -34,6 +38,7 @@ use events::primitives::{Confidence, PredictionId};
 use events::{DomainEvent, EventEnvelope};
 use predictive::cascade::{CascadeEngine, RiskThresholds};
 use predictive::config::Config;
+use predictive::http::{self as predictive_http, AppState};
 use predictive::intel_client::{IntelligenceClient, LabelLookup};
 use predictive::position::PositionTracker;
 use predictive::position_consumer::{self, PositionConsumer};
@@ -152,17 +157,18 @@ async fn run(cfg: Config) -> Result<()> {
         cfg.cascade.rpc_url.clone(),
         cfg.cascade.feeds.clone(),
     ));
-    let assets: HashMap<Address, TokenMeta> = cfg
-        .cascade
-        .feeds
-        .iter()
-        .map(|feed| {
-            (
-                feed.asset,
-                TokenMeta::new(feed.asset, None, feed.asset_decimals),
-            )
-        })
-        .collect();
+    let assets: Arc<HashMap<Address, TokenMeta>> = Arc::new(
+        cfg.cascade
+            .feeds
+            .iter()
+            .map(|feed| {
+                (
+                    feed.asset,
+                    TokenMeta::new(feed.asset, None, feed.asset_decimals),
+                )
+            })
+            .collect(),
+    );
     let (price_tx, price_rx) = mpsc::channel::<PriceTick>(1024);
     let price_poller_task = tokio::spawn(run_price_poller(
         price_source,
@@ -170,11 +176,15 @@ async fn run(cfg: Config) -> Result<()> {
         price_tx,
         shutdown.clone(),
     ));
+    // Shared with task 6's read API below — `Arc<Mutex<_>>` mirrors the
+    // position tracker's own sharing discipline (see module docs).
+    let cascade_engine = Arc::new(Mutex::new(CascadeEngine::new(cfg.cascade.thresholds)));
     let cascade_task = tokio::spawn(run_cascade(
         price_rx,
-        position_tracker,
+        Arc::clone(&position_tracker),
+        Arc::clone(&cascade_engine),
         CascadeParams {
-            assets,
+            assets: Arc::clone(&assets),
             thresholds: cfg.cascade.thresholds,
             reflexivity_limits: cfg.cascade.reflexivity,
             price_impact_model: cfg.cascade.price_impact,
@@ -183,6 +193,28 @@ async fn run(cfg: Config) -> Result<()> {
         cascade_sink,
         shutdown.clone(),
     ));
+
+    // Sprint 16 task 4 (§16.4): the internal read API, sharing the same
+    // tracker/engine every other task reads/writes — never a second copy of
+    // live state.
+    let http_state = AppState {
+        tracker: position_tracker,
+        engine: cascade_engine,
+        assets,
+        thresholds: cfg.cascade.thresholds,
+        reflexivity_limits: cfg.cascade.reflexivity,
+        price_impact_model: cfg.cascade.price_impact,
+    };
+    let http_listener = tokio::net::TcpListener::bind(cfg.http_addr)
+        .await
+        .with_context(|| format!("binding predictive HTTP listener on {}", cfg.http_addr))?;
+    tracing::info!(addr = %cfg.http_addr, "predictive read API listening");
+    let http_shutdown = shutdown.clone();
+    let http_task = tokio::spawn(async move {
+        axum::serve(http_listener, predictive_http::router(http_state))
+            .with_graceful_shutdown(async move { http_shutdown.cancelled().await })
+            .await
+    });
 
     health.set_ready(true);
 
@@ -195,6 +227,10 @@ async fn run(cfg: Config) -> Result<()> {
         .await
         .context("oracle price poller task panicked")?;
     cascade_task.await.context("cascade engine task panicked")?;
+    http_task
+        .await
+        .context("HTTP server task panicked")?
+        .context("HTTP server error")?;
     tracing::info!("predictive pipeline shut down");
     Ok(())
 }
@@ -254,24 +290,29 @@ async fn run_consumer(
 /// grouped into one struct so the function stays under clippy's argument-count
 /// lint rather than growing a ninth positional parameter.
 struct CascadeParams {
-    assets: HashMap<Address, TokenMeta>,
+    assets: Arc<HashMap<Address, TokenMeta>>,
     thresholds: RiskThresholds,
     reflexivity_limits: ReflexivityLimits,
     price_impact_model: SteppedImpactModel,
     chain: events::primitives::Chain,
 }
 
-/// Drain oracle price ticks off `rx`: fold each into the cascade engine
-/// against the shared position tracker's current snapshot, publish a
+/// Drain oracle price ticks off `rx`: fold each into the shared cascade
+/// engine against the shared position tracker's current snapshot, publish a
 /// `LiquidationRiskPredicted` for every worsening risk-band crossing, then
 /// walk the reflexivity model (§16.3, Sprint 16 task 3) off the same tick and
 /// publish a `LiquidationCascadeWarned` if it finds reflexive growth beyond
 /// the plain at-risk set. Returns when `rx` closes (the price poller stopped)
 /// or `shutdown` fires — mirrors [`run_consumer`]'s shape one channel-driven
 /// stage over.
+///
+/// `engine` is `Arc<Mutex<_>>`-shared with the read API (§16.4) rather than
+/// owned locally, so a live `GET /v1/positions` sees the exact price cache
+/// this task just folded a tick into, never a second, potentially-stale copy.
 async fn run_cascade(
     mut rx: mpsc::Receiver<PriceTick>,
     tracker: Arc<Mutex<PositionTracker>>,
+    engine: Arc<Mutex<CascadeEngine>>,
     params: CascadeParams,
     sink: Arc<dyn EventSink>,
     shutdown: CancellationToken,
@@ -283,7 +324,6 @@ async fn run_cascade(
         price_impact_model,
         chain,
     } = params;
-    let mut engine = CascadeEngine::new(thresholds);
 
     loop {
         let tick = tokio::select! {
@@ -309,6 +349,10 @@ async fn run_cascade(
         let snapshot = tracker.lock().unwrap().snapshot();
         let (worsened, outcome) = match &snapshot {
             Some(positions) => {
+                // Held only for this synchronous mutate-then-read — no
+                // `.await` inside — so a concurrent `GET /v1/positions`
+                // never blocks longer than one tick's fold.
+                let mut engine = engine.lock().unwrap();
                 let worsened = engine.on_price_tick(tick, &assets, positions);
                 // Reads the engine's price cache *after* folding this tick in,
                 // so the walk reasons over the same real prices the worsening

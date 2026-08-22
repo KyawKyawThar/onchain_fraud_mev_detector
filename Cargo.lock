@@ -5127,7 +5127,9 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-transport",
  "anyhow",
+ "api-error",
  "async-trait",
+ "axum",
  "detector-api",
  "event-bus",
  "events",
@@ -5143,8 +5145,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic 0.14.6",
+ "tower-http 0.7.0",
  "tracing",
  "url",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-swagger-ui",
 ]
 
 [[package]]

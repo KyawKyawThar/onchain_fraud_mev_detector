@@ -44,11 +44,18 @@
 //!   move a mark price into more positions.
 //! - [`metrics`] — [`metrics::record_cascade_walk`], the walk-rate/hub-cap/
 //!   warning-rate counters recorded at `detect_cascade`'s single call site.
+//!
+//! Sprint 16 task 4 (§16.4) adds the internal read API:
+//!
+//! - [`http`] — live position/risk reads and a cascade what-if simulator
+//!   over the shared position tracker/cascade engine, Swagger-documented so
+//!   the pipeline is directly testable via Postman/Swagger UI, not just Kafka.
 
 mod abi_words;
 pub mod cascade;
 pub mod config;
 pub mod decode;
+pub mod http;
 pub mod intel_client;
 pub mod lending_decode;
 pub mod metrics;

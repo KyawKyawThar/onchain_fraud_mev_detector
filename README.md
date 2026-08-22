@@ -187,6 +187,31 @@ synchronously (`allow` / `review` / `block`) over the intelligence cache, with a
 customer-configurable, versioned decision policy and a hard-block-on-sanctions
 override. Every decision carries the factor breakdown so a block is auditable.
 
+### Interactive API docs (Swagger)
+
+`api-service` above is the public, JWT-gated surface. A few internal services
+also expose their own read APIs with a live Swagger UI — useful for exploring
+the system by hand while developing, no Postman collection to maintain:
+
+| Service | Run it | Swagger UI |
+|---|---|---|
+| `server` (public API) | `cargo run -p server` | `http://localhost:8080/swagger-ui` |
+| `event-store` (audit/replay — every domain event ever published, incl. every predictive forecast) | `cargo run -p event-store` | `http://localhost:8081/swagger-ui` |
+| `predictive` (live liquidation-cascade risk — §16) | `cargo run -p predictive` | `http://localhost:9466/swagger-ui` |
+
+Each Swagger UI lets you fire a request straight from the browser ("Try it
+out") — no separate client needed. `predictive`'s is the newest: `GET
+/v1/positions` lists every currently tracked position's live risk, and `GET
+/v1/cascade/simulate?asset=0x...&price=2180` runs the reflexivity model
+on-demand against whatever the tracker currently holds ("what if this asset
+drops to $X right now") without waiting for a real oracle tick. `event-store`
+covers the historical side of the same feature — `GET
+/v1/replay?event_type=LiquidationCascadeWarned` returns every cascade warning
+ever published, since it durably stores every event type automatically.
+
+These internal services need their `.env` configured (Kafka/Postgres/ClickHouse
+per `.env.example`) to boot for real; `just up` brings up the dev stack.
+
 ---
 
 ## Tech stack
@@ -279,6 +304,7 @@ binary/container.
 │   ├── simulation/              slow-path revm confirmation (RabbitMQ workers)
 │   ├── intelligence/            labels · entities · attribution · risk scores
 │   ├── rule-engine/             customer rules: compiler, temporal windows, webhooks
+│   ├── predictive/              pre-harm forecasts: mempool + liquidation cascade risk (§16)
 │   ├── server/                  public API: REST · WebSocket · JWT · usage metering
 │   ├── db/ · ch-migrate/        shared Postgres pool + ClickHouse migration runner
 │   ├── telemetry/               tracing + metrics boot, W3C trace propagation

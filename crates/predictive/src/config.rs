@@ -41,6 +41,11 @@ pub struct Config {
     pub dedup_capacity: usize,
     pub kafka: KafkaConfig,
     pub metrics_addr: SocketAddr,
+    /// Where the internal read API (§16.4) listens — live position/risk
+    /// reads and the cascade what-if simulator, Swagger-documented. Always
+    /// on with a default, the same convention as `metrics_addr` (not an
+    /// opt-in probe like `telemetry::health`'s `HEALTH_ADDR`).
+    pub http_addr: SocketAddr,
     pub position_tracker: PositionTrackerConfig,
     pub cascade: CascadeConfig,
 }
@@ -142,6 +147,9 @@ impl Config {
             metrics_addr: env_parse("METRICS_ADDR", "0.0.0.0:9465".to_string())?
                 .parse()
                 .context("METRICS_ADDR is not a valid socket address")?,
+            http_addr: env_parse("PREDICTIVE_HTTP_ADDR", "0.0.0.0:9466".to_string())?
+                .parse()
+                .context("PREDICTIVE_HTTP_ADDR is not a valid socket address")?,
             position_tracker: PositionTrackerConfig {
                 rpc_url: lending_rpc_url,
                 contract_addresses: env_addr_list("LENDING_CONTRACT_ADDRESSES")?,

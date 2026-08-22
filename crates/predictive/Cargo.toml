@@ -17,11 +17,23 @@ name = "predictive"
 path = "src/main.rs"
 
 [dependencies]
-events = { workspace = true }
+# `openapi` feature: derives `utoipa::ToSchema` on the wire event types so the
+# read API's Swagger spec can embed them directly (§16.4) — same reason
+# event-store turns this feature on.
+events = { workspace = true, features = ["openapi"] }
 # Shared publish seam (§20) — ships `PredictedAlert` through the same
 # `EventSink`/`publish_resilient` every other producer uses.
 event-bus = { workspace = true }
 telemetry = { workspace = true }
+# The internal read API (§16.4): live position/risk/cascade-simulation reads
+# over HTTP, Swagger-documented the same way event-store's append API is —
+# "easy to exercise by hand", not just machine-readable.
+api-error = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
 # Reuses `TxActions`/`Swap`/`TokenTransfer` — the decoded-action shapes
 # `detection` already models — rather than inventing a parallel set.
 detector-api = { workspace = true }
