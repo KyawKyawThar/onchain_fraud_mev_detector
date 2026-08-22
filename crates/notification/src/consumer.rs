@@ -48,6 +48,18 @@
 //! the adapter's own bounded policy); only a *store* fault leaves the offset
 //! for redelivery, and because `claim_delivery` is dedup-safe, a redelivered
 //! record re-attempts only the deliveries that didn't already land.
+//!
+//! ## Two consumers, one delivery core (§16.4, Sprint 16 task 4)
+//!
+//! [`DeliveryEngine`] holds everything above (route/claim/deliver/meter) with
+//! no opinion on event types. [`NotificationConsumer`] wraps it with the
+//! incident-correlation bookkeeping this module's docs describe; the opt-in
+//! predictive stream gets its own lean [`PredictiveConsumer`] wrapping the
+//! same engine shape instead of reusing `NotificationConsumer` — it has no
+//! provisional/confirmed/retracted lifecycle to correlate, so it carries none
+//! of that state. `main.rs` builds one of each per process, sharing the
+//! underlying store/channels/sink/subscribers via cheap `Arc` clones, and
+//! runs them as two independent consumer-group subscriptions.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -87,6 +99,24 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
     "WalletExposureReportReady",
 ];
 
+/// §16.4 (Sprint 16 task 4): the predictive pipeline's own event family, each
+/// already on its own `mev.events.<EventType>` topic (§2) with no coupling to
+/// the incident-stream topics above. This list feeds [`PredictiveConsumer`],
+/// a second, independently spawned consumer task (wired up in `main.rs`)
+/// with its own consumer group and DLQ — deployed only when a risk desk
+/// actually opts in (`NOTIFICATION_PREDICTIVE_ENABLED`), and never sharing
+/// an offset/lag budget with the incident-critical consumer.
+const PREDICTIVE_EVENT_TYPES: &[&str] = &[
+    "PredictedAlert",
+    "LiquidationRiskPredicted",
+    "LiquidationCascadeWarned",
+];
+
+/// Log/span label for the predictive consumer task — distinct from
+/// [`CONSUMER`] so its lag-reporting series and DLQ topic never collide with
+/// the incident-stream consumer's.
+const CONSUMER_PREDICTIVE: &str = "notification-predictive";
+
 /// Bound on the in-memory pending-correlation buffer (see the module docs) —
 /// mirrors `rule_engine::consumer::DEFAULT_PENDING_CAPACITY`.
 pub const DEFAULT_PENDING_CAPACITY: usize = 100_000;
@@ -94,14 +124,40 @@ pub const DEFAULT_PENDING_CAPACITY: usize = 100_000;
 /// Counter (labeled by `stage`): notices routed — the §19 throughput signal.
 pub const NOTIFICATION_NOTICES_TOTAL: &str = "notification_notices_total";
 
+/// Gauge (0/1): whether the predictive-events consumer task is currently
+/// subscribed and consuming. `main.rs`'s supervisor loop sets it to `1` for
+/// the duration of each [`PredictiveConsumer::run`] attempt and back to `0`
+/// the moment it exits (cleanly or not) — a distinct signal from K8s
+/// readiness, which only reflects "boot wiring completed" and would stay
+/// `true` even if this task died at subscribe and no retry existed. Alert on
+/// this being `0` for longer than one retry cycle while
+/// `NOTIFICATION_PREDICTIVE_ENABLED=true` (§19).
+pub const PREDICTIVE_CONSUMER_UP: &str = "notification_predictive_consumer_up";
+
 pub fn consumed_topics() -> Vec<String> {
     events::topics_for(CONSUMED_EVENT_TYPES)
+}
+
+/// The predictive-only topic list (§16.4) — a distinct, opt-in subscription
+/// from [`consumed_topics`], never merged into it (see [`PREDICTIVE_EVENT_TYPES`]'s docs).
+pub fn predictive_topics() -> Vec<String> {
+    events::topics_for(PREDICTIVE_EVENT_TYPES)
 }
 
 /// Build the consumer. Manual offset commit ties the commit to a fully
 /// claimed/delivered/receipted record.
 pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<LagReporting>> {
     build_reporting_consumer(brokers, group_id, CONSUMER)
+}
+
+/// Build the predictive consumer — its own consumer group, so a lagging or
+/// down predictive pipeline can never stall the incident-stream consumer's
+/// offset progress (§16.4's "opt-in, no coupling").
+pub fn build_predictive_consumer(
+    brokers: &str,
+    group_id: &str,
+) -> Result<StreamConsumer<LagReporting>> {
+    build_reporting_consumer(brokers, group_id, CONSUMER_PREDICTIVE)
 }
 
 // ── Bounded FIFO map (rule-engine's `PendingState` tolerance, locally) ────
@@ -183,9 +239,24 @@ impl Transience for ConsumerError {
     }
 }
 
-/// The §11 consumer: holds every seam evaluation needs. See the module docs
-/// for the per-record flow.
-pub struct NotificationConsumer {
+/// The delivery core every consumer in this crate drives through: resolve
+/// the candidate `(subscriber, channel)` set, claim/dedup/deliver/receipt
+/// each one, and meter `AlertDelivered` on every successful send.
+/// Deliberately has **no opinion on which event types feed it** — building a
+/// [`Notice`] from a `DomainEvent` is each consumer's own job (see
+/// [`NotificationConsumer::handle`]/[`PredictiveConsumer::handle`]); this
+/// struct only knows how to route and deliver one already-built `Notice`.
+///
+/// Two consumers each hold one of these — never the *same* instance (see
+/// `main.rs`, which builds two via cheap `Arc::clone`s of the same
+/// underlying store/channels/sink/subscribers): [`NotificationConsumer`] for
+/// the incident stream (§11), and [`PredictiveConsumer`] for the §16.4
+/// opt-in predictive stream. Splitting this out — rather than folding
+/// predictive dispatch into `NotificationConsumer` directly — means
+/// `PredictiveConsumer` carries no incident-correlation state it would never
+/// touch; see [`NotificationConsumer`]'s docs for what stays specific to the
+/// incident stream.
+struct DeliveryEngine {
     store: Arc<dyn NotificationStore>,
     channels: Arc<dyn ChannelSink>,
     sink: Arc<dyn EventSink>,
@@ -198,11 +269,10 @@ pub struct NotificationConsumer {
     subscribers: Arc<SubscriberSetHandle>,
     shutdown: CancellationToken,
     publish_backoff: Duration,
-    pending: Mutex<BoundedFifoMap<IncidentId, PendingCorrelation>>,
 }
 
-impl NotificationConsumer {
-    pub fn new(
+impl DeliveryEngine {
+    fn new(
         store: Arc<dyn NotificationStore>,
         channels: Arc<dyn ChannelSink>,
         sink: Arc<dyn EventSink>,
@@ -216,37 +286,21 @@ impl NotificationConsumer {
             subscribers,
             shutdown,
             publish_backoff: event_bus::PUBLISH_BACKOFF,
-            pending: Mutex::new(BoundedFifoMap::new(DEFAULT_PENDING_CAPACITY)),
         }
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub fn with_publish_backoff(mut self, backoff: Duration) -> Self {
+    fn with_publish_backoff(mut self, backoff: Duration) -> Self {
         self.publish_backoff = backoff;
         self
     }
 
-    /// Drive the consumer off Kafka until shutdown or a fatal subscribe
-    /// error, via the shared [`event_bus::run_consumer`] loop.
-    pub async fn run(
-        self,
-        consumer: StreamConsumer<LagReporting>,
-        retry_backoff: Duration,
-        dlq: Option<&DeadLetterQueue>,
-        shutdown: &CancellationToken,
-    ) -> Result<()> {
-        let topics = consumed_topics();
-        let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
-        event_bus::run_consumer(
-            consumer,
-            &topic_refs,
-            CONSUMER,
-            retry_backoff,
-            dlq,
-            self,
-            shutdown,
-        )
-        .await
+    /// The underlying store — [`NotificationConsumer`]'s incident-correlation
+    /// bookkeeping (`record_incident_alert`/`alert_for_incident`/`finalize`)
+    /// needs it directly, beyond what [`Self::route_and_deliver`]/
+    /// [`Self::deliver_one`] already do with it internally.
+    fn store(&self) -> &Arc<dyn NotificationStore> {
+        &self.store
     }
 
     fn verdict(&self, result: Result<(), ConsumerError>) -> Handled {
@@ -258,10 +312,11 @@ impl NotificationConsumer {
     }
 
     /// Resolve candidates and deliver `notice` to each — the shared path
-    /// every event type routes through. `Retracted` re-targets prior
-    /// recipients via the delivery ledger (unfiltered, see `notice.rs`'s
-    /// module docs); every other stage scans+filters the subscriber
-    /// snapshot (`crate::subscriber_cache`) — no Postgres read on this path.
+    /// every event type routes through, regardless of which consumer built
+    /// it. `Retracted` re-targets prior recipients via the delivery ledger
+    /// (unfiltered, see `notice.rs`'s module docs); every other stage
+    /// scans+filters the subscriber snapshot (`crate::subscriber_cache`) —
+    /// no Postgres read on this path.
     async fn route_and_deliver(&self, notice: Notice) -> Result<(), ConsumerError> {
         let targets: Vec<(SubscriberId, CustomerId, Channel)> =
             if notice.stage == LifecycleStage::Retracted {
@@ -364,6 +419,60 @@ impl NotificationConsumer {
         }
         Ok(())
     }
+}
+
+/// The §11 incident-stream consumer: a [`DeliveryEngine`] plus the
+/// provisional↔confirmed↔retracted correlation bookkeeping specific to the
+/// incident lifecycle (§7) — nothing here is shared with
+/// [`PredictiveConsumer`], which has no such lifecycle to correlate. See the
+/// module docs for the per-record flow.
+pub struct NotificationConsumer {
+    engine: DeliveryEngine,
+    pending: Mutex<BoundedFifoMap<IncidentId, PendingCorrelation>>,
+}
+
+impl NotificationConsumer {
+    pub fn new(
+        store: Arc<dyn NotificationStore>,
+        channels: Arc<dyn ChannelSink>,
+        sink: Arc<dyn EventSink>,
+        subscribers: Arc<SubscriberSetHandle>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            engine: DeliveryEngine::new(store, channels, sink, subscribers, shutdown),
+            pending: Mutex::new(BoundedFifoMap::new(DEFAULT_PENDING_CAPACITY)),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_publish_backoff(mut self, backoff: Duration) -> Self {
+        self.engine = self.engine.with_publish_backoff(backoff);
+        self
+    }
+
+    /// Drive the consumer off Kafka until shutdown or a fatal subscribe
+    /// error, via the shared [`event_bus::run_consumer`] loop.
+    pub async fn run(
+        self,
+        consumer: StreamConsumer<LagReporting>,
+        retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        let topics = consumed_topics();
+        let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+        event_bus::run_consumer(
+            consumer,
+            &topic_refs,
+            CONSUMER,
+            retry_backoff,
+            dlq,
+            self,
+            shutdown,
+        )
+        .await
+    }
 
     /// `IncidentCreated`: record the incident↔alert mapping, deliver the
     /// Confirmed notice, then replay anything buffered waiting for exactly
@@ -375,11 +484,12 @@ impl NotificationConsumer {
         occurred_at: DateTime<Utc>,
     ) -> Result<(), ConsumerError> {
         let (incident_id, alert_id) = notice::incident_alert_link(&event);
-        self.store
+        self.engine
+            .store()
             .record_incident_alert(incident_id, alert_id, Utc::now())
             .await?;
         let notice = Notice::from_incident_created(&event, chain, occurred_at);
-        self.route_and_deliver(notice).await?;
+        self.engine.route_and_deliver(notice).await?;
 
         let replay = self
             .pending
@@ -400,7 +510,7 @@ impl NotificationConsumer {
         incident_id: IncidentId,
         correlate: PendingCorrelation,
     ) -> Result<(), ConsumerError> {
-        match self.store.alert_for_incident(incident_id).await? {
+        match self.engine.store().alert_for_incident(incident_id).await? {
             Some(alert_id) => self.apply_correlation(alert_id, correlate).await,
             None => {
                 self.pending
@@ -424,10 +534,11 @@ impl NotificationConsumer {
                 occurred_at,
             } => {
                 let notice = Notice::retraction(alert_id, chain, &reason, occurred_at);
-                self.route_and_deliver(notice).await
+                self.engine.route_and_deliver(notice).await
             }
             PendingCorrelation::Finalized => {
-                self.store
+                self.engine
+                    .store()
                     .finalize(&alert_id.to_string(), Utc::now())
                     .await?;
                 Ok(())
@@ -445,12 +556,13 @@ impl EventHandler for NotificationConsumer {
         match envelope.payload {
             DomainEvent::PreliminaryAlertCreated(event) => {
                 let notice = Notice::from_preliminary_alert(&event, chain, occurred_at);
-                self.verdict(self.route_and_deliver(notice).await)
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
             }
 
-            DomainEvent::IncidentCreated(event) => {
-                self.verdict(self.on_incident_created(event, chain, occurred_at).await)
-            }
+            DomainEvent::IncidentCreated(event) => self
+                .engine
+                .verdict(self.on_incident_created(event, chain, occurred_at).await),
 
             DomainEvent::IncidentRetracted(event) => {
                 let result = self
@@ -463,29 +575,32 @@ impl EventHandler for NotificationConsumer {
                         },
                     )
                     .await;
-                self.verdict(result)
+                self.engine.verdict(result)
             }
 
             DomainEvent::IncidentFinalized(event) => {
                 let result = self
                     .resolve_and_apply(event.incident_id, PendingCorrelation::Finalized)
                     .await;
-                self.verdict(result)
+                self.engine.verdict(result)
             }
 
             DomainEvent::RuleAlertCreated(event) => {
                 let notice = Notice::from_rule_alert(&event, chain, occurred_at);
-                self.verdict(self.route_and_deliver(notice).await)
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
             }
 
             DomainEvent::SanctionHit(event) => {
                 let notice = Notice::from_sanction_hit(&event, chain, occurred_at);
-                self.verdict(self.route_and_deliver(notice).await)
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
             }
 
             DomainEvent::WalletExposureReportReady(event) => {
                 let notice = Notice::from_exposure_report(&event, chain, occurred_at);
-                self.verdict(self.route_and_deliver(notice).await)
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
             }
 
             other => {
@@ -499,15 +614,111 @@ impl EventHandler for NotificationConsumer {
     }
 }
 
+/// The §16.4 (Sprint 16 task 4) opt-in predictive-events consumer: the same
+/// [`DeliveryEngine`] as [`NotificationConsumer`], but no incident-
+/// correlation state — `PredictedAlert`/`LiquidationRiskPredicted`/
+/// `LiquidationCascadeWarned` are all Standalone notices (`notice.rs`),
+/// never provisional/confirmed/retracted, so there is nothing here to
+/// correlate. Deployed as a second, independent task (`main.rs`) with its
+/// own consumer group/DLQ against [`predictive_topics`], never folded into
+/// [`NotificationConsumer::run`]'s subscription — a lagging or down
+/// predictive pipeline can never stall the incident-stream consumer.
+pub struct PredictiveConsumer {
+    engine: DeliveryEngine,
+}
+
+impl PredictiveConsumer {
+    pub fn new(
+        store: Arc<dyn NotificationStore>,
+        channels: Arc<dyn ChannelSink>,
+        sink: Arc<dyn EventSink>,
+        subscribers: Arc<SubscriberSetHandle>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            engine: DeliveryEngine::new(store, channels, sink, subscribers, shutdown),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_publish_backoff(mut self, backoff: Duration) -> Self {
+        self.engine = self.engine.with_publish_backoff(backoff);
+        self
+    }
+
+    /// Drive the predictive-only consumer off its own Kafka consumer group
+    /// until shutdown or a fatal subscribe error — the same
+    /// [`event_bus::run_consumer`] loop [`NotificationConsumer::run`] uses,
+    /// over [`predictive_topics`] and labeled [`CONSUMER_PREDICTIVE`] so its
+    /// lag/DLQ never share a budget with the incident-stream consumer.
+    pub async fn run(
+        self,
+        consumer: StreamConsumer<LagReporting>,
+        retry_backoff: Duration,
+        dlq: Option<&DeadLetterQueue>,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        let topics = predictive_topics();
+        let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+        event_bus::run_consumer(
+            consumer,
+            &topic_refs,
+            CONSUMER_PREDICTIVE,
+            retry_backoff,
+            dlq,
+            self,
+            shutdown,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl EventHandler for PredictiveConsumer {
+    #[tracing::instrument(skip_all, fields(chain = %envelope.chain, event = envelope.payload.event_type()))]
+    async fn handle(&self, envelope: EventEnvelope) -> Handled {
+        let chain = envelope.chain;
+        let occurred_at = envelope.occurred_at;
+        match envelope.payload {
+            DomainEvent::PredictedAlert(event) => {
+                let notice = Notice::from_predicted_alert(&event, chain, occurred_at);
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
+            }
+
+            DomainEvent::LiquidationRiskPredicted(event) => {
+                let notice = Notice::from_liquidation_risk_predicted(&event, chain, occurred_at);
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
+            }
+
+            DomainEvent::LiquidationCascadeWarned(event) => {
+                let notice = Notice::from_liquidation_cascade_warned(&event, chain, occurred_at);
+                self.engine
+                    .verdict(self.engine.route_and_deliver(notice).await)
+            }
+
+            other => {
+                tracing::warn!(
+                    event = other.event_type(),
+                    "unexpected event on the predictive-events consumer; skipping"
+                );
+                Handled::Commit
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use event_bus::test_util::RecordingSink;
     use events::detection::PreliminaryAlertCreated;
     use events::intelligence::SanctionHit;
+    use events::predictive::{LiquidationRiskPredicted, PredictedAlert};
     use events::primitives::{
-        AccountAddress, AlertKind, Confidence, CustomerId, DetectorRef, RuleId, Severity,
-        SuggestedAction,
+        AccountAddress, AlertKind, Confidence, CustomerId, DetectorRef, LendingProtocol,
+        PredictionId, RuleId, Severity, SuggestedAction,
     };
     use events::rule_engine::RuleAlertCreated;
     use events::simulation::{IncidentCreated, IncidentFinalized, IncidentRetracted};
@@ -578,6 +789,49 @@ mod tests {
             subscribers,
             channels,
             sink,
+        }
+    }
+
+    /// [`PredictiveConsumer`]'s own harness — deliberately not folded into
+    /// [`Harness`]: the two consumer types are different structs (that's the
+    /// point of the [`DeliveryEngine`] split), so a test exercising
+    /// `PredictiveConsumer::handle` needs a `PredictiveConsumer` in hand, not
+    /// a `NotificationConsumer`.
+    struct PredictiveHarness {
+        consumer: PredictiveConsumer,
+        store: Arc<InMemoryNotificationStore>,
+        subscribers: Arc<SubscriberSetHandle>,
+        channels: Arc<RecordingChannelSink>,
+    }
+
+    impl PredictiveHarness {
+        /// Mirrors [`Harness::seed`] — see its docs.
+        fn seed(&self, subscriber: Subscriber) {
+            self.store.seed(subscriber.clone());
+            let mut current = (*self.subscribers.load()).clone();
+            current.push(subscriber);
+            self.subscribers.swap(current);
+        }
+    }
+
+    fn predictive_harness() -> PredictiveHarness {
+        let store = Arc::new(InMemoryNotificationStore::new());
+        let subscribers = Arc::new(SubscriberSetHandle::new(vec![]));
+        let channels = Arc::new(RecordingChannelSink::new());
+        let sink = Arc::new(RecordingSink::default());
+        let consumer = PredictiveConsumer::new(
+            store.clone(),
+            channels.clone(),
+            sink,
+            subscribers.clone(),
+            CancellationToken::new(),
+        )
+        .with_publish_backoff(Duration::from_millis(1));
+        PredictiveHarness {
+            consumer,
+            store,
+            subscribers,
+            channels,
         }
     }
 
@@ -918,6 +1172,84 @@ mod tests {
         assert_eq!(
             usage[0].event_type,
             UsageEventType::AlertDelivered.as_wire_str()
+        );
+    }
+
+    /// §16.4, Sprint 16 task 4: `predictive_topics` is a distinct list from
+    /// `consumed_topics` — the whole point of the opt-in, decoupled consumer.
+    #[test]
+    fn predictive_topics_are_disjoint_from_the_incident_stream_topics() {
+        let incident = consumed_topics();
+        let predictive = predictive_topics();
+        for topic in &predictive {
+            assert!(
+                !incident.contains(topic),
+                "{topic} must not also be one of the incident-stream topics"
+            );
+        }
+        assert_eq!(
+            predictive,
+            vec![
+                "mev.events.PredictedAlert",
+                "mev.events.LiquidationRiskPredicted",
+                "mev.events.LiquidationCascadeWarned",
+            ]
+        );
+    }
+
+    /// A risk-desk subscriber filtered on `AlertKind::Liquidation` receives
+    /// the liquidation-forecast event but not a `PredictedAlert` tagged with
+    /// a different kind — the routing this task wires up. Exercises
+    /// [`PredictiveConsumer`] directly (not [`NotificationConsumer`]): these
+    /// two events are only ever dispatched through the predictive consumer
+    /// in production, since `NotificationConsumer::run` never subscribes to
+    /// their topics.
+    #[tokio::test]
+    async fn a_risk_desk_subscriber_filters_liquidation_predictions_by_kind() {
+        let h = predictive_harness();
+        h.seed(webhook_subscriber(
+            CustomerId::new(),
+            SubscriptionFilter {
+                min_severity: None,
+                min_suggested_action: None,
+                kinds: Some(vec![AlertKind::Liquidation]),
+                chains: None,
+            },
+        ));
+
+        h.consumer
+            .handle(envelope(DomainEvent::PredictedAlert(PredictedAlert {
+                prediction_id: PredictionId::new(),
+                tx_hash: Default::default(),
+                addresses: vec![addr(1)],
+                kind: AlertKind::Sandwich,
+                confidence: Confidence::new(0.9),
+                provisional: true,
+            })))
+            .await;
+        assert!(
+            h.channels.deliveries().is_empty(),
+            "a Sandwich forecast doesn't match a Liquidation-only filter"
+        );
+
+        h.consumer
+            .handle(envelope(DomainEvent::LiquidationRiskPredicted(
+                LiquidationRiskPredicted {
+                    prediction_id: PredictionId::new(),
+                    protocol: LendingProtocol::Aave,
+                    account: addr(2),
+                    health_factor: 0.9,
+                    distance_pct: -10.0,
+                    severity: Severity::Critical,
+                    confidence: Confidence::new(1.0),
+                    provisional: true,
+                },
+            )))
+            .await;
+        assert_eq!(
+            h.channels.deliveries().len(),
+            1,
+            "the liquidation-risk forecast matches the risk-desk filter"
         );
     }
 

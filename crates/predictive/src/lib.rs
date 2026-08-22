@@ -50,6 +50,22 @@
 //! - [`http`] — live position/risk reads and a cascade what-if simulator
 //!   over the shared position tracker/cascade engine, Swagger-documented so
 //!   the pipeline is directly testable via Postman/Swagger UI, not just Kafka.
+//!
+//! Sprint 16 task 4 (§16.4/§19) also closes the loop on this whole pipeline:
+//! predictive events already publish on their own `mev.events.<EventType>`
+//! topics (§2 — one topic per type, opt-in for a consumer with no coupling
+//! to the incident stream), so what's left is measuring them and routing
+//! them —
+//!
+//! - [`metrics`] (extended) — [`metrics::record_prediction`], the §19
+//!   prediction-rate counter, alongside the existing cascade-walk metrics.
+//! - [`lead_time`] — [`lead_time::LeadTimeTracker`], pairing a
+//!   `LiquidationRiskPredicted` forecast with the real liquidation it warned
+//!   about, feeding [`metrics::record_liquidation_lead_time`] (§19's
+//!   lead-time-to-actual-liquidation accuracy signal).
+//! - `notification` consumes these topics on its own opt-in consumer task
+//!   (never the incident-stream one) and routes them to risk-desk
+//!   subscribers filtered on `AlertKind::Liquidation`.
 
 mod abi_words;
 pub mod cascade;
@@ -57,6 +73,7 @@ pub mod config;
 pub mod decode;
 pub mod http;
 pub mod intel_client;
+pub mod lead_time;
 pub mod lending_decode;
 pub mod metrics;
 pub mod position;

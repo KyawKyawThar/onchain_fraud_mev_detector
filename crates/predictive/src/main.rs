@@ -40,6 +40,7 @@ use predictive::cascade::{CascadeEngine, RiskThresholds};
 use predictive::config::Config;
 use predictive::http::{self as predictive_http, AppState};
 use predictive::intel_client::{IntelligenceClient, LabelLookup};
+use predictive::lead_time::LeadTimeTracker;
 use predictive::position::PositionTracker;
 use predictive::position_consumer::{self, PositionConsumer};
 use predictive::position_source::RpcLendingLogSource;
@@ -134,10 +135,16 @@ async fn run(cfg: Config) -> Result<()> {
         cfg.position_tracker.window_blocks,
         cfg.position_tracker.liquidation_thresholds,
     )));
+    // Sprint 16 task 4 (§16.4/§19): shared with the cascade engine below —
+    // it records a `LiquidationRiskPredicted` the moment it publishes one,
+    // and this consumer consumes it the moment the same `(protocol, account)`
+    // is really liquidated on-chain (see `lead_time`'s module docs).
+    let lead_time = Arc::new(Mutex::new(LeadTimeTracker::new()));
     let position_consumer = PositionConsumer::new(
         cfg.chain,
         position_log_source,
         Arc::clone(&position_tracker),
+        Arc::clone(&lead_time),
     );
     let position_shutdown = shutdown.clone();
     let position_task = tokio::spawn(async move {
@@ -183,6 +190,7 @@ async fn run(cfg: Config) -> Result<()> {
         price_rx,
         Arc::clone(&position_tracker),
         Arc::clone(&cascade_engine),
+        Arc::clone(&lead_time),
         CascadeParams {
             assets: Arc::clone(&assets),
             thresholds: cfg.cascade.thresholds,
@@ -282,6 +290,7 @@ async fn run_consumer(
             provisional: true,
         };
         let envelope = EventEnvelope::new(chain, DomainEvent::PredictedAlert(alert));
+        predictive_metrics::record_prediction(envelope.event_type());
         publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
     }
 }
@@ -313,6 +322,7 @@ async fn run_cascade(
     mut rx: mpsc::Receiver<PriceTick>,
     tracker: Arc<Mutex<PositionTracker>>,
     engine: Arc<Mutex<CascadeEngine>>,
+    lead_time: Arc<Mutex<LeadTimeTracker>>,
     params: CascadeParams,
     sink: Arc<dyn EventSink>,
     shutdown: CancellationToken,
@@ -384,6 +394,13 @@ async fn run_cascade(
                 provisional: true,
             };
             let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationRiskPredicted(alert));
+            predictive_metrics::record_prediction(envelope.event_type());
+            // §16.4/§19: remember this forecast so a real liquidation of the
+            // same `(protocol, account)` can report how much warning it got.
+            lead_time
+                .lock()
+                .unwrap()
+                .record_prediction(key, envelope.occurred_at);
             publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
         }
 
@@ -404,6 +421,7 @@ async fn run_cascade(
                 provisional: true,
             };
             let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationCascadeWarned(alert));
+            predictive_metrics::record_prediction(envelope.event_type());
             publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
         }
     }

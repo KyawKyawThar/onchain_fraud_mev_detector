@@ -49,6 +49,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
+# Lead-time-to-actual-liquidation tracking (§19, Sprint 16 task 4) — the one
+# place in this crate that reads wall-clock time (`crate::lead_time`).
+chrono = { workspace = true }
 alloy-primitives = { workspace = true }
 # `join_all` — predict-engine fans its per-counterparty label lookups out
 # concurrently rather than one `.await` at a time (§16, §17 sub-block
