@@ -19,6 +19,23 @@
 //! ancestor's snapshot *is* the state as of the ancestor, no replay of
 //! undo-deltas required.
 //!
+//! ## Idempotent under redelivery (§7), symmetric with `revert_tip`
+//!
+//! [`revert_tip`](Self::revert_tip) has always been tip-conditional so that
+//! replaying a redelivered `BlockReverted` is safe (`detection::reorg`'s
+//! module docs: "resilience covers staleness... a consumer can still *see* a
+//! duplicate"). [`apply`](Self::apply) is the other half of that same
+//! contract, and — until this pass — didn't hold it: `event_bus::run_consumer`
+//! commits offsets with `CommitMode::Async` and documents outright that a
+//! commit failure means "the broker redelivers an uncommitted record", which
+//! can happen without a process restart (the in-memory accumulator survives,
+//! unlike a crash). A redelivered `BlockCanonicalized` for a block already at
+//! or below the tip must not be re-applied — the caller's `state` argument
+//! already reflects it, so folding it in again double-counts. [`apply`] now
+//! ignores any `block.number` at or below the current tip rather than
+//! unconditionally pushing a new version, the same "idempotent to a stale
+//! resend" stance `revert_tip` already took.
+//!
 //! ## Snapshot-per-block, not a delta/undo-log
 //!
 //! Storing a full snapshot per block trades memory for correctness, and over a
@@ -110,20 +127,34 @@ impl<S> CrossBlockState<S> {
     }
 
     /// Record `state` as of applying canonical `block`, becoming the new tip,
-    /// and prune versions that have fallen outside the window.
+    /// and prune versions that have fallen outside the window — *unless*
+    /// `block` is already at or below the current tip, in which case this is
+    /// a no-op (module docs' "idempotent under redelivery").
     ///
-    /// Blocks must be applied in strictly ascending number order (the caller
-    /// feeds canonical blocks in order). A wiring bug that applies out of order is
-    /// caught by `debug_assert!` — loud in test/CI builds, compiled out of the
-    /// release hot path, the same discipline as
-    /// [`DetectionCtx::with_enrichment`](crate::DetectionCtx::with_enrichment).
+    /// A `block.number` at or below the tip is expected to be an
+    /// at-least-once redelivery of an already-applied block, not a caller
+    /// bug, so it is silently ignored — `self` already reflects it. The one
+    /// case that genuinely *is* a wiring bug — a **different** block
+    /// (mismatched hash) claiming the current tip's height without an
+    /// intervening [`revert_tip`](Self::revert_tip)/[`rewind_to`](Self::rewind_to)
+    /// — is still caught loudly by `debug_assert!` (loud in test/CI builds,
+    /// compiled out of the release hot path, the same discipline as
+    /// [`DetectionCtx::with_enrichment`](crate::DetectionCtx::with_enrichment)),
+    /// but even there the safe response is to ignore the apply rather than
+    /// silently overwrite the retained tip with an un-reverted branch.
     pub fn apply(&mut self, block: BlockRef, state: S) {
-        debug_assert!(
-            self.tip().is_none_or(|tip| block.number > tip.number),
-            "cross-block state applied out of order: block {} after tip {}",
-            block.number,
-            self.tip().map(|t| t.number).unwrap_or_default(),
-        );
+        if let Some(tip) = self.tip() {
+            debug_assert!(
+                block.number != tip.number || block == tip,
+                "cross-block state applied a different block at the tip height \
+                 ({} vs retained tip {}) without an intervening revert",
+                block.number,
+                tip.number,
+            );
+            if block.number <= tip.number {
+                return;
+            }
+        }
         self.versions.push_back(Version { block, state });
         self.prune_to_window();
     }
@@ -220,6 +251,52 @@ mod tests {
         assert_eq!(s.current(), Some(&40));
         assert_eq!(s.tip(), Some(block(3)));
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn reapplying_the_exact_tip_is_a_no_op() {
+        // §7: an at-least-once redelivery of the block just applied (no crash
+        // in between — `run_consumer`'s async commit can lose an ack) must
+        // not double-fold its contribution into `state`.
+        let mut s = CrossBlockState::new(8);
+        s.apply(block(1), 10u64);
+        s.apply(block(2), 25);
+
+        s.apply(block(2), 999); // redelivered — must be ignored, not overwrite
+        assert_eq!(
+            s.current(),
+            Some(&25),
+            "the redelivered apply must be dropped"
+        );
+        assert_eq!(s.tip(), Some(block(2)));
+        assert_eq!(s.len(), 2, "no duplicate version pushed");
+    }
+
+    #[test]
+    fn reapplying_an_older_retained_block_is_a_no_op() {
+        let mut s = CrossBlockState::new(8);
+        s.apply(block(1), 10u64);
+        s.apply(block(2), 25);
+        s.apply(block(3), 40);
+
+        s.apply(block(1), 999); // a stale redelivery well behind the tip
+        assert_eq!(s.current(), Some(&40));
+        assert_eq!(s.tip(), Some(block(3)));
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "without an intervening revert")]
+    fn a_different_block_at_the_tip_height_without_a_revert_is_a_caught_wiring_bug() {
+        // Not a redelivery — a genuinely different block claiming the
+        // current tip's height means the caller skipped `revert_tip` before
+        // applying the new branch. Caught loudly here (debug/test builds);
+        // a release build still safely ignores it (see `apply`'s doc).
+        let mut s = CrossBlockState::new(8);
+        s.apply(block(1), 10u64);
+        s.apply(block(2), 25);
+
+        s.apply(forked_block(2, 0xAB), 999);
     }
 
     #[test]

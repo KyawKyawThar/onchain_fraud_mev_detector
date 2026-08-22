@@ -301,6 +301,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redelivered_canonicalized_block_does_not_double_count_its_collateral() {
+        // §7: `event_bus::run_consumer` commits offsets asynchronously and can
+        // redeliver an already-handled record without a process restart —
+        // `CrossBlockState::apply`'s idempotency guard must stop this from
+        // folding the same Mint's collateral into the tracked position twice.
+        let market = addr(0xC1);
+        let minter = addr(0x11);
+        let b = block(1);
+        let mut by_hash = HashMap::new();
+        by_hash.insert(b.hash, vec![mint_log(market, minter, 1_000)]);
+        let c = consumer(FakeSource::new(by_hash));
+
+        for _ in 0..2 {
+            let handled = c
+                .dispatch(envelope(
+                    Chain::ETHEREUM,
+                    DomainEvent::BlockCanonicalized(BlockCanonicalized { block: b }),
+                ))
+                .await;
+            assert_eq!(handled, Handled::Commit);
+        }
+
+        let tracker = c.tracker.lock().unwrap();
+        let position = tracker
+            .current()
+            .unwrap()
+            .get(&crate::position::PositionKey {
+                protocol: Protocol::Compound,
+                account: minter,
+            })
+            .expect("position opened from the decoded Mint");
+        assert_eq!(
+            position.collateral.get(&market),
+            Some(&U256::from(1_000u64)),
+            "the redelivered block must not double the tracked collateral"
+        );
+    }
+
+    #[tokio::test]
     async fn a_block_with_no_recognized_logs_still_advances_the_tip() {
         let c = consumer(FakeSource::empty());
         let handled = c
