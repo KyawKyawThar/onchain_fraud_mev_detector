@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
+use events::cross_chain::{BridgeMevDetected, CrossChainLegRef, CrossChainMevDetected};
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
     AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
@@ -327,6 +328,46 @@ fn sample_events() -> Vec<DomainEvent> {
             confidence: Confidence::CERTAIN,
             provisional: true,
         }),
+        // Cross-chain (§24)
+        DomainEvent::BridgeMevDetected(BridgeMevDetected {
+            bridge: "usdc-eth-base".into(),
+            deposit_leg: CrossChainLegRef {
+                chain: Chain::ETHEREUM,
+                block: block(),
+                tx: tx(),
+            },
+            fill_leg: CrossChainLegRef {
+                chain: Chain::BASE,
+                block: BlockRef::new(8_453_000, B256::repeat_byte(0x66)),
+                tx: B256::repeat_byte(0x77),
+            },
+            entity_hint: addr(),
+            profit: 5_000.0,
+            victim_loss: 4_800.0,
+            confidence: Confidence::new(0.8),
+            severity: Severity::High,
+        }),
+        DomainEvent::CrossChainMevDetected(CrossChainMevDetected {
+            kind: AlertKind::Arbitrage,
+            bridge: "usdc-eth-base".into(),
+            legs: vec![
+                CrossChainLegRef {
+                    chain: Chain::ETHEREUM,
+                    block: block(),
+                    tx: tx(),
+                },
+                CrossChainLegRef {
+                    chain: Chain::BASE,
+                    block: BlockRef::new(8_453_000, B256::repeat_byte(0x66)),
+                    tx: B256::repeat_byte(0x77),
+                },
+            ],
+            entity_hint: addr(),
+            profit: 12_000.0,
+            latency_ms: 4_500,
+            confidence: Confidence::new(0.75),
+            severity: Severity::Medium,
+        }),
     ]
 }
 
@@ -457,6 +498,14 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "LiquidationCascadeWarned",
         r#"{"type":"LiquidationCascadeWarned","payload":{"prediction_id":"00000000-0000-0000-0000-0000000000f1","trigger_asset":"0x4444444444444444444444444444444444444444","trigger_price":1500.0,"reflexive_depth":2,"accounts":["0x3333333333333333333333333333333333333333"],"aggregate_at_risk_usd":40000000.0,"hub_capped":false,"confidence":1.0,"provisional":true}}"#,
+    ),
+    (
+        "BridgeMevDetected",
+        r#"{"type":"BridgeMevDetected","payload":{"bridge":"usdc-eth-base","deposit_leg":{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},"fill_leg":{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"},"entity_hint":"0x3333333333333333333333333333333333333333","profit":5000.0,"victim_loss":4800.0,"confidence":0.8,"severity":"high"}}"#,
+    ),
+    (
+        "CrossChainMevDetected",
+        r#"{"type":"CrossChainMevDetected","payload":{"kind":"arbitrage","bridge":"usdc-eth-base","legs":[{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"}],"entity_hint":"0x3333333333333333333333333333333333333333","profit":12000.0,"latency_ms":4500,"confidence":0.75,"severity":"medium"}}"#,
     ),
 ];
 
