@@ -58,7 +58,7 @@
 //! requires re-keying the rule-engine's feed by address first — documented in
 //! `worker.rs`; until then, scale is the in-process partition count.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -66,6 +66,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bounded_map::BoundedFifoMap;
 use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
@@ -497,69 +498,6 @@ pub async fn drain_fires(emitter: Arc<FireEmitter>, mut fires: mpsc::Receiver<Te
         emitter
             .emit(TEMPORAL_FIRE_CHAIN, Fire::temporal(fire))
             .await;
-    }
-}
-
-// ── Bounded FIFO map (the attribution consumer's tolerance, locally) ───────
-
-/// A `HashMap` bounded to `capacity` distinct keys, FIFO-evicting the oldest
-/// on overflow — same shape as `intelligence::attribution`'s (private) map,
-/// for the same reason: unbounded correlation buffers are a memory-exhaustion
-/// vector.
-struct BoundedFifoMap<K, V> {
-    capacity: usize,
-    what: &'static str,
-    entries: HashMap<K, V>,
-    order: VecDeque<K>,
-}
-
-impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
-    fn new(capacity: usize, what: &'static str) -> Self {
-        Self {
-            capacity,
-            what,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn put(&mut self, key: K, value: V) {
-        if !self.entries.contains_key(&key) {
-            self.evict_to_fit();
-            self.order.push_back(key);
-        }
-        self.entries.insert(key, value);
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.entries.get(key)
-    }
-
-    fn take(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key)
-    }
-
-    fn evict_to_fit(&mut self) {
-        if self.capacity == 0 {
-            return;
-        }
-        while self.entries.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    if self.entries.remove(&oldest).is_some() {
-                        tracing::warn!(
-                            key = %oldest,
-                            capacity = self.capacity,
-                            what = self.what,
-                            "rule-engine consumer's bounded buffer is full; evicting the \
-                             oldest entry — check for a stalled upstream partition"
-                        );
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
     }
 }
 

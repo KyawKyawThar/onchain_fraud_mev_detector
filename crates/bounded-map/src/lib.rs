@@ -1,20 +1,33 @@
 //! [`BoundedFifoMap`] — a `HashMap` bounded to a fixed number of distinct
 //! keys, FIFO-evicting the oldest on overflow.
 //!
-//! The bounded-memory discipline every buffering consumer in this crate
-//! shares (mirrors `simulation::projection`'s `OrphanBuffer`): an attacker (or
-//! a stalled upstream partition) flooding a correlation buffer with entries
-//! that never resolve must not grow memory without bound. Extracted from
-//! [`crate::attribution`] when the block-production consumer (§10) needed the
-//! identical structure for its own cross-topic buffers.
+//! The bounded-memory discipline every correlation/orphan buffer on the
+//! backbone shares: an attacker (or a stalled upstream partition) flooding a
+//! buffer with entries that never resolve must not grow memory without
+//! bound. Originally grown inside `intelligence::attribution` (Sprint 7 t4),
+//! then copy-pasted byte-for-byte (with the same doc comment admitting it)
+//! into `intelligence::production_consumer` (§10), `rule_engine::consumer`
+//! (Sprint 9 t4) and `notification::consumer` (Sprint 12), plus two more
+//! independently-written buffers in `simulation` (Sprint 6 t5, Sprint 17
+//! t4) — five near-identical copies across five crates before this got
+//! pulled out. If you're about to write a sixth, depend on this instead.
+//!
+//! This crate deliberately stays a primitive: `put`/`get`/`get_mut`/`take`
+//! plus the `Vec`-value `retain_values` convenience. "Buffer this value under
+//! this key, appending if one already exists, and tell me whether it was
+//! new" is a policy each call site's own value type decides differently
+//! (compare-then-skip-duplicates for a `Vec<Terminal>`, plain overwrite for a
+//! `(String, DateTime<Utc>)`) — composed by the caller on top of these
+//! primitives, not baked in here.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
 /// A `HashMap` bounded to `capacity` distinct keys, FIFO-evicting the oldest
 /// on overflow. `what` names the buffer in the eviction warning so multiple
-/// bounded buffers in one consumer stay distinguishable.
-pub(crate) struct BoundedFifoMap<K, V> {
+/// bounded buffers in one consumer stay distinguishable in logs.
+#[derive(Debug)]
+pub struct BoundedFifoMap<K, V> {
     capacity: usize,
     what: &'static str,
     entries: HashMap<K, V>,
@@ -22,7 +35,10 @@ pub(crate) struct BoundedFifoMap<K, V> {
 }
 
 impl<K: Eq + Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
-    pub(crate) fn new(capacity: usize, what: &'static str) -> Self {
+    /// `capacity` is the max distinct keys held at once; `0` means unbounded
+    /// (a deliberate opt-out, not the default — every production call site
+    /// should pass a real cap). `what` names this buffer in eviction warnings.
+    pub fn new(capacity: usize, what: &'static str) -> Self {
         Self {
             capacity,
             what,
@@ -33,7 +49,7 @@ impl<K: Eq + Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
 
     /// Insert/overwrite `key`. Evicts the oldest distinct key first if this is
     /// a *new* key and the map is at capacity.
-    pub(crate) fn put(&mut self, key: K, value: V) {
+    pub fn put(&mut self, key: K, value: V) {
         if !self.entries.contains_key(&key) {
             self.evict_to_fit();
             self.order.push_back(key);
@@ -41,25 +57,30 @@ impl<K: Eq + Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
         self.entries.insert(key, value);
     }
 
-    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+    pub fn get(&self, key: &K) -> Option<&V> {
         self.entries.get(key)
     }
 
     /// Mutable access to an existing entry — appending to a `Vec` value in
     /// place without the take-then-put dance (which would duplicate the key in
     /// the eviction order).
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         self.entries.get_mut(key)
     }
 
     /// Remove and return the value for `key`, if buffered.
-    pub(crate) fn take(&mut self, key: &K) -> Option<V> {
+    pub fn take(&mut self, key: &K) -> Option<V> {
         self.entries.remove(key)
     }
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    /// Distinct keys currently buffered — the gauge a consuming shell exports
+    /// for alarming on a non-draining buffer (§19).
+    pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     fn evict_to_fit(&mut self) {
@@ -91,7 +112,7 @@ impl<K: Eq + Hash + Copy + std::fmt::Display, T> BoundedFifoMap<K, Vec<T>> {
     /// Retain only the elements matching `keep` inside every buffered `Vec`
     /// value — how a consumer scrubs a since-retracted item out of its pending
     /// buffers without knowing which key it was buffered under.
-    pub(crate) fn retain_values(&mut self, mut keep: impl FnMut(&T) -> bool) {
+    pub fn retain_values(&mut self, mut keep: impl FnMut(&T) -> bool) {
         for value in self.entries.values_mut() {
             value.retain(&mut keep);
         }
@@ -138,5 +159,26 @@ mod tests {
         map.put(2, vec![]);
         map.put(3, vec![]);
         assert!(map.get(&1).is_none());
+    }
+
+    #[test]
+    fn zero_capacity_is_unbounded() {
+        let mut map: BoundedFifoMap<u32, u8> = BoundedFifoMap::new(0, "test");
+        for key in 0..1000u32 {
+            map.put(key, 1);
+        }
+        assert_eq!(map.len(), 1000);
+    }
+
+    #[test]
+    fn retain_values_scrubs_matching_elements_across_every_key() {
+        let mut map: BoundedFifoMap<u32, Vec<u8>> = BoundedFifoMap::new(0, "test");
+        map.put(1, vec![1, 2, 3]);
+        map.put(2, vec![2, 4]);
+
+        map.retain_values(|value| *value != 2);
+
+        assert_eq!(map.get(&1), Some(&vec![1, 3]));
+        assert_eq!(map.get(&2), Some(&vec![4]));
     }
 }

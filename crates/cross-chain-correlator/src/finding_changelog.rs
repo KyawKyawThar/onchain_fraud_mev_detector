@@ -56,26 +56,16 @@ use events::primitives::{Chain, CrossChainFindingId};
 /// here — finality/reorg is decided at the block level).
 pub type LegKey = (Chain, alloy_primitives::B256);
 
-/// Which behaviour a tracked finding is — a closed, typed alternative to a
-/// bare `&'static str` so the changelog (and [`crate::finality`]'s tracker)
-/// have a real serde shape instead of an opaque string. [`Self::as_str`]
-/// bridges back to the label this crate's metrics/logs already key on
-/// (`crate::metrics::FINDINGS_TOTAL` et al.) — that existing string
-/// vocabulary is kept as-is rather than renamed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FindingKind {
-    BridgeMev,
-    CrossChainMev,
-}
-
-impl FindingKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FindingKind::BridgeMev => "bridge_mev",
-            FindingKind::CrossChainMev => "cross_chain_mev",
-        }
-    }
-}
+/// Which behaviour a tracked finding is. Re-exported under this crate's own
+/// established name (rather than every call site importing
+/// `events::cross_chain::CrossChainFindingKind` directly) so `actor.rs`/
+/// `finality.rs` need no changes — the canonical *definition* now lives in
+/// `events::cross_chain` (§24) since `intelligence`'s block-production
+/// snapshots and `simulation`'s `cross_chain_findings` read model both need
+/// the identical vocabulary and previously each grew their own copy. Wire
+/// format is unaffected: serde encodes by variant name, not module path, and
+/// [`Self::as_str`]'s strings are unchanged.
+pub use events::cross_chain::CrossChainFindingKind as FindingKind;
 
 /// The changelog-append seam — mirrors `crate::changelog::ChangelogSink`
 /// exactly (a trait, not a bare writer type, so tests substitute an

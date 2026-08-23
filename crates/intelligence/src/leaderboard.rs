@@ -21,6 +21,14 @@
 //!
 //! The ClickHouse query is the only I/O; the share math is a pure function with
 //! its own unit tests, so the interesting logic is testable without a database.
+//!
+//! **Not yet surfaced here (Sprint 17 t4 scope boundary):** the per-block
+//! `cross_chain_bridge_count`/`cross_chain_arb_count`/
+//! `cross_chain_provisional_usd` columns [`crate::production_store`] added
+//! (§24) are written and readable per-block, but this leaderboard's
+//! aggregation, proto, and the public API-service proxy don't roll them up
+//! into `BuilderStats`/`RelayStats` yet — a documented follow-up, not a gap in
+//! the underlying data.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

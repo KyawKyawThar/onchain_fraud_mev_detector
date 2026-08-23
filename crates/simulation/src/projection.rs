@@ -81,8 +81,9 @@
 //! metrics (§19), keeping this fold exporter-agnostic.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
+use bounded_map::BoundedFifoMap;
 use chrono::{DateTime, Utc};
 use events::primitives::{AccountAddress, AlertId, AlertKind, IncidentId, Severity, UsdAmount};
 use events::simulation::{
@@ -358,29 +359,26 @@ enum Terminal {
 pub const DEFAULT_ORPHAN_CAPACITY: usize = 100_000;
 
 /// FIFO-bounded buffer of terminal (incident-keyed) events awaiting the `IncidentCreated`
-/// that links their `incident_id` to an alert row — the same bounded-map discipline as
-/// [`crate::cache`], because an unbounded orphan map is a memory-exhaustion vector under a
-/// flood of terminals for incidents that never get created.
+/// that links their `incident_id` to an alert row — a thin, policy-specific wrapper over
+/// the shared [`bounded_map::BoundedFifoMap`] primitive: "buffer this terminal, appending
+/// if others are already held for this incident, and tell me whether it's a redelivered
+/// duplicate" is this buffer's own decision, not the primitive's.
 ///
 /// Bounded by *distinct incident count*. At capacity the oldest orphaned incident is
-/// evicted whole (its buffered terminals are dropped and a warning logged): if that
-/// incident's `IncidentCreated` later arrives, its retraction/finalization is lost — an
-/// accepted trade-off, since a non-draining orphan set signals upstream partition breakage
-/// (surfaced by the log/metric), and bounded memory beats perfect retention under attack.
+/// evicted whole (its buffered terminals are dropped and a warning logged, via the shared
+/// primitive): if that incident's `IncidentCreated` later arrives, its retraction/
+/// finalization is lost — an accepted trade-off, since a non-draining orphan set signals
+/// upstream partition breakage (surfaced by the log/metric), and bounded memory beats
+/// perfect retention under attack.
 #[derive(Debug)]
 struct OrphanBuffer {
-    capacity: usize,
-    terminals: HashMap<IncidentId, Vec<Terminal>>,
-    /// First-seen order of the buffered incident ids — the FIFO eviction order.
-    order: VecDeque<IncidentId>,
+    inner: BoundedFifoMap<IncidentId, Vec<Terminal>>,
 }
 
 impl OrphanBuffer {
     fn new(capacity: usize) -> Self {
         Self {
-            capacity,
-            terminals: HashMap::new(),
-            order: VecDeque::new(),
+            inner: BoundedFifoMap::new(capacity, "incident projection orphan buffer"),
         }
     }
 
@@ -388,56 +386,26 @@ impl OrphanBuffer {
     /// redelivered identical terminal already held is a no-op (`false`). Buffering a
     /// *new* incident evicts the oldest first when at capacity.
     fn buffer(&mut self, incident_id: IncidentId, terminal: Terminal) -> bool {
-        if let Some(existing) = self.terminals.get_mut(&incident_id) {
+        if let Some(existing) = self.inner.get_mut(&incident_id) {
             if existing.contains(&terminal) {
                 return false;
             }
             existing.push(terminal);
             return true;
         }
-
-        self.evict_to_fit();
-        self.terminals.insert(incident_id, vec![terminal]);
-        self.order.push_back(incident_id);
+        self.inner.put(incident_id, vec![terminal]);
         true
     }
 
     /// Remove and return every terminal buffered for `incident_id`, once its
-    /// `IncidentCreated` links it. The stale `order` entry is reaped lazily on eviction.
+    /// `IncidentCreated` links it.
     fn take(&mut self, incident_id: &IncidentId) -> Option<Vec<Terminal>> {
-        self.terminals.remove(incident_id)
+        self.inner.take(incident_id)
     }
 
     /// How many distinct incidents are currently orphaned — the gauge ops alarms on.
     fn len(&self) -> usize {
-        self.terminals.len()
-    }
-
-    /// Drop oldest orphaned incidents until there is room for one more (capacity `0` means
-    /// unbounded — a deliberate opt-out, not the default). Skips `order` entries already
-    /// drained by [`take`](Self::take).
-    fn evict_to_fit(&mut self) {
-        if self.capacity == 0 {
-            return;
-        }
-        while self.terminals.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    if let Some(dropped) = self.terminals.remove(&oldest) {
-                        tracing::warn!(
-                            incident_id = %oldest,
-                            dropped_terminals = dropped.len(),
-                            capacity = self.capacity,
-                            "incident projection orphan buffer full; evicting oldest \
-                             uncorrelated incident — check for a stalled upstream partition"
-                        );
-                        break;
-                    }
-                    // Already drained by `take`: freed a slot for free, keep popping.
-                }
-                None => break, // order empty but map full shouldn't happen; bail safe.
-            }
-        }
+        self.inner.len()
     }
 }
 

@@ -20,12 +20,13 @@ use events::primitives::{AccountAddress, Chain, CustomerId, Severity};
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
+use crate::cross_chain_projection::CrossChainFindingRecord;
 use crate::exposure::{self, MevExposureSummary};
 use crate::monitored_wallet_store::{AddOutcome, MonitoredWallet, MonitoredWalletStore};
 use crate::projection::{IncidentRecord, IncidentStatus};
 use crate::store::{
-    IncidentCursor, IncidentFilters, IncidentStore, PgIncidentStore, TimingStore,
-    WalletExposureStore,
+    CrossChainFindingFilters, CrossChainFindingStore, IncidentCursor, IncidentFilters,
+    IncidentStore, PgIncidentStore, TimingStore, WalletExposureStore,
 };
 use crate::timing::{self, SizeBand, TimingRecommendation};
 
@@ -43,6 +44,10 @@ pub struct AppState {
     pub timing: Arc<dyn TimingStore>,
     /// Backs the `/v1/monitored-wallets` opt-in CRUD (§25, Sprint 15 t5).
     pub monitored_wallets: Arc<dyn MonitoredWalletStore>,
+    /// Backs the `cross_chain_findings` array `GET /v1/incidents` also returns
+    /// (§24, Sprint 17 t4) — a separate read model, see
+    /// [`crate::cross_chain_projection`]'s module docs.
+    pub cross_chain: Arc<dyn CrossChainFindingStore>,
 }
 
 /// Build the router: `/v1/incidents`, `/v1/wallet/{addr}/mev-exposure`,
@@ -81,7 +86,11 @@ async fn healthz(State(state): State<AppState>) -> Result<&'static str, ApiError
 }
 
 /// Query string for `GET /v1/incidents`: an optional status filter and keyset
-/// pagination (`limit` + `cursor`). Every field is optional.
+/// pagination (`limit` + `cursor`), plus the independent cross-chain-finding
+/// narrowing (§24, Sprint 17 t4) — its own params rather than overloading
+/// `status`/`limit`, since a finding's lifecycle isn't the incident status
+/// ladder (see [`crate::cross_chain_projection`]'s module docs). Every field
+/// is optional.
 #[derive(Debug, Deserialize)]
 struct ListParams {
     /// `unconfirmed` | `confirmed` | `finalized` | `retracted`.
@@ -90,21 +99,29 @@ struct ListParams {
     limit: Option<u64>,
     /// Opaque cursor from a previous page's `next_cursor`; resumes after it.
     cursor: Option<String>,
+    /// Narrow `cross_chain_findings` to live (`false`) or retracted (`true`)
+    /// only; unset returns both.
+    cross_chain_retracted: Option<bool>,
+    /// Max `cross_chain_findings` rows (clamped server-side; no cursor — see
+    /// [`crate::store::CrossChainFindingFilters`]'s docs on why).
+    cross_chain_limit: Option<u64>,
 }
 
 impl ListParams {
-    fn into_filters(self) -> Result<IncidentFilters, ApiError> {
+    fn incident_filters(&self) -> Result<IncidentFilters, ApiError> {
         let status = self
             .status
+            .as_deref()
             .map(|raw| {
-                IncidentStatus::parse(&raw)
+                IncidentStatus::parse(raw)
                     .ok_or_else(|| ApiError::bad_request(format!("invalid status `{raw}`")))
             })
             .transpose()?;
         let cursor = self
             .cursor
+            .as_deref()
             .map(|token| {
-                IncidentCursor::parse(&token)
+                IncidentCursor::parse(token)
                     .ok_or_else(|| ApiError::bad_request(format!("invalid cursor `{token}`")))
             })
             .transpose()?;
@@ -113,6 +130,13 @@ impl ListParams {
             cursor,
             limit: self.limit,
         })
+    }
+
+    fn cross_chain_filters(&self) -> CrossChainFindingFilters {
+        CrossChainFindingFilters {
+            retracted: self.cross_chain_retracted,
+            limit: self.cross_chain_limit,
+        }
     }
 }
 
@@ -151,29 +175,102 @@ impl From<&IncidentRecord> for IncidentDto {
     }
 }
 
+/// One leg of a [`CrossChainFindingDto`] (§24) — the wire shape of
+/// [`events::cross_chain::CrossChainLegRef`].
+#[derive(Debug, Serialize)]
+struct CrossChainLegDto {
+    chain: u64,
+    block_number: u64,
+    block_hash: String,
+    tx: String,
+}
+
+/// One row of `GET /v1/incidents`'s `cross_chain_findings` array (§24, Sprint
+/// 17 t4) — a wire-shaped projection of [`CrossChainFindingRecord`], kept
+/// deliberately separate from [`IncidentDto`] rather than merged into it (see
+/// [`crate::cross_chain_projection`]'s module docs on why). `provisional`
+/// isn't a field here because it's always `true` and never flips (§24) —
+/// `retracted` is the only lifecycle bit that matters to a reader.
+#[derive(Debug, Serialize)]
+struct CrossChainFindingDto {
+    finding_id: String,
+    kind: &'static str,
+    bridge: String,
+    legs: Vec<CrossChainLegDto>,
+    entity_hint: String,
+    profit: f64,
+    victim_loss: f64,
+    confidence: f64,
+    severity: &'static str,
+    retracted: bool,
+    retraction_reason: Option<String>,
+    observed_at: DateTime<Utc>,
+}
+
+impl From<&CrossChainFindingRecord> for CrossChainFindingDto {
+    fn from(record: &CrossChainFindingRecord) -> Self {
+        Self {
+            finding_id: record.finding_id.to_string(),
+            kind: record.kind.as_str(),
+            bridge: record.bridge.clone(),
+            legs: record
+                .legs
+                .iter()
+                .map(|leg| CrossChainLegDto {
+                    chain: leg.chain.id(),
+                    block_number: leg.block.number,
+                    block_hash: format!("{:#x}", leg.block.hash),
+                    tx: format!("{:#x}", leg.tx),
+                })
+                .collect(),
+            entity_hint: format!("{:#x}", record.entity_hint),
+            profit: record.profit,
+            victim_loss: record.victim_loss,
+            confidence: record.confidence.get(),
+            severity: <&'static str>::from(record.severity),
+            retracted: record.retracted,
+            retraction_reason: record.retraction_reason.clone(),
+            observed_at: record.observed_at,
+        }
+    }
+}
+
 /// Response body: a page of incidents plus the cursor to fetch the next page
-/// (`null` when the listing is exhausted).
+/// (`null` when the listing is exhausted), plus the cross-chain findings array
+/// (§24, Sprint 17 t4) — its own unpaginated, capped listing (see
+/// [`crate::store::CrossChainFindingFilters`]'s docs).
 #[derive(Debug, Serialize)]
 struct IncidentPageResponse {
     incidents: Vec<IncidentDto>,
     next_cursor: Option<String>,
+    cross_chain_findings: Vec<CrossChainFindingDto>,
 }
 
 /// `GET /v1/incidents` — confirmed-incident rows, newest-updated first, optionally
-/// narrowed by `status` and paginated.
+/// narrowed by `status` and paginated, plus cross-chain findings (§24) newest-observed
+/// first, optionally narrowed by `cross_chain_retracted`/`cross_chain_limit`.
 async fn list_incidents(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<IncidentPageResponse>, ApiError> {
     let page = state
         .store
-        .list_incidents(&params.into_filters()?)
+        .list_incidents(&params.incident_filters()?)
+        .await
+        .map_err(ApiError::internal)?;
+    let cross_chain_findings = state
+        .cross_chain
+        .list_findings(&params.cross_chain_filters())
         .await
         .map_err(ApiError::internal)?;
 
     Ok(Json(IncidentPageResponse {
         incidents: page.incidents.iter().map(IncidentDto::from).collect(),
         next_cursor: page.next_cursor.map(|cursor| cursor.token()),
+        cross_chain_findings: cross_chain_findings
+            .iter()
+            .map(CrossChainFindingDto::from)
+            .collect(),
     }))
 }
 
@@ -374,6 +471,26 @@ mod tests {
         }
     }
 
+    /// Unused by these handlers, but `AppState` needs a
+    /// [`CrossChainFindingStore`] to construct (§24, Sprint 17 t4).
+    struct UnusedCrossChainFindingStore;
+
+    #[async_trait]
+    impl CrossChainFindingStore for UnusedCrossChainFindingStore {
+        async fn upsert_finding(
+            &self,
+            _record: &CrossChainFindingRecord,
+        ) -> Result<(), PersistError> {
+            unimplemented!("not exercised by these handler tests")
+        }
+        async fn list_findings(
+            &self,
+            _filters: &CrossChainFindingFilters,
+        ) -> Result<Vec<CrossChainFindingRecord>, PersistError> {
+            unimplemented!("not exercised by these handler tests")
+        }
+    }
+
     fn state(rows: Vec<ExposureRow>) -> AppState {
         // `connect_lazy` does no I/O — nothing here ever dials Postgres, since
         // `pg` (only used by `/healthz`) is never touched by this handler.
@@ -385,6 +502,7 @@ mod tests {
             exposure: Arc::new(InMemoryWalletExposure::new(rows)),
             timing: Arc::new(InMemoryTimingStore::default()),
             monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
+            cross_chain: Arc::new(UnusedCrossChainFindingStore),
         }
     }
 
@@ -403,6 +521,7 @@ mod tests {
             exposure: Arc::new(InMemoryWalletExposure::default()),
             timing: Arc::new(InMemoryTimingStore::new(rows)),
             monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
+            cross_chain: Arc::new(UnusedCrossChainFindingStore),
         }
     }
 
@@ -418,6 +537,7 @@ mod tests {
             exposure: Arc::new(InMemoryWalletExposure::default()),
             timing: Arc::new(InMemoryTimingStore::default()),
             monitored_wallets: Arc::new(InMemoryMonitoredWalletStore::new()),
+            cross_chain: Arc::new(UnusedCrossChainFindingStore),
         }
     }
 

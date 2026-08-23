@@ -1,14 +1,26 @@
-# ── intelligence (§8/§10/§11) — three run modes, three Deployments ─────
-#   attribute        — the label/attribution consumer (default mode).
-#                      Single writer: the in-process MergeActor serializes
-#                      entity merges and does NOT coordinate across processes,
-#                      so replicas: 1 + Recreate.
-#   grpc             — the IntelligenceRead read path (§20 "scale read path"):
-#                      stateless over Redis cache-aside + Postgres/ClickHouse
-#                      → replicas + HPA.
-#   block-production — §10 builder/relay pipeline (PBS/Ethereum-specific,
-#                      gated on INTEL_PRODUCTION_CHAIN_ID=1). Pending-writes
-#                      flush queue is per-instance → 1 + Recreate.
+# ── intelligence (§8/§10/§11/§24) — four run modes, four Deployments ────
+#   attribute             — the label/attribution consumer (default mode).
+#                           Single writer: the in-process MergeActor serializes
+#                           entity merges and does NOT coordinate across
+#                           processes, so replicas: 1 + Recreate.
+#   cross-chain-attribute — the Sprint 17 t4 cross-chain attribution consumer
+#                           (§8, §24): same single-writer MergeActor
+#                           constraint as `attribute`, its own process (a
+#                           separate deployment has no in-process caller to
+#                           share the actor with), so also 1 + Recreate. A
+#                           disjoint Kafka consumer group and topic pair
+#                           (`BridgeMevDetected`/`CrossChainMevDetected`) from
+#                           `attribute`, independently scalable/restartable.
+#   grpc                  — the IntelligenceRead read path (§20 "scale read
+#                           path"): stateless over Redis cache-aside +
+#                           Postgres/ClickHouse → replicas + HPA.
+#   block-production      — §10 builder/relay pipeline (PBS/Ethereum-specific,
+#                           gated on INTEL_PRODUCTION_CHAIN_ID=1). Pending-
+#                           writes flush queue is per-instance → 1 + Recreate.
+#
+# NOTE: the `score` and `reorg` run modes (§8.3/§15) have no Deployment here
+# yet — a pre-existing gap this file's four-mode set doesn't close, not
+# something introduced alongside cross-chain-attribute.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,6 +49,77 @@ spec:
         - name: intelligence
           image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
           # No arg = the attribute consumer.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+          ports:
+            - name: health
+              containerPort: 8086
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-cross-chain-attribute
+  labels:
+    app.kubernetes.io/name: intelligence-cross-chain-attribute
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-cross-chain-attribute
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-cross-chain-attribute
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          args: [cross-chain-attribute]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

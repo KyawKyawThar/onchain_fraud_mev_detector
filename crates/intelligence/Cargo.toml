@@ -31,6 +31,7 @@ path = "src/main.rs"
 events = { workspace = true }
 event-bus = { workspace = true }
 telemetry = { workspace = true }
+bounded-map = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

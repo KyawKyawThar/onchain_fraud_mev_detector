@@ -49,19 +49,27 @@ use rdkafka::consumer::StreamConsumer;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::cross_chain_projection::CrossChainFindingProjection;
 use crate::projection::{Applied, IncidentProjection, IncidentRecord};
-use crate::store::{AnalyticsRow, IncidentAnalytics, IncidentStore, JobUpdate, PersistError};
+use crate::store::{
+    AnalyticsRow, CrossChainFindingStore, IncidentAnalytics, IncidentStore, JobUpdate, PersistError,
+};
 
 /// The result-path event types the projection consumes. `SimulationRequested` is here for
-/// in-flight *job* tracking (the fold ignores it); the other four drive the incident read
-/// model. An explicit, closed list (not a `mev.events.*` regex) so a renamed/missing topic
-/// fails loudly rather than silently matching nothing — same discipline as the dispatcher.
+/// in-flight *job* tracking (the fold ignores it); the incident-lifecycle five drive the
+/// incident read model; the three cross-chain finding types (§24, Sprint 17 t4) drive the
+/// separate [`CrossChainFindingProjection`] read model. An explicit, closed list (not a
+/// `mev.events.*` regex) so a renamed/missing topic fails loudly rather than silently
+/// matching nothing — same discipline as the dispatcher.
 const CONSUMED_EVENT_TYPES: &[&str] = &[
     "SimulationRequested",
     "SimulationCompleted",
     "IncidentCreated",
     "IncidentRetracted",
     "IncidentFinalized",
+    "BridgeMevDetected",
+    "CrossChainMevDetected",
+    "CrossChainFindingRetracted",
 ];
 
 /// The topics the projection subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
@@ -83,15 +91,26 @@ pub struct ProjectionConsumer {
     projection: Mutex<IncidentProjection>,
     store: Arc<dyn IncidentStore>,
     analytics: Arc<dyn IncidentAnalytics>,
+    /// The §24 cross-chain-finding fold + its store, additive to the incident
+    /// pair above (see [`crate::cross_chain_projection`]'s module docs for why
+    /// it's a separate read model rather than folded through `projection`).
+    cross_chain_projection: Mutex<CrossChainFindingProjection>,
+    cross_chain_store: Arc<dyn CrossChainFindingStore>,
 }
 
 impl ProjectionConsumer {
-    /// Build the consumer over its two stores with a fresh, empty projection.
-    pub fn new(store: Arc<dyn IncidentStore>, analytics: Arc<dyn IncidentAnalytics>) -> Self {
+    /// Build the consumer over its stores with fresh, empty projections.
+    pub fn new(
+        store: Arc<dyn IncidentStore>,
+        analytics: Arc<dyn IncidentAnalytics>,
+        cross_chain_store: Arc<dyn CrossChainFindingStore>,
+    ) -> Self {
         Self {
             projection: Mutex::new(IncidentProjection::new()),
             store,
             analytics,
+            cross_chain_projection: Mutex::new(CrossChainFindingProjection::new()),
+            cross_chain_store,
         }
     }
 
@@ -117,11 +136,60 @@ impl ProjectionConsumer {
         )
         .await
     }
+
+    /// Fold a cross-chain finding event into [`CrossChainFindingProjection`],
+    /// then upsert the affected row (§24, Sprint 17 t4) — the cross-chain
+    /// analogue of the incident branch in [`EventHandler::handle`], minus job
+    /// tracking and analytics (neither concept applies to a finding).
+    async fn handle_cross_chain(&self, envelope: &EventEnvelope) -> Handled {
+        let (verdict, record) = {
+            let mut projection = self
+                .cross_chain_projection
+                .lock()
+                .expect("cross-chain projection mutex poisoned");
+            let verdict = projection.apply(envelope);
+            let finding_id = match &envelope.payload {
+                DomainEvent::BridgeMevDetected(e) => Some(e.finding_id),
+                DomainEvent::CrossChainMevDetected(e) => Some(e.finding_id),
+                DomainEvent::CrossChainFindingRetracted(e) => Some(e.finding_id),
+                _ => None,
+            };
+            let record = finding_id.and_then(|id| projection.record(&id)).cloned();
+            (verdict, record)
+        };
+
+        match verdict {
+            Applied::Ignored => Handled::Commit,
+            Applied::Updated | Applied::Duplicate => {
+                let Some(record) = record else {
+                    // A retraction that arrived before its finding's creation: buffered as
+                    // an orphan, nothing to persist yet (see the module docs).
+                    return Handled::Commit;
+                };
+                if let Err(err) = self.cross_chain_store.upsert_finding(&record).await {
+                    return handled_for(err, "cross-chain finding upsert");
+                }
+                Handled::Commit
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl EventHandler for ProjectionConsumer {
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
+        // 0. Cross-chain findings (§24, Sprint 17 t4) fold and persist through
+        //    their own, separate read model — routed first since they share
+        //    nothing with the incident fold below (no `alert_id`/job tracking).
+        if matches!(
+            envelope.payload,
+            DomainEvent::BridgeMevDetected(_)
+                | DomainEvent::CrossChainMevDetected(_)
+                | DomainEvent::CrossChainFindingRetracted(_)
+        ) {
+            return self.handle_cross_chain(&envelope).await;
+        }
+
         // 1. In-flight job tracking — derived straight from the event type, independent of
         //    the incident fold (the SQL upsert is itself idempotent + monotonic).
         if let Some(job) = JobUpdate::from_event(&envelope) {
@@ -276,6 +344,31 @@ mod tests {
         }
     }
 
+    /// Records every cross-chain finding upsert (§24, Sprint 17 t4) — the
+    /// cross-chain sibling of [`RecordingStore`].
+    #[derive(Default)]
+    struct RecordingCrossChainStore {
+        findings: Mutex<Vec<crate::cross_chain_projection::CrossChainFindingRecord>>,
+    }
+
+    #[async_trait]
+    impl crate::store::CrossChainFindingStore for RecordingCrossChainStore {
+        async fn upsert_finding(
+            &self,
+            record: &crate::cross_chain_projection::CrossChainFindingRecord,
+        ) -> Result<(), PersistError> {
+            self.findings.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+        async fn list_findings(
+            &self,
+            _filters: &crate::store::CrossChainFindingFilters,
+        ) -> Result<Vec<crate::cross_chain_projection::CrossChainFindingRecord>, PersistError>
+        {
+            unimplemented!("RecordingCrossChainStore only records writes for these tests")
+        }
+    }
+
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
     }
@@ -316,7 +409,8 @@ mod tests {
     ) {
         let store = Arc::new(RecordingStore::default());
         let analytics = Arc::new(RecordingAnalytics::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone());
+        let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
+        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
         (consumer, store, analytics)
     }
 
@@ -395,7 +489,8 @@ mod tests {
             ..Default::default()
         });
         let analytics = Arc::new(RecordingAnalytics::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone());
+        let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
+        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
 
         let alert = AlertId::new();
         assert_eq!(
@@ -413,7 +508,8 @@ mod tests {
             ..Default::default()
         });
         let analytics = Arc::new(RecordingAnalytics::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone());
+        let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
+        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
 
         let alert = AlertId::new();
         assert_eq!(
@@ -452,10 +548,85 @@ mod tests {
     }
 
     #[test]
-    fn consumed_topics_are_the_five_result_path_topics() {
+    fn consumed_topics_are_the_result_path_and_cross_chain_finding_topics() {
         let topics = consumed_topics();
-        assert_eq!(topics.len(), 5);
+        assert_eq!(topics.len(), 8);
         assert!(topics.contains(&"mev.events.SimulationCompleted".to_string()));
         assert!(topics.contains(&"mev.events.IncidentRetracted".to_string()));
+        assert!(topics.contains(&"mev.events.BridgeMevDetected".to_string()));
+        assert!(topics.contains(&"mev.events.CrossChainMevDetected".to_string()));
+        assert!(topics.contains(&"mev.events.CrossChainFindingRetracted".to_string()));
+    }
+
+    // ── Cross-chain findings (§24, Sprint 17 t4) ──────────────────────
+
+    use events::cross_chain::{BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef};
+
+    fn cc_leg(chain: Chain, byte: u8) -> CrossChainLegRef {
+        CrossChainLegRef {
+            chain,
+            block: events::primitives::BlockRef::new(100, B256::repeat_byte(byte)),
+            tx: B256::repeat_byte(byte),
+        }
+    }
+
+    fn bridge_finding(finding_id: events::primitives::CrossChainFindingId) -> DomainEvent {
+        DomainEvent::BridgeMevDetected(BridgeMevDetected {
+            finding_id,
+            bridge: "usdc-eth-base".into(),
+            deposit_leg: cc_leg(Chain::BASE, 0x01),
+            fill_leg: cc_leg(Chain::ETHEREUM, 0x02),
+            entity_hint: events::primitives::AccountAddress::repeat_byte(0xaa),
+            profit: 1_000.0,
+            victim_loss: 900.0,
+            confidence: events::primitives::Confidence::new(0.8),
+            severity: Severity::Medium,
+            provisional: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cross_chain_finding_upserts_its_own_store_not_the_incident_one() {
+        let (consumer, store, analytics) = consumer();
+        let finding_id = events::primitives::CrossChainFindingId::new();
+
+        assert_eq!(
+            consumer
+                .handle(env(bridge_finding(finding_id), at(1)))
+                .await,
+            Handled::Commit
+        );
+
+        assert!(
+            store.incidents.lock().unwrap().is_empty(),
+            "a finding never touches the incident read model"
+        );
+        assert!(analytics.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cross_chain_finding_retraction_marks_the_row_retracted() {
+        let store = Arc::new(RecordingStore::default());
+        let analytics = Arc::new(RecordingAnalytics::default());
+        let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
+        let consumer =
+            ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store.clone());
+        let finding_id = events::primitives::CrossChainFindingId::new();
+
+        consumer
+            .handle(env(bridge_finding(finding_id), at(1)))
+            .await;
+        let retracted = DomainEvent::CrossChainFindingRetracted(CrossChainFindingRetracted {
+            finding_id,
+            reason: "leg block reverted".into(),
+        });
+        assert_eq!(
+            consumer.handle(env(retracted, at(2))).await,
+            Handled::Commit
+        );
+
+        let findings = cross_chain_store.findings.lock().unwrap();
+        assert_eq!(findings.len(), 2, "one upsert per real change");
+        assert!(findings.last().unwrap().retracted);
     }
 }

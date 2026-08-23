@@ -105,14 +105,24 @@
 //! together). Builder identity flows through `BuilderAddress` *labels* — read
 //! from, and heuristically minted into, the same [`store::LabelStore`] the
 //! rest of the service uses — never a hardcoded name table (§10).
+//!
+//! Sprint 17 t4 adds [`cross_chain_attribution`] and extracts [`association`]
+//! (the §8.1/§8.6 flywheel pass, lifted out of [`attribution`] so both share
+//! it): the cross-chain analogue of Sprint 7 t4 — `BridgeMevDetected`/
+//! `CrossChainMevDetected` (§24) in, the same entity-clustering + association-
+//! flywheel machinery run against each finding's `entity_hint` once per leg
+//! chain, so a bridge deposit's chain-A funding cluster and its fill's
+//! chain-B funding cluster converge on one entity. `entity_hint` itself is
+//! never turned into a label — see [`cross_chain_attribution`]'s module docs.
 
 pub mod adjacency;
+pub mod association;
 pub mod attribution;
-mod bounded;
 pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
+pub mod cross_chain_attribution;
 pub mod graph;
 pub mod grpc;
 pub mod leaderboard;

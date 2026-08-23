@@ -29,7 +29,8 @@ use simulation::http;
 use simulation::monitored_wallet_store::{MonitoredWalletStore, PgMonitoredWalletStore};
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
 use simulation::store::{
-    build_clickhouse_client, ClickhouseAnalytics, PgIncidentStore, TimingStore, WalletExposureStore,
+    build_clickhouse_client, ClickhouseAnalytics, CrossChainFindingStore, PgIncidentStore,
+    TimingStore, WalletExposureStore,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -85,6 +86,10 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         .context("connecting to Postgres")?;
     let pg_store = PgIncidentStore::new(pool.clone());
     let store = Arc::new(pg_store.clone());
+    // Same pool, the §24 cross-chain-finding sibling seam (`PgIncidentStore`
+    // implements both `IncidentStore` and `CrossChainFindingStore`, mirroring
+    // `PgIntelligenceStore`'s multi-seam-over-one-pool shape).
+    let cross_chain_store: Arc<dyn CrossChainFindingStore> = Arc::new(pg_store.clone());
     let analytics = ClickhouseAnalytics::new(client);
     analytics
         .ping()
@@ -133,8 +138,9 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
             .context("provisioning the projection DLQ topic")?;
     let consumer_task = tokio::spawn({
         let shutdown = shutdown.clone();
+        let cross_chain_store = cross_chain_store.clone();
         async move {
-            let result = ProjectionConsumer::new(store, analytics)
+            let result = ProjectionConsumer::new(store, analytics, cross_chain_store)
                 .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
                 .await;
             if let Err(ref err) = result {
@@ -201,6 +207,7 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         exposure: exposure_store,
         timing: timing_store,
         monitored_wallets,
+        cross_chain: cross_chain_store,
     };
     let listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await

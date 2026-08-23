@@ -89,6 +89,12 @@ pub struct KafkaConfig {
     /// (`IncidentRetracted`) and is independently deployable/scalable, like
     /// `score`/`attribute`.
     pub reorg_group_id: String,
+    /// Consumer-group id for the Sprint 17 t4 cross-chain attribution
+    /// consumer ([`crate::cross_chain_attribution`], §8/§24) — its own group
+    /// since it reads a disjoint topic pair (`BridgeMevDetected`/
+    /// `CrossChainMevDetected`) and is independently deployable/scalable,
+    /// like `score`/`attribute`/`reorg`.
+    pub cross_chain_group_id: String,
 }
 
 /// How to reach Redis and how long cached entries live. The full URL is secret
@@ -151,6 +157,10 @@ impl Config {
                 group_id: env_or("INTELLIGENCE_KAFKA_GROUP", "intelligence-attribution"),
                 risk_group_id: env_or("INTELLIGENCE_RISK_KAFKA_GROUP", "intelligence-risk-scoring"),
                 reorg_group_id: env_or("INTELLIGENCE_REORG_KAFKA_GROUP", "intelligence-reorg"),
+                cross_chain_group_id: env_or(
+                    "INTELLIGENCE_CROSS_CHAIN_KAFKA_GROUP",
+                    "intelligence-cross-chain-attribution",
+                ),
             },
             grpc_addr,
             metrics_addr,

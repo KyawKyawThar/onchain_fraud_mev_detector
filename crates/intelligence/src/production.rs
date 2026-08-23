@@ -45,11 +45,13 @@
 use std::collections::HashMap;
 
 use alloy_primitives::{B256, U256};
+use bounded_map::BoundedFifoMap;
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, AlertKind, BlockRef, Chain, IncidentId};
+use events::cross_chain::CrossChainFindingKind;
+use events::primitives::{
+    AccountAddress, AlertKind, BlockRef, Chain, CrossChainFindingId, IncidentId,
+};
 use serde::{Deserialize, Serialize};
-
-use crate::bounded::BoundedFifoMap;
 
 /// A direct value transfer to the block's fee recipient inside its own block —
 /// the classic coinbase-tip MEV payment channel (§10). Detected from the full
@@ -104,6 +106,20 @@ pub struct BlockProductionRecord {
     /// Confirmed incidents of every other [`AlertKind`].
     pub other_mev_count: u32,
     pub coinbase_transfers: Vec<CoinbaseTransfer>,
+    /// Confirmed `BridgeMevDetected` findings (§24, Sprint 17 t4) folded in
+    /// whose deposit or fill leg landed in this block.
+    pub cross_chain_bridge_count: u32,
+    /// Confirmed `CrossChainMevDetected` findings (§24, Sprint 17 t4) folded
+    /// in with a leg in this block.
+    pub cross_chain_arb_count: u32,
+    /// Summed `profit` of every folded cross-chain finding (USD). Kept
+    /// **separate** from `mev_extracted_usd` on purpose: a cross-chain
+    /// finding's `profit` is a coarse, fast-path proxy that is never
+    /// simulation-confirmed and stays `provisional: true` forever (§24) —
+    /// folding it into the confirmed-incident total would misreport a
+    /// builder's *confirmed* MEV with an estimate the platform itself never
+    /// upgrades to confirmed.
+    pub cross_chain_provisional_usd: f64,
     /// Set when the block was reverted by a reorg after the record opened —
     /// the final snapshot a reader must exclude (§15).
     pub reverted: bool,
@@ -117,6 +133,12 @@ pub struct BlockProductionRecord {
     /// the folded totals).
     #[serde(skip)]
     folded: HashMap<IncidentId, Contribution>,
+    /// The cross-chain analogue of `folded`, keyed by `finding_id` (§24,
+    /// Sprint 17 t4) — the idempotency key for a redelivered
+    /// `BridgeMevDetected`/`CrossChainMevDetected` leg and the exact amount a
+    /// `CrossChainFindingRetracted` takes back. Not persisted.
+    #[serde(skip)]
+    folded_cross_chain: HashMap<CrossChainFindingId, CrossChainContribution>,
 }
 
 /// The gathered facts a record opens with — everything the consumer assembles
@@ -153,9 +175,13 @@ impl BlockProductionRecord {
             arb_count: 0,
             other_mev_count: 0,
             coinbase_transfers: facts.coinbase_transfers,
+            cross_chain_bridge_count: 0,
+            cross_chain_arb_count: 0,
+            cross_chain_provisional_usd: 0.0,
             reverted: false,
             snapshot_at: at,
             folded: HashMap::new(),
+            folded_cross_chain: HashMap::new(),
         }
     }
 
@@ -197,6 +223,54 @@ impl BlockProductionRecord {
         };
         Counter(counter)
     }
+
+    /// Fold one cross-chain finding's leg in (§24, Sprint 17 t4). Returns
+    /// `false` (and changes nothing) when this `finding_id` was already
+    /// folded here — the redelivery no-op.
+    fn apply_cross_chain(
+        &mut self,
+        finding_id: CrossChainFindingId,
+        contribution: CrossChainContribution,
+        at: DateTime<Utc>,
+    ) -> bool {
+        if self.folded_cross_chain.contains_key(&finding_id) {
+            return false;
+        }
+        self.cross_chain_count_mut(contribution.kind).increment();
+        self.cross_chain_provisional_usd += contribution.profit_usd;
+        self.snapshot_at = at;
+        self.folded_cross_chain.insert(finding_id, contribution);
+        true
+    }
+
+    /// Take a previously-folded cross-chain finding back out (§15/§24
+    /// retraction — a finding is only as final as its least-final leg).
+    /// Returns `false` when `finding_id` was never folded here.
+    fn retract_cross_chain(&mut self, finding_id: CrossChainFindingId, at: DateTime<Utc>) -> bool {
+        let Some(contribution) = self.folded_cross_chain.remove(&finding_id) else {
+            return false;
+        };
+        self.cross_chain_count_mut(contribution.kind).decrement();
+        self.cross_chain_provisional_usd -= contribution.profit_usd;
+        self.snapshot_at = at;
+        true
+    }
+
+    fn cross_chain_count_mut(&mut self, kind: CrossChainFindingKind) -> Counter<'_> {
+        let counter = match kind {
+            CrossChainFindingKind::BridgeMev => &mut self.cross_chain_bridge_count,
+            CrossChainFindingKind::CrossChainMev => &mut self.cross_chain_arb_count,
+        };
+        Counter(counter)
+    }
+}
+
+/// One cross-chain finding's contribution to its block's record (§24, Sprint
+/// 17 t4): the kind bucket and the provisional profit proxy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CrossChainContribution {
+    pub kind: CrossChainFindingKind,
+    pub profit_usd: f64,
 }
 
 /// Saturating counter over one of the record's `u32` tallies — a retraction
@@ -227,6 +301,17 @@ pub struct Contribution {
 struct PendingIncident {
     incident_id: IncidentId,
     contribution: Contribution,
+    at: DateTime<Utc>,
+}
+
+/// A cross-chain finding leg (§24, Sprint 17 t4) waiting for its block's
+/// record to open — the cross-chain analogue of [`PendingIncident`]. No
+/// `tx → block` join stage exists here (a leg carries its `BlockRef`
+/// directly), so this only ever buffers under [`ProductionBook::awaiting_cross_chain`].
+#[derive(Debug, Clone, PartialEq)]
+struct PendingCrossChain {
+    finding_id: CrossChainFindingId,
+    contribution: CrossChainContribution,
     at: DateTime<Utc>,
 }
 
@@ -313,6 +398,16 @@ pub struct ProductionBook {
     awaiting_block: BoundedFifoMap<B256, Vec<PendingIncident>>,
     /// Which block each folded incident landed in — routes a retraction.
     folded_blocks: BoundedFifoMap<IncidentId, B256>,
+    /// Cross-chain finding legs (§24, Sprint 17 t4) whose block's record
+    /// isn't open yet, keyed by that block's hash — unlike an incident, a
+    /// finding's leg carries its block directly (no `tx → block` join
+    /// needed), so there is only one waiting stage, not two.
+    awaiting_cross_chain: BoundedFifoMap<B256, Vec<PendingCrossChain>>,
+    /// Which block(s) each folded finding landed in *on this chain* — routes
+    /// a retraction. A `Vec` rather than one hash: a >2-chain
+    /// `CrossChainMevDetected` cycle can in principle carry more than one leg
+    /// on this book's own chain.
+    folded_cross_chain_blocks: BoundedFifoMap<CrossChainFindingId, Vec<B256>>,
 }
 
 impl ProductionBook {
@@ -323,6 +418,14 @@ impl ProductionBook {
             awaiting_record: BoundedFifoMap::new(capacity.pending, "incidents awaiting record"),
             awaiting_block: BoundedFifoMap::new(capacity.pending, "incidents awaiting block"),
             folded_blocks: BoundedFifoMap::new(capacity.pending, "folded incident index"),
+            awaiting_cross_chain: BoundedFifoMap::new(
+                capacity.pending,
+                "cross-chain findings awaiting record",
+            ),
+            folded_cross_chain_blocks: BoundedFifoMap::new(
+                capacity.pending,
+                "folded cross-chain finding index",
+            ),
         }
     }
 
@@ -370,6 +473,13 @@ impl ProductionBook {
         if let Some(pending) = self.awaiting_record.take(&hash) {
             for incident in pending {
                 snapshots.extend(self.route_to_block(hash, incident).into_snapshots());
+            }
+        }
+        // Same drain for cross-chain finding legs that arrived before this
+        // block's record did (§24, Sprint 17 t4).
+        if let Some(pending) = self.awaiting_cross_chain.take(&hash) {
+            for cross_chain in pending {
+                snapshots.extend(self.apply_cross_chain_to_open(hash, cross_chain));
             }
         }
         Folded::applied(snapshots)
@@ -428,12 +538,113 @@ impl ProductionBook {
         Folded::Noop
     }
 
+    /// A cross-chain finding leg on this book's chain was consumed (§24,
+    /// Sprint 17 t4): fold it into the leg's block record, or buffer it
+    /// against that record's arrival. Unlike an incident, the leg carries its
+    /// block directly — no `tx → block` join to wait on. Redelivery of the
+    /// same `(finding_id, block)` pair is a no-op.
+    pub fn fold_cross_chain_finding(
+        &mut self,
+        finding_id: CrossChainFindingId,
+        block: BlockRef,
+        contribution: CrossChainContribution,
+        at: DateTime<Utc>,
+    ) -> Folded {
+        if self
+            .folded_cross_chain_blocks
+            .get(&finding_id)
+            .is_some_and(|blocks| blocks.contains(&block.hash))
+        {
+            return Folded::Noop; // redelivered — already folded into this block
+        }
+        let pending = PendingCrossChain {
+            finding_id,
+            contribution,
+            at,
+        };
+        match self.records.get_mut(&block.hash) {
+            Some(_) => Folded::applied(self.apply_cross_chain_to_open(block.hash, pending)),
+            None => {
+                self.buffer_cross_chain(block.hash, pending);
+                Folded::Buffered
+            }
+        }
+    }
+
+    /// An open record exists for `block_hash`: fold `pending` into it and
+    /// index the (finding_id → block) link. Shared by
+    /// [`fold_cross_chain_finding`](Self::fold_cross_chain_finding)'s direct
+    /// path and [`open_record`](Self::open_record)'s drain of legs that
+    /// arrived first. Returns the changed snapshot, or nothing for a
+    /// redelivered duplicate.
+    fn apply_cross_chain_to_open(
+        &mut self,
+        block_hash: B256,
+        pending: PendingCrossChain,
+    ) -> Vec<BlockProductionRecord> {
+        let Some(record) = self.records.get_mut(&block_hash) else {
+            return Vec::new();
+        };
+        if !record.apply_cross_chain(pending.finding_id, pending.contribution, pending.at) {
+            return Vec::new();
+        }
+        let snapshot = record.clone();
+        match self.folded_cross_chain_blocks.get_mut(&pending.finding_id) {
+            Some(blocks) => blocks.push(block_hash),
+            None => self
+                .folded_cross_chain_blocks
+                .put(pending.finding_id, vec![block_hash]),
+        }
+        vec![snapshot]
+    }
+
+    fn buffer_cross_chain(&mut self, block_hash: B256, pending: PendingCrossChain) {
+        match self.awaiting_cross_chain.get_mut(&block_hash) {
+            Some(list) => {
+                if !list.iter().any(|p| p.finding_id == pending.finding_id) {
+                    list.push(pending);
+                }
+            }
+            None => self.awaiting_cross_chain.put(block_hash, vec![pending]),
+        }
+    }
+
+    /// A `CrossChainFindingRetracted` was consumed: take the finding's
+    /// contribution back out of every block it landed in *on this chain*
+    /// (§15, §24 — a finding is only as final as its least-final leg, so any
+    /// leg's reorg retracts the whole thing, not just this chain's share of
+    /// it). Unknown finding (never folded, evicted, or folded before a
+    /// restart) → no-op; still buffered → the buffer entry is dropped so it
+    /// can't fold later.
+    pub fn retract_cross_chain_finding(
+        &mut self,
+        finding_id: CrossChainFindingId,
+        at: DateTime<Utc>,
+    ) -> Folded {
+        if let Some(blocks) = self.folded_cross_chain_blocks.take(&finding_id) {
+            let mut snapshots = Vec::new();
+            for block_hash in blocks {
+                let Some(record) = self.records.get_mut(&block_hash) else {
+                    continue; // record evicted since — nothing to update
+                };
+                if record.retract_cross_chain(finding_id, at) {
+                    snapshots.push(record.clone());
+                }
+            }
+            return Folded::applied(snapshots);
+        }
+        self.awaiting_cross_chain
+            .retain_values(|pending| pending.finding_id != finding_id);
+        Folded::Noop
+    }
+
     /// A `BlockReverted` was consumed: mark the record's final snapshot
     /// reverted and drop it from the working set (§15) — late incidents for a
     /// reverted block will be retracted by simulation anyway. No record open
     /// (never canonicalized here, or already evicted) → no-op.
     pub fn revert_block(&mut self, block_hash: B256, at: DateTime<Utc>) -> Folded {
         self.awaiting_record.take(&block_hash);
+        self.awaiting_cross_chain.take(&block_hash);
         let Some(mut record) = self.records.take(&block_hash) else {
             return Folded::Noop;
         };
