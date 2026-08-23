@@ -292,6 +292,13 @@ id_newtype!(
     RuleId
 );
 id_newtype!(
+    /// Cross-chain correlated-finding id, minted by the cross-chain
+    /// correlator's windowed join (§24, Sprint 17 task 2/3) so a later
+    /// `BlockReverted` on any of the finding's legs' chains can retract it by
+    /// id via `CrossChainFindingRetracted` (§15).
+    CrossChainFindingId
+);
+id_newtype!(
     /// Billing customer id (§13).
     CustomerId
 );

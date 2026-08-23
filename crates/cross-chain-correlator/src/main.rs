@@ -2,7 +2,10 @@
 //! production hardening) — boot:
 //!
 //! 1. provision the leg-buffer changelog topic and replay it
-//!    ([`changelog::replay`]) to warm-start every actor's buffer;
+//!    ([`changelog::replay`]) to warm-start every actor's buffer, then do the
+//!    same for the finding-finality changelog ([`finding_changelog::replay`],
+//!    §15, Sprint 17 task 3) to warm-start which findings were still
+//!    awaiting finality;
 //! 2. for every bridge/pair *this replica owns*
 //!    ([`Config::owned_bridges_or_pairs`], production hardening's
 //!    horizontal-sharding seam), spawn its [`CorrelationActor`] — sharing
@@ -12,7 +15,11 @@
 //!    that filters to that chain, dedupes Kafka redeliveries, and routes any
 //!    leg [`EvidenceLegExtractor`] recognizes to its actor over the shared
 //!    [`LegRouter`] (never blocking on a stalled actor — see `router`'s
-//!    docs).
+//!    docs);
+//! 4. spawn one [`FinalityConsumer`] task (§15, Sprint 17 task 3) sharing
+//!    every actor's [`SharedFindingFinalityTracker`], broadcast-subscribed
+//!    to `BlockReverted`/`BlockFinalized` so a reorg on any configured chain
+//!    retracts whichever findings it orphaned — see `finality` module docs.
 //!
 //! See `lib.rs` for the full module map and the "Production hardening"
 //! section.
@@ -26,6 +33,10 @@ use cross_chain_correlator::actor::CorrelationActor;
 use cross_chain_correlator::chain_consumer::{self, ChainConsumer};
 use cross_chain_correlator::changelog::{self, ChangelogSink, ChangelogWriter};
 use cross_chain_correlator::config::Config;
+use cross_chain_correlator::finality::{self, FinalityConsumer, SharedFindingFinalityTracker};
+use cross_chain_correlator::finding_changelog::{
+    self, FindingChangelogSink, FindingChangelogWriter,
+};
 use cross_chain_correlator::leg::{BridgeOrPair, CandidateLeg, EvidenceLegExtractor};
 use cross_chain_correlator::router::LegRouter;
 use event_bus::dlq::DeadLetterQueue;
@@ -98,6 +109,31 @@ async fn run(cfg: Config) -> Result<()> {
     .await
     .context("replaying the leg-changelog")?;
 
+    // ── Finding-finality changelog: same provision-then-replay-before-live-
+    // traffic discipline as the leg changelog above, for the same reason
+    // (`crate::finding_changelog` module docs, Sprint 17 task 3) ───────────
+    FindingChangelogWriter::ensure_topic(
+        &cfg.kafka.brokers,
+        topic_replication,
+        cfg.finding_changelog_retention_ms,
+    )
+    .await
+    .context("provisioning the finding-changelog topic")?;
+    let finding_changelog_sink: Arc<dyn FindingChangelogSink> = Arc::new(
+        FindingChangelogWriter::new(&cfg.kafka.brokers)
+            .context("building the finding-changelog producer")?,
+    );
+    let replayed_finality_tracker = finding_changelog::replay(
+        &cfg.kafka.brokers,
+        &cfg.consumer_group_prefix,
+        cfg.replica_index,
+        cfg.finding_changelog_replay_timeout,
+        cfg.finding_retention,
+        cfg.finding_capacity,
+    )
+    .await
+    .context("replaying the finding-changelog")?;
+
     let shutdown = CancellationToken::new();
     // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
     // completes below. Opt-in via HEALTH_ADDR — unset (dev) serves nothing.
@@ -113,6 +149,18 @@ async fn run(cfg: Config) -> Result<()> {
             shutdown.cancel();
         }
     });
+
+    // ── Cross-chain finality/reorg retraction (§15, Sprint 17 task 3):
+    // shared by every actor below (writer via `record_finding`) and the one
+    // finality consumer task spawned further down (writer via
+    // `on_block_reverted`/`on_block_finalized`) — warm-started from the
+    // finding-changelog replay above, see `finality`/`finding_changelog`
+    // module docs ─────────────────────────────────────────────────────────
+    let finality_tracker = SharedFindingFinalityTracker::from_tracker(
+        replayed_finality_tracker,
+        finding_changelog_sink,
+        shutdown.clone(),
+    );
 
     // ── One correlation actor per bridge/pair this replica owns (§17,
     // production hardening's horizontal-sharding seam) ─────────────────
@@ -132,6 +180,7 @@ async fn run(cfg: Config) -> Result<()> {
             rx,
             Arc::clone(&sink),
             Arc::clone(&changelog),
+            Arc::clone(&finality_tracker),
             PUBLISH_BACKOFF,
             shutdown.clone(),
         )));
@@ -156,6 +205,22 @@ async fn run(cfg: Config) -> Result<()> {
         )));
     }
 
+    // ── The one finality/reorg-retraction consumer (§15, Sprint 17 task 3):
+    // a broadcast consumer, unique group per replica — every replica must
+    // see every chain's `BlockReverted`/`BlockFinalized` (see `finality`
+    // module docs) ───────────────────────────────────────────────────────
+    let finality_group_id = format!(
+        "{}-r{}-finality",
+        cfg.consumer_group_prefix, cfg.replica_index
+    );
+    let finality_consumer =
+        finality::build_broadcast_consumer(&cfg.kafka.brokers, &finality_group_id)
+            .context("building the Kafka consumer for finality/reorg tracking")?;
+    let finality_task = tokio::spawn(
+        FinalityConsumer::new(finality_tracker, Arc::clone(&sink), shutdown.clone())
+            .run(finality_consumer, RETRY_BACKOFF),
+    );
+
     health.set_ready(true);
 
     for task in actor_tasks {
@@ -164,6 +229,10 @@ async fn run(cfg: Config) -> Result<()> {
     for task in consumer_tasks {
         task.await.context("chain consumer task panicked")??;
     }
+    finality_task
+        .await
+        .context("finality consumer task panicked")?
+        .context("finality consumer task failed")?;
     tracing::info!("cross-chain correlator shut down");
     Ok(())
 }

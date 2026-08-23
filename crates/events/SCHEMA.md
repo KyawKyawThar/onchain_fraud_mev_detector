@@ -34,7 +34,7 @@ set of types that drift freely.
 | **Rule engine** (§9) | `RuleCreated`, `RuleTriggered`, `RuleAlertCreated` | rule-engine |
 | **System** (§13) | `UsageRecorded`, `ScreeningDecisionRecorded` | api |
 | **Predictive** (§16) | `PredictedAlert`, `LiquidationRiskPredicted`, `LiquidationCascadeWarned` | predictive |
-| **Cross-chain** (§24) | `BridgeMevDetected`, `CrossChainMevDetected` | cross-chain-correlator |
+| **Cross-chain** (§24) | `BridgeMevDetected`, `CrossChainMevDetected`, `CrossChainFindingRetracted` | cross-chain-correlator |
 
 ### Not in the contract: commands
 

@@ -30,7 +30,7 @@ pub mod simulation;
 pub mod system;
 
 use chrono::{DateTime, Utc};
-use primitives::{AccountAddress, AlertId, Chain, CustomerId, IncidentId};
+use primitives::{AccountAddress, AlertId, Chain, CrossChainFindingId, CustomerId, IncidentId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -126,6 +126,14 @@ pub enum PartitionKey {
     /// *is* meaningful (one customer's usage stream) while spreading load
     /// across the topic's partitions.
     Customer(CustomerId),
+    /// The cross-chain correlator's finding lifecycle (§24, Sprint 17 task
+    /// 3): `BridgeMevDetected`/`CrossChainMevDetected` and the
+    /// `CrossChainFindingRetracted` that may later withdraw one share this
+    /// key so a reorg-driven retraction always lands on the same partition as
+    /// the finding it withdraws, regardless of which chain's revert triggered
+    /// it or which leg's chain the original finding happened to be
+    /// envelope-keyed under (§20).
+    CrossChainFinding(CrossChainFindingId),
 }
 
 impl std::fmt::Display for PartitionKey {
@@ -137,6 +145,7 @@ impl std::fmt::Display for PartitionKey {
             PartitionKey::Alert(alert) => write!(f, "{alert}"),
             PartitionKey::Incident(incident) => write!(f, "{incident}"),
             PartitionKey::Customer(customer) => write!(f, "{customer}"),
+            PartitionKey::CrossChainFinding(finding) => write!(f, "{finding}"),
         }
     }
 }
@@ -228,6 +237,7 @@ pub enum DomainEvent {
     // Cross-chain (§24)
     BridgeMevDetected(cross_chain::BridgeMevDetected),
     CrossChainMevDetected(cross_chain::CrossChainMevDetected),
+    CrossChainFindingRetracted(cross_chain::CrossChainFindingRetracted),
 }
 
 /// Which service domain an event belongs to. Used for coarse routing/metrics;
@@ -302,7 +312,9 @@ impl DomainEvent {
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
-            BridgeMevDetected(_) | CrossChainMevDetected(_) => EventFamily::CrossChain,
+            BridgeMevDetected(_) | CrossChainMevDetected(_) | CrossChainFindingRetracted(_) => {
+                EventFamily::CrossChain
+            }
         }
     }
 
@@ -351,14 +363,15 @@ impl DomainEvent {
             | LiquidationRiskPredicted(_)
             | LiquidationCascadeWarned(_)
             | BridgeMevDetected(_)
-            | CrossChainMevDetected(_) => None,
+            | CrossChainMevDetected(_)
+            | CrossChainFindingRetracted(_) => None,
         }
     }
 
     /// The [`PartitionKey`] override for events whose meaningful ordering key is
     /// a **business key**, not their chain — or `None` for every event that
     /// stays chain-partitioned (§20 — see [`EventEnvelope::partition_key`],
-    /// which supplies the `Chain` default). Two paths carry an override:
+    /// which supplies the `Chain` default). Three paths carry an override:
     ///
     /// **The metering path (§13).** `UsageRecorded` is keyed by its
     /// `customer_id` when it has one: usage has no cross-customer ordering
@@ -390,6 +403,16 @@ impl DomainEvent {
     /// `SimulationRequested` is deliberately *not* here — it is the dispatcher's
     /// audit fact, not part of the confirm/retract result path, so it stays
     /// chain-keyed with the rest of the request side.
+    ///
+    /// **The cross-chain finding lifecycle (§24, Sprint 17 task 3):**
+    /// `BridgeMevDetected`/`CrossChainMevDetected` and the
+    /// `CrossChainFindingRetracted` that may later withdraw one all key off
+    /// [`PartitionKey::CrossChainFinding`] — mirrors the simulation result
+    /// path's shape (creation and retraction sharing one keyspace) rather
+    /// than defaulting to chain-partitioning, since a finding's envelope
+    /// chain (§17's `envelope_chain` — the fill leg, or the chronologically
+    /// last leg) need not be the same chain a later `BlockReverted` on a
+    /// *different* leg retracts it from.
     pub fn business_partition_key(&self) -> Option<PartitionKey> {
         use DomainEvent::*;
         match self {
@@ -400,6 +423,9 @@ impl DomainEvent {
             UsageRecorded(e) => e.customer_id.map(PartitionKey::Customer),
             ScreeningDecisionRecorded(e) => Some(PartitionKey::Customer(e.customer_id)),
             WalletExposureReportReady(e) => Some(PartitionKey::Customer(e.customer_id)),
+            BridgeMevDetected(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
+            CrossChainMevDetected(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
+            CrossChainFindingRetracted(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -423,9 +449,7 @@ impl DomainEvent {
             | RuleAlertCreated(_)
             | PredictedAlert(_)
             | LiquidationRiskPredicted(_)
-            | LiquidationCascadeWarned(_)
-            | BridgeMevDetected(_)
-            | CrossChainMevDetected(_) => None,
+            | LiquidationCascadeWarned(_) => None,
         }
     }
 
@@ -473,7 +497,8 @@ impl DomainEvent {
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
-            | UsageRecorded(_) => Vec::new(),
+            | UsageRecorded(_)
+            | CrossChainFindingRetracted(_) => Vec::new(),
         }
     }
 }
