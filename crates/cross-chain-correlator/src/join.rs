@@ -29,7 +29,7 @@
 
 use alloy_primitives::B256;
 use events::cross_chain::{BridgeMevDetected, CrossChainLegRef, CrossChainMevDetected};
-use events::primitives::{AlertKind, Confidence, UsdAmount};
+use events::primitives::{AlertKind, Confidence, CrossChainFindingId, UsdAmount};
 use events::scoring::severity_band;
 
 use crate::buffer::CandidateLegBuffer;
@@ -182,6 +182,7 @@ fn build_bridge_mev(a: CandidateLeg, b: CandidateLeg) -> BridgeMevDetected {
     let victim_loss = impact(&deposit);
     let severity = severity_band(Some(UsdAmount::new(profit.max(victim_loss))), confidence);
     BridgeMevDetected {
+        finding_id: CrossChainFindingId::new(),
         bridge: deposit.bridge_or_pair.to_string(),
         deposit_leg: leg_ref(&deposit),
         fill_leg: leg_ref(&fill),
@@ -190,6 +191,9 @@ fn build_bridge_mev(a: CandidateLeg, b: CandidateLeg) -> BridgeMevDetected {
         victim_loss,
         confidence,
         severity,
+        // Always true — see `BridgeMevDetected::provisional`'s docs (§15,
+        // Sprint 17 task 3): this finding is retracted, not confirmed.
+        provisional: true,
     }
 }
 
@@ -212,6 +216,7 @@ fn build_cross_chain_mev(mut legs: Vec<CandidateLeg>) -> CrossChainMevDetected {
         .unwrap_or(0);
     let severity = severity_band(Some(UsdAmount::new(profit)), confidence);
     CrossChainMevDetected {
+        finding_id: CrossChainFindingId::new(),
         kind: AlertKind::Arbitrage,
         bridge: legs[0].bridge_or_pair.to_string(),
         entity_hint: legs[0].correlation_key,
@@ -220,6 +225,7 @@ fn build_cross_chain_mev(mut legs: Vec<CandidateLeg>) -> CrossChainMevDetected {
         latency_ms,
         confidence,
         severity,
+        provisional: true,
     }
 }
 

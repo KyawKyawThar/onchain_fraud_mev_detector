@@ -13,6 +13,11 @@ use crate::buffer::DEFAULT_CANDIDATE_LEG_CAPACITY;
 use crate::changelog::{
     DEFAULT_REPLAY_TIMEOUT, DEFAULT_RETENTION_MS as DEFAULT_CHANGELOG_RETENTION_MS,
 };
+use crate::finality::{DEFAULT_FINDING_CAPACITY, DEFAULT_FINDING_RETENTION_SECS};
+use crate::finding_changelog::{
+    DEFAULT_FINDING_CHANGELOG_RETENTION_MS,
+    DEFAULT_REPLAY_TIMEOUT as DEFAULT_FINDING_CHANGELOG_REPLAY_TIMEOUT,
+};
 use crate::leg::BridgeOrPair;
 
 /// Default per-bridge/pair window: how long an unmatched candidate leg stays
@@ -96,6 +101,26 @@ pub struct Config {
     /// (`crate::changelog::replay`) before continuing with whatever warm
     /// start it managed.
     pub changelog_replay_timeout: Duration,
+    /// How long [`crate::finality::FindingFinalityTracker`] retains a
+    /// finding awaiting finality before its retention-window safety valve
+    /// drops it (§15, Sprint 17 task 3) — see that module's "bounded memory"
+    /// docs.
+    pub finding_retention: TimeDelta,
+    /// Hard cap on findings [`crate::finality::FindingFinalityTracker`]
+    /// tracks awaiting finality (the memory-DoS backstop).
+    pub finding_capacity: usize,
+    /// Retention for the finding-finality changelog topic
+    /// (`crate::finding_changelog`, production hardening) — must stay
+    /// comfortably longer than [`Self::finding_retention`], or a restart's
+    /// replay can miss the `Recorded` fact for a finding that would
+    /// otherwise still legitimately be tracked (see
+    /// [`crate::finding_changelog::DEFAULT_FINDING_CHANGELOG_RETENTION_MS`]'s
+    /// docs); [`Self::from_env`] warns if this invariant doesn't hold.
+    pub finding_changelog_retention_ms: i64,
+    /// Deadline for the finding-finality changelog replay at boot
+    /// (`crate::finding_changelog::replay`) before continuing with whatever
+    /// warm start it managed.
+    pub finding_changelog_replay_timeout: Duration,
     pub metrics_addr: SocketAddr,
 }
 
@@ -143,6 +168,25 @@ impl Config {
             );
         }
 
+        let finding_retention_secs: i64 = env_parse(
+            "CROSS_CHAIN_FINDING_RETENTION_SECS",
+            DEFAULT_FINDING_RETENTION_SECS,
+        )?;
+        let finding_changelog_retention_ms: i64 = env_parse(
+            "CROSS_CHAIN_FINDING_CHANGELOG_RETENTION_MS",
+            DEFAULT_FINDING_CHANGELOG_RETENTION_MS,
+        )?;
+        if finding_changelog_retention_ms < finding_retention_secs * 1_000 {
+            tracing::warn!(
+                finding_retention_secs,
+                finding_changelog_retention_ms,
+                "CROSS_CHAIN_FINDING_CHANGELOG_RETENTION_MS is shorter than \
+                 CROSS_CHAIN_FINDING_RETENTION_SECS — a restart's changelog replay can miss \
+                 the `Recorded` fact for a finding that would otherwise still legitimately be \
+                 tracked; set the changelog retention comfortably longer"
+            );
+        }
+
         Ok(Self {
             chains,
             bridges_or_pairs,
@@ -177,6 +221,13 @@ impl Config {
             changelog_replay_timeout: Duration::from_secs(env_parse(
                 "CROSS_CHAIN_CHANGELOG_REPLAY_TIMEOUT_SECS",
                 DEFAULT_REPLAY_TIMEOUT.as_secs(),
+            )?),
+            finding_retention: TimeDelta::seconds(finding_retention_secs),
+            finding_capacity: env_parse("CROSS_CHAIN_FINDING_CAPACITY", DEFAULT_FINDING_CAPACITY)?,
+            finding_changelog_retention_ms,
+            finding_changelog_replay_timeout: Duration::from_secs(env_parse(
+                "CROSS_CHAIN_FINDING_CHANGELOG_REPLAY_TIMEOUT_SECS",
+                DEFAULT_FINDING_CHANGELOG_REPLAY_TIMEOUT.as_secs(),
             )?),
             metrics_addr: env_parse("CROSS_CHAIN_METRICS_ADDR", "0.0.0.0:9114".to_string())?
                 .parse()
@@ -326,6 +377,10 @@ mod tests {
             replica_count: 1,
             changelog_retention_ms: DEFAULT_CHANGELOG_RETENTION_MS,
             changelog_replay_timeout: DEFAULT_REPLAY_TIMEOUT,
+            finding_retention: TimeDelta::seconds(DEFAULT_FINDING_RETENTION_SECS),
+            finding_capacity: DEFAULT_FINDING_CAPACITY,
+            finding_changelog_retention_ms: DEFAULT_FINDING_CHANGELOG_RETENTION_MS,
+            finding_changelog_replay_timeout: DEFAULT_FINDING_CHANGELOG_REPLAY_TIMEOUT,
             metrics_addr: "0.0.0.0:9114".parse().unwrap(),
         }
     }

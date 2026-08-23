@@ -40,6 +40,26 @@ pub const FINDINGS_TOTAL: &str = "cross_chain_correlator_findings_total";
 /// whose actor task has already exited.
 pub const LEGS_DROPPED_TOTAL: &str = "cross_chain_correlator_legs_dropped_total";
 
+/// Counter (labeled `bridge_or_pair`, `kind`): findings retracted because a
+/// `BlockReverted` orphaned one of their legs (§15, Sprint 17 task 3,
+/// [`crate::finality`]) — a finding is only as final as its least-final leg,
+/// so this fires the instant *any* leg reverts, not once every leg has.
+/// Non-zero is expected under normal reorg activity; a sustained high rate
+/// relative to [`FINDINGS_TOTAL`] is worth investigating (an unstable chain,
+/// or a `leg_window` too tight against real finality depth).
+pub const FINDINGS_RETRACTED_TOTAL: &str = "cross_chain_correlator_findings_retracted_total";
+
+/// Counter (labeled `bridge_or_pair`, `kind`): findings whose *every* leg
+/// reached finality depth (§15) and so are no longer tracked for a possible
+/// reorg retraction ([`crate::finality`]) — the "confirmed final" milestone
+/// counterpart to [`FINDINGS_RETRACTED_TOTAL`].
+pub const FINDINGS_FINALIZED_TOTAL: &str = "cross_chain_correlator_findings_finalized_total";
+
+/// Gauge: findings currently tracked awaiting finality
+/// ([`crate::finality::FindingFinalityTracker::len`]) — the memory-DoS signal
+/// for the finality tracker, same spirit as [`LEG_BUFFER_SIZE`].
+pub const PENDING_FINDINGS: &str = "cross_chain_correlator_pending_findings";
+
 /// Counter (labeled `stage`): leg-buffer changelog append failures
 /// (`crate::changelog`, production hardening) — `stage = "encode"` for a
 /// local (de)serialize bug (never retried), `"publish_retry"` for a
@@ -89,6 +109,28 @@ pub fn record_leg_dropped(bridge_or_pair: &BridgeOrPair, reason: &'static str) {
 
 pub fn record_changelog_error(stage: &'static str) {
     metrics::counter!(CHANGELOG_ERRORS_TOTAL, "stage" => stage).increment(1);
+}
+
+pub fn record_finding_retracted(bridge_or_pair: &BridgeOrPair, kind: &'static str) {
+    metrics::counter!(
+        FINDINGS_RETRACTED_TOTAL,
+        "bridge_or_pair" => bridge_or_pair.0.clone(),
+        "kind" => kind,
+    )
+    .increment(1);
+}
+
+pub fn record_finding_finalized(bridge_or_pair: &BridgeOrPair, kind: &'static str) {
+    metrics::counter!(
+        FINDINGS_FINALIZED_TOTAL,
+        "bridge_or_pair" => bridge_or_pair.0.clone(),
+        "kind" => kind,
+    )
+    .increment(1);
+}
+
+pub fn record_pending_findings(count: usize) {
+    metrics::gauge!(PENDING_FINDINGS).set(count as f64);
 }
 
 #[cfg(test)]
@@ -188,6 +230,26 @@ mod tests {
             })
             .collect();
         assert_eq!(counters.iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn findings_retracted_and_finalized_count_by_kind() {
+        let bridge = BridgeOrPair("usdc-eth-base".to_owned());
+        let series = captured(|| {
+            record_finding_retracted(&bridge, "bridge_mev");
+            record_finding_finalized(&bridge, "cross_chain_mev");
+        });
+        assert!(value(&series, FINDINGS_RETRACTED_TOTAL).is_some());
+        assert!(value(&series, FINDINGS_FINALIZED_TOTAL).is_some());
+    }
+
+    #[test]
+    fn pending_findings_records_a_gauge() {
+        let series = captured(|| record_pending_findings(3));
+        match value(&series, PENDING_FINDINGS) {
+            Some(DebugValue::Gauge(v)) => assert_eq!(f64::from(*v), 3.0),
+            other => panic!("expected a gauge, got {other:?}"),
+        }
     }
 
     #[test]

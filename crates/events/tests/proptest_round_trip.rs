@@ -35,7 +35,9 @@ use uuid::Uuid;
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
-use events::cross_chain::{BridgeMevDetected, CrossChainLegRef, CrossChainMevDetected};
+use events::cross_chain::{
+    BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef, CrossChainMevDetected,
+};
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
     AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
@@ -43,8 +45,9 @@ use events::intelligence::{
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
-    AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef, EntityId, IncidentId,
-    LabelId, LendingProtocol, PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
+    AlertId, AlertKind, BlockRef, Chain, Confidence, CrossChainFindingId, CustomerId, DetectorRef,
+    EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId, Severity,
+    SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -192,6 +195,9 @@ fn customer_id() -> impl Strategy<Value = CustomerId> {
 }
 fn prediction_id() -> impl Strategy<Value = PredictionId> {
     uuid().prop_map(PredictionId)
+}
+fn finding_id() -> impl Strategy<Value = CrossChainFindingId> {
+    uuid().prop_map(CrossChainFindingId)
 }
 
 fn lending_protocol() -> impl Strategy<Value = LendingProtocol> {
@@ -642,10 +648,12 @@ fn cross_chain_leg_ref() -> impl Strategy<Value = CrossChainLegRef> {
     })
 }
 
-/// Cross-chain (§24): `BridgeMevDetected`, `CrossChainMevDetected`.
+/// Cross-chain (§24): `BridgeMevDetected`, `CrossChainMevDetected`,
+/// `CrossChainFindingRetracted`.
 fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
         (
+            finding_id(),
             any::<String>(),
             cross_chain_leg_ref(),
             cross_chain_leg_ref(),
@@ -654,9 +662,11 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
             finite_f64(),
             confidence(),
             severity(),
+            any::<bool>(),
         )
             .prop_map(
                 |(
+                    finding_id,
                     bridge,
                     deposit_leg,
                     fill_leg,
@@ -665,8 +675,10 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
                     victim_loss,
                     confidence,
                     severity,
+                    provisional,
                 )| {
                     DomainEvent::BridgeMevDetected(BridgeMevDetected {
+                        finding_id,
                         bridge,
                         deposit_leg,
                         fill_leg,
@@ -675,10 +687,12 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
                         victim_loss,
                         confidence,
                         severity,
+                        provisional,
                     })
                 }
             ),
         (
+            finding_id(),
             alert_kind(),
             any::<String>(),
             prop::collection::vec(cross_chain_leg_ref(), 2..4),
@@ -687,10 +701,23 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
             any::<u64>(),
             confidence(),
             severity(),
+            any::<bool>(),
         )
             .prop_map(
-                |(kind, bridge, legs, entity_hint, profit, latency_ms, confidence, severity)| {
+                |(
+                    finding_id,
+                    kind,
+                    bridge,
+                    legs,
+                    entity_hint,
+                    profit,
+                    latency_ms,
+                    confidence,
+                    severity,
+                    provisional,
+                )| {
                     DomainEvent::CrossChainMevDetected(CrossChainMevDetected {
+                        finding_id,
                         kind,
                         bridge,
                         legs,
@@ -699,9 +726,16 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
                         latency_ms,
                         confidence,
                         severity,
+                        provisional,
                     })
                 }
             ),
+        (finding_id(), any::<String>()).prop_map(|(finding_id, reason)| {
+            DomainEvent::CrossChainFindingRetracted(CrossChainFindingRetracted {
+                finding_id,
+                reason,
+            })
+        }),
     ]
 }
 

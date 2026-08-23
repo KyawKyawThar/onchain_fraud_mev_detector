@@ -21,6 +21,14 @@
 //! never reported upstream on the strength of a mutation this process can't
 //! actually replay after a crash. See `crate::changelog` module docs for the
 //! full design and its accepted limits.
+//!
+//! **Finality/reorg tracking (§15, Sprint 17 task 3).** `run` also registers
+//! every published finding's legs with the shared
+//! [`crate::finality::SharedFindingFinalityTracker`] — *before* publishing,
+//! the same "durable/trackable before public" causality the changelog
+//! append already follows — so [`crate::finality::FinalityConsumer`] can
+//! retract it later if any leg's block reverts. See `crate::finality`
+//! module docs for the full design.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +41,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::CandidateLegBuffer;
 use crate::changelog::{ChangelogEntry, ChangelogSink};
+use crate::finality::SharedFindingFinalityTracker;
+use crate::finding_changelog::{FindingKind, LegKey};
 use crate::join::{self, JoinOutcome};
 use crate::leg::{BridgeOrPair, CandidateLeg};
 
@@ -192,6 +202,7 @@ impl CorrelationActor {
         mut rx: mpsc::Receiver<CandidateLeg>,
         sink: Arc<dyn EventSink>,
         changelog: Arc<dyn ChangelogSink>,
+        finality: Arc<SharedFindingFinalityTracker>,
         publish_backoff: Duration,
         shutdown: CancellationToken,
     ) {
@@ -217,6 +228,22 @@ impl CorrelationActor {
             }
             if let Some(event) = outcome.finding {
                 let chain = envelope_chain(&event);
+                // Start tracking the finding's legs for reorg retraction
+                // *before* publishing it (`crate::finality` module docs):
+                // once the finding is on the wire, a revert of any leg must
+                // already be able to retract it, not race a window where
+                // it's public but not yet watched.
+                let (finding_id, legs, kind) = finding_record_args(&event);
+                finality
+                    .record_finding(
+                        finding_id,
+                        self.bridge_or_pair.clone(),
+                        kind,
+                        legs,
+                        Utc::now(),
+                    )
+                    .await;
+                crate::metrics::record_pending_findings(finality.len());
                 let envelope = EventEnvelope::new(chain, event);
                 publish_resilient(sink.as_ref(), envelope, publish_backoff, &shutdown).await;
             }
@@ -238,6 +265,37 @@ fn envelope_chain(event: &DomainEvent) -> events::primitives::Chain {
                 .expect("join::join_leg never builds an empty leg list")
                 .chain
         }
+        _ => unreachable!("CorrelationActor::on_leg only ever returns a cross-chain finding"),
+    }
+}
+
+/// Everything [`crate::finality::SharedFindingFinalityTracker::record_finding`]
+/// needs from a just-built finding: its retraction key, the `(chain, block
+/// hash)` of every leg to watch, and the metric/log label for its kind.
+fn finding_record_args(
+    event: &DomainEvent,
+) -> (
+    events::primitives::CrossChainFindingId,
+    Vec<LegKey>,
+    FindingKind,
+) {
+    match event {
+        DomainEvent::BridgeMevDetected(e) => (
+            e.finding_id,
+            vec![
+                (e.deposit_leg.chain, e.deposit_leg.block.hash),
+                (e.fill_leg.chain, e.fill_leg.block.hash),
+            ],
+            FindingKind::BridgeMev,
+        ),
+        DomainEvent::CrossChainMevDetected(e) => (
+            e.finding_id,
+            e.legs
+                .iter()
+                .map(|leg| (leg.chain, leg.block.hash))
+                .collect(),
+            FindingKind::CrossChainMev,
+        ),
         _ => unreachable!("CorrelationActor::on_leg only ever returns a cross-chain finding"),
     }
 }
@@ -266,6 +324,18 @@ mod tests {
             confidence: Confidence::new(0.9),
             impact_usd: None,
         }
+    }
+
+    fn test_finality() -> Arc<SharedFindingFinalityTracker> {
+        use crate::finding_changelog::{FindingChangelogSink, RecordingFindingChangelogWriter};
+        let changelog: Arc<dyn FindingChangelogSink> =
+            Arc::new(RecordingFindingChangelogWriter::default());
+        SharedFindingFinalityTracker::new(
+            TimeDelta::hours(1),
+            100,
+            changelog,
+            CancellationToken::new(),
+        )
     }
 
     fn a_deposit_leg(bridge_or_pair: BridgeOrPair, key: u8, tag: u8) -> CandidateLeg {
@@ -378,6 +448,7 @@ mod tests {
                 rx,
                 sink,
                 changelog,
+                test_finality(),
                 Duration::from_millis(1),
                 CancellationToken::new(),
             ),
@@ -405,12 +476,14 @@ mod tests {
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
         let changelog = Arc::new(RecordingChangelogWriter::default());
         let changelog_dyn: Arc<dyn ChangelogSink> = changelog.clone();
+        let finality = test_finality();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             actor.run(
                 rx,
                 sink_dyn,
                 changelog_dyn,
+                finality.clone(),
                 Duration::from_millis(1),
                 CancellationToken::new(),
             ),
@@ -430,6 +503,10 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(matches!(entries[0], ChangelogEntry::Buffered(_)));
         assert!(matches!(entries[1], ChangelogEntry::Removed { .. }));
+
+        // The published finding's legs are now tracked for reorg retraction
+        // (§15, Sprint 17 task 3) — see `crate::finality`.
+        assert_eq!(finality.len(), 1);
     }
 
     #[tokio::test]
@@ -444,7 +521,14 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            actor.run(rx, sink, changelog, Duration::from_millis(1), shutdown),
+            actor.run(
+                rx,
+                sink,
+                changelog,
+                test_finality(),
+                Duration::from_millis(1),
+                shutdown,
+            ),
         )
         .await
         .expect("run must return on an already-cancelled shutdown token");

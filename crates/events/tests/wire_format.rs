@@ -31,7 +31,9 @@ use chrono::{DateTime, Utc};
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
-use events::cross_chain::{BridgeMevDetected, CrossChainLegRef, CrossChainMevDetected};
+use events::cross_chain::{
+    BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef, CrossChainMevDetected,
+};
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
     AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
@@ -39,9 +41,9 @@ use events::intelligence::{
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
-    AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CustomerId, DetectorRef,
-    EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId, Severity,
-    SuggestedAction, UsdAmount,
+    AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CrossChainFindingId,
+    CustomerId, DetectorRef, EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId,
+    Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -110,6 +112,10 @@ fn customer_id() -> CustomerId {
 
 fn prediction_id() -> PredictionId {
     PredictionId(uuid::Uuid::from_u128(0xF1))
+}
+
+fn finding_id() -> CrossChainFindingId {
+    CrossChainFindingId(uuid::Uuid::from_u128(0xFD))
 }
 
 /// One representative value for every [`DomainEvent`] variant. The exhaustiveness
@@ -330,6 +336,7 @@ fn sample_events() -> Vec<DomainEvent> {
         }),
         // Cross-chain (§24)
         DomainEvent::BridgeMevDetected(BridgeMevDetected {
+            finding_id: finding_id(),
             bridge: "usdc-eth-base".into(),
             deposit_leg: CrossChainLegRef {
                 chain: Chain::ETHEREUM,
@@ -346,8 +353,10 @@ fn sample_events() -> Vec<DomainEvent> {
             victim_loss: 4_800.0,
             confidence: Confidence::new(0.8),
             severity: Severity::High,
+            provisional: true,
         }),
         DomainEvent::CrossChainMevDetected(CrossChainMevDetected {
+            finding_id: finding_id(),
             kind: AlertKind::Arbitrage,
             bridge: "usdc-eth-base".into(),
             legs: vec![
@@ -367,6 +376,11 @@ fn sample_events() -> Vec<DomainEvent> {
             latency_ms: 4_500,
             confidence: Confidence::new(0.75),
             severity: Severity::Medium,
+            provisional: true,
+        }),
+        DomainEvent::CrossChainFindingRetracted(CrossChainFindingRetracted {
+            finding_id: finding_id(),
+            reason: "block 19800000 (0x1111…) reverted by reorg, replaced by 0x4444…".into(),
         }),
     ]
 }
@@ -501,11 +515,15 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "BridgeMevDetected",
-        r#"{"type":"BridgeMevDetected","payload":{"bridge":"usdc-eth-base","deposit_leg":{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},"fill_leg":{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"},"entity_hint":"0x3333333333333333333333333333333333333333","profit":5000.0,"victim_loss":4800.0,"confidence":0.8,"severity":"high"}}"#,
+        r#"{"type":"BridgeMevDetected","payload":{"finding_id":"00000000-0000-0000-0000-0000000000fd","bridge":"usdc-eth-base","deposit_leg":{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},"fill_leg":{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"},"entity_hint":"0x3333333333333333333333333333333333333333","profit":5000.0,"victim_loss":4800.0,"confidence":0.8,"severity":"high","provisional":true}}"#,
     ),
     (
         "CrossChainMevDetected",
-        r#"{"type":"CrossChainMevDetected","payload":{"kind":"arbitrage","bridge":"usdc-eth-base","legs":[{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"}],"entity_hint":"0x3333333333333333333333333333333333333333","profit":12000.0,"latency_ms":4500,"confidence":0.75,"severity":"medium"}}"#,
+        r#"{"type":"CrossChainMevDetected","payload":{"finding_id":"00000000-0000-0000-0000-0000000000fd","kind":"arbitrage","bridge":"usdc-eth-base","legs":[{"chain":1,"block":{"number":19800000,"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"},"tx":"0x2222222222222222222222222222222222222222222222222222222222222222"},{"chain":8453,"block":{"number":8453000,"hash":"0x6666666666666666666666666666666666666666666666666666666666666666"},"tx":"0x7777777777777777777777777777777777777777777777777777777777777777"}],"entity_hint":"0x3333333333333333333333333333333333333333","profit":12000.0,"latency_ms":4500,"confidence":0.75,"severity":"medium","provisional":true}}"#,
+    ),
+    (
+        "CrossChainFindingRetracted",
+        r#"{"type":"CrossChainFindingRetracted","payload":{"finding_id":"00000000-0000-0000-0000-0000000000fd","reason":"block 19800000 (0x1111…) reverted by reorg, replaced by 0x4444…"}}"#,
     ),
 ];
 

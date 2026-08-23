@@ -41,9 +41,20 @@
 //! the evidence-field contract and why it is still a legitimate no-op
 //! against today's live detectors.
 //!
-//! Task 3 adds cross-chain finality/reorg retraction; task 4 wires findings
-//! into intelligence. See `sprint_plan.md`'s Sprint 17 row and
-//! `docs/onchain_mev_detector_v2_microservices_rev2.md` §17/§24.
+//! **Task 3** ("cross-chain finality + reorg") adds [`finality`]: a finding
+//! is only as final as its least-final leg, so
+//! [`finality::FindingFinalityTracker`] tracks every published finding's legs
+//! until each is finalized (§15), and [`finality::FinalityConsumer`] retracts
+//! the whole finding — publishing
+//! [`events::cross_chain::CrossChainFindingRetracted`] — the instant *any*
+//! leg's block reverts, via the same `finding_id` task 2 minted for exactly
+//! this. [`finding_changelog`] gives that tracking durability (event-sourced,
+//! replayed at boot), the same gap-closing move task 2's hardening pass made
+//! for the leg buffer. See [`finality`]/[`finding_changelog`]'s module docs
+//! for the full design.
+//!
+//! Task 4 wires findings into intelligence. See `sprint_plan.md`'s Sprint 17
+//! row and `docs/onchain_mev_detector_v2_microservices_rev2.md` §17/§24.
 //!
 //! ## Production hardening (post-task-2)
 //!
@@ -72,6 +83,8 @@ pub mod buffer;
 pub mod chain_consumer;
 pub mod changelog;
 pub mod config;
+pub mod finality;
+pub mod finding_changelog;
 pub mod join;
 pub mod leg;
 pub mod metrics;
