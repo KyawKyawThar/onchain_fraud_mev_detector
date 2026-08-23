@@ -1,9 +1,21 @@
-//! Cross-chain correlator service binary (§17, §24, Sprint 17 t1) — boot: for
-//! every configured bridge/pair, spawn its [`CorrelationActor`]; for every
-//! configured chain, spawn a dedicated [`ChainConsumer`] task that filters to
-//! that chain and routes any recognized candidate leg to its actor over the
-//! shared [`LegRouter`]. See `lib.rs` for the module docs and this pass's
-//! scope (the consumer/actor/buffer skeleton — leg recognition is task 2).
+//! Cross-chain correlator service binary (§17, §24, Sprint 17 t1+t2, plus
+//! production hardening) — boot:
+//!
+//! 1. provision the leg-buffer changelog topic and replay it
+//!    ([`changelog::replay`]) to warm-start every actor's buffer;
+//! 2. for every bridge/pair *this replica owns*
+//!    ([`Config::owned_bridges_or_pairs`], production hardening's
+//!    horizontal-sharding seam), spawn its [`CorrelationActor`] — sharing
+//!    one Kafka producer for findings and one for the changelog across every
+//!    actor;
+//! 3. for every configured chain, spawn a dedicated [`ChainConsumer`] task
+//!    that filters to that chain, dedupes Kafka redeliveries, and routes any
+//!    leg [`EvidenceLegExtractor`] recognizes to its actor over the shared
+//!    [`LegRouter`] (never blocking on a stalled actor — see `router`'s
+//!    docs).
+//!
+//! See `lib.rs` for the full module map and the "Production hardening"
+//! section.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,10 +24,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use cross_chain_correlator::actor::CorrelationActor;
 use cross_chain_correlator::chain_consumer::{self, ChainConsumer};
+use cross_chain_correlator::changelog::{self, ChangelogSink, ChangelogWriter};
 use cross_chain_correlator::config::Config;
-use cross_chain_correlator::leg::{BridgeOrPair, CandidateLeg, StubExtractor};
+use cross_chain_correlator::leg::{BridgeOrPair, CandidateLeg, EvidenceLegExtractor};
 use cross_chain_correlator::router::LegRouter;
 use event_bus::dlq::DeadLetterQueue;
+use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
 use events::primitives::Chain;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -36,11 +50,53 @@ async fn main() -> Result<()> {
 
 async fn run(cfg: Config) -> Result<()> {
     telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+    let owned_bridges_or_pairs = cfg.owned_bridges_or_pairs();
     tracing::info!(
         chains = cfg.chains.len(),
         bridges_or_pairs = cfg.bridges_or_pairs.len(),
+        owned_bridges_or_pairs = owned_bridges_or_pairs.len(),
+        replica_index = cfg.replica_index,
+        replica_count = cfg.replica_count,
         "starting cross-chain correlator"
     );
+    if cfg.replica_count > 1
+        && !cfg.bridges_or_pairs.is_empty()
+        && owned_bridges_or_pairs.is_empty()
+    {
+        tracing::warn!(
+            replica_index = cfg.replica_index,
+            replica_count = cfg.replica_count,
+            "this replica owns zero of the configured bridges/pairs after sharding \
+             (more replicas than bridges/pairs) — it will boot but correlate nothing"
+        );
+    }
+
+    let sink: Arc<dyn EventSink> =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building Kafka producer")?);
+
+    // ── Leg-buffer changelog: provision + replay before anything else
+    // starts consuming live legs, so a warm-started actor never processes a
+    // live leg against a still-empty buffer while replay is in flight
+    // (production hardening, `changelog` module docs) ─────────────────────
+    let topic_replication = telemetry::env::parse_or("KAFKA_TOPIC_REPLICATION", 1)?;
+    ChangelogWriter::ensure_topic(
+        &cfg.kafka.brokers,
+        topic_replication,
+        cfg.changelog_retention_ms,
+    )
+    .await
+    .context("provisioning the leg-changelog topic")?;
+    let changelog: Arc<dyn ChangelogSink> = Arc::new(
+        ChangelogWriter::new(&cfg.kafka.brokers).context("building the leg-changelog producer")?,
+    );
+    let mut replayed_state = changelog::replay(
+        &cfg.kafka.brokers,
+        &cfg.consumer_group_prefix,
+        cfg.replica_index,
+        cfg.changelog_replay_timeout,
+    )
+    .await
+    .context("replaying the leg-changelog")?;
 
     let shutdown = CancellationToken::new();
     // K8s probes (§20): /livez immediately; /readyz flips on once boot wiring
@@ -58,18 +114,34 @@ async fn run(cfg: Config) -> Result<()> {
         }
     });
 
-    // ── One correlation actor per bridge/pair (§17) ─────────────────────
+    // ── One correlation actor per bridge/pair this replica owns (§17,
+    // production hardening's horizontal-sharding seam) ─────────────────
     let mut senders: HashMap<BridgeOrPair, mpsc::Sender<CandidateLeg>> = HashMap::new();
     let mut actor_tasks = Vec::new();
-    for bridge_or_pair in &cfg.bridges_or_pairs {
+    for bridge_or_pair in &owned_bridges_or_pairs {
         let (tx, rx) = mpsc::channel::<CandidateLeg>(cfg.actor_channel_capacity);
         senders.insert(bridge_or_pair.clone(), tx);
-        let actor = CorrelationActor::new(
+        let seed = replayed_state.remove(bridge_or_pair).unwrap_or_default();
+        let actor = CorrelationActor::new_with_seed(
             bridge_or_pair.clone(),
             cfg.leg_window,
             cfg.leg_buffer_capacity,
+            seed,
         );
-        actor_tasks.push(tokio::spawn(actor.run(rx, shutdown.clone())));
+        actor_tasks.push(tokio::spawn(actor.run(
+            rx,
+            Arc::clone(&sink),
+            Arc::clone(&changelog),
+            PUBLISH_BACKOFF,
+            shutdown.clone(),
+        )));
+    }
+    if !replayed_state.is_empty() {
+        tracing::warn!(
+            unowned_bridges_or_pairs = replayed_state.len(),
+            "leg-changelog replay found state for bridges/pairs this replica doesn't own \
+             (a different replica's, or one removed from the roster) — discarding it"
+        );
     }
     let router = Arc::new(LegRouter::new(senders));
 
@@ -97,15 +169,16 @@ async fn run(cfg: Config) -> Result<()> {
 }
 
 /// Build and run one chain's [`ChainConsumer`] — its own Kafka consumer group
-/// and DLQ (see `chain_consumer` module docs for why every chain needs its
-/// own group), so a chain whose consumer can't subscribe (a broker blip at
-/// exactly the wrong moment) doesn't take any other chain's task down with
-/// it; each chain's own retry loop is `event_bus::run_consumer`'s internal
-/// transient-fault handling, not a supervisor here (contrast
-/// `notification`'s opt-in predictive consumer, which layers one because it
-/// alone can die silently on a *subscribe* failure with nothing else
-/// watching — every chain consumer here is joined and its `Err` surfaces the
-/// same way).
+/// (per-replica too, once sharded — see
+/// `Config::consumer_group_for`'s docs) and DLQ (see `chain_consumer` module
+/// docs for why every chain needs its own group), so a chain whose consumer
+/// can't subscribe (a broker blip at exactly the wrong moment) doesn't take
+/// any other chain's task down with it; each chain's own retry loop is
+/// `event_bus::run_consumer`'s internal transient-fault handling, not a
+/// supervisor here (contrast `notification`'s opt-in predictive consumer,
+/// which layers one because it alone can die silently on a *subscribe*
+/// failure with nothing else watching — every chain consumer here is joined
+/// and its `Err` surfaces the same way).
 async fn run_chain_consumer(
     chain: Chain,
     cfg: Config,
@@ -118,10 +191,11 @@ async fn run_chain_consumer(
         .with_context(|| format!("provisioning the DLQ topic for chain {}", chain.id()))?;
     let consumer = chain_consumer::build_consumer(&cfg.kafka.brokers, &group_id)
         .with_context(|| format!("building the Kafka consumer for chain {}", chain.id()))?;
-    // `StubExtractor` until Sprint 17 task 2 lands a real `LegExtractor` —
-    // swapping it in is the only change this call site needs (see
-    // `chain_consumer` module docs).
-    let handler = ChainConsumer::new(chain, router, StubExtractor);
+    let extractor = EvidenceLegExtractor::new(
+        cfg.bridge_deposit_detector_ids.clone(),
+        cfg.large_swap_detector_ids.clone(),
+    );
+    let handler = ChainConsumer::new(chain, router, extractor, cfg.dedup_capacity);
     handler
         .run(consumer, RETRY_BACKOFF, Some(&dlq), &shutdown)
         .await

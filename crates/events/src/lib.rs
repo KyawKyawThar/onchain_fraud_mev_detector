@@ -19,6 +19,7 @@
 //! what lets the same struct be the wire format *and* the stored record.
 
 pub mod chain;
+pub mod cross_chain;
 pub mod detection;
 pub mod intelligence;
 pub mod predictive;
@@ -223,6 +224,10 @@ pub enum DomainEvent {
     PredictedAlert(predictive::PredictedAlert),
     LiquidationRiskPredicted(predictive::LiquidationRiskPredicted),
     LiquidationCascadeWarned(predictive::LiquidationCascadeWarned),
+
+    // Cross-chain (§24)
+    BridgeMevDetected(cross_chain::BridgeMevDetected),
+    CrossChainMevDetected(cross_chain::CrossChainMevDetected),
 }
 
 /// Which service domain an event belongs to. Used for coarse routing/metrics;
@@ -242,6 +247,7 @@ pub enum EventFamily {
     RuleEngine,
     System,
     Predictive,
+    CrossChain,
 }
 
 impl EventFamily {
@@ -296,6 +302,7 @@ impl DomainEvent {
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
+            BridgeMevDetected(_) | CrossChainMevDetected(_) => EventFamily::CrossChain,
         }
     }
 
@@ -342,7 +349,9 @@ impl DomainEvent {
             | WalletExposureReportReady(_)
             | PredictedAlert(_)
             | LiquidationRiskPredicted(_)
-            | LiquidationCascadeWarned(_) => None,
+            | LiquidationCascadeWarned(_)
+            | BridgeMevDetected(_)
+            | CrossChainMevDetected(_) => None,
         }
     }
 
@@ -414,7 +423,9 @@ impl DomainEvent {
             | RuleAlertCreated(_)
             | PredictedAlert(_)
             | LiquidationRiskPredicted(_)
-            | LiquidationCascadeWarned(_) => None,
+            | LiquidationCascadeWarned(_)
+            | BridgeMevDetected(_)
+            | CrossChainMevDetected(_) => None,
         }
     }
 
@@ -443,6 +454,8 @@ impl DomainEvent {
             ScreeningDecisionRecorded(e) => vec![e.address],
             IncidentCreated(e) => e.victim_address.into_iter().collect(),
             WalletExposureReportReady(e) => vec![e.address],
+            BridgeMevDetected(e) => vec![e.entity_hint],
+            CrossChainMevDetected(e) => vec![e.entity_hint],
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)

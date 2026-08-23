@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Cross-chain MEV correlator (§17, §24, Sprint 17 t1) — one async consumer per
-# chain's event stream feeding a single correlation actor per bridge/pair, over
-# a bounded, time-window-evicted candidate-leg buffer. Deliberately its own
-# crate/binary, the same "independent deployment/scaling" stance as
-# `predictive` (§16) — reuses the whole backbone (event-bus, telemetry), no new
-# broker or store.
+# Cross-chain MEV correlator (§17, §24, Sprint 17 t1+t2, + production
+# hardening) — one async consumer per chain's event stream feeding a single
+# correlation actor per bridge/pair, over a bounded, time-window-evicted
+# candidate-leg buffer, joined into BridgeMevDetected/CrossChainMevDetected.
+# Deliberately its own crate/binary, the same "independent deployment/scaling"
+# stance as `predictive` (§16) — reuses the whole backbone (event-bus,
+# telemetry), no new broker or store beyond its own internal leg-changelog
+# topic (`crate::changelog`, production hardening — durable buffer state
+# across restarts, kept off the shared `events`/`event-bus` seam since it is
+# this crate's own implementation detail, not a platform domain event).
 
 [[bin]]
 name = "cross-chain-correlator"
@@ -31,6 +35,9 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 chrono = { workspace = true }
 alloy-primitives = { workspace = true }
+# Redelivery dedup keys on EventEnvelope::event_id (production hardening,
+# `chain_consumer` module docs).
+uuid = { workspace = true }
 
 # Concurrency model (§17): one bounded mpsc channel per bridge/pair correlation
 # actor (backpressure — a slow actor blocks its feeding consumers rather than

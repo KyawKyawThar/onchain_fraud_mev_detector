@@ -35,6 +35,7 @@ use uuid::Uuid;
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
+use events::cross_chain::{BridgeMevDetected, CrossChainLegRef, CrossChainMevDetected};
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
     AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
@@ -633,7 +634,78 @@ fn predictive_event() -> impl Strategy<Value = DomainEvent> {
     ]
 }
 
-/// Every `DomainEvent` variant, uniformly across the seven families.
+fn cross_chain_leg_ref() -> impl Strategy<Value = CrossChainLegRef> {
+    (any::<u64>(), block_ref(), b256()).prop_map(|(chain_id, block, tx)| CrossChainLegRef {
+        chain: Chain(chain_id),
+        block,
+        tx,
+    })
+}
+
+/// Cross-chain (§24): `BridgeMevDetected`, `CrossChainMevDetected`.
+fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
+    prop_oneof![
+        (
+            any::<String>(),
+            cross_chain_leg_ref(),
+            cross_chain_leg_ref(),
+            address(),
+            finite_f64(),
+            finite_f64(),
+            confidence(),
+            severity(),
+        )
+            .prop_map(
+                |(
+                    bridge,
+                    deposit_leg,
+                    fill_leg,
+                    entity_hint,
+                    profit,
+                    victim_loss,
+                    confidence,
+                    severity,
+                )| {
+                    DomainEvent::BridgeMevDetected(BridgeMevDetected {
+                        bridge,
+                        deposit_leg,
+                        fill_leg,
+                        entity_hint,
+                        profit,
+                        victim_loss,
+                        confidence,
+                        severity,
+                    })
+                }
+            ),
+        (
+            alert_kind(),
+            any::<String>(),
+            prop::collection::vec(cross_chain_leg_ref(), 2..4),
+            address(),
+            finite_f64(),
+            any::<u64>(),
+            confidence(),
+            severity(),
+        )
+            .prop_map(
+                |(kind, bridge, legs, entity_hint, profit, latency_ms, confidence, severity)| {
+                    DomainEvent::CrossChainMevDetected(CrossChainMevDetected {
+                        kind,
+                        bridge,
+                        legs,
+                        entity_hint,
+                        profit,
+                        latency_ms,
+                        confidence,
+                        severity,
+                    })
+                }
+            ),
+    ]
+}
+
+/// Every `DomainEvent` variant, uniformly across the eight families.
 fn domain_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
         chain_event(),
@@ -643,6 +715,7 @@ fn domain_event() -> impl Strategy<Value = DomainEvent> {
         rule_engine_event(),
         system_event(),
         predictive_event(),
+        cross_chain_event(),
     ]
 }
 
