@@ -85,6 +85,15 @@ rule-engine = { path = "crates/rule-engine" }
 # reuses it). Deliberately its own crate rather than folded into `detection` —
 # §16 calls for independent deployment/scaling, not a shared process.
 predictive = { path = "crates/predictive" }
+# Cross-chain MEV correlator (§17, §24, Sprint 17 t1) — one async consumer per
+# chain's event stream feeding a single correlation actor per bridge/pair over
+# a bounded, time-window-evicted candidate-leg buffer (the cross-chain analogue
+# of `detector-api::CrossBlockState`, windowed on wall-clock observation time
+# instead of block count since chains have different block times/finality).
+# The first consumer in the workspace that deliberately processes every
+# monitored chain's records from one process rather than filtering foreign
+# chains away (contrast `predictive`/`detection`, one instance per chain).
+cross-chain-correlator = { path = "crates/cross-chain-correlator" }
 
 # Errors.
 anyhow = "1"

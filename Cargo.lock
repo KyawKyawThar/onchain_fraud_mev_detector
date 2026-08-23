@@ -2187,6 +2187,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cross-chain-correlator"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "event-bus",
+ "events",
+ "metrics",
+ "metrics-util",
+ "rdkafka",
+ "serde",
+ "serde_json",
+ "telemetry",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

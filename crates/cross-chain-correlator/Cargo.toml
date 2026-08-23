@@ -1,0 +1,51 @@
+[package]
+name = "cross-chain-correlator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Cross-chain MEV correlator (§17, §24, Sprint 17 t1) — one async consumer per
+# chain's event stream feeding a single correlation actor per bridge/pair, over
+# a bounded, time-window-evicted candidate-leg buffer. Deliberately its own
+# crate/binary, the same "independent deployment/scaling" stance as
+# `predictive` (§16) — reuses the whole backbone (event-bus, telemetry), no new
+# broker or store.
+
+[[bin]]
+name = "cross-chain-correlator"
+path = "src/main.rs"
+
+[dependencies]
+events = { workspace = true }
+# Every per-chain consumer rides the shared at-least-once run_consumer loop
+# (Skip+DLQ, lag reporting) — arch-conformance forbids hand-rolled rdkafka.
+event-bus = { workspace = true }
+telemetry = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+chrono = { workspace = true }
+alloy-primitives = { workspace = true }
+
+# Concurrency model (§17): one bounded mpsc channel per bridge/pair correlation
+# actor (backpressure — a slow actor blocks its feeding consumers rather than
+# buffering unboundedly), a CancellationToken for graceful shutdown — mirrors
+# `predictive`/`notification`.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+rdkafka = { workspace = true }
+
+[dev-dependencies]
+event-bus = { workspace = true, features = ["test-util"] }
+# In-memory recorder for the metrics tests (§19) — same seam
+# `predictive::metrics`'s tests use.
+metrics-util = { workspace = true }
+
+[lints]
+workspace = true
