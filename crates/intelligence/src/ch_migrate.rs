@@ -27,6 +27,11 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0002_create_block_production.up.sql"),
         down: include_str!("../migrations/0002_create_block_production.down.sql"),
     },
+    Migration {
+        version: "0003_add_cross_chain_columns",
+        up: include_str!("../migrations/0003_add_cross_chain_columns.up.sql"),
+        down: include_str!("../migrations/0003_add_cross_chain_columns.down.sql"),
+    },
 ];
 
 /// The intelligence service's migrator: apply on boot via

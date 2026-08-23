@@ -63,6 +63,13 @@ pub struct ProductionRow {
     pub other_mev_count: u32,
     pub coinbase_transfer_count: u32,
     pub coinbase_transfers: String,
+    /// Confirmed `BridgeMevDetected`/`CrossChainMevDetected` findings folded
+    /// in with a leg in this block (§24, Sprint 17 t4) — separate from
+    /// `mev_extracted_usd`/`sandwich_count`/`arb_count`, which are
+    /// confirmed-incident-only.
+    pub cross_chain_bridge_count: u32,
+    pub cross_chain_arb_count: u32,
+    pub cross_chain_provisional_usd: f64,
     pub reverted: u8,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     pub snapshot_at: chrono::DateTime<chrono::Utc>,
@@ -97,6 +104,9 @@ impl ProductionRow {
             coinbase_transfer_count: record.coinbase_transfers.len() as u32,
             coinbase_transfers: serde_json::to_string(&record.coinbase_transfers)
                 .expect("Vec<CoinbaseTransfer> serialization is total"),
+            cross_chain_bridge_count: record.cross_chain_bridge_count,
+            cross_chain_arb_count: record.cross_chain_arb_count,
+            cross_chain_provisional_usd: record.cross_chain_provisional_usd,
             reverted: u8::from(record.reverted),
             snapshot_at: record.snapshot_at,
         }
@@ -187,6 +197,9 @@ mod tests {
         assert_eq!(row.builder_label, "beaverbuild");
         assert_eq!(row.relay, "flashbots");
         assert_eq!(row.coinbase_transfer_count, 1);
+        assert_eq!(row.cross_chain_bridge_count, 0);
+        assert_eq!(row.cross_chain_arb_count, 0);
+        assert_eq!(row.cross_chain_provisional_usd, 0.0);
         assert_eq!(row.reverted, 0);
         assert_eq!(row.snapshot_at, at());
         // The transfers survive a JSON round-trip through the string column.

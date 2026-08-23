@@ -82,6 +82,7 @@ pub mod ch_migrate;
 pub mod command;
 pub mod config;
 pub mod consumer;
+pub mod cross_chain_projection;
 pub mod dispatcher;
 pub mod exposure;
 pub mod exposure_report;

@@ -43,6 +43,13 @@
 //!     ClickHouse (apply the `block_production` table first via `migrate up`)
 //!     and heuristic `BuilderAddress` `LabelAdded`s out, until a shutdown
 //!     signal — see [`intelligence::production_consumer`].
+//!   - `cross-chain-attribute` — drive the Sprint 17 t4 cross-chain
+//!     attribution consumer (§8, §24): `BridgeMevDetected`/
+//!     `CrossChainMevDetected` in (its own Kafka consumer group), each
+//!     finding's `entity_hint` clustered across its legs' chains into one
+//!     entity plus the association flywheel, `EntityCreated`/`EntityMerged`/
+//!     `LabelAdded`/`SanctionHit` out, until a shutdown signal — see
+//!     [`intelligence::cross_chain_attribution`].
 //!
 //! The label/entity-split trio above are one-shot operator actions with no Kafka consumer of
 //! their own (nothing else in this service calls `revoke_label`/
@@ -64,6 +71,7 @@ use intelligence::cache::{HotCache, RedisHotCache};
 use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
+use intelligence::cross_chain_attribution::{self, CrossChainAttributor};
 use intelligence::grpc::IntelligenceReadService;
 use intelligence::leaderboard::ClickhouseLeaderboard;
 use intelligence::merge_actor::MergeActor;
@@ -85,6 +93,7 @@ const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
                      `risk <address>`, `score`, `reorg`, `grpc`, `block-production`, \
+                     `cross-chain-attribute`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -113,6 +122,7 @@ async fn main() -> Result<()> {
         Some("reorg") => reorg_cmd(&cfg).await,
         Some("grpc") => grpc_serve(&cfg, client).await,
         Some("block-production") => block_production(&cfg, client).await,
+        Some("cross-chain-attribute") => cross_chain_attribute(&cfg, client).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -406,6 +416,87 @@ async fn attribute(cfg: &Config, client: Client) -> Result<()> {
         .context("attribution consumer exited with error")?;
 
     tracing::info!("intelligence attribution consumer shut down");
+    Ok(())
+}
+
+/// Run the Sprint 17 t4 cross-chain attribution consumer (§8, §24): connect
+/// the same seams `attribute` uses (Postgres store, Redis hot cache,
+/// ClickHouse adjacency, Kafka sink), then drain `BridgeMevDetected`/
+/// `CrossChainMevDetected` until shutdown — clustering each finding's
+/// `entity_hint` across its legs' chains into one entity and running the
+/// association flywheel against it, publishing `EntityCreated`/`EntityMerged`/
+/// `LabelAdded`/`SanctionHit` for the existing `score`/`reorg` consumers to
+/// react to exactly as if an incident had triggered them. Its own consumer
+/// group (`cfg.kafka.cross_chain_group_id`) — an independently deployable
+/// process from `attribute`, reading a disjoint pair of topics — see
+/// [`intelligence::cross_chain_attribution`].
+async fn cross_chain_attribute(cfg: &Config, client: Client) -> Result<()> {
+    tracing::info!(
+        group = %cfg.kafka.cross_chain_group_id,
+        "starting intelligence cross-chain attribution consumer"
+    );
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+
+    let cache = Arc::new(
+        RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+            .await
+            .context("connecting to Redis")?,
+    );
+
+    let graph = Arc::new(ClickhouseAdjacency::new(client));
+
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+
+    let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let attributor = CrossChainAttributor::new(
+        StoreSeams::single(store),
+        graph,
+        cache,
+        sink,
+        shutdown.clone(),
+        // This process's own actor — a separate deployment from `attribute`,
+        // so there is no in-process caller to share it with (§17).
+        MergeActor::spawn(),
+    );
+
+    let dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(
+        &cfg.kafka.brokers,
+        "intel-cross-chain-attribution",
+    )
+    .await
+    .context("provisioning the cross-chain attribution DLQ topic")?;
+    let consumer = cross_chain_attribution::build_consumer(
+        &cfg.kafka.brokers,
+        &cfg.kafka.cross_chain_group_id,
+    )
+    .context("building the cross-chain attribution Kafka consumer")?;
+    health.set_ready(true);
+    attributor
+        .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
+        .await
+        .context("cross-chain attribution consumer exited with error")?;
+
+    tracing::info!("intelligence cross-chain attribution consumer shut down");
     Ok(())
 }
 

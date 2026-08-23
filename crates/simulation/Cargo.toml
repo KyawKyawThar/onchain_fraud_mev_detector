@@ -47,6 +47,7 @@ path = "src/bin/projection.rs"
 
 [dependencies]
 events = { workspace = true }
+bounded-map = { workspace = true }
 # Shared Kafka producer seam (§20) — the dispatcher ships its `SimulationRequested`
 # audit event through the same `EventSink`/`publish_resilient` ingestion/detection
 # use, so the at-least-once policy lives in one place.

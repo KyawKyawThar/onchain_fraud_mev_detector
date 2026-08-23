@@ -1742,6 +1742,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bounded-map"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3839,6 +3846,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "anyhow",
  "async-trait",
+ "bounded-map",
  "ch-migrate",
  "chrono",
  "clickhouse",
@@ -4454,6 +4462,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bounded-map",
  "chrono",
  "db",
  "event-bus",
@@ -6239,6 +6248,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bounded-map",
  "chrono",
  "db",
  "event-bus",
@@ -7059,6 +7069,7 @@ dependencies = [
  "api-error",
  "async-trait",
  "axum",
+ "bounded-map",
  "ch-migrate",
  "chrono",
  "clickhouse",

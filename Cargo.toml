@@ -22,6 +22,12 @@ publish = false
 events    = { path = "crates/events" }
 telemetry = { path = "crates/telemetry" }
 db        = { path = "crates/db" }
+# The shared bounded-FIFO-map primitive (§4/§19): a `HashMap` capped to a fixed
+# number of distinct keys, evicting the oldest on overflow — every correlation/
+# orphan buffer on the backbone needs this discipline; consolidates five
+# near-identical hand-rolled copies across intelligence/simulation/rule-engine/
+# notification (see crates/bounded-map/Cargo.toml) into one implementation.
+bounded-map = { path = "crates/bounded-map" }
 # Shared ClickHouse migration runner (§4/§14): one `Migrator` implementation
 # (apply/revert/status + the `migrate` CLI arm, with fail-fast set validation)
 # that event-store, simulation and intelligence each bind to their OWN

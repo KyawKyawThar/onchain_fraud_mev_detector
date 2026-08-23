@@ -29,7 +29,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use events::primitives::{AccountAddress, AlertId, Chain, IncidentId, UsdAmount};
+use events::primitives::{
+    AccountAddress, AlertId, Chain, Confidence, CrossChainFindingId, IncidentId, UsdAmount,
+};
 use events::{DomainEvent, EventEnvelope};
 use revm::primitives::B256;
 use secrecy::ExposeSecret;
@@ -38,6 +40,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::config::ClickhouseConfig;
+use crate::cross_chain_projection::{CrossChainFindingKind, CrossChainFindingRecord};
 use crate::projection::{IncidentRecord, IncidentStatus};
 
 /// A failure writing to (or probing) one of the stores. The variant — and, for Postgres,
@@ -489,6 +492,159 @@ impl IncidentStore for PgIncidentStore {
             incidents,
             next_cursor,
         })
+    }
+}
+
+/// Hard ceiling on one [`CrossChainFindingStore::list_findings`] page (§24,
+/// Sprint 17 t4) — a guard against an unbounded scan, mirroring
+/// [`MAX_INCIDENTS_LIMIT`]. Cross-chain findings are a much lower-volume
+/// stream than incidents (they need a correlated multi-chain match, not just
+/// a single-chain detector trigger), so both the ceiling and the default sit
+/// lower.
+pub const MAX_CROSS_CHAIN_FINDINGS_LIMIT: u64 = 200;
+/// Default page size when a caller doesn't ask for one.
+pub const DEFAULT_CROSS_CHAIN_FINDINGS_LIMIT: u64 = 50;
+
+/// Optional narrowing for [`CrossChainFindingStore::list_findings`] (§11
+/// `/v1/incidents`, whose `cross_chain_findings` array this backs — see
+/// [`crate::http`]). No keyset cursor, unlike [`IncidentFilters`]: today's
+/// low finding volume doesn't yet justify one — a documented simplification,
+/// not an oversight (see [`crate::cross_chain_projection`]'s module docs for
+/// why this is its own read model rather than reusing `IncidentFilters`).
+#[derive(Debug, Default, Clone)]
+pub struct CrossChainFindingFilters {
+    /// `Some(false)` = live findings only, `Some(true)` = retracted only,
+    /// `None` = both.
+    pub retracted: Option<bool>,
+    /// Max rows; clamped to `[1, MAX_CROSS_CHAIN_FINDINGS_LIMIT]`, defaulting
+    /// to [`DEFAULT_CROSS_CHAIN_FINDINGS_LIMIT`].
+    pub limit: Option<u64>,
+}
+
+impl CrossChainFindingFilters {
+    fn effective_limit(&self) -> u64 {
+        self.limit
+            .unwrap_or(DEFAULT_CROSS_CHAIN_FINDINGS_LIMIT)
+            .clamp(1, MAX_CROSS_CHAIN_FINDINGS_LIMIT)
+    }
+}
+
+/// The mutable Postgres cross-chain-finding read model (§24, Sprint 17 t4).
+/// Object-safe for the same reason as [`IncidentStore`] — a sibling seam, not
+/// a method on it, since a finding is a structurally different row (see
+/// [`crate::cross_chain_projection`]'s module docs).
+#[async_trait]
+pub trait CrossChainFindingStore: Send + Sync {
+    /// Upsert the folded finding read-model row, keyed by `finding_id`.
+    /// Idempotent: the [`CrossChainFindingRecord`] is always the current
+    /// merged truth (creation is set-once; only `retracted`/
+    /// `retraction_reason`/`observed_at` ever change), so re-applying a
+    /// redelivered event overwrites with identical values.
+    async fn upsert_finding(&self, record: &CrossChainFindingRecord) -> Result<(), PersistError>;
+
+    /// List finding rows, newest-observed first (§11 `GET /v1/incidents`),
+    /// optionally narrowed by `filters`.
+    async fn list_findings(
+        &self,
+        filters: &CrossChainFindingFilters,
+    ) -> Result<Vec<CrossChainFindingRecord>, PersistError>;
+}
+
+#[async_trait]
+impl CrossChainFindingStore for PgIncidentStore {
+    async fn upsert_finding(&self, record: &CrossChainFindingRecord) -> Result<(), PersistError> {
+        let finding_id: Uuid = record.finding_id.0;
+        let kind = record.kind.as_str();
+        let legs = serde_json::to_value(&record.legs).map_err(|err| {
+            PersistError::Postgres(sqlx::Error::Encode(
+                format!("encoding cross-chain finding legs: {err}").into(),
+            ))
+        })?;
+        let entity_hint = normalized_address(&record.entity_hint);
+        let confidence = record.confidence.get();
+        let severity = <&str>::from(record.severity);
+
+        sqlx::query!(
+            "INSERT INTO cross_chain_findings (
+                 finding_id, kind, bridge, legs, entity_hint, profit, victim_loss,
+                 confidence, severity, retracted, retraction_reason, observed_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+             ON CONFLICT (finding_id) DO UPDATE SET
+                 retracted         = EXCLUDED.retracted,
+                 retraction_reason = EXCLUDED.retraction_reason,
+                 observed_at       = EXCLUDED.observed_at,
+                 updated_at        = now()",
+            finding_id,
+            kind,
+            record.bridge,
+            legs,
+            entity_hint,
+            record.profit,
+            record.victim_loss,
+            confidence,
+            severity,
+            record.retracted,
+            record.retraction_reason.as_deref(),
+            record.observed_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_findings(
+        &self,
+        filters: &CrossChainFindingFilters,
+    ) -> Result<Vec<CrossChainFindingRecord>, PersistError> {
+        let limit = filters.effective_limit() as i64;
+        let rows = sqlx::query!(
+            "SELECT finding_id, kind, bridge, legs, entity_hint, profit, victim_loss,
+                    confidence, severity, retracted, retraction_reason, observed_at
+             FROM cross_chain_findings
+             WHERE ($1::bool IS NULL OR retracted = $1)
+             ORDER BY observed_at DESC
+             LIMIT $2",
+            filters.retracted,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let kind = CrossChainFindingKind::parse(&row.kind).ok_or_else(|| {
+                    PersistError::Postgres(sqlx::Error::ColumnDecode {
+                        index: "kind".to_owned(),
+                        source: format!("unrecognized cross-chain finding kind {:?}", row.kind)
+                            .into(),
+                    })
+                })?;
+                let legs = serde_json::from_value(row.legs).map_err(|err| {
+                    PersistError::Postgres(sqlx::Error::ColumnDecode {
+                        index: "legs".to_owned(),
+                        source: format!("stored legs: {err}").into(),
+                    })
+                })?;
+                let entity_hint = parse_address_column("entity_hint", &row.entity_hint)?;
+                let severity = parse_wire_enum(&row.severity)?;
+
+                Ok(CrossChainFindingRecord::from_stored(
+                    CrossChainFindingId(row.finding_id),
+                    kind,
+                    row.bridge,
+                    legs,
+                    entity_hint,
+                    row.profit,
+                    row.victim_loss,
+                    Confidence::new(row.confidence),
+                    severity,
+                    row.retracted,
+                    row.retraction_reason,
+                    row.observed_at,
+                ))
+            })
+            .collect()
     }
 }
 

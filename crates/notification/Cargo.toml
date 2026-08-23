@@ -16,6 +16,7 @@ publish.workspace = true
 
 [dependencies]
 events = { workspace = true }
+bounded-map = { workspace = true }
 
 thiserror = { workspace = true }
 serde = { workspace = true }

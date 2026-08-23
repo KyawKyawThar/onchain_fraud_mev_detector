@@ -1,0 +1,21 @@
+[package]
+name = "bounded-map"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The shared bounded-FIFO-map primitive: a `HashMap` capped to a fixed number of
+# distinct keys, evicting the oldest on overflow. Every correlation/orphan buffer
+# on the backbone needs this same discipline (an attacker, or a stalled upstream
+# partition, flooding a buffer with entries that never resolve must not grow
+# memory without bound). Consolidates five near-identical hand-rolled copies:
+# `intelligence::attribution`/`production_consumer`, `simulation::projection`/
+# `cross_chain_projection`, `rule_engine::consumer`, and `notification::consumer`
+# — every future one depends on this instead of growing a sixth. See src/lib.rs.
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }

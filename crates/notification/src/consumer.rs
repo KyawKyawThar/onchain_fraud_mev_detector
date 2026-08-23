@@ -15,9 +15,9 @@
 //! order. The durable `incident_alerts` mapping
 //! (`NotificationStore::alert_for_incident`) is the primary lookup; a small
 //! in-memory bounded FIFO buffer covers a retraction/finalization that
-//! outruns its confirm within one process's lifetime — the exact shape
-//! `rule_engine::consumer`'s `PendingState`/`BoundedFifoMap` already uses for
-//! the identical race.
+//! outruns its confirm within one process's lifetime — the same shared
+//! `bounded_map::BoundedFifoMap` `rule_engine::consumer`'s `PendingState`
+//! already uses for the identical race.
 //!
 //! **Inherited, accepted gap** (same as `rule_engine::consumer`'s own
 //! buffer): a buffered retraction/finalization commits its Kafka offset
@@ -61,12 +61,12 @@
 //! underlying store/channels/sink/subscribers via cheap `Arc` clones, and
 //! runs them as two independent consumer-group subscriptions.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bounded_map::BoundedFifoMap;
 use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
@@ -158,58 +158,6 @@ pub fn build_predictive_consumer(
     group_id: &str,
 ) -> Result<StreamConsumer<LagReporting>> {
     build_reporting_consumer(brokers, group_id, CONSUMER_PREDICTIVE)
-}
-
-// ── Bounded FIFO map (rule-engine's `PendingState` tolerance, locally) ────
-
-struct BoundedFifoMap<K, V> {
-    capacity: usize,
-    entries: HashMap<K, V>,
-    order: VecDeque<K>,
-}
-
-impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display, V> BoundedFifoMap<K, V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn put(&mut self, key: K, value: V) {
-        if !self.entries.contains_key(&key) {
-            self.evict_to_fit();
-            self.order.push_back(key);
-        }
-        self.entries.insert(key, value);
-    }
-
-    fn take(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key)
-    }
-
-    fn evict_to_fit(&mut self) {
-        if self.capacity == 0 {
-            return;
-        }
-        while self.entries.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    if self.entries.remove(&oldest).is_some() {
-                        tracing::warn!(
-                            key = %oldest,
-                            capacity = self.capacity,
-                            "notification consumer's pending-correlation buffer is full; \
-                             evicting the oldest entry — check for a stalled upstream partition"
-                        );
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-    }
 }
 
 /// What a buffered `IncidentRetracted`/`IncidentFinalized` needs replayed
@@ -441,7 +389,10 @@ impl NotificationConsumer {
     ) -> Self {
         Self {
             engine: DeliveryEngine::new(store, channels, sink, subscribers, shutdown),
-            pending: Mutex::new(BoundedFifoMap::new(DEFAULT_PENDING_CAPACITY)),
+            pending: Mutex::new(BoundedFifoMap::new(
+                DEFAULT_PENDING_CAPACITY,
+                "notification consumer's pending-correlation buffer",
+            )),
         }
     }
 

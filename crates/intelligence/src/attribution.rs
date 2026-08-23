@@ -68,7 +68,7 @@
 //!
 //! Every *store* write this pass makes is keyed, so a redelivered/retried
 //! incident converges rather than duplicates: `cluster_address` is idempotent
-//! (§8.2), derived labels use a deterministic id ([`seeded_label_id`]) so
+//! (§8.2), derived labels use a deterministic id (`seeded_label_id`) so
 //! `LabelAdded` fires only once per claim, and `record_attribution` is a
 //! keyed upsert. `SanctionHit` and `AttributionUpdated` are re-emitted on
 //! every redelivery (a hard alert and a summary respectively — restating the
@@ -83,6 +83,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bounded_map::BoundedFifoMap;
 use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
@@ -97,33 +98,12 @@ use rdkafka::consumer::StreamConsumer;
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::AdjacencyStore;
-use crate::bounded::BoundedFifoMap;
-use crate::cache::{CacheError, HotCache};
+use crate::association::{self, AssociationError};
+use crate::cache::HotCache;
 use crate::cluster::{cluster_address, ClusterError, ClusterLimits, ClusterSeams};
 use crate::merge_actor::MergeActorHandle;
-use crate::model::{AttributionRecord, LabelKind, LabelRecord, LabelSource};
-use crate::seed::seeded_label_id;
+use crate::model::AttributionRecord;
 use crate::store::{StoreError, StoreSeams};
-
-/// Label kinds that mark an address as a *directly known* bad actor — the
-/// association flywheel's trigger (§8.1/§8.6). `SanctionedEntity` is included
-/// alongside `KnownScammer` because a sanctions hit is exactly as strong a
-/// direct signal.
-const BAD_ACTOR_KINDS: &[LabelKind] = &[LabelKind::KnownScammer, LabelKind::SanctionedEntity];
-
-/// Label kinds that already mark an address as flagged, directly or by prior
-/// association — skipped when deciding whether a member needs a *fresh*
-/// derived label, so an already-flagged member is never relabeled.
-const FLAGGED_KINDS: &[LabelKind] = &[
-    LabelKind::KnownScammer,
-    LabelKind::SanctionedEntity,
-    LabelKind::ScammerAssociate,
-];
-
-/// The `source_detail` every association-flywheel label carries. Distinct from
-/// any feed's `source_detail` (§8.1) so [`seeded_label_id`]'s deterministic id
-/// can never collide with a seeded feed label for the same address/kind/value.
-const ASSOCIATION_SOURCE_DETAIL: &str = "entity_clustering_v1";
 
 /// Attribution confidence (§8.3) when the resolved entity is exactly the
 /// incident address itself — no clustering signal was needed to name it, so
@@ -207,7 +187,7 @@ pub enum AttributionError {
     #[error(transparent)]
     Cluster(#[from] ClusterError),
     #[error(transparent)]
-    Cache(#[from] CacheError),
+    Association(#[from] AssociationError),
 }
 
 impl Transience for AttributionError {
@@ -216,7 +196,7 @@ impl Transience for AttributionError {
         match self {
             AttributionError::Store(err) => err.is_transient(),
             AttributionError::Cluster(err) => err.is_transient(),
-            AttributionError::Cache(err) => err.is_transient(),
+            AttributionError::Association(err) => err.is_transient(),
         }
     }
 }
@@ -481,85 +461,31 @@ impl Attributor {
         })
     }
 
-    /// The association flywheel (§8.1/§8.6): if any member of `entity_id`
-    /// already carries a directly-known bad-actor label ([`BAD_ACTOR_KINDS`]),
-    /// every other member lacking one of [`FLAGGED_KINDS`] gets a derived
-    /// `ScammerAssociate` label — `EntityDerived` provenance, the §8.1 reduced
-    /// confidence band. The deterministic label id ([`seeded_label_id`]) makes
-    /// a re-run an idempotent no-op: `LabelAdded` fires only for a label newly
-    /// stored, and the hot cache is evicted only when one lands.
+    /// The association flywheel (§8.1/§8.6), delegating the store/cache pass
+    /// to [`association::label_associates`] (shared with
+    /// [`crate::cross_chain_attribution`]) and publishing `LabelAdded` for
+    /// every label it newly stored — `LabelAdded` fires only for a label
+    /// newly stored, so a redelivered/duplicate pass publishes nothing.
     async fn label_associates(
         &self,
         entity_id: EntityId,
         chain: Chain,
         at: DateTime<Utc>,
     ) -> Result<(), AttributionError> {
-        let Some(entity) = self.stores.entities.entity(entity_id).await? else {
-            return Ok(());
-        };
-        if entity.addresses.len() < 2 {
-            return Ok(());
-        }
-
-        let mut flagged_by: Option<AccountAddress> = None;
-        for member in &entity.addresses {
-            let member_labels = self.stores.labels.labels_for(member, at).await?;
-            if member_labels
-                .iter()
-                .any(|label| BAD_ACTOR_KINDS.contains(&label.kind))
-            {
-                flagged_by = Some(*member);
-                break;
-            }
-        }
-        let Some(flagged_by) = flagged_by else {
-            return Ok(());
-        };
-
-        for member in &entity.addresses {
-            if *member == flagged_by {
-                continue;
-            }
-            let existing = self.stores.labels.labels_for(member, at).await?;
-            if existing
-                .iter()
-                .any(|label| FLAGGED_KINDS.contains(&label.kind))
-            {
-                continue;
-            }
-
-            let value = format!("clustered with {flagged_by:#x}");
-            let derived = LabelRecord {
-                label_id: seeded_label_id(
-                    ASSOCIATION_SOURCE_DETAIL,
-                    member,
-                    LabelKind::ScammerAssociate,
-                    &value,
-                ),
-                address: *member,
-                kind: LabelKind::ScammerAssociate,
-                value,
-                confidence: LabelSource::EntityDerived.default_confidence(),
-                source: LabelSource::EntityDerived,
-                source_detail: ASSOCIATION_SOURCE_DETAIL.to_owned(),
-                created_at: at,
-                valid_until: None,
-            };
-
-            if self.stores.labels.add_label(&derived).await? {
-                self.cache.evict(member).await?;
-                self.publish(
-                    chain,
-                    DomainEvent::LabelAdded(LabelAdded {
-                        address: derived.address,
-                        kind: <&str>::from(derived.kind).to_owned(),
-                        value: derived.value.clone(),
-                        confidence: derived.confidence,
-                        source: <&str>::from(derived.source).to_owned(),
-                    }),
-                )
-                .await;
-            }
+        let newly_stored =
+            association::label_associates(&self.stores, self.cache.as_ref(), entity_id, at).await?;
+        for derived in newly_stored {
+            self.publish(
+                chain,
+                DomainEvent::LabelAdded(LabelAdded {
+                    address: derived.address,
+                    kind: <&str>::from(derived.kind).to_owned(),
+                    value: derived.value.clone(),
+                    confidence: derived.confidence,
+                    source: <&str>::from(derived.source).to_owned(),
+                }),
+            )
+            .await;
         }
         Ok(())
     }
@@ -646,7 +572,9 @@ impl EventHandler for Attributor {
 mod tests {
     use super::*;
     use crate::merge_actor::MergeActor;
-    use crate::model::{AdjacencyEdge, EdgeKind, SanctionEntry};
+    use crate::model::{
+        AdjacencyEdge, EdgeKind, LabelKind, LabelRecord, LabelSource, SanctionEntry,
+    };
     use crate::store::{AttributionStore, EntityStore, LabelStore, SanctionsStore};
     use crate::test_util::{
         store_seams, InMemoryAdjacency, InMemoryHotCache, InMemoryIntelligenceStore,

@@ -29,6 +29,55 @@ fn default_true() -> bool {
     true
 }
 
+/// Which cross-chain finding shape (§24) a finding is — [`BridgeMevDetected`]
+/// vs. [`CrossChainMevDetected`]. Not a field on either event (the shape
+/// *is* the event's variant); this exists because every downstream consumer
+/// that persists or counts findings by kind needs the same closed
+/// vocabulary — `cross-chain-correlator`'s finality changelog
+/// (`FindingChangelogEntry`, journaled to Kafka), `intelligence`'s
+/// block-production snapshots (§10, ClickHouse), and `simulation`'s
+/// `cross_chain_findings` read model (Postgres) all key off exactly this
+/// enum rather than each minting its own — a bare `&'static str` (or three
+/// near-identical local enums) would let a consumer's kind label silently
+/// drift from another's.
+///
+/// The variant names (`BridgeMev`/`CrossChainMev`) are on the wire —
+/// `cross-chain-correlator`'s `FindingChangelogEntry` serializes this enum
+/// directly via serde's default tag-by-variant-name encoding — so **do not
+/// rename a variant** without treating it as a breaking wire-format change
+/// (§2). [`Self::as_str`] gives the separate, already-established
+/// `"bridge_mev"`/`"cross_chain_mev"` snake_case strings the metrics/log/
+/// ClickHouse/Postgres label vocabulary uses; the two encodings are
+/// deliberately different (Rust variant tag vs. storage label) and neither
+/// should be reused for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum CrossChainFindingKind {
+    BridgeMev,
+    CrossChainMev,
+}
+
+impl CrossChainFindingKind {
+    /// The snake_case label every metric/log/stored-row uses — distinct from
+    /// the wire-serialized variant tag, see the type's docs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CrossChainFindingKind::BridgeMev => "bridge_mev",
+            CrossChainFindingKind::CrossChainMev => "cross_chain_mev",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`] — parses a stored/queried label back
+    /// into the enum.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "bridge_mev" => Some(CrossChainFindingKind::BridgeMev),
+            "cross_chain_mev" => Some(CrossChainFindingKind::CrossChainMev),
+            _ => None,
+        }
+    }
+}
+
 /// One chain's contribution to a correlated cross-chain finding: which chain,
 /// which block, which transaction. Carried per leg (rather than flattening to
 /// a single `chain`/`block`) so a `BlockReverted` on *any* leg's chain can
@@ -150,4 +199,52 @@ pub struct CrossChainFindingRetracted {
     /// replacement) — mirrors
     /// `simulation::reorg::retraction_reason`'s explainability.
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finding_kind_as_str_round_trips_through_parse() {
+        for kind in [
+            CrossChainFindingKind::BridgeMev,
+            CrossChainFindingKind::CrossChainMev,
+        ] {
+            assert_eq!(CrossChainFindingKind::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn finding_kind_as_str_is_pinned() {
+        // Pinned exactly: every metrics label, ClickHouse column, and Postgres
+        // row this enum feeds already keys on these strings — changing them
+        // silently would fork the vocabulary across services.
+        assert_eq!(CrossChainFindingKind::BridgeMev.as_str(), "bridge_mev");
+        assert_eq!(
+            CrossChainFindingKind::CrossChainMev.as_str(),
+            "cross_chain_mev"
+        );
+    }
+
+    #[test]
+    fn finding_kind_parse_rejects_garbage() {
+        assert_eq!(CrossChainFindingKind::parse("bridgemev"), None);
+        assert_eq!(CrossChainFindingKind::parse(""), None);
+    }
+
+    /// The wire-serialized variant tag (serde's default enum encoding) is
+    /// pinned too — `finding_changelog::FindingChangelogEntry` in
+    /// `cross-chain-correlator` already persists it to a durable Kafka topic.
+    #[test]
+    fn finding_kind_wire_tag_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&CrossChainFindingKind::BridgeMev).unwrap(),
+            "\"BridgeMev\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CrossChainFindingKind::CrossChainMev).unwrap(),
+            "\"CrossChainMev\""
+        );
+    }
 }

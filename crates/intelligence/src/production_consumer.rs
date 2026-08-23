@@ -15,6 +15,20 @@
 //!   its block's record.
 //! * **`IncidentRetracted`** — subtracts exactly what that incident added (§15).
 //! * **`BlockReverted`** — marks the record's final snapshot reverted (§15).
+//! * **`BridgeMevDetected`/`CrossChainMevDetected`** (§24, Sprint 17 t4) — a
+//!   cross-chain finding's legs each carry their own `chain` (unlike every
+//!   event above, whose *envelope* is tagged to this pipeline's one chain),
+//!   so this consumer folds in only the legs whose `chain` matches
+//!   [`ProductionConsumer::chain`], apportioning the finding's `profit` to
+//!   whichever of *this chain's* blocks the finding actually touched. Kept
+//!   in `cross_chain_bridge_count`/`cross_chain_arb_count`/
+//!   `cross_chain_provisional_usd` — separate counters from the confirmed-
+//!   incident ones, since a cross-chain finding is never simulation-confirmed
+//!   (§24: `provisional` stays `true` forever) and conflating the two would
+//!   misreport a builder's *confirmed* MEV total.
+//! * **`CrossChainFindingRetracted`** — subtracts exactly what that finding
+//!   added on this chain (§15/§24: a finding is only as final as its
+//!   least-final leg, so any leg's reorg retracts the whole thing).
 //!
 //! ## Builder auto-labeling (§8.1)
 //!
@@ -54,8 +68,11 @@ use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::{
     handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
 };
+use events::cross_chain::{
+    BridgeMevDetected, CrossChainFindingKind, CrossChainFindingRetracted, CrossChainMevDetected,
+};
 use events::intelligence::LabelAdded;
-use events::primitives::{AccountAddress, BlockRef, Chain};
+use events::primitives::{AccountAddress, BlockRef, Chain, CrossChainFindingId};
 use events::{DomainEvent, EventEnvelope};
 use rdkafka::consumer::StreamConsumer;
 use tokio_util::sync::CancellationToken;
@@ -64,22 +81,28 @@ use crate::cache::{CacheError, HotCache};
 use crate::model::{LabelKind, LabelRecord, LabelSource};
 use crate::production::{
     heuristic_builder_value, sanitize_extra_data, BlockProductionRecord, BookCapacity,
-    Contribution, Folded, OpenFacts, ProductionBook, RelayAttribution,
+    Contribution, CrossChainContribution, Folded, OpenFacts, ProductionBook, RelayAttribution,
 };
 use crate::production_source::{coinbase_transfers, BlockFactsSource, RelaySource, SourceFault};
 use crate::production_store::{BlockProductionStore, ProductionStoreError};
 use crate::seed::seeded_label_id;
 use crate::store::{LabelStore, StoreError};
 
-/// The five event types this consumer subscribes to (see the module docs). An
+/// The event types this consumer subscribes to (see the module docs). An
 /// explicit, closed list (not a `mev.events.*` regex) so a renamed/missing
 /// topic fails loudly — the same discipline as every consumer on the backbone.
+/// The three cross-chain finding types (§24, Sprint 17 t4) are **not**
+/// chain-scoped by envelope the way the first five are (see
+/// [`EventHandler::handle`]'s routing) — see the module docs.
 const CONSUMED_EVENT_TYPES: &[&str] = &[
     "BlockCanonicalized",
     "BlockReverted",
     "DetectorTriggered",
     "IncidentCreated",
     "IncidentRetracted",
+    "BridgeMevDetected",
+    "CrossChainMevDetected",
+    "CrossChainFindingRetracted",
 ];
 
 /// The `source_detail` every relay-derived builder label carries — distinct
@@ -99,6 +122,12 @@ pub const PRODUCTION_BUILDER_LABELS_MINTED_TOTAL: &str =
 /// a persistently climbing value means a stalled upstream partition).
 pub const PRODUCTION_INCIDENTS_BUFFERED_TOTAL: &str =
     "intel_block_production_incidents_buffered_total";
+/// Cross-chain finding legs buffered awaiting their block's record (§24,
+/// Sprint 17 t4) — tracked separately from
+/// [`PRODUCTION_INCIDENTS_BUFFERED_TOTAL`] so a stalled cross-chain topic is
+/// distinguishable from a stalled incident-correlation one.
+pub const PRODUCTION_CROSS_CHAIN_BUFFERED_TOTAL: &str =
+    "intel_block_production_cross_chain_buffered_total";
 
 /// The topics the consumer subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
 pub fn consumed_topics() -> Vec<String> {
@@ -405,6 +434,109 @@ impl ProductionConsumer {
         }
         self.queue_and_flush(folded.into_snapshots()).await
     }
+
+    /// Run one pure cross-chain-finding fold under the state lock, then flush
+    /// its snapshots — the cross-chain analogue of
+    /// [`fold_and_flush`](Self::fold_and_flush), with its own buffered-count
+    /// metric (§19, §24).
+    async fn fold_cross_chain_and_flush(
+        &self,
+        fold: impl FnOnce(&mut ProductionBook) -> Folded,
+    ) -> Result<(), ProductionError> {
+        let folded = {
+            let mut state = self.state.lock().expect("production state mutex poisoned");
+            fold(&mut state.book)
+        };
+        if matches!(folded, Folded::Buffered) {
+            metrics::counter!(PRODUCTION_CROSS_CHAIN_BUFFERED_TOTAL).increment(1);
+        }
+        self.queue_and_flush(folded.into_snapshots()).await
+    }
+
+    /// Fold every leg of a `BridgeMevDetected`/`CrossChainMevDetected` that
+    /// lands on this book's own chain (§24, Sprint 17 t4) — a bridge finding
+    /// has at most one such leg by construction (its two legs are on
+    /// different chains, §24 task 2's join requirement); a cross-chain-cycle
+    /// finding could in principle have more than one.
+    async fn fold_finding_legs(
+        &self,
+        finding_id: CrossChainFindingId,
+        legs: &[(Chain, BlockRef)],
+        kind: CrossChainFindingKind,
+        profit_usd: f64,
+        at: DateTime<Utc>,
+    ) -> Handled {
+        for &(leg_chain, block) in legs {
+            if leg_chain != self.chain {
+                continue;
+            }
+            let contribution = CrossChainContribution { kind, profit_usd };
+            let result = self
+                .fold_cross_chain_and_flush(|book| {
+                    book.fold_cross_chain_finding(finding_id, block, contribution, at)
+                })
+                .await;
+            if let Err(err) = result {
+                return handled(err, "block-production");
+            }
+        }
+        Handled::Commit
+    }
+
+    async fn handle_bridge_finding(
+        &self,
+        finding: &BridgeMevDetected,
+        at: DateTime<Utc>,
+    ) -> Handled {
+        let legs = [
+            (finding.deposit_leg.chain, finding.deposit_leg.block),
+            (finding.fill_leg.chain, finding.fill_leg.block),
+        ];
+        self.fold_finding_legs(
+            finding.finding_id,
+            &legs,
+            CrossChainFindingKind::BridgeMev,
+            finding.profit,
+            at,
+        )
+        .await
+    }
+
+    async fn handle_cross_chain_mev(
+        &self,
+        finding: &CrossChainMevDetected,
+        at: DateTime<Utc>,
+    ) -> Handled {
+        let legs: Vec<(Chain, BlockRef)> = finding
+            .legs
+            .iter()
+            .map(|leg| (leg.chain, leg.block))
+            .collect();
+        self.fold_finding_legs(
+            finding.finding_id,
+            &legs,
+            CrossChainFindingKind::CrossChainMev,
+            finding.profit,
+            at,
+        )
+        .await
+    }
+
+    async fn handle_cross_chain_retraction(
+        &self,
+        retracted: &CrossChainFindingRetracted,
+        at: DateTime<Utc>,
+    ) -> Handled {
+        let result = self
+            .fold_cross_chain_and_flush(|book| {
+                book.retract_cross_chain_finding(retracted.finding_id, at)
+            })
+            .await;
+        match result {
+            Ok(()) => Handled::Commit,
+            Err(err) => handled(err, "block-production"),
+        }
+    }
 }
 
 #[async_trait]
@@ -412,6 +544,25 @@ impl EventHandler for ProductionConsumer {
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
         let at = envelope.occurred_at;
         let chain = envelope.chain;
+
+        // Cross-chain finding events (§24) are routed before the single-chain
+        // early-exit below: unlike every other topic this consumer reads,
+        // their *envelope* chain (§17's fill-leg/last-leg convention) need
+        // not be this pipeline's chain even when one of the finding's *legs*
+        // is — each handler filters legs itself (see the module docs).
+        match &envelope.payload {
+            DomainEvent::BridgeMevDetected(finding) => {
+                return self.handle_bridge_finding(finding, at).await;
+            }
+            DomainEvent::CrossChainMevDetected(finding) => {
+                return self.handle_cross_chain_mev(finding, at).await;
+            }
+            DomainEvent::CrossChainFindingRetracted(retracted) => {
+                return self.handle_cross_chain_retraction(retracted, at).await;
+            }
+            _ => {}
+        }
+
         // Another chain's event on the shared topics (Sprint 13 t2): this
         // pipeline attributes exactly one chain (its facts RPC and relays are
         // that chain's), so commit-skip rather than error on a block hash the
@@ -816,5 +967,226 @@ mod tests {
         let appended = h.store.appended();
         assert_eq!(appended.len(), before, "duplicate folded nothing new");
         assert_eq!(appended.last().unwrap().sandwich_count, 1);
+    }
+
+    // ── Cross-chain findings (§24, Sprint 17 t4) ──────────────────────
+
+    use events::cross_chain::CrossChainLegRef;
+
+    fn cc_leg(chain: Chain, n: u64, byte: u8) -> CrossChainLegRef {
+        CrossChainLegRef {
+            chain,
+            block: block(n, byte),
+            tx: hash(byte),
+        }
+    }
+
+    fn bridge_finding(
+        deposit_leg: CrossChainLegRef,
+        fill_leg: CrossChainLegRef,
+        profit: f64,
+    ) -> BridgeMevDetected {
+        BridgeMevDetected {
+            finding_id: CrossChainFindingId::new(),
+            bridge: "usdc-eth-base".into(),
+            deposit_leg,
+            fill_leg,
+            entity_hint: AccountAddress::repeat_byte(0xaa),
+            profit,
+            victim_loss: profit * 0.9,
+            confidence: Confidence::new(0.8),
+            severity: Severity::Medium,
+            provisional: true,
+        }
+    }
+
+    fn cross_chain_mev_finding(legs: Vec<CrossChainLegRef>, profit: f64) -> CrossChainMevDetected {
+        CrossChainMevDetected {
+            finding_id: CrossChainFindingId::new(),
+            kind: AlertKind::Arbitrage,
+            bridge: "usdc-eth-base".into(),
+            legs,
+            entity_hint: AccountAddress::repeat_byte(0xaa),
+            profit,
+            latency_ms: 2_500,
+            confidence: Confidence::new(0.7),
+            severity: Severity::Low,
+            provisional: true,
+        }
+    }
+
+    /// Envelope tagged under an explicit chain — unlike [`envelope`] (always
+    /// `Chain::ETHEREUM`), used to prove a cross-chain finding is routed by
+    /// its *legs*, not by the envelope's own chain (§17's fill-leg/last-leg
+    /// convention need not be this pipeline's chain).
+    fn envelope_on(payload: DomainEvent, chain: Chain, secs: i64) -> EventEnvelope {
+        EventEnvelope::with_metadata(Uuid::new_v4(), at(secs), chain, payload)
+    }
+
+    /// The fill leg lands on this pipeline's chain (Ethereum); the deposit
+    /// leg is on Base. Folding proceeds off the *leg*, even though the
+    /// envelope itself is tagged Base — the crux of the routing fix.
+    #[tokio::test]
+    async fn a_bridge_finding_leg_on_this_chain_folds_into_its_open_block() {
+        let h = harness();
+        h.facts.insert(hash(0x07), facts_with_tip());
+        h.consumer.handle(canonicalized(block(7, 0x07), 0)).await;
+
+        let finding = bridge_finding(
+            cc_leg(Chain::BASE, 900, 0x90),
+            cc_leg(Chain::ETHEREUM, 7, 0x07),
+            500.0,
+        );
+        let handled = h
+            .consumer
+            .handle(envelope_on(
+                DomainEvent::BridgeMevDetected(finding),
+                Chain::BASE,
+                1,
+            ))
+            .await;
+        assert_eq!(handled, Handled::Commit);
+
+        let last = h.store.appended().last().unwrap().clone();
+        assert_eq!(last.cross_chain_bridge_count, 1);
+        assert_eq!(last.cross_chain_provisional_usd, 500.0);
+        assert_eq!(
+            last.cross_chain_arb_count, 0,
+            "not double-counted as an arb"
+        );
+    }
+
+    /// Neither leg is on this pipeline's chain: nothing is folded, and the
+    /// consumer doesn't error trying to open a block it was never asked to
+    /// canonicalize.
+    #[tokio::test]
+    async fn a_finding_with_no_leg_on_this_chain_is_ignored() {
+        let h = harness();
+        let finding = cross_chain_mev_finding(
+            vec![
+                cc_leg(Chain::BASE, 900, 0x90),
+                cc_leg(Chain(999), 901, 0x91),
+            ],
+            250.0,
+        );
+
+        let handled = h
+            .consumer
+            .handle(envelope_on(
+                DomainEvent::CrossChainMevDetected(finding),
+                Chain::BASE,
+                1,
+            ))
+            .await;
+        assert_eq!(handled, Handled::Commit);
+        assert!(h.store.appended().is_empty());
+    }
+
+    /// A finding leg that arrives before its block's record is buffered, then
+    /// folds once the canonicalization opens the record (mirrors the incident
+    /// buffering behaviour).
+    #[tokio::test]
+    async fn a_finding_leg_buffers_until_its_block_opens() {
+        let h = harness();
+        let finding = cross_chain_mev_finding(
+            vec![
+                cc_leg(Chain::ETHEREUM, 7, 0x07),
+                cc_leg(Chain::BASE, 900, 0x90),
+            ],
+            250.0,
+        );
+
+        let handled = h
+            .consumer
+            .handle(envelope_on(
+                DomainEvent::CrossChainMevDetected(finding),
+                Chain::BASE,
+                1,
+            ))
+            .await;
+        assert_eq!(handled, Handled::Commit);
+        assert!(h.store.appended().is_empty(), "buffered, not lost");
+
+        h.facts.insert(hash(0x07), facts_with_tip());
+        h.consumer.handle(canonicalized(block(7, 0x07), 2)).await;
+
+        let last = h.store.appended().last().unwrap().clone();
+        assert_eq!(last.cross_chain_arb_count, 1);
+        assert_eq!(last.cross_chain_provisional_usd, 250.0);
+    }
+
+    /// `CrossChainFindingRetracted` subtracts exactly what the finding added
+    /// on this chain (§15/§24).
+    #[tokio::test]
+    async fn cross_chain_finding_retraction_subtracts_what_it_added() {
+        let h = harness();
+        h.facts.insert(hash(0x07), facts_with_tip());
+        h.consumer.handle(canonicalized(block(7, 0x07), 0)).await;
+
+        let finding = bridge_finding(
+            cc_leg(Chain::BASE, 900, 0x90),
+            cc_leg(Chain::ETHEREUM, 7, 0x07),
+            500.0,
+        );
+        let finding_id = finding.finding_id;
+        h.consumer
+            .handle(envelope_on(
+                DomainEvent::BridgeMevDetected(finding),
+                Chain::BASE,
+                1,
+            ))
+            .await;
+
+        let handled = h
+            .consumer
+            .handle(envelope_on(
+                DomainEvent::CrossChainFindingRetracted(CrossChainFindingRetracted {
+                    finding_id,
+                    reason: "leg block reverted".into(),
+                }),
+                Chain::BASE,
+                2,
+            ))
+            .await;
+        assert_eq!(handled, Handled::Commit);
+
+        let last = h.store.appended().last().unwrap().clone();
+        assert_eq!(last.cross_chain_bridge_count, 0);
+        assert_eq!(last.cross_chain_provisional_usd, 0.0);
+    }
+
+    /// A redelivered finding leg does not double-count (§4/§7 idempotency).
+    #[tokio::test]
+    async fn a_redelivered_finding_leg_does_not_double_count() {
+        let h = harness();
+        h.facts.insert(hash(0x07), facts_with_tip());
+        h.consumer.handle(canonicalized(block(7, 0x07), 0)).await;
+
+        let finding = bridge_finding(
+            cc_leg(Chain::BASE, 900, 0x90),
+            cc_leg(Chain::ETHEREUM, 7, 0x07),
+            500.0,
+        );
+        h.consumer
+            .handle(envelope_on(
+                DomainEvent::BridgeMevDetected(finding.clone()),
+                Chain::BASE,
+                1,
+            ))
+            .await;
+        h.consumer
+            .handle(envelope_on(
+                DomainEvent::BridgeMevDetected(finding),
+                Chain::BASE,
+                2,
+            ))
+            .await;
+
+        let last = h.store.appended().last().unwrap().clone();
+        assert_eq!(
+            last.cross_chain_bridge_count, 1,
+            "redelivery didn't double-count"
+        );
+        assert_eq!(last.cross_chain_provisional_usd, 500.0);
     }
 }
