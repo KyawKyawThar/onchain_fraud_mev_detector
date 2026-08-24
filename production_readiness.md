@@ -94,8 +94,12 @@ Run these *after* the MVP path is green, sequenced by the exit gates below — n
 - [ ] **False-positive feedback loop** wired to the FP-rate panel (§19); track it as an SLO.
 - [ ] **Sanctions freshness SLA:** OFAC/EU lists ingested within a bounded window; `SanctionHit` is a hard alert (§8.5) — staleness is a compliance failure.
 - [ ] **Risk-score explainability audited:** every `delta` carries an `evidence_ref` (§8.3); "taint-by-association" documented as reduced-confidence, legally-contested (§8.3).
+- [ ] **ML model provenance (§20):** every deployed model artifact is hash-pinned in the registry (`artifact_hash`, `feature_version`); serving/training feature-version skew is a boot failure, not a silent accuracy decay; retraining walks the same Shadow → backtest → Live gate as any detector change — no weight hot-swap path exists.
+- [ ] **Drift monitoring as an SLO (§20.5):** serving-time feature distributions tracked against the training snapshot; drift past threshold alerts and flags the model version *before* precision decays.
+- [ ] **LLM output governance (§20.4):** no LLM output enters the event store as detection evidence or mutates the graph — enforced structurally (drafts are their own event types) and tested; every narrative claim's `grounded_event_ids` resolve in the store (grounding audit test); prompts are versioned, hashed artifacts stamped into every draft; NL-created rules only run after compiling through the rule parse boundary and customer activation.
+- [ ] **LLM cost containment:** token usage metered per customer through `UsageRecorded`, budget alarms wired; a runaway prompt loop is a billing incident, not a surprise invoice.
 
-**Exit gate:** no detector ships without a passing backtest; FP rate within SLO; sanctions freshness monitored.
+**Exit gate:** no detector ships without a passing backtest; FP rate within SLO; sanctions freshness monitored; no ML artifact deployed outside the registry; grounding audit green.
 
 ## Hardening Epic F — Release engineering & operations
 

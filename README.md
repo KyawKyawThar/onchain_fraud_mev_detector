@@ -126,6 +126,7 @@ rationale.
 | Liquidation MEV | Protocol liquidation event + bot clustering | On-chain verification |
 | Wash trading | Cross-block transfer graph cycle detection | Entity clustering |
 | Address poisoning | Near-duplicate address generation pattern | Heuristic |
+| Novel patterns *(Sprint 18)* | ML anomaly model (isolation forest, ONNX in-process) | revm full replay |
 
 ---
 
@@ -160,6 +161,46 @@ Score: 91 / 100   Confidence: 0.94   (model v1.4.2)
 `score` and `confidence` are independent axes. Score answers "how risky."
 Confidence answers "how sure." Surfacing both prevents over-trusting a number
 backed only by heuristic labels.
+
+---
+
+## AI layer
+
+Full design: [ARCHITECTURE.md §20](./ARCHITECTURE.md#20-aiml-layer) · build-out: Sprints 18–20.
+
+The platform's event-sourced core makes it an unusually good substrate for
+ML — and the AI layer is designed to exploit exactly that, under the same
+governance as everything else:
+
+**The training data is free.** Every detection is confirmed or refuted by EVM
+simulation with a measured profit/loss — so the event store continuously
+generates labeled ground truth, and deterministic replay makes every training
+dataset reproducible byte-for-byte. No hand-labeling, no external dataset.
+
+**ML detection rides the existing rails.** An ML detector is just another
+`DetectorPlugin` (`ModelKind::ML` has been in the trait since day one):
+ONNX inference in-process via `ort` behind an `InferenceEngine` seam, model
+weights hash-pinned into the registry's `config_hash`, shadow-deployed and
+gated by the same backtest precision/recall harness as every heuristic. A
+supervised classifier sharpens confidence on known patterns; an
+isolation-forest anomaly model flags attacks that *have no signature yet* —
+with feature-level evidence, because unexplainable detection doesn't ship
+here.
+
+**Behavioral embeddings widen the moat.** Per-address behavior vectors +
+ClickHouse vector search answer "which addresses behave like this known
+attacker" — surfacing cluster candidates a fresh-funded bot can't hide from.
+Similarity is a reduced-confidence clustering signal, never an auto-merge:
+the graph's correctness story stays intact.
+
+**The LLM copilot is hallucination-safe by construction.** SAR narrative
+drafts are grounded in the audit trail — every factual claim carries the
+event ids it derives from, so reviewers verify against the store, not the
+model. Natural-language rule creation ("alert when a wallet within 2 hops of
+a sanctioned address moves > $10K") emits the rule engine's wire form, which
+must compile through the existing parse boundary — a hallucinated rule fails
+compilation and can never run. LLM output is a proposal, never a fact:
+nothing it produces enters the event store as evidence.
 
 ---
 

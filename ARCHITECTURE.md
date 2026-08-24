@@ -95,6 +95,12 @@ RuleAlertCreated      { alert_id, rule_id, address, explanation }
 UsageRecorded         { customer_id, event_type, quantity, timestamp }
 ```
 
+### AI events (copilot-service — §20)
+```
+IncidentNarrativeDrafted { incident_id, narrative_ref, model_id, prompt_version, grounded_event_ids }
+RuleDraftProposed        { draft_id, owner, source_text_hash, definition, model_id, prompt_version }
+```
+
 > **Schema evolution.** Events ride a versioned envelope with an upcasting
 > seam (see [`crates/events/SCHEMA.md`](./crates/events/SCHEMA.md)): changes
 > are additive, old events replay unchanged, and the wire format is pinned by
@@ -634,6 +640,7 @@ separate concern wired to these aggregates.
 | api | No own store | Reads intelligence + event-store |
 | notification | Postgres | Delivery records, subscriber config, dedup keys |
 | billing | Postgres + ClickHouse | Accounts/plans + usage events |
+| copilot | Postgres | Draft narratives/rules, prompt versions, approval state (§20) |
 
 **Cross-service data sharing rule:** no cross-service database joins, no
 shared tables. A service that needs another's data subscribes to its events or
@@ -715,6 +722,7 @@ rule-engine-service    — scale by partition count
 api-service            — stateless, horizontal behind a load balancer
 notification-service   — scale by customer count
 billing-service        — single instance or small HA pair
+copilot-service        — small pool (LLM calls are I/O-bound, never hot-path)
 event-store-service    — ClickHouse cluster with replication
 kafka                  — partitioned by chain, one topic per event type
 rabbitmq               — sim job dispatch only: quorum queue, DLX, priority
@@ -743,3 +751,160 @@ full engineering discipline.
 **Quality & ops:** `tracing` + OpenTelemetry, `metrics` + Prometheus,
 `thiserror`/`anyhow`, `criterion`, `proptest`, cargo-nextest, cargo-deny +
 cargo-audit, cargo-chef, `just`, lefthook, Renovate.
+
+**AI/ML (§20):** `ort` (ONNX Runtime inference), `linfa` (isolation forest),
+ClickHouse vector search, Claude API (Messages + Batches, via a thin internal
+HTTP client — no official Rust SDK).
+
+---
+
+## 20. AI/ML layer
+
+Machine learning and LLMs extend the platform at three points: an ML detector
+on the fast path, behavioral embeddings in the intelligence graph, and an LLM
+investigation copilot. Three rules govern all of them — each one an extension
+of a principle the rest of the system already enforces:
+
+1. **The fast path stays attribution-blind and explainable.** An ML detector
+   is just another `DetectorPlugin` with `ModelKind::ML` (§6): registered in
+   the model registry, versioned by `(id, version, config_hash)`,
+   shadow-deployed first, gated by the backtest harness (§16) like any
+   rule-based detector. An ML hit flows into the same simulation confirmation
+   path — it is never surfaced to customers unconfirmed.
+2. **LLM output is a proposal, never a fact.** Nothing an LLM produces enters
+   the event store as detection evidence or mutates the intelligence graph.
+   Drafts are validated at existing parse boundaries (rules) or approved by
+   humans (narratives), and every draft records the model id and prompt
+   version that produced it — the same provenance discipline labels carry
+   (§8.1).
+3. **Training data comes from the system's own flywheel.** Every
+   `SimulationCompleted` confirms or refutes a `DetectorTriggered` — a
+   labeled example the platform generates for free, continuously, with an
+   exact ground truth (simulated profit/loss). No hand-labeling pipeline, no
+   external dataset dependency.
+
+### 20.1 Training-data flywheel
+
+The event store is a deterministic training-data generator. A dataset is
+defined by `(time window, feature_version, label rule)` and materialized by
+replaying that window (§16) — reproducible byte-for-byte, because replay is.
+
+- **Labels:** `DetectorTriggered` joined to its `SimulationCompleted` outcome.
+  `confirmed: true` with measured profit is a positive; a retraction or
+  failed confirmation is a hard negative. The false-positive feedback loop
+  (production-readiness Epic E) supplies corrective relabels.
+- **Features:** an `ml-features` crate extracts a versioned, deterministic
+  feature vector from the same `DetectionCtx` detectors see (§6) —
+  transaction structure, gas dynamics, value flows, pool interactions,
+  cross-block position deltas. No labels, no attribution: features obey the
+  same attribution-blindness rule as the detectors that will consume them.
+  `feature_version` is stamped into every dataset and every deployed model.
+- **Export:** a dataset binary (same pattern as the backfill binary, §16)
+  replays an event-store window through feature extraction into ClickHouse /
+  Parquet. Model training itself happens offline; the contract between
+  training and serving is the ONNX artifact plus its `feature_version` —
+  train in whatever stack fits, serve in Rust.
+
+### 20.2 ML detection on the fast path
+
+An `anomaly-detector` crate implements `DetectorPlugin` (depending on
+`detector-api` only, like every detector crate) and runs two models:
+
+- **Supervised classifier** (gradient-boosted trees, trained on flywheel
+  labels): scores candidate MEV patterns the heuristic detectors already
+  shape, sharpening `raw_confidence` on ambiguous structures.
+- **Unsupervised anomaly model** (isolation forest over the same feature
+  vectors): flags blocks/bundles that look like *nothing seen before* — the
+  detector for attacks that have no signature yet. Its evidence says "this is
+  anomalous and here are the top contributing features," not "this is a
+  sandwich."
+
+Serving mechanics:
+
+- **`InferenceEngine` seam:** `fn infer(&self, features: &FeatureVector) ->
+  Score` — a trait with an `ort` (ONNX Runtime) backend and an in-memory test
+  double, the same seam discipline as `EventSink`. Inference is CPU work and
+  runs inside the detector's rayon fan-out (§15); the model is loaded once at
+  boot, link-or-fail.
+- **Weights are config:** the model artifact's SHA-256 is folded into the
+  registry `config_hash`, so a weight change is a new `(id, version,
+  config_hash)` triple — historical evidence stays attributable to the exact
+  weights that produced it, and rollback is the registry's existing
+  `deprecated_at` mechanism.
+- **Rollout:** Shadow (evidence suppressed from customer surfaces, §6 rollout
+  policy) → backtest gate (precision/recall ≥ committed baseline) → Live.
+  Identical lifecycle to a heuristic detector change — ML gets no special
+  path around the gates.
+- **Latency budget:** inference must fit the < 1s fast path (§6). ONNX GBDT /
+  isolation-forest inference is microseconds per candidate; the budget is
+  enforced by the same per-detector latency metrics (§17).
+
+### 20.3 Behavioral embeddings (intelligence service)
+
+A per-address **behavior vector** — activity cadence, counterparty-type
+distribution, value-flow shape, incident history — computed from the
+ClickHouse adjacency store on a schedule, versioned like risk-score models.
+
+- **Similarity search:** "addresses that behave like entity #183" via
+  ClickHouse vector search over the embedding column. Exposed as
+  `GET /v1/address/{addr}/similar` and as an investigation surface in the
+  dashboard.
+- **A clustering signal, not a merge trigger:** high similarity to a known
+  actor enters entity clustering as a reduced-confidence heuristic signal —
+  exactly how §8.1 treats heuristic labels. It never auto-merges entities;
+  merges still require the on-chain evidence heuristics (§8.2). This keeps
+  the graph's correctness story intact while widening its recall.
+- **Flywheel effect:** embeddings surface candidate links → confirmed links
+  improve attribution → richer incident history sharpens the embeddings —
+  the §8.5 loop, now with a learned component.
+
+### 20.4 LLM investigation copilot (copilot-service)
+
+A separate service consuming `IncidentCreated` and reading the audit stream
+(§4). Two capabilities, both grounded in data the system already trusts:
+
+- **Incident narratives / SAR drafts.** Compliance teams file Suspicious
+  Activity Reports by hand from raw event streams. The copilot drafts the
+  narrative from the incident's complete audit trail — every factual claim in
+  the draft carries the event id it derives from (`grounded_event_ids`), so a
+  reviewer verifies claims against the store, not against the model. Drafts
+  are `IncidentNarrativeDrafted` events: provisional forever, human-approved
+  before leaving the platform. Backfill over historical incidents runs
+  through the Batch API at half cost — narrative generation is never
+  latency-critical.
+- **Natural-language rule creation.** "Alert me when any wallet within 2 hops
+  of a sanctioned address moves more than $10K into our pools" → the model
+  emits the rule engine's wire form under a structured-output schema → the
+  draft compiles through the **existing rule parse boundary** (§9). A
+  hallucinated condition fails compilation and returns the compiler's error —
+  it can never run. The customer reviews the compiled rule (echoed back in
+  plain language) before activating it. `RuleDraftProposed` is the audit
+  record; activation flows through the normal `POST /v1/rules` path.
+
+Mechanics:
+
+- **`llm` seam crate:** an `LlmClient` trait over the Claude Messages API
+  (thin `reqwest` client — there is no official Rust SDK), with retry/backoff
+  under the shared permanent-vs-transient error classification and an
+  in-memory double for tests. Default model `claude-opus-5`; model id is
+  config, never hardcoded at call sites.
+- **Prompts are versioned artifacts** — checked in, hashed, and stamped into
+  every draft event alongside the model id. A prompt change is a diff review,
+  and every historical draft is attributable to the exact prompt that
+  produced it.
+- **Cost is metered:** token usage flows through `UsageRecorded` like every
+  other billable quantity, with per-customer budget alarms.
+
+### 20.5 Model governance
+
+- **Drift detection:** serving-time feature distributions are monitored
+  against the training snapshot (population-stability metrics per feature);
+  drift past threshold raises an alert and flags the model version in the
+  registry — visible before precision decays, not after.
+- **Retraining is a release:** a retrained model is a new registry version and
+  walks the same Shadow → backtest → Live gate. There is no "hot-swap the
+  weights" path.
+- **The registry is the single source of truth** for what is deployed: model
+  cards gain `artifact_hash` and `feature_version` fields, and the
+  serving/training skew check (deployed `feature_version` == artifact's
+  training `feature_version`) is enforced at boot, link-or-fail (§6).
