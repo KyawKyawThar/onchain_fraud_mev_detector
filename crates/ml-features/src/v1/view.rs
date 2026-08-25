@@ -68,6 +68,10 @@ struct BlockAggregates {
     transfer_usd_total: f64,
     max_transfer_usd: f64,
     max_tx_flow: f64,
+    /// Sum of the per-tx flows `max_tx_flow` is the max of — same summation
+    /// path, so `max_tx_flow <= total_flow` holds bitwise (see the
+    /// accumulation comment in [`BlockFeatureView::new`]).
+    total_flow: f64,
     distinct_pools: usize,
     top_pool_swaps: usize,
     round_trip_pools: usize,
@@ -140,6 +144,7 @@ impl<'a> BlockFeatureView<'a> {
         let mut transfer_usd_total = 0.0;
         let mut max_transfer_usd = 0.0f64;
         let mut max_tx_flow = 0.0f64;
+        let mut total_flow = 0.0f64;
         let mut pool_swap_counts: HashMap<Address, usize> = HashMap::new();
         let mut pool_directions: HashSet<(Address, Address, Address)> = HashSet::new();
         let mut max_impact = 0.0f64;
@@ -173,6 +178,16 @@ impl<'a> BlockFeatureView<'a> {
                 }
             }
             max_tx_flow = max_tx_flow.max(tx_flow);
+            // The concentration denominator is accumulated from the SAME
+            // per-tx sums as the numerator's max — never as
+            // `swap_usd_total + transfer_usd_total`, whose different
+            // association order can round 1 ulp below a tx's own flow and
+            // push `flow_concentration` above 1.0 (found by proptest). A
+            // running sum of non-negative f64s under round-to-nearest is
+            // always >= each addend, so `max_tx_flow <= total_flow` holds
+            // bitwise and the Fraction contract is met by construction, not
+            // by a clamp that could mask a real numerator bug.
+            total_flow += tx_flow;
         }
 
         // Pools traded in *both* directions inside one block — the sandwich /
@@ -206,6 +221,7 @@ impl<'a> BlockFeatureView<'a> {
             transfer_usd_total,
             max_transfer_usd,
             max_tx_flow,
+            total_flow,
             distinct_pools: pool_swap_counts.len(),
             top_pool_swaps: pool_swap_counts.values().copied().max().unwrap_or(0),
             round_trip_pools,
@@ -413,7 +429,7 @@ fn block_value(f: BlockFeature, a: &BlockAggregates) -> f64 {
         F::TransferUsdVolumeLog => log10_1p(a.transfer_usd_total),
         F::PricedTransferFraction => fraction(a.priced_transfers, a.transfer_count),
         F::MaxTransferUsdLog => log10_1p(a.max_transfer_usd),
-        F::FlowConcentration => ratio(a.max_tx_flow, a.swap_usd_total + a.transfer_usd_total),
+        F::FlowConcentration => ratio(a.max_tx_flow, a.total_flow),
         // — pool interactions —
         F::DistinctPoolCountLog => log10_1p(a.distinct_pools as f64),
         F::SwapsPerPool => fraction(a.swap_count, a.distinct_pools),
@@ -584,6 +600,33 @@ mod tests {
         assert!((value(&v, "transfer_usd_volume_log") - (3.0f64).log10()).abs() < 1e-12);
         assert!((value(&v, "max_transfer_usd_log") - (3.0f64).log10()).abs() < 1e-12);
         // The single flow-bearing tx carries all of the block's flow.
+        assert_eq!(value(&v, "flow_concentration"), 1.0);
+    }
+
+    #[test]
+    fn flow_concentration_never_exceeds_one_by_a_rounding_ulp() {
+        // Regression for a CI-found proptest counterexample: one tx carrying
+        // a large priced swap plus two tiny priced transfers. The old code
+        // summed the denominator as `swap_usd_total + transfer_usd_total`,
+        // which associates differently from the per-tx flow sum and rounded
+        // 1 ulp *below* it — flow_concentration came out 1.0000000000000002.
+        // The denominator now accumulates along the same per-tx path, so a
+        // single flow-bearing tx concentrates to exactly 1.0.
+        let (weth, usdc) = (addr(0x10), addr(0x11));
+        let pool = addr(0x20);
+        let ctx = CtxBuilder::new()
+            .priced_token(weth, 18, 2_000.0)
+            .priced_token(usdc, 6, 1.0)
+            .tx_actions(
+                TxActions::new(b256(1), addr(1), None)
+                    .with_swaps(vec![swap(pool, usdc, weth, 262_932_866_534, 1)])
+                    .with_transfers(vec![
+                        transfer(weth, addr(1), addr(1), 877_551_778_104),
+                        transfer(weth, addr(1), addr(1), 54_709_016_695),
+                    ]),
+            )
+            .build();
+        let v = extract_block(&ctx);
         assert_eq!(value(&v, "flow_concentration"), 1.0);
     }
 
