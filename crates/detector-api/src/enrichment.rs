@@ -223,6 +223,28 @@ impl PoolState {
     }
 }
 
+/// Gas facts for one transaction, as its receipt reports them: how much gas
+/// execution consumed and the effective price paid per unit.
+///
+/// Both are raw market *quantities* — what a sender paid for inclusion — never
+/// anything about who paid (module no-labels invariant). `effective_gas_price`
+/// is the receipt's all-in wei-per-gas number, total across tx types (legacy
+/// and EIP-1559 alike), deliberately not a base/priority-fee decomposition:
+/// the receipt field is what every source can report uniformly.
+///
+/// Lives as an `Option` on [`TxActions`] because a header-only or receipt-less
+/// source honestly has no gas facts — a consumer (e.g. the §20.1 ml-features
+/// gas-dynamics family) must encode that absence explicitly, never treat it as
+/// "paid nothing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxGas {
+    /// Gas units consumed by execution (the receipt's `gasUsed`).
+    pub gas_used: u64,
+    /// Effective price paid per gas unit, in wei (the receipt's
+    /// `effectiveGasPrice`).
+    pub effective_gas_price: u128,
+}
+
 /// A decoded ERC-20 transfer (a `Transfer` log), normalized away from raw log
 /// topics. Addresses are on-chain facts, not labels (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +285,9 @@ pub struct TxActions {
     pub to: Option<Address>,
     pub swaps: Vec<Swap>,
     pub transfers: Vec<TokenTransfer>,
+    /// Receipt gas facts, when the source provides receipts; `None` for a
+    /// header-only source (see [`TxGas`]).
+    pub gas: Option<TxGas>,
 }
 
 impl TxActions {
@@ -275,6 +300,7 @@ impl TxActions {
             to,
             swaps: Vec::new(),
             transfers: Vec::new(),
+            gas: None,
         }
     }
 
@@ -287,6 +313,12 @@ impl TxActions {
     #[must_use]
     pub fn with_transfers(mut self, transfers: Vec<TokenTransfer>) -> Self {
         self.transfers = transfers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_gas(mut self, gas: TxGas) -> Self {
+        self.gas = Some(gas);
         self
     }
 }
@@ -636,5 +668,20 @@ mod tests {
         assert_eq!(tx.swaps[0].amount_out, U256::from(9u64));
         assert_eq!(tx.transfers.len(), 1);
         assert_eq!(tx.transfers[0].token, addr(3));
+    }
+
+    #[test]
+    fn tx_actions_gas_is_absent_unless_provided() {
+        // Header-only sources have no receipts: the default is the honest
+        // "no gas facts", and `with_gas` layers the receipt numbers on.
+        let bare = TxActions::new(hash(1), addr(1), None);
+        assert_eq!(bare.gas, None);
+
+        let gassed = bare.with_gas(TxGas {
+            gas_used: 21_000,
+            effective_gas_price: 30_000_000_000, // 30 gwei
+        });
+        assert_eq!(gassed.gas.unwrap().gas_used, 21_000);
+        assert_eq!(gassed.gas.unwrap().effective_gas_price, 30_000_000_000);
     }
 }

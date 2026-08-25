@@ -1,0 +1,23 @@
+---
+source: crates/ml-features/tests/invariants.rs
+expression: render(&v)
+---
+position_in_block = 0.000000
+is_enriched = 1.000000
+is_contract_creation = 0.000000
+swap_count_log = 0.301030
+transfer_count_log = 0.000000
+sender_block_tx_share = 0.500000
+gas_known = 1.000000
+gas_price_gwei_log = 1.908485
+gas_price_vs_block_median = 4.000000
+gas_used_log = 5.255275
+swap_in_usd_log = 4.000043
+priced_swap_fraction = 1.000000
+transfer_usd_log = 0.000000
+max_transfer_usd_log = 0.000000
+distinct_pool_count_log = 0.301030
+distinct_token_count_log = 0.477121
+swap_chain_overlap = 0.000000
+self_pool_round_trip = 0.000000
+max_pool_impact_log = 0.002166

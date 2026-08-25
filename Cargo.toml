@@ -100,6 +100,13 @@ predictive = { path = "crates/predictive" }
 # monitored chain's records from one process rather than filtering foreign
 # chains away (contrast `predictive`/`detection`, one instance per chain).
 cross-chain-correlator = { path = "crates/cross-chain-correlator" }
+# ML feature extraction (§20.1, Sprint 18 t1) — the versioned, deterministic
+# `DetectionCtx → FeatureVector` contract shared by the dataset-export binary
+# (t2), offline training, and the serving-side anomaly detector (t4). Held to
+# the detector purity rules (detector-api only, attribution-blind — enforced
+# in arch-conformance): the training data must obey the same
+# attribution-blindness as the detectors that will consume the model (§6).
+ml-features = { path = "crates/ml-features" }
 
 # Errors.
 anyhow = "1"
