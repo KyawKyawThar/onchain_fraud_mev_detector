@@ -59,6 +59,40 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── Feature extraction is held to detector purity (§20.1) ─────────
+        // ml-features turns the DetectionCtx into training/serving vectors,
+        // so it obeys the same rules as the detectors that consume them:
+        // detector-api only, no service/broker/store edges — and above all no
+        // `intelligence`, whose labels would silently turn "attribution-blind
+        // features" into a list of known actors in disguise.
+        if krate == "ml-features" {
+            if !has("detector-api") {
+                out.push(format!(
+                    "{krate}: must extract from the detector-api seam \
+                     (it has no detector-api dependency)"
+                ));
+            }
+            for forbidden in [
+                "detection",
+                "intelligence",
+                "event-bus",
+                "rdkafka",
+                "lapin",
+                "sqlx",
+                "redis",
+                "clickhouse",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — feature extraction \
+                         is a pure, attribution-blind function of the DetectionCtx \
+                         (§20.1); export/serving plumbing lives in the composing \
+                         binaries"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -192,6 +226,7 @@ mod tests {
             ("events", &[]),
             ("detector-api", &["events"]),
             ("sandwich-detector", &["detector-api", "events"]),
+            ("ml-features", &["detector-api", "serde", "sha2"]),
             ("event-bus", &["events", "rdkafka", "metrics"]),
             ("detection", &["detector-api", "event-bus", "rdkafka"]),
             ("backtest", &["detection", "detector-api"]),
@@ -242,6 +277,12 @@ mod tests {
             ("reporting", &["sqlx"], "without the shared `db` crate"),
             ("reporting", &["redis"], "db::redis"),
             ("reporting", &["clickhouse"], "without ch-migrate"),
+            ("ml-features", &["events"], "no detector-api dependency"),
+            (
+                "ml-features",
+                &["detector-api", "intelligence"],
+                "attribution-blind function of the DetectionCtx",
+            ),
         ];
         for (krate, deps, expected) in cases {
             let g = graph(&[(*krate, *deps)]);

@@ -43,7 +43,7 @@ pub use cross_block_state::CrossBlockState;
 pub use ctx::{BlockBundle, DetectionCtx};
 pub use enrichment::{
     Enrichment, EnrichmentBuilder, InvalidPrice, PoolState, Swap, TokenMeta, TokenTransfer,
-    TxActions, UsdPrice,
+    TxActions, TxGas, UsdPrice,
 };
 pub use plugin::{
     DetectorId, DetectorPlugin, Evidence, ModelKind, Scope, SemVer, SemVerParseError,

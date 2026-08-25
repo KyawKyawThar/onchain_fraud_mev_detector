@@ -4409,6 +4409,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-features"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "insta",
+ "libm",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

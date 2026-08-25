@@ -1,0 +1,28 @@
+---
+source: crates/ml-features/tests/invariants.rs
+expression: render(&extract_block(&golden_ctx()))
+---
+tx_count_log = 0.698970
+enriched_tx_fraction = 1.000000
+contract_creation_fraction = 0.000000
+distinct_sender_fraction = 0.750000
+top_sender_tx_share = 0.500000
+repeat_sender_tx_fraction = 0.500000
+gas_known_fraction = 0.750000
+gas_price_gwei_log_mean = 1.510578
+gas_price_gwei_log_std = 0.281496
+head_gas_premium = 4.000000
+gas_used_log_mean = 5.220607
+swap_count_log = 0.602060
+transfer_count_log = 0.477121
+swap_usd_volume_log = 4.376595
+priced_swap_fraction = 1.000000
+transfer_usd_volume_log = 2.399674
+priced_transfer_fraction = 0.500000
+max_transfer_usd_log = 2.399674
+flow_concentration = 0.490644
+distinct_pool_count_log = 0.301030
+swaps_per_pool = 3.000000
+top_pool_swap_share = 1.000000
+pool_round_trip_fraction = 1.000000
+max_pool_impact_log = 0.002555

@@ -1,0 +1,50 @@
+[package]
+name = "ml-features"
+version = "0.1.0"        # the wire-visible contract is `FEATURE_VERSION`, not this.
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# ML feature extraction (§20.1, Sprint 18 t1). A pure library that turns the
+# `DetectionCtx` detectors see into a versioned, deterministic `FeatureVector`
+# — the shared input contract between the dataset-export binary (t2), model
+# training (offline), and the serving-side `anomaly-detector` (t4). It holds
+# itself to the same rules as a detector crate: `detector-api` only, no service
+# or store dependencies, and **attribution-blind by construction** — features
+# are structural/statistical quantities that never encode which address did
+# something (enforced by a bijective-renaming property test, and by the
+# arch-conformance rule that keeps `intelligence` and friends off its edge).
+
+[dependencies]
+detector-api = { workspace = true }
+
+serde = { workspace = true }
+alloy-primitives = { workspace = true }
+# `FeatureSchema::content_hash` — the schema digest folded into a model's
+# registry `config_hash` (§20.2), so serving/training skew is detectable.
+sha2 = { workspace = true }
+# Each version's feature layout IS an enum (variant order = vector order,
+# variant name = wire name via `IntoStaticStr`): a missing, duplicated, or
+# reordered feature is a compile error, not a runtime assert.
+strum = { workspace = true }
+# Bit-identical `log10` on every platform — see the workspace manifest note.
+libm = { workspace = true }
+
+[dev-dependencies]
+# Shared fixtures (`CtxBuilder`, `addr`/`b256`/`swap`) for the extraction tests.
+detector-api = { workspace = true, features = ["test-util"] }
+# `Chain`/`BlockRef` for building the header-only (no-enrichment) contexts.
+events = { workspace = true }
+# The v1 schema + a golden vector are pinned as snapshots: any drift in feature
+# names, order, or extraction semantics fails loudly and forces a deliberate
+# `FEATURE_VERSION` bump (§20.1 — the version is stamped into every dataset
+# and every deployed model).
+insta = { workspace = true }
+# Property tests: every feature is finite on arbitrary blocks, and the vector
+# is invariant under a bijective renaming of addresses/hashes
+# (attribution-blindness as a checked property).
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
