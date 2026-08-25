@@ -4,49 +4,49 @@ expression: lock
 ---
 feature_version: v1
 
-[Block] 24 features, content_hash 469da01bcaba25ec349775d35cf2baf3a22557d95b2231963ceaec3f88b73c5a
-  tx_count_log
-  enriched_tx_fraction
-  contract_creation_fraction
-  distinct_sender_fraction
-  top_sender_tx_share
-  repeat_sender_tx_fraction
-  gas_known_fraction
-  gas_price_gwei_log_mean
-  gas_price_gwei_log_std
-  head_gas_premium
-  gas_used_log_mean
-  swap_count_log
-  transfer_count_log
-  swap_usd_volume_log
-  priced_swap_fraction
-  transfer_usd_volume_log
-  priced_transfer_fraction
-  max_transfer_usd_log
-  flow_concentration
-  distinct_pool_count_log
-  swaps_per_pool
-  top_pool_swap_share
-  pool_round_trip_fraction
-  max_pool_impact_log
+[Block] 24 features, content_hash 5b0fc53e9545c623817cc1ccfa66002372726ae7f2057aa136d7e86201f7d31c
+  tx_count_log (LogMagnitude)
+  enriched_tx_fraction (Fraction)
+  contract_creation_fraction (Fraction)
+  distinct_sender_fraction (Fraction)
+  top_sender_tx_share (Fraction)
+  repeat_sender_tx_fraction (Fraction)
+  gas_known_fraction (Fraction)
+  gas_price_gwei_log_mean (LogMagnitude)
+  gas_price_gwei_log_std (LogMagnitude)
+  head_gas_premium (Ratio)
+  gas_used_log_mean (LogMagnitude)
+  swap_count_log (LogMagnitude)
+  transfer_count_log (LogMagnitude)
+  swap_usd_volume_log (LogMagnitude)
+  priced_swap_fraction (Fraction)
+  transfer_usd_volume_log (LogMagnitude)
+  priced_transfer_fraction (Fraction)
+  max_transfer_usd_log (LogMagnitude)
+  flow_concentration (Fraction)
+  distinct_pool_count_log (LogMagnitude)
+  swaps_per_pool (Ratio)
+  top_pool_swap_share (Fraction)
+  pool_round_trip_fraction (Fraction)
+  max_pool_impact_log (LogMagnitude)
 
-[Tx] 19 features, content_hash f1fdddd9912aa604d655beb77d458688266a5f56399cb914c66583c0dce445f8
-  position_in_block
-  is_enriched
-  is_contract_creation
-  swap_count_log
-  transfer_count_log
-  sender_block_tx_share
-  gas_known
-  gas_price_gwei_log
-  gas_price_vs_block_median
-  gas_used_log
-  swap_in_usd_log
-  priced_swap_fraction
-  transfer_usd_log
-  max_transfer_usd_log
-  distinct_pool_count_log
-  distinct_token_count_log
-  swap_chain_overlap
-  self_pool_round_trip
-  max_pool_impact_log
+[Tx] 19 features, content_hash f54b74fdc2ec8a923c0c12331ce083543b08359dff1810756f8a2643a74ef2f3
+  position_in_block (Fraction)
+  is_enriched (Indicator)
+  is_contract_creation (Indicator)
+  swap_count_log (LogMagnitude)
+  transfer_count_log (LogMagnitude)
+  sender_block_tx_share (Fraction)
+  gas_known (Indicator)
+  gas_price_gwei_log (LogMagnitude)
+  gas_price_vs_block_median (Ratio)
+  gas_used_log (LogMagnitude)
+  swap_in_usd_log (LogMagnitude)
+  priced_swap_fraction (Fraction)
+  transfer_usd_log (LogMagnitude)
+  max_transfer_usd_log (LogMagnitude)
+  distinct_pool_count_log (LogMagnitude)
+  distinct_token_count_log (LogMagnitude)
+  swap_chain_overlap (Indicator)
+  self_pool_round_trip (Indicator)
+  max_pool_impact_log (LogMagnitude)

@@ -7,90 +7,103 @@
 //! serving-side `anomaly-detector` (t4) building the same vector on the < 1s
 //! fast path. Three rules make that contract hold:
 //!
-//! - **Versioned.** Every [`FeatureVector`] is stamped with the
-//!   [`FEATURE_VERSION`] it was extracted under, and each version's schema
-//!   ([`block_schema`]/[`tx_schema`]: names, order, semantics) is frozen
-//!   forever once shipped — *any* observable change to extraction is a new
-//!   version, because a model trained on v1 must be served v1 (the §20.5
-//!   serving/training skew check compares exactly this stamp). A snapshot
-//!   test pins the current schema and a golden vector so accidental drift
-//!   fails CI instead of silently poisoning a model.
-//! - **Deterministic.** The same context always yields the same bits:
-//!   transactions are iterated in bundle (block) order, set-shaped aggregates
-//!   are order-free, and every arithmetic path is total (no `NaN`/`inf` can
-//!   reach a vector). Determinism is what makes a dataset defined by
-//!   `(time window, feature_version, label rule)` reproducible
-//!   byte-for-byte under event-store replay (§16, §20.1).
+//! - **Versioned, with versions kept forever.** Every [`FeatureVector`] is
+//!   stamped with the [`FeatureVersion`] it was extracted under. Each shipped
+//!   version is a frozen module whose feature *enums* are its schema —
+//!   variant order is vector order, variant names are wire names, and one
+//!   exhaustive `match` per granularity computes the values, so layout drift
+//!   is a compile error. The current version is [`FEATURE_VERSION`] (the
+//!   crate-root `extract_*` functions and schemas are its re-exports);
+//!   historical versions stay resolvable through [`extractor_for`], because a
+//!   dataset defined by `(window, feature_version, label rule)` must remain
+//!   reproducible after the current version moves on (§20.1, §20.5). Snapshot
+//!   tests pin the current schema and golden vectors so accidental drift
+//!   fails CI; deliberate change means a new version module.
+//! - **Deterministic — across platforms, not just per binary.** The same
+//!   context always yields the same bits: transactions are iterated in
+//!   bundle (block) order, set-shaped aggregates are order-free, every
+//!   arithmetic path is total (no `NaN`/`inf` can reach a vector), and the
+//!   one transcendental (`log10`) is pinned to the pure-Rust `libm` so a
+//!   dataset exported on macOS matches one exported on Linux bit-for-bit.
+//!   Determinism is what makes replay-materialized datasets reproducible
+//!   (§16, §20.1).
 //! - **Attribution-blind (§6).** Features are structural and statistical
 //!   quantities — counts, fractions, log-scaled magnitudes, block-relative
 //!   ratios — and never encode *which* address did something. The
 //!   [`DetectionCtx`] physically carries no labels, and on top of that this
 //!   crate guarantees the stronger property that its output is invariant
 //!   under a bijective renaming of every address and tx hash (checked by a
-//!   property test): an ML model fed these vectors *cannot* become a
-//!   list of known actors in disguise.
+//!   property test): an ML model fed these vectors *cannot* become a list of
+//!   known actors in disguise. The arch-conformance rule keeps it that way
+//!   structurally (`detector-api` only; `intelligence` forbidden).
 //!
-//! Four feature families, mirroring what the heuristic detectors reason over:
-//! transaction structure, gas dynamics, value flows, pool interactions.
-//! Missing upstream data (a header-only source, an unpriced token, a
-//! receipt-less tx) is *encoded* via explicit presence features
-//! (`is_enriched`, `gas_known_fraction`, `priced_swap_fraction`, …) — never
-//! imputed, so a model learns "we couldn't see" as its own signal.
-//! Cross-block position deltas (§20.1's fifth family) land additively as a
-//! later `FEATURE_VERSION` when the first cross-block ML consumer needs them
-//! — they take a `CrossBlockState` input this pure per-block API deliberately
-//! doesn't have.
+//! Each feature carries a [`FeatureKind`] in the schema (and in its
+//! [`content_hash`](FeatureSchema::content_hash)) — the statistical shape
+//! consumers key off (test bounds, drift statistics, normalization) instead
+//! of re-deriving it from naming conventions.
+//!
+//! # Serving-side usage
+//!
+//! Per-tx vectors share block-wide context (gas median, sender census). The
+//! crate-root one-shot functions rebuild that context per call — fine for a
+//! single vector; a consumer extracting many vectors from one block (the
+//! anomaly detector's fan-out, the dataset exporter) holds one
+//! [`BlockFeatureView`] per block instead:
+//!
+//! ```
+//! use detector_api::test_util::CtxBuilder;
+//! use ml_features::BlockFeatureView;
+//!
+//! let ctx = CtxBuilder::new().build();
+//! let view = BlockFeatureView::new(&ctx);
+//! let block = view.block_vector();
+//! let per_tx = view.all_tx_vectors();
+//! # assert_eq!(per_tx.len(), ctx.txs().len());
+//! ```
 
-mod block;
+mod registry;
 mod schema;
 mod stats;
-mod tx;
+pub mod v1;
 mod vector;
 
 use alloy_primitives::B256;
 use detector_api::DetectionCtx;
 
-pub use block::extract_block;
-pub use schema::{
-    block_schema, schema_for, tx_schema, FeatureSchema, FeatureVersion, Granularity,
-    FEATURE_VERSION,
-};
-pub use tx::extract_tx;
+pub use registry::{current, extractor_for, VersionedExtractor};
+pub use schema::{FeatureDef, FeatureKind, FeatureSchema, FeatureVersion, Granularity};
+pub use v1::BlockFeatureView;
 pub use vector::FeatureVector;
 
-/// Extract the per-tx vector for every transaction in the block, in block
-/// order — the shape the dataset-export binary (t2) writes rows in.
-pub fn extract_all_txs(ctx: &DetectionCtx) -> Vec<(B256, FeatureVector)> {
-    ctx.txs()
-        .iter()
-        .map(|&hash| {
-            let vector = extract_tx(ctx, hash).expect("hash comes from the bundle itself");
-            (hash, vector)
-        })
-        .collect()
+/// The current feature-extraction version — what the crate-root functions
+/// produce and what new models train against.
+pub const FEATURE_VERSION: FeatureVersion = v1::VERSION;
+
+/// The current block-level schema ([`v1::block_schema`]).
+pub fn block_schema() -> &'static FeatureSchema {
+    v1::block_schema()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use detector_api::test_util::{addr, b256, CtxBuilder};
+/// The current per-transaction schema ([`v1::tx_schema`]).
+pub fn tx_schema() -> &'static FeatureSchema {
+    v1::tx_schema()
+}
 
-    #[test]
-    fn extract_all_txs_covers_the_block_in_order() {
-        let ctx = CtxBuilder::new()
-            .tx(b256(3), addr(1), vec![])
-            .tx(b256(1), addr(2), vec![])
-            .tx(b256(2), addr(3), vec![])
-            .build();
-        let all = extract_all_txs(&ctx);
-        // Block order, not hash order.
-        assert_eq!(
-            all.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
-            vec![b256(3), b256(1), b256(2)]
-        );
-        for (hash, vector) in &all {
-            assert_eq!(Some(vector.clone()), extract_tx(&ctx, *hash));
-            assert_eq!(vector.feature_version(), FEATURE_VERSION);
-        }
-    }
+/// Extract the block-level vector under the current [`FEATURE_VERSION`].
+pub fn extract_block(ctx: &DetectionCtx) -> FeatureVector {
+    v1::extract_block(ctx)
+}
+
+/// Extract the per-tx vector for `tx_hash` under the current
+/// [`FEATURE_VERSION`]; `None` iff the hash is not in the block's bundle.
+/// For many txs of one block, hold a [`BlockFeatureView`].
+pub fn extract_tx(ctx: &DetectionCtx, tx_hash: B256) -> Option<FeatureVector> {
+    v1::extract_tx(ctx, tx_hash)
+}
+
+/// Per-tx vectors for every transaction in the block, in block order, under
+/// the current [`FEATURE_VERSION`] — the shape the dataset-export binary (t2)
+/// writes rows in.
+pub fn extract_all_txs(ctx: &DetectionCtx) -> Vec<(B256, FeatureVector)> {
+    v1::extract_all_txs(ctx)
 }

@@ -1,24 +1,28 @@
-//! The crate's three contract-level invariants, enforced where drift would
+//! The crate's contract-level invariants, enforced where drift would
 //! otherwise be silent:
 //!
 //! 1. **The v1 schema and a golden vector are pinned as snapshots.** Any
-//!    change to feature names, order, count, or extraction *semantics* fails
-//!    here — the fix is `FEATURE_VERSION += 1` with a new frozen schema,
-//!    never an in-place edit (§20.1: the version is stamped into every
-//!    dataset and every deployed model, and §20.5's skew check compares it).
+//!    change to feature names, order, count, kinds, or extraction *semantics*
+//!    fails here — the fix is a new frozen version module and a
+//!    `FEATURE_VERSION` bump, never an in-place edit (§20.1: the version is
+//!    stamped into every dataset and every deployed model, and §20.5's skew
+//!    check compares it).
 //! 2. **Extraction is total and well-formed on arbitrary blocks** (property
-//!    test): finite values, schema-length vectors, version stamped.
+//!    test): finite values, schema-length vectors, version stamped, and each
+//!    value inside the range its schema-declared [`FeatureKind`] promises.
 //! 3. **Extraction is attribution-blind** (property test): renaming every
 //!    address and tx hash through a bijection leaves every vector bit-for-bit
 //!    unchanged — no feature can depend on *which* address acted, only on the
 //!    structure of what happened (§6 as a checked property, not a comment).
+//! 4. **The version registry resolves every shipped version**, and resolving
+//!    the current one is the same computation as the crate-root functions.
 
 use alloy_primitives::{Address, B256};
 use detector_api::test_util::{swap, transfer, CtxBuilder};
 use detector_api::{DetectionCtx, TxActions, TxGas};
 use ml_features::{
-    block_schema, extract_all_txs, extract_block, extract_tx, tx_schema, FeatureVector,
-    FEATURE_VERSION,
+    block_schema, current, extract_all_txs, extract_block, extract_tx, extractor_for, tx_schema,
+    FeatureKind, FeatureVector, FeatureVersion, FEATURE_VERSION,
 };
 use proptest::prelude::*;
 
@@ -27,8 +31,8 @@ use proptest::prelude::*;
 #[test]
 fn the_v1_schema_is_frozen() {
     // If this snapshot changes, you are changing the serving/training
-    // contract: bump FEATURE_VERSION and freeze the previous schema instead
-    // of accepting an in-place edit.
+    // contract: add a new frozen version module and bump FEATURE_VERSION
+    // instead of accepting an in-place edit.
     let mut lock = format!("feature_version: {FEATURE_VERSION}\n");
     for schema in [block_schema(), tx_schema()] {
         lock.push_str(&format!(
@@ -37,8 +41,8 @@ fn the_v1_schema_is_frozen() {
             schema.len(),
             schema.content_hash()
         ));
-        for name in schema.names() {
-            lock.push_str(&format!("  {name}\n"));
+        for def in schema.defs() {
+            lock.push_str(&format!("  {} ({:?})\n", def.name, def.kind));
         }
     }
     insta::assert_snapshot!("v1_schema", lock);
@@ -233,19 +237,21 @@ fn spec_tx() -> impl Strategy<Value = SpecTx> {
 fn assert_well_formed(v: &FeatureVector, len: usize) {
     assert_eq!(v.feature_version(), FEATURE_VERSION);
     assert_eq!(v.values().len(), len);
-    for (name, value) in v.pairs().expect("current version") {
+    // Each feature's legal range comes from its schema-declared kind — not
+    // from name conventions — so a misclassified feature fails here.
+    let schema = v.schema().expect("current version");
+    for (def, &value) in schema.defs().iter().zip(v.values()) {
+        let name = def.name;
         assert!(value.is_finite(), "{name} is not finite: {value}");
-        // Fraction/share/indicator features live in [0, 1] by contract.
-        let bounded = name.contains("fraction")
-            || name.contains("share")
-            || name.starts_with("is_")
-            || name == "gas_known"
-            || name == "swap_chain_overlap"
-            || name == "self_pool_round_trip"
-            || name == "position_in_block"
-            || name == "flow_concentration";
-        if bounded {
+        assert!(value >= 0.0, "{name} is negative: {value}");
+        if def.kind.unit_bounded() {
             assert!((0.0..=1.0).contains(&value), "{name} out of [0,1]: {value}");
+        }
+        if def.kind == FeatureKind::Indicator {
+            assert!(
+                value == 0.0 || value == 1.0,
+                "{name} is an indicator but neither 0 nor 1: {value}"
+            );
         }
     }
 }
@@ -299,4 +305,29 @@ proptest! {
             );
         }
     }
+}
+
+// ── 4. The version registry: the current version is one of many ──────────────
+
+#[test]
+fn the_registry_resolves_the_current_version_to_the_crate_root_functions() {
+    // What t2 (dataset export) relies on: extracting "under version N" via
+    // the registry is the same computation as the version's own module.
+    let ctx = golden_ctx();
+    let extractor = extractor_for(FEATURE_VERSION).expect("current version is registered");
+    assert_eq!(extractor.version(), FEATURE_VERSION);
+    assert_eq!(current().version(), FEATURE_VERSION);
+    assert_eq!(extractor.extract_block(&ctx), extract_block(&ctx));
+    assert_eq!(extractor.extract_all_txs(&ctx), extract_all_txs(&ctx));
+    assert_eq!(
+        extractor.extract_tx(&ctx, hash_b(1)),
+        extract_tx(&ctx, hash_b(1))
+    );
+    let schema = extractor.schema(ml_features::Granularity::Block);
+    assert_eq!(schema.content_hash(), block_schema().content_hash());
+}
+
+#[test]
+fn an_unshipped_version_is_unresolvable() {
+    assert!(extractor_for(FeatureVersion(999)).is_none());
 }

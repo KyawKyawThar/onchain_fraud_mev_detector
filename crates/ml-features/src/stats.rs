@@ -10,9 +10,15 @@
 /// `log10(1 + x)` for a non-negative magnitude; `0.0` for anything else
 /// (including non-finite). Compresses heavy-tailed on-chain quantities
 /// (counts, USD amounts, gas) into a scale a model can use.
+///
+/// Routed through the pure-Rust `libm` rather than `f64::log10` (the host C
+/// library): C libms differ in the last ulp across platforms, and this is the
+/// one non-IEEE-exact operation in the extractors — pinning it is what makes
+/// "same context ⇒ same bits" hold across OSes, not just per binary. (The
+/// `sqrt` in [`std_dev`] stays std: IEEE 754 requires it correctly rounded.)
 pub(crate) fn log10_1p(x: f64) -> f64 {
     if x.is_finite() && x > 0.0 {
-        (1.0 + x).log10()
+        libm::log10(1.0 + x)
     } else {
         0.0
     }
