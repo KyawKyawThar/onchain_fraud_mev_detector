@@ -1,0 +1,102 @@
+[package]
+name = "dataset"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Dataset export binary (§20.1, Sprint 18 t2) — the training-data flywheel's
+# materialiser. Replays an event-store window (§16), joins each
+# `DetectorTriggered` to the `SimulationCompleted` outcome that confirms or
+# refutes it, extracts an `ml-features` vector per finding, and writes labeled
+# `(features, label)` rows to ClickHouse and/or Parquet.
+#
+# Reproducible by construction: the store's `(occurred_at, event_id)` total
+# order makes replay deterministic, `ml-features` makes extraction
+# bit-deterministic across platforms, and every run emits a manifest whose
+# `content_hash` covers the rows themselves — so "same window + same
+# feature_version + same label rule ⇒ same dataset" is a checkable claim, not a
+# comment.
+#
+# Reads the event store over its public `GET /v1/replay` endpoint rather than
+# linking the service crate: the replay API *is* the §16 seam, and going
+# through it keeps this binary off ClickHouse's read path (it only ever
+# *writes* its own tables) and off Kafka entirely.
+
+[[bin]]
+name = "dataset"
+path = "src/main.rs"
+
+[dependencies]
+# The event schema being replayed, and the feature contract being materialised.
+events = { workspace = true }
+ml-features = { workspace = true }
+# `DetectionCtx`/`BlockBundle` — what a feature vector is extracted from. This
+# crate reconstructs one per block from the replayed window (see `ctx.rs`).
+detector-api = { workspace = true }
+telemetry = { workspace = true }
+# This binary owns the `ml_dataset_*` tables outright (§14: no shared tables),
+# so it carries its own migration set bound to its own bookkeeping table.
+ch-migrate = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+tokio = { workspace = true }
+clickhouse = { workspace = true }
+# The replay client. Same rustls-only stance as every other outbound HTTP
+# caller in the workspace (no system OpenSSL).
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+alloy-primitives = { workspace = true }
+# The manifest's `dataset_id` and `content_hash`: real digests, because they
+# are the identifiers a trained model cites as its provenance (§20.1).
+sha2 = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+# Metrics through the shared facade only — `telemetry::metrics::init` owns the
+# global recorder (§19). Near-free no-ops until an exporter is installed, so an
+# export with no METRICS_ADDR pays nothing for the call sites.
+metrics = { workspace = true }
+# The offline-training boundary (§20.1): "train in whatever stack fits, serve
+# in Rust". `default-features = false` deliberately drops the whole arrow
+# subtree — the writer here is columnar by construction (one DOUBLE column per
+# feature name), so the low-level column API is a better fit than building
+# arrow record batches. `snap` is the one compression codec kept: pure Rust, no
+# C toolchain, no new `cargo deny` surface.
+parquet = { workspace = true }
+
+[dev-dependencies]
+# `DomainEvent::VARIANTS`, so the join's event-type list is checked against the
+# live schema rather than trusted (the `events::topics_for` discipline, applied
+# to a replay filter instead of a Kafka subscription).
+strum = { workspace = true }
+# In-memory recorder to assert on published series without standing up a scrape.
+metrics-util = { workspace = true }
+# The join's safety property is stated over *all* interleavings, so it is a
+# property test, not a table of examples (`ml-features` sets the precedent with
+# its attribution-blindness proptest).
+proptest = { workspace = true }
+# `CtxBuilder` — the same fixture helper `ml-features`' own tests build
+# contexts with, so an end-to-end export test can supply a *fully enriched*
+# context through the `CtxSource` seam and assert on real feature values.
+detector-api = { workspace = true, features = ["test-util"] }
+# Real ClickHouse in a throwaway container for the `#[ignore]`d sink test.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# The replay client's counterparty. `GET /v1/replay` is the §16 seam this
+# binary reads through, and its query-parameter names, cursor tokens and page
+# JSON are a contract no unit test can check — so the end-to-end test serves
+# the *real* event-store router in-process and exports through it. Dev-only:
+# nothing in the shipped binary links the service crate.
+event-store = { path = "../event-store" }
+axum = { workspace = true }
+
+[lints]
+workspace = true

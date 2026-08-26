@@ -805,6 +805,20 @@ replaying that window (§16) — reproducible byte-for-byte, because replay is.
   training and serving is the ONNX artifact plus its `feature_version` —
   train in whatever stack fits, serve in Rust.
 
+  Delivered as the `dataset` crate, reading through the event store's own
+  `GET /v1/replay` (the §16 seam) rather than its storage. Every run emits a
+  **manifest** whose content hash covers the rows — so "reproducible by
+  construction" is a comparison an operator can make, not a claim. Two joins
+  in the schema are weaker than they look and are therefore *marked* rather
+  than assumed: `DetectorTriggered` carries no id (so the trigger→alert edge
+  is reconstructed, and ambiguity is recorded per row and excluded by
+  default), and the store holds events rather than blocks (so the
+  `DetectionCtx` behind a feature vector is rebuilt at a declared **fidelity**
+  until an archive-backed source lands — the same deferral, and the same seam
+  discipline, as simulation's `JobResolver`). A partial block reconstruction
+  yields *wrong* block-relative features rather than missing ones, which is
+  why fidelity gates a dataset instead of merely annotating it.
+
 ### 20.2 ML detection on the fast path
 
 An `anomaly-detector` crate implements `DetectorPlugin` (depending on
