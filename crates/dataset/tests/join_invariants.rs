@@ -187,45 +187,65 @@ fn stored_stream(plan: &[Planned]) -> (Vec<EventEnvelope>, Truth) {
     (events, Truth { by_tx })
 }
 
+/// Every way `plan` produced a **trusted** binding that is not the right one.
+/// Empty is the invariant; anything else is a row that would carry another
+/// finding's label into training.
+///
+/// Shared by the property test and the pinned counterexamples below, so a case
+/// CI found is checked by exactly the same rule the generator explores.
+fn trusted_mislabels(plan: &[Planned]) -> Vec<String> {
+    let (events, truth) = stored_stream(plan);
+    let result = join(CHAIN, &events);
+    let mut wrong = Vec::new();
+
+    for finding in &result.findings {
+        if !finding.binding.is_trusted() {
+            continue; // Giving up is allowed; being confidently wrong is not.
+        }
+        let tx = finding.txs[0];
+        let (true_alert, confirmed) = truth.by_tx[&tx];
+
+        if finding.alert_id != Some(true_alert) {
+            wrong.push(format!(
+                "tx {tx:?} bound to {:?} ({:?}) but belongs to {true_alert:?}",
+                finding.alert_id, finding.binding
+            ));
+            continue;
+        }
+        // The label follows the binding, so a correct binding must yield the
+        // correct outcome — this is the assertion that protects the training
+        // set, not just the bookkeeping.
+        let expected = if confirmed {
+            Outcome::Confirmed {
+                profit: 100.0,
+                victim_loss: 0.0,
+            }
+        } else {
+            Outcome::Refuted
+        };
+        if finding.effective_outcome(false) != expected {
+            wrong.push(format!(
+                "tx {tx:?} bound correctly but labeled {:?}, expected {expected:?}",
+                finding.effective_outcome(false)
+            ));
+        }
+    }
+    wrong
+}
+
 proptest! {
     // Higher than proptest's default: the hazard needs several findings to
     // collide in one millisecond *and* an unlucky permutation, so the
     // interesting region is a small slice of the input space. 512 cases missed
-    // a real cascade that CI then hit. Still ~1s.
+    // a real cascade that CI then hit. Still well under a second.
     #![proptest_config(ProptestConfig::with_cases(4096))]
 
     /// The safety property: whenever the join reports a *trusted* binding, it
     /// is the right one — and therefore so is the label derived from it.
     #[test]
     fn a_trusted_binding_is_never_a_wrong_one(plan in prop::collection::vec(planned(), 1..12)) {
-        let (events, truth) = stored_stream(&plan);
-        let result = join(CHAIN, &events);
-
-        for finding in &result.findings {
-            if !finding.binding.is_trusted() {
-                continue; // Giving up is allowed; being confidently wrong is not.
-            }
-            let tx = finding.txs[0];
-            let (true_alert, confirmed) = truth.by_tx[&tx];
-
-            prop_assert_eq!(
-                finding.alert_id,
-                Some(true_alert),
-                "finding on tx {:?} was trusted ({:?}) but bound to the wrong alert",
-                tx,
-                finding.binding
-            );
-
-            // The label follows the binding, so a correct binding must yield
-            // the correct outcome — this is the assertion that actually
-            // protects the training set.
-            let expected = if confirmed {
-                Outcome::Confirmed { profit: 100.0, victim_loss: 0.0 }
-            } else {
-                Outcome::Refuted
-            };
-            prop_assert_eq!(finding.effective_outcome(false), expected);
-        }
+        let wrong = trusted_mislabels(&plan);
+        prop_assert!(wrong.is_empty(), "{}", wrong.join("; "));
     }
 
     /// Every emitted trigger is accounted for, whatever the interleaving: the
@@ -252,6 +272,128 @@ proptest! {
     fn the_fold_is_deterministic(plan in prop::collection::vec(planned(), 1..12)) {
         let (events, _) = stored_stream(&plan);
         prop_assert_eq!(join(CHAIN, &events), join(CHAIN, &events));
+    }
+}
+
+/// Counterexamples the generator (or CI) has already found, pinned as
+/// **literal** plans rather than left to `.proptest-regressions`.
+///
+/// The seed file is worth keeping, but it is not a substitute: its `cc <hash>`
+/// entries replay only under the same proptest version *and* the same
+/// generator shape, so any future tweak to [`planned`] silently retires every
+/// one of them. A literal plan keeps working, and it documents the shape of
+/// the hazard where a reader will actually see it.
+///
+/// Each entry below is a real failure, in the order they were found:
+/// 1. Two findings at one instant with their pairs interleaved — adjacency
+///    binds the wrong way round (fixed by [`TriggerIndex`]-style rival
+///    counting in the join).
+/// 2. An alert stored ahead of its own trigger, leaving a stale trigger to
+///    capture the *next* alert.
+/// 3. The same, cascading across three findings — the shift persists, which is
+///    why the group is desynced permanently rather than one trigger tainted.
+/// 4. The case CI hit on 2026-08-26 (`detector: 2`, one finding at ms 0 and
+///    one at ms 2, both alerts sorting ahead of their triggers).
+#[test]
+fn pinned_counterexamples_stay_fixed() {
+    let cases: &[(&str, &[Planned])] = &[
+        (
+            "interleaved pairs at one instant",
+            &[
+                Planned {
+                    detector: 0,
+                    confidence_step: 0,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 5576586908107558907,
+                    alert_key: 3855211634834851894,
+                },
+                Planned {
+                    detector: 0,
+                    confidence_step: 0,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 0,
+                    alert_key: 3855211634834851894,
+                },
+            ],
+        ),
+        (
+            "alert stored ahead of its own trigger",
+            &[
+                Planned {
+                    detector: 0,
+                    confidence_step: 2,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 254783065118090166,
+                    alert_key: 0,
+                },
+                Planned {
+                    detector: 0,
+                    confidence_step: 2,
+                    millis: 2,
+                    confirmed: false,
+                    trigger_key: 7441130985736525602,
+                    alert_key: 0,
+                },
+            ],
+        ),
+        (
+            "the shift cascading over three findings",
+            &[
+                Planned {
+                    detector: 1,
+                    confidence_step: 2,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 1772772790922968957,
+                    alert_key: 0,
+                },
+                Planned {
+                    detector: 1,
+                    confidence_step: 2,
+                    millis: 2,
+                    confirmed: false,
+                    trigger_key: 15342922324636368493,
+                    alert_key: 0,
+                },
+                Planned {
+                    detector: 1,
+                    confidence_step: 2,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 11821833404959860777,
+                    alert_key: 1772772790922968957,
+                },
+            ],
+        ),
+        (
+            "found by CI, 2026-08-26",
+            &[
+                Planned {
+                    detector: 2,
+                    confidence_step: 0,
+                    millis: 0,
+                    confirmed: false,
+                    trigger_key: 3396066195964491383,
+                    alert_key: 0,
+                },
+                Planned {
+                    detector: 2,
+                    confidence_step: 0,
+                    millis: 2,
+                    confirmed: false,
+                    trigger_key: 9663680950642558409,
+                    alert_key: 0,
+                },
+            ],
+        ),
+    ];
+
+    for (what, plan) in cases {
+        let wrong = trusted_mislabels(plan);
+        assert!(wrong.is_empty(), "{what}: {}", wrong.join("; "));
     }
 }
 
