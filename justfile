@@ -190,6 +190,52 @@ usage-ch-migrate-info:
 usage-ping:
     cargo run -p usage -- ping
 
+# ── ClickHouse migrations (ML training datasets, §20.1/§14) ──────
+# The dataset binary owns the ml_dataset_rows / ml_dataset_manifests tables
+# (migrations under crates/dataset/migrations). Same pattern as above; an
+# export with --clickhouse applies them itself, so these are for inspection
+# and for reverting.
+
+# Apply all pending dataset ClickHouse migrations
+dataset-ch-migrate-up:
+    cargo run -p dataset -- migrate up
+
+# Revert the last one (destructive — drops a dataset table)
+dataset-ch-migrate-down:
+    cargo run -p dataset -- migrate down
+
+# Show dataset ClickHouse migration status
+dataset-ch-migrate-info:
+    cargo run -p dataset -- migrate info
+
+# ── ML dataset export (§20.1, Sprint 18 t2) ──────────────────────
+# Replay an event-store window, join every DetectorTriggered to the
+# SimulationCompleted that confirms or refutes it, and materialise labeled
+# (features, label) rows. Reproducible by construction: the same window +
+# feature_version + label rule always yields the same content_hash, printed in
+# the manifest.
+#
+# The default is a DRY RUN — it replays, joins, extracts and prints the
+# manifest without writing anywhere, which is the cheap way to see what a
+# window holds before committing a table to it. Add `--clickhouse` and/or
+# `--parquet <path>` to write.
+#
+#   from/to: RFC 3339, half-open [from, to) so adjacent windows tile.
+#   Needs EVENT_STORE_URL (default http://127.0.0.1:8081).
+dataset-export from to *args:
+    cargo run -p dataset -- export --from {{from}} --to {{to}} {{args}}
+
+# Export the last hour to Parquet + ClickHouse, the shape a training run takes.
+# `--min-fidelity full_bundle` is the honest gate: rows built from a partial
+# block reconstruction have wrong block-relative features, not missing ones.
+dataset-export-hour out="target/dataset.parquet":
+    cargo run -p dataset -- export \
+        --from "$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+        --to "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --min-fidelity full_bundle \
+        --parquet {{out}} \
+        --clickhouse
+
 # ── Label seeding from public feeds (§8.1, Sprint 7 t2) ──────────
 # Import a downloaded feed file. Feeds are fetched out-of-band so an import is
 # a reproducible file, not a moving URL. Re-running the same file is a no-op

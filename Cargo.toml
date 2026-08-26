@@ -107,6 +107,12 @@ cross-chain-correlator = { path = "crates/cross-chain-correlator" }
 # in arch-conformance): the training data must obey the same
 # attribution-blindness as the detectors that will consume the model (§6).
 ml-features = { path = "crates/ml-features" }
+# Dataset export binary (§20.1, Sprint 18 t2) — replays an event-store window
+# (§16), joins `DetectorTriggered` to its `SimulationCompleted` outcome, and
+# materialises labeled `(features, label)` rows into ClickHouse/Parquet. A
+# binary, not a library other crates link: it is listed here only so the
+# workspace's crate inventory stays in one place.
+dataset = { path = "crates/dataset" }
 
 # Errors.
 anyhow = "1"
@@ -249,6 +255,14 @@ revm = { version = "41", default-features = false, features = [
 # alert lifecycle to connected clients.
 axum = { version = "0.8", features = ["ws"] }
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+# Parquet writer for the dataset-export binary (§20.1) — the handoff format to
+# offline training ("train in whatever stack fits, serve in Rust"). Default
+# features are OFF deliberately: they would pull the entire arrow subtree plus
+# four compression codecs (two of them C). A feature matrix is already
+# columnar, so the low-level `SerializedFileWriter` column API fits better than
+# arrow record batches, and `snap` is the one codec kept — pure Rust, so the
+# self-contained-image stance (rustls/vendored-rdkafka) holds.
+parquet = { version = "59", default-features = false, features = ["snap"] }
 rdkafka = { version = "0.39", features = ["tokio"] }
 # Production hardening for the network service:
 # tower-http — TraceLayer (HTTP spans into the existing OTel stack) + TimeoutLayer.

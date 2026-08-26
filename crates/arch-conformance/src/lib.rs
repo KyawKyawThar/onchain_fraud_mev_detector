@@ -93,6 +93,35 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── Training data inherits attribution-blindness (§20.1) ──────────
+        // The dataset exporter materialises what an ML detector will learn
+        // from, so the §6 rule has to hold one step *upstream* of the
+        // detector: if a training row could carry a label or an attribution,
+        // the model becomes a list of known actors no matter how blind the
+        // serving path is. It gets its features from `ml-features` (which is
+        // itself held to detector purity above) and never from a store, and
+        // `intelligence` — the crate that owns labels, entities and risk
+        // scores — must not be on its edge at all.
+        if krate == "dataset" {
+            if !has("ml-features") {
+                out.push(format!(
+                    "{krate}: must build feature vectors through the `ml-features` seam \
+                     (it has no ml-features dependency) — the training/serving contract \
+                     is that crate's versioned schema, not a local extraction"
+                ));
+            }
+            for forbidden in ["intelligence", "detection", "sqlx", "redis"] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — training data obeys the \
+                         same attribution-blindness as the detectors that consume it \
+                         (§20.1); a labeled row is a replayed event plus an ml-features \
+                         vector, nothing else"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -230,6 +259,16 @@ mod tests {
             ("event-bus", &["events", "rdkafka", "metrics"]),
             ("detection", &["detector-api", "event-bus", "rdkafka"]),
             ("backtest", &["detection", "detector-api"]),
+            (
+                "dataset",
+                &[
+                    "ml-features",
+                    "detector-api",
+                    "events",
+                    "clickhouse",
+                    "ch-migrate",
+                ],
+            ),
             ("telemetry", &["metrics-exporter-prometheus"]),
             ("db", &["sqlx", "redis"]),
             ("ch-migrate", &["clickhouse"]),
@@ -282,6 +321,16 @@ mod tests {
                 "ml-features",
                 &["detector-api", "intelligence"],
                 "attribution-blind function of the DetectionCtx",
+            ),
+            (
+                "dataset",
+                &["ml-features", "intelligence", "clickhouse", "ch-migrate"],
+                "training data obeys the same attribution-blindness",
+            ),
+            (
+                "dataset",
+                &["events", "clickhouse", "ch-migrate"],
+                "no ml-features dependency",
             ),
         ];
         for (krate, deps, expected) in cases {
