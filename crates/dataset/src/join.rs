@@ -344,23 +344,35 @@ pub struct Joiner {
     /// tie produces one honest `Ambiguous` and one falsely-confident `Exact`,
     /// and the confident one would carry a coin-flip label into training.
     contaminated: HashSet<usize>,
-    /// Alerts of a `(detector, confidence)` group that arrived with no
-    /// candidate trigger, and whose real trigger must therefore still be ahead
-    /// of us in the stream.
+    /// Alerts of a `(detector, confidence)` group that arrived with **no**
+    /// candidate trigger, recorded by the millisecond they arrived.
     ///
-    /// The emitter always publishes a trigger before its alert, so an orphaned
-    /// alert means the *stored* order disagrees with the emitted one — the
-    /// pair got reordered inside its millisecond. The orphan's true trigger is
-    /// the next one of its group to arrive, so that trigger is marked
-    /// contaminated: whatever alert later binds to it is a guess, because the
-    /// orphan has a prior claim.
+    /// The emitter always publishes a trigger before its alert, so an orphan
+    /// means one of two things, and they must be told apart:
     ///
-    /// Without this, the stale trigger silently captures the *next* alert and
-    /// the fold reports it as `Exact` — a confidently wrong binding, which is
-    /// exactly what the property test forbids. (An alert whose trigger fell
-    /// before the window start orphans too; taints one trigger, which is the
-    /// proportionate cost.)
-    pending_orphans: HashMap<(DetectorKey, u64), usize>,
+    /// - The alert's trigger is genuinely outside the window (it fell before
+    ///   `from`, or the detector's stream starts mid-flight). Nothing is
+    ///   wrong; later pairs in the group are still sound.
+    /// - The pair got **reordered inside its millisecond**, so the trigger is
+    ///   still ahead of us. This one is corrosive: that trigger will arrive,
+    ///   sit in the queue, and be handed to the *next* alert — and every
+    ///   binding in the group after it is shifted by one, forever. Tainting
+    ///   just the one trigger is not enough; the shift cascades.
+    ///
+    /// The two are distinguished on arrival by the same test the pairing
+    /// itself uses: a trigger within [`PAIR_TOLERANCE_MS`] of the orphaned
+    /// alert could be that alert's own, so the group is marked
+    /// [`desynced`](Joiner::desynced); a trigger arriving much later (the next
+    /// block, say) cannot be, and costs nothing.
+    pending_orphans: HashMap<(DetectorKey, u64), Vec<i64>>,
+    /// Groups whose queue is known to be shifted: an orphaned alert's trigger
+    /// turned up after it, so every later pairing in the group is off by one.
+    /// No binding in a desynced group may be trusted for the rest of the fold.
+    ///
+    /// Permanent rather than "until the queue drains", because in the shifted
+    /// regime the queue empties after *every* binding — it oscillates 0/1 just
+    /// as it does when healthy, so emptiness carries no information.
+    desynced: HashSet<(DetectorKey, u64)>,
     finding_of_alert: HashMap<AlertId, usize>,
     incident_of_alert: HashMap<AlertId, IncidentId>,
     sim: HashMap<AlertId, SimResult>,
@@ -380,6 +392,7 @@ impl Joiner {
             unbound: BTreeMap::new(),
             contaminated: HashSet::new(),
             pending_orphans: HashMap::new(),
+            desynced: HashSet::new(),
             finding_of_alert: HashMap::new(),
             incident_of_alert: HashMap::new(),
             sim: HashMap::new(),
@@ -417,16 +430,20 @@ impl Joiner {
                     outcome: Outcome::Unalerted,
                 });
                 let key = detector_key(&trigger.detector);
-                // An earlier alert of this group is still looking for its
-                // trigger; this is most likely it, so nothing that binds here
-                // may claim to be certain.
-                if let Some(claims) = self
-                    .pending_orphans
-                    .get_mut(&(key.clone(), confidence_bits(trigger.raw_confidence)))
-                    .filter(|claims| **claims > 0)
-                {
-                    *claims -= 1;
-                    self.contaminated.insert(index);
+                // If an earlier alert of this group is still looking for a
+                // trigger and this one is close enough in time to be it, the
+                // pair was reordered: the group's queue is shifted from here
+                // on (see `pending_orphans`).
+                let group = (key.clone(), confidence_bits(trigger.raw_confidence));
+                let at = envelope.occurred_at.timestamp_millis();
+                if let Some(waiting) = self.pending_orphans.get_mut(&group) {
+                    if let Some(pos) = waiting
+                        .iter()
+                        .position(|orphan| (at - orphan).abs() <= PAIR_TOLERANCE_MS)
+                    {
+                        waiting.remove(pos);
+                        self.desynced.insert(group);
+                    }
                 }
                 self.unbound.entry(key).or_default().push(index);
                 self.stats.triggers += 1;
@@ -484,14 +501,15 @@ impl Joiner {
         alert_ms: i64,
     ) {
         let key = detector_key(detector);
-        // Rivals stamped the same instant make *any* pairing here a guess, even
-        // when only one candidate is in the queue — see `TriggerIndex`.
-        let indistinguishable = self
-            .index
-            .rivals_near(&(key.clone(), confidence_bits(confidence)), alert_ms)
-            > 1;
+        let group = (key.clone(), confidence_bits(confidence));
+        // Two ways a pairing here is a guess even with a single candidate in
+        // the queue: a rival stamped the same instant (see [`TriggerIndex`]),
+        // or a group whose queue is already known to be shifted by an earlier
+        // reorder (see [`Joiner::pending_orphans`]).
+        let indistinguishable =
+            self.index.rivals_near(&group, alert_ms) > 1 || self.desynced.contains(&group);
         let Some(queue) = self.unbound.get_mut(&key) else {
-            self.orphan_alert(key, confidence);
+            self.orphan_alert(key, confidence, alert_ms);
             return;
         };
 
@@ -506,7 +524,7 @@ impl Joiner {
             .collect();
 
         let Some(&chosen) = matches.first() else {
-            self.orphan_alert(key, confidence);
+            self.orphan_alert(key, confidence, alert_ms);
             return;
         };
 
@@ -528,15 +546,15 @@ impl Joiner {
         self.finding_of_alert.insert(alert_id, chosen);
     }
 
-    /// An alert arrived with no candidate trigger. Its real trigger is still
-    /// ahead in the stream (see [`Joiner::pending_orphans`]), so stake a claim
-    /// on the next one of its group.
-    fn orphan_alert(&mut self, key: DetectorKey, confidence: Confidence) {
+    /// An alert arrived with no candidate trigger. Record when, so that a
+    /// trigger turning up close enough in time to be its own can be recognised
+    /// as a reorder — see [`Joiner::pending_orphans`].
+    fn orphan_alert(&mut self, key: DetectorKey, confidence: Confidence, alert_ms: i64) {
         self.stats.alerts_without_trigger += 1;
-        *self
-            .pending_orphans
+        self.pending_orphans
             .entry((key, confidence_bits(confidence)))
-            .or_default() += 1;
+            .or_default()
+            .push(alert_ms);
     }
 
     /// Layer 2: `IncidentCreated` names both the alert and the exact tx set the

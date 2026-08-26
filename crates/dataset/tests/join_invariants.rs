@@ -188,7 +188,11 @@ fn stored_stream(plan: &[Planned]) -> (Vec<EventEnvelope>, Truth) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    // Higher than proptest's default: the hazard needs several findings to
+    // collide in one millisecond *and* an unlucky permutation, so the
+    // interesting region is a small slice of the input space. 512 cases missed
+    // a real cascade that CI then hit. Still ~1s.
+    #![proptest_config(ProptestConfig::with_cases(4096))]
 
     /// The safety property: whenever the join reports a *trusted* binding, it
     /// is the right one — and therefore so is the label derived from it.
