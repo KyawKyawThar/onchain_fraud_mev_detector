@@ -835,16 +835,35 @@ An `anomaly-detector` crate implements `DetectorPlugin` (depending on
 
 Serving mechanics:
 
-- **`InferenceEngine` seam:** `fn infer(&self, features: &FeatureVector) ->
-  Score` — a trait with an `ort` (ONNX Runtime) backend and an in-memory test
-  double, the same seam discipline as `EventSink`. Inference is CPU work and
-  runs inside the detector's rayon fan-out (§15); the model is loaded once at
-  boot, link-or-fail.
+- **`InferenceEngine` seam:** `infer(&self, &FeatureVector) -> Score` — a
+  trait with an `ort` (ONNX Runtime) backend and an in-memory test double, the
+  same seam discipline as `EventSink`. Inference is CPU work and runs inside
+  the detector's rayon fan-out (§15); the model is loaded once at boot,
+  link-or-fail.
+
+  Delivered as the `inference` crate. Two shape decisions the sketch above
+  leaves open: `infer` is **fallible**, because the alternative to a `Result`
+  when a runtime call fails is a fabricated score, which is the one output a
+  detection system must never produce; and the scored unit is a
+  `FeatureVector`, never a `DetectionCtx`, so the serving side is
+  attribution-blind *by construction* exactly as extraction is. `ort` is built
+  to load the runtime dynamically rather than link or download it, keeping
+  `cargo build` hermetic and making a missing library a typed boot error
+  instead of a panic in a rayon worker. Since ONNX Runtime's `Run` is not
+  thread-safe, the engine holds a pool of independently-locked sessions rather
+  than funnelling a parallel fan-out through one mutex.
 - **Weights are config:** the model artifact's SHA-256 is folded into the
   registry `config_hash`, so a weight change is a new `(id, version,
   config_hash)` triple — historical evidence stays attributable to the exact
   weights that produced it, and rollback is the registry's existing
   `deprecated_at` mechanism.
+
+  The fold is one function, `ConfigHash::with_model_artifact`, over a
+  `ModelDescriptor` digest that covers the artifact hash *and* the trained
+  `feature_version` and its schema digest — so a feature-schema change is as
+  visible in the triple as a retrain. A deployment may additionally **pin** the
+  expected artifact digest, at which point a swapped weights file is a refused
+  boot rather than a silent change of behaviour.
 - **Rollout:** Shadow (evidence suppressed from customer surfaces, §6 rollout
   policy) → backtest gate (precision/recall ≥ committed baseline) → Live.
   Identical lifecycle to a heuristic detector change — ML gets no special
@@ -852,6 +871,20 @@ Serving mechanics:
 - **Latency budget:** inference must fit the < 1s fast path (§6). ONNX GBDT /
   isolation-forest inference is microseconds per candidate; the budget is
   enforced by the same per-detector latency metrics (§17).
+
+  Serving metrics are a **decorator over the seam** (`ObservedEngine`), not
+  call-site instrumentation: it wraps any engine — the real backend and the
+  test double alike — so no backend and no call path can ship unmeasured, and
+  the backend itself stays free of metrics. Alongside latency, throughput and
+  failures-by-reason it records the served **score distribution**, which is the
+  cheapest §20.5 drift signal available; the per-feature population-stability
+  statistics build on it rather than replacing it.
+- **Explainability sits above the seam.** An anomaly finding's "top
+  contributing features" is derived from the feature vector against the drift
+  monitor's own distribution statistics, not from a model-specific attribution
+  output. The seam returns a score and nothing else, so a model format with no
+  attribution support is still explainable and one subsystem owns the answer to
+  "why did this fire?".
 
 ### 20.3 Behavioral embeddings (intelligence service)
 

@@ -76,7 +76,10 @@ direction explicit and acyclic.
 [`detector-api::DetectorPlugin`](../crates/detector-api/src/plugin.rs),
 [`ingestion`](../crates/ingestion/) `ChainSource`,
 [`intelligence::cache::HotCache`](../crates/intelligence/src/cache.rs),
-[`rule_engine::state_store::TemporalStateStore`](../crates/rule-engine/src/state_store.rs).
+[`rule_engine::state_store::TemporalStateStore`](../crates/rule-engine/src/state_store.rs),
+[`inference::InferenceEngine`](../crates/inference/src/engine.rs) (§20.2 — the
+`ort` ONNX backend vs. `StubEngine`, so ML detector logic is testable with no
+native runtime present).
 Each pairs with a `Recording*` / canned double in its `#[cfg(test)]` module.
 
 **Anti-pattern.** Reaching for `rdkafka`/`lapin`/`reqwest` types directly in service
@@ -88,7 +91,9 @@ seam rules (detector crates → `detector-api` never `detection`; `rdkafka` neve
 without `event-bus`; `lapin` in `simulation` only; one Prometheus exporter; `sqlx`
 alongside `db`; `redis` alongside `db` too (§8/§9 — `db::redis` is the shared
 connect + transient/permanent classification, the Redis analog of the sqlx rule);
-`clickhouse` alongside `ch-migrate`; `events`/`detector-api` stay at
+`clickhouse` alongside `ch-migrate`; `ml-features`/`dataset`/`inference` never
+touch `intelligence`, so attribution-blindness holds upstream and downstream of
+the model as well as inside it; `events`/`detector-api` stay at
 the bottom of the graph) against `cargo metadata` on every `cargo test` — a
 violation fails the same gate locally and in CI. Changing a rule is an architecture
 decision: edit the rule in the same PR, with the reasoning in the commit.

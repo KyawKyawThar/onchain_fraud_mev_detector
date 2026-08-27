@@ -122,6 +122,42 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── Model serving is held to the same purity (§20.2) ─────────────
+        // `inference` is the seam a model is executed behind. It scores a
+        // `FeatureVector` and nothing else, which is what keeps the *serving*
+        // side attribution-blind by construction (§6) — an engine that could
+        // reach `intelligence` would undo everything `ml-features` guarantees
+        // upstream of it. It also stays off the service/broker/store edges so
+        // a detector crate can link it without dragging a runtime's worth of
+        // infrastructure into its tests.
+        if krate == "inference" {
+            if !has("ml-features") {
+                out.push(format!(
+                    "{krate}: must serve the `ml-features` contract (it has no ml-features \
+                     dependency) — the training/serving boundary is that crate's versioned \
+                     schema plus the ONNX artifact, nothing else"
+                ));
+            }
+            for forbidden in [
+                "detection",
+                "intelligence",
+                "event-bus",
+                "rdkafka",
+                "lapin",
+                "sqlx",
+                "redis",
+                "clickhouse",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — model serving is a pure \
+                         function of a FeatureVector (§20.2); a model that could see anything \
+                         else would not be attribution-blind"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -269,6 +305,10 @@ mod tests {
                     "ch-migrate",
                 ],
             ),
+            (
+                "inference",
+                &["ml-features", "detector-api", "ort", "metrics"],
+            ),
             ("telemetry", &["metrics-exporter-prometheus"]),
             ("db", &["sqlx", "redis"]),
             ("ch-migrate", &["clickhouse"]),
@@ -332,6 +372,12 @@ mod tests {
                 &["events", "clickhouse", "ch-migrate"],
                 "no ml-features dependency",
             ),
+            (
+                "inference",
+                &["ml-features", "intelligence"],
+                "model serving is a pure function of a FeatureVector",
+            ),
+            ("inference", &["ort"], "no ml-features dependency"),
         ];
         for (krate, deps, expected) in cases {
             let g = graph(&[(*krate, *deps)]);

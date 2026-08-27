@@ -91,6 +91,35 @@ impl ConfigHash {
         &self.0
     }
 
+    /// Fold a deployed ML model's identity into this config hash — **weights
+    /// are config** (§20.2).
+    ///
+    /// `model_digest` is a `inference::ModelDescriptor::content_hash()`: a
+    /// digest over the ONNX artifact's SHA-256, the `feature_version` it was
+    /// trained on, and that schema's own content hash. Folding it in means a
+    /// retrain, a re-export, or a feature-schema change each produce a new
+    /// `(id, version, config_hash)` triple, exactly as a threshold change
+    /// does — so historical evidence stays attributable to the precise weights
+    /// that produced it and rollback is the registry's existing
+    /// `deprecated_at`, not an archaeology exercise.
+    ///
+    /// Taken as raw bytes rather than a typed descriptor deliberately: the
+    /// serving seam (`inference`) stays off this crate's dependency edge, and
+    /// this stays the *one* fold, so a detector's hash can't be composed two
+    /// different ways (the same reason [`boot_placeholder`](Self::boot_placeholder)
+    /// is a single function).
+    ///
+    /// Domain-separated, so folding a model into a config hash can never
+    /// collide with hashing a config that happens to contain those bytes.
+    #[must_use]
+    pub fn with_model_artifact(self, model_digest: &[u8; 32]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"config-hash/model-artifact/v1\n");
+        hasher.update(self.0);
+        hasher.update(model_digest);
+        Self(hasher.finalize().into())
+    }
+
     /// The lowercase-hex rendering, as it lands in [`DetectorRef::config_hash`].
     pub fn to_hex(&self) -> String {
         alloy_primitives::hex::encode(self.0)
@@ -631,6 +660,66 @@ mod tests {
         // SHA-256 is 32 bytes / 64 hex chars.
         assert_eq!(ConfigHash::of(&a).unwrap().as_bytes().len(), 32);
         assert_eq!(ConfigHash::of(&a).unwrap().to_hex().len(), 64);
+    }
+
+    #[test]
+    fn folding_a_model_artifact_versions_the_weights_like_config() {
+        // §20.2: a retrain must be a new `(id, version, config_hash)` triple,
+        // so evidence stays attributable to the weights that produced it.
+        let config = ConfigHash::of(&Cfg {
+            min_profit_wei: 1,
+            pools: vec!["uniswap"],
+        })
+        .unwrap();
+
+        let march = [7u8; 32];
+        let april = [8u8; 32];
+
+        assert_eq!(
+            config.clone().with_model_artifact(&march),
+            config.clone().with_model_artifact(&march),
+            "the same config + weights is the same triple across boots"
+        );
+        assert_ne!(
+            config.clone().with_model_artifact(&march),
+            config.clone().with_model_artifact(&april),
+            "a weight change must move the config hash"
+        );
+        assert_ne!(
+            config.clone().with_model_artifact(&march),
+            config.clone(),
+            "an ML detector's triple is not its unfolded config's"
+        );
+
+        // A *config* change still moves it, with the weights held fixed —
+        // both halves are live, neither shadows the other.
+        let other_config = ConfigHash::of(&Cfg {
+            min_profit_wei: 2,
+            pools: vec!["uniswap"],
+        })
+        .unwrap();
+        assert_ne!(
+            config.with_model_artifact(&march),
+            other_config.with_model_artifact(&march)
+        );
+    }
+
+    #[test]
+    fn the_model_fold_is_domain_separated_from_plain_hashing() {
+        // Without the domain prefix, folding a model into a config hash would
+        // be indistinguishable from hashing a config whose bytes happen to be
+        // that concatenation — a collision between two different meanings.
+        let config = ConfigHash::of_bytes(b"cfg");
+        let digest = [3u8; 32];
+
+        let mut naive = Vec::new();
+        naive.extend_from_slice(config.as_bytes());
+        naive.extend_from_slice(&digest);
+
+        assert_ne!(
+            config.with_model_artifact(&digest),
+            ConfigHash::of_bytes(&naive)
+        );
     }
 
     #[test]
