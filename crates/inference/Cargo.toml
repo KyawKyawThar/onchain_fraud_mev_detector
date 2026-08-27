@@ -1,0 +1,78 @@
+[package]
+name = "inference"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The model-serving seam (§20.2, Sprint 18 t3). `InferenceEngine` is the
+# object-safe trait an ML detector programs against — the `EventSink`
+# discipline applied to model inference: the interesting logic (t4's
+# `anomaly-detector`) is unit-testable against an in-memory double with no
+# ONNX Runtime, no artifact file, and no native library anywhere near the test
+# binary.
+#
+# Held to the same purity as `ml-features`/the detector crates: the feature
+# contract (`ml-features`) and nothing else — no service, broker, or store
+# edge, and above all no `intelligence`, because a serving path that could
+# reach labels would undo the attribution-blindness the features were built to
+# guarantee (arch-conformance enforces it).
+
+[features]
+default = []
+# The ONNX Runtime backend. Off by default so the *seam* — trait, artifact
+# digest, descriptor, test double — costs nothing to link: a detector crate
+# that only needs the vocabulary, and every test that runs against the double,
+# never pulls `ort` in at all.
+onnx = ["dep:ort"]
+# The shared in-memory `InferenceEngine` double, for the dev-dependencies of
+# crates that consume the seam (t4's detector, the composing service).
+test-util = []
+
+[dependencies]
+# The versioned feature contract this seam serves: a `FeatureVector` carries
+# the `FeatureVersion` a model was trained under, which is what makes the
+# §20.5 serving/training skew check a *check* and not a convention.
+ml-features = { workspace = true }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Per-model serving metrics (§19, §20.5) recorded through the facade at the one
+# call site `ObservedEngine` owns. A near-free no-op until the *binary*
+# installs the Prometheus exporter (`telemetry::metrics::init`), so this
+# library — and its tests, replay and backtests — stays exporter-agnostic
+# (conventions §8). The score histogram is also t5's cheapest drift signal.
+metrics = { workspace = true }
+# SHA-256 over the model artifact — "weights are config" (§20.2): the digest is
+# folded into the registry `config_hash`, so it is an audit identifier where
+# collision-resistance matters, exactly like `detection::ConfigHash`.
+sha2 = { workspace = true }
+# Hex rendering of the digests at the edges (the same helper `ConfigHash` and
+# `FeatureSchema::content_hash` use, so all three render identically).
+alloy-primitives = { workspace = true }
+
+# ONNX Runtime, behind the `onnx` feature. `default-features = false` drops the
+# `download-binaries` default, which would fetch a prebuilt ONNX Runtime from a
+# CDN *during the build* — an unreviewed binary and a network dependency in
+# `cargo build`, which this workspace's supply-chain stance (conventions §10)
+# doesn't accept. `load-dynamic` instead makes `ort` `dlopen` the runtime at
+# *boot* from `ORT_DYLIB_PATH` (or `OrtConfig::dylib_path`): the build stays
+# hermetic and needs no C++ toolchain, and a missing/incompatible runtime is a
+# typed boot error (see `onnx::OrtEngine::load`) rather than a link failure.
+# The deployable image installs `libonnxruntime` and points the variable at it.
+ort = { workspace = true, optional = true }
+
+[dev-dependencies]
+# In-memory recorder so the observability tests assert on the series a scrape
+# would see — including that a failed batch still counts the vectors it
+# attempted, which is the under-reporting §14 exists to prevent.
+metrics-util = { workspace = true }
+# Round-trip the hex-encoded digest / the serde-loaded `OrtConfig`.
+serde_json = { workspace = true }
+# `CtxBuilder` — a real `DetectionCtx` to extract real vectors from, so the
+# seam's tests use the same values the fast path will.
+detector-api = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

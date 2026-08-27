@@ -107,6 +107,15 @@ cross-chain-correlator = { path = "crates/cross-chain-correlator" }
 # in arch-conformance): the training data must obey the same
 # attribution-blindness as the detectors that will consume the model (§6).
 ml-features = { path = "crates/ml-features" }
+# Model-serving seam (§20.2, Sprint 18 t3) — the `InferenceEngine` trait an ML
+# detector programs against, its `ort` (ONNX Runtime) backend, and the in-memory
+# double, so t4's detector is testable with no native runtime present. Held to
+# the same purity as `ml-features` (feature contract only; no store/broker/
+# `intelligence` edge, enforced in arch-conformance): the artifact's SHA-256 and
+# the trained `feature_version` travel in a `ModelDescriptor` whose content hash
+# is what `detection::ConfigHash::with_model_artifact` folds into the registry
+# triple — weights are versioned like config.
+inference = { path = "crates/inference" }
 # Dataset export binary (§20.1, Sprint 18 t2) — replays an event-store window
 # (§16), joins `DetectorTriggered` to its `SimulationCompleted` outcome, and
 # materialises labeled `(features, label)` rows into ClickHouse/Parquet. A
@@ -264,6 +273,20 @@ clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 # self-contained-image stance (rustls/vendored-rdkafka) holds.
 parquet = { version = "59", default-features = false, features = ["snap"] }
 rdkafka = { version = "0.39", features = ["tokio"] }
+# ONNX Runtime bindings for the model-serving seam (§20.2) — the contract
+# between offline training ("train in whatever stack fits") and Rust serving is
+# an ONNX artifact, so this is the one place a trained model is executed.
+# `default-features = false` drops `download-binaries`, which downloads a
+# prebuilt ONNX Runtime from a CDN inside `build.rs` — a network fetch and an
+# unreviewed binary in every `cargo build`, which the deliberate-supply-chain
+# stance (conventions §10) rules out for the same reason `cmake-build` was
+# rejected for rdkafka. `load-dynamic` instead resolves the runtime at *boot*
+# via `dlopen` (`ORT_DYLIB_PATH`), so: the build is hermetic and needs no C++
+# toolchain, CI's `--all-features` compiles it with zero native deps, and a
+# missing or too-old runtime surfaces as a typed boot error. Pinned exactly
+# (`=`) because ort 2.0 is pre-release: rc-to-rc is a breaking-change channel.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+
 # Production hardening for the network service:
 # tower-http — TraceLayer (HTTP spans into the existing OTel stack) + TimeoutLayer.
 # tokio-util — CancellationToken for cooperative, drain-then-exit shutdown.
