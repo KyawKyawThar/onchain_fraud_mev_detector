@@ -51,7 +51,8 @@ use events::simulation::{
     SimulationRequested, WalletExposureReportReady,
 };
 use events::system::{
-    ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
+    DriftedFeature, ModelDriftDetected, ScreeningDecision, ScreeningDecisionBasis,
+    ScreeningDecisionRecorded, UsageRecorded,
 };
 use events::{DomainEvent, EventEnvelope};
 use serde_json::json;
@@ -286,6 +287,24 @@ fn sample_events() -> Vec<DomainEvent> {
             quantity: 1,
             timestamp: ts(),
         }),
+        DomainEvent::ModelDriftDetected(ModelDriftDetected {
+            model_id: "anomaly-iforest".into(),
+            detector: detector(),
+            feature_version: 1,
+            granularity: "block".into(),
+            baseline_hash: "9f2c".into(),
+            samples: 512,
+            window_closed_by: "full".into(),
+            threshold: 3.0,
+            max_magnitude: 4.5,
+            drifted: vec![DriftedFeature {
+                feature: "tx_count_log".into(),
+                magnitude: 4.5,
+                shift: 4.5,
+                spread: 1.0,
+            }],
+            observed_at: ts(),
+        }),
         DomainEvent::ScreeningDecisionRecorded(ScreeningDecisionRecorded {
             customer_id: customer_id(),
             address: addr(),
@@ -500,6 +519,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "ScreeningDecisionRecorded",
         r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "ModelDriftDetected",
+        r#"{"type":"ModelDriftDetected","payload":{"model_id":"anomaly-iforest","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"feature_version":1,"granularity":"block","baseline_hash":"9f2c","samples":512,"window_closed_by":"full","threshold":3.0,"max_magnitude":4.5,"drifted":[{"feature":"tx_count_log","magnitude":4.5,"shift":4.5,"spread":1.0}],"observed_at":"2023-11-14T22:13:20Z"}}"#,
     ),
     (
         "PredictedAlert",

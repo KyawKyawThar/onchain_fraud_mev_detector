@@ -1,0 +1,28 @@
+---
+source: crates/ml-features/tests/invariants.rs
+expression: "with(&|v|\n{\n    let mut values = v.values().to_vec(); values[moved] =\n    baseline.stats()[moved].center; rebuild(v, values)\n})"
+---
+tx_count_log shift=0.000000 spread=0.001000 magnitude=6.907755
+enriched_tx_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+contract_creation_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+distinct_sender_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+top_sender_tx_share shift=0.000000 spread=1.000000 magnitude=0.000000
+repeat_sender_tx_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+gas_known_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+gas_price_gwei_log_mean shift=0.000000 spread=0.001000 magnitude=0.000000
+gas_price_gwei_log_std shift=0.000000 spread=0.001000 magnitude=0.000000
+head_gas_premium shift=0.000000 spread=0.001000 magnitude=0.000000
+gas_used_log_mean shift=0.000000 spread=0.001000 magnitude=0.000000
+swap_count_log shift=0.000000 spread=1.000000 magnitude=0.000000
+transfer_count_log shift=0.000000 spread=0.001000 magnitude=0.000000
+swap_usd_volume_log shift=0.000000 spread=1.000000 magnitude=0.000000
+priced_swap_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+transfer_usd_volume_log shift=0.000000 spread=0.001000 magnitude=0.000000
+priced_transfer_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+max_transfer_usd_log shift=0.000000 spread=0.001000 magnitude=0.000000
+flow_concentration shift=0.000000 spread=1.000000 magnitude=0.000000
+distinct_pool_count_log shift=0.000000 spread=0.001000 magnitude=0.000000
+swaps_per_pool shift=0.000000 spread=1.000000 magnitude=0.000000
+top_pool_swap_share shift=0.000000 spread=0.001000 magnitude=0.000000
+pool_round_trip_fraction shift=0.000000 spread=0.001000 magnitude=0.000000
+max_pool_impact_log shift=0.000000 spread=1.000000 magnitude=0.000000

@@ -113,6 +113,31 @@ pub struct Scheduler {
     shutdown: CancellationToken,
     /// Back-off between transient publish retries; a field so tests can shrink it.
     publish_backoff: Duration,
+    /// Contributes events on the block boundary (§20.5's drift publisher is
+    /// the only one today). `None` in a build or deployment that has none —
+    /// the common case, and why this is an `Option` rather than an empty
+    /// publisher nobody notices.
+    boundary: Option<Arc<dyn BlockBoundaryEvents>>,
+}
+
+/// A source of events that are not produced *by* detection but should ride out
+/// with the block's publish batch.
+///
+/// The scheduler deliberately does not know what any implementor is. Drift
+/// monitoring (§20.5) lives behind an optional Cargo feature — a build without
+/// it links neither `inference` nor `ml-features` — so a scheduler field typed
+/// as `DriftPublisher` would have to be `#[cfg]`-gated, and a `#[cfg]` on a
+/// struct field is how a hot-path type quietly grows two shapes. One neutral
+/// trait keeps the scheduler feature-agnostic and gives the next such source
+/// (a periodic health fact, a rollout marker) somewhere obvious to go.
+///
+/// Called once per `Assembled` block, on the block boundary, and expected to be
+/// cheap and usually empty.
+pub trait BlockBoundaryEvents: Send + Sync + std::fmt::Debug {
+    /// Whatever has accumulated since the last block. Draining is the
+    /// implementor's business — the scheduler calls this exactly once per
+    /// block and publishes what it gets.
+    fn events(&self) -> Vec<DomainEvent>;
 }
 
 impl Scheduler {
@@ -133,7 +158,20 @@ impl Scheduler {
             sink,
             shutdown,
             publish_backoff: event_bus::PUBLISH_BACKOFF,
+            boundary: None,
         }
+    }
+
+    /// Publish `boundary`'s events alongside each block's own (§20.5).
+    ///
+    /// A builder step rather than a `new` parameter: every existing caller —
+    /// the tests, the backtest harness — has none, and widening the constructor
+    /// would make them all say so explicitly for no gain. The one binary that
+    /// has an ML deployment opts in.
+    #[must_use]
+    pub fn with_boundary_events(mut self, boundary: Option<Arc<dyn BlockBoundaryEvents>>) -> Self {
+        self.boundary = boundary;
+        self
     }
 
     /// Run the roster over one decoded [`BlockEvent`] — the scheduler **core**,
@@ -165,6 +203,18 @@ impl Scheduler {
                 // Cross-block detectors run serially (mutable state); usually a
                 // no-op (empty roster) until the first CrossBlock detector lands.
                 events.extend(self.cross_block.observe_and_detect(&ctx));
+
+                // Drift readings (§20.5) ride out on the events this block was
+                // publishing anyway — same sink, same `publish_resilient`
+                // retry, same shutdown behaviour. A second producer for a
+                // handful of events per hour would be new failure modes for no
+                // gain, and a drift reading is urgent to the hour, not the
+                // millisecond. Usually empty: a window closes every few hundred
+                // vectors, and only a *breaching* one becomes an event.
+                if let Some(boundary) = &self.boundary {
+                    events.extend(boundary.events());
+                }
+
                 ProcessOutcome {
                     events,
                     detector_runs,

@@ -1,0 +1,645 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": [
+    "detection",
+    "ml",
+    "mev",
+    "§20.2",
+    "§20.5"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Model serving & drift (§20.2, §20.5)",
+  "uid": "model-serving-drift",
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(model_inference_calls_total, model)",
+          "refId": "models"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Inference latency p50 / p99 (s)",
+      "description": "Per-model wall time of one seam call, from ObservedEngine. This is the §20.2 budget number: inference has to fit inside the §6 <1s fast path. Measures inference alone — the drift monitor wraps this decorator, not the other way round.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum by (model, le) (rate(model_inference_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (model, le) (rate(model_inference_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{model}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Cost per feature vector (s)",
+      "description": "duration_sum / vectors — what a single candidate actually costs. A per-call histogram alone can't give this once batching makes call size vary, which is why model_inference_vectors_total is counted separately from calls.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(model_inference_duration_seconds_sum{model=~\"$model\"}[$__rate_interval])) / clamp_min(sum by (model) (rate(model_inference_vectors_total{model=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Vectors scored / sec",
+      "description": "Serving throughput. One block produces one vector for a block-granularity model and one per transaction for a tx-granularity one, so this tracks block size, not call rate.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(model_inference_vectors_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Inference failures / sec, by reason",
+      "description": "Every InferenceErrorKind is permanent for the input that caused it — this is not a retry backlog. A failed call means the detector skipped those candidates rather than fabricating a score. `skew` is a wiring bug; `backend` points at the runtime.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model, reason) (rate(model_inference_failures_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{model}} {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Served score distribution",
+      "description": "Every score the model served (§20.5's cheapest drift signal): a model whose output distribution has shifted is visible here without instrumenting all 24 inputs. The per-feature drift panels below sit on top of this, they don't replace it.",
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (le) (rate(model_inference_score_bucket{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Worst-feature drift (model_drift_max)",
+      "description": "The one series the drift alerts page on. Units: max(|median shift in training spreads|, |ln(variance ratio)|) over the last completed window. 0 means the serving window sits exactly where training did. The threshold lines come from the exported model_drift_threshold gauge, not from a literal — each deployment configures its own, and the alert rules compare against the same series.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (model) (model_drift_max{model=~\"$model\"})",
+          "legendFormat": "{{model}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (model) (model_drift_threshold{model=~\"$model\"})",
+          "legendFormat": "threshold {{model}}"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (model) (model_drift_threshold{model=~\"$model\"}) * 2.5",
+          "legendFormat": "page {{model}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Per-feature drift (model_feature_drift)",
+      "description": "Which features moved. Every feature is published on every window, including the unmoved ones — a series that reads 0 and a series that vanished mean opposite things. Top-k here, because 24 flat lines at zero is not a chart.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(8, max by (model, feature) (model_feature_drift{model=~\"$model\"}))",
+          "legendFormat": "{{model}} {{feature}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Drift breaches / hour, by feature",
+      "description": "How *often* a feature is over the threshold, which the gauge alone can't answer. One increment per completed window per breached feature.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model, feature) (rate(model_drift_breaches_total{model=~\"$model\"}[1h])) * 3600",
+          "legendFormat": "{{model}} {{feature}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Completed drift windows / hour",
+      "description": "The denominator that says whether the drift gauges mean anything yet: a model that has served fewer vectors than its window (512 by default) has published nothing.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(model_drift_windows_total{model=~\"$model\"}[1h])) * 3600",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Serving/training skew (rejected vectors / sec)",
+      "description": "Vectors the drift monitor refused because they don't match the baseline's schema. Any nonzero value is a wiring bug — the boot-time §20.5 skew check already passed, so something is feeding this model vectors its own training snapshot can't describe. Pages via ModelServingSkew.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(model_drift_rejected_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "ML detector hit rate vs. the heuristics",
+      "description": "The §17 per-detector view, kept here so a model's serving behaviour and its detection behaviour read on one screen. Uses the detector:hit_rate:ratio_rate1h recording rule so this and the alerts share one definition of hit rate.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "detector:hit_rate:ratio_rate1h",
+          "legendFormat": "{{detector}} v{{version}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Detect latency p99 by detector (s)",
+      "description": "The §17 latency budget, per detector. DetectorLatencyBudgetExceeded warns at 250ms — a quarter of the §6 <1s whole-roster SLO — because every detector in the roster runs on every block.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (detector, le) (rate(detector_detect_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 {{detector}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "0.25",
+          "legendFormat": "budget warning"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Drift windows / hour by close reason",
+      "description": "`full` = reached the configured vector count; `aged` = hit the latency bound with fewer (still at least MIN_WINDOW). A model showing only `aged` is quieter than its window size assumes — worth shrinking `window` so readings are full rather than partial.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 41
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model, closed_by) (rate(model_drift_windows_total{model=~\"$model\"}[1h])) * 3600",
+          "legendFormat": "{{model}} {{closed_by}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Dropped drift observations / sec, by reason",
+      "description": "The monitor fails open — it must never block the fast path — so this is how you find out it did. `contended`: the accumulator lock was held, which today's one-block-at-a-time scheduler should make impossible. `poisoned`: something panicked inside the accumulator. `undrained`: readings were evicted before the scheduler drained them, so ModelDriftDetected events were lost.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 41
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model, reason) (rate(model_drift_skipped_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{model}} {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Drift events published / hour",
+      "description": "`ModelDriftDetected` reaching the event store — the durable §20.5 record, keyed by the exact (id, version, config_hash) triple that was serving. Only *breaching* windows become events, so a healthy model shows a flat zero here while still publishing gauges every window.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 41
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (model) (rate(detection_drift_events_total{model=~\"$model\"}[1h])) * 3600",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    }
+  ]
+}

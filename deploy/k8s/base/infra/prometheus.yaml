@@ -171,6 +171,93 @@ data:
             annotations:
               summary: "Block → notification latency (p95) is elevated"
               description: "notification_alert_end_to_end_seconds p95 above 30s for 10m. Placeholder threshold."
+
+      # ── Model serving + governance (§17, §20.2, §20.5; Sprint 18 t5) ──
+      # Silent in a cluster with no ML bundle mounted — there is no model to
+      # govern. Enabled by the `anomaly-detection` kustomize component.
+      - name: mevwatch-model-governance
+        rules:
+          - record: detector:hit_rate:ratio_rate1h
+            expr: |
+              sum by (detector, version) (rate(detector_hits_total[1h]))
+              /
+              clamp_min(sum by (detector, version) (rate(detector_runs_total[1h])), 1e-9)
+          - alert: DetectorLatencyBudgetExceeded
+            expr: |
+              histogram_quantile(0.99,
+                sum by (detector, le) (rate(detector_detect_duration_seconds_bucket[5m]))
+              ) > 0.25
+            for: 10m
+            labels:
+              severity: informational
+            annotations:
+              summary: "{{ $labels.detector }} p99 detect latency is eating the fast-path budget"
+              description: "One detector above 250ms p99 for 10m; the §6 SLO is <1s for the whole roster. Early warning for FastPathLatencyHigh."
+          - alert: ModelServingSkew
+            expr: sum(rate(model_drift_rejected_total[15m])) by (model) > 0
+            for: 15m
+            labels:
+              severity: page
+            annotations:
+              summary: "{{ $labels.model }} is being served vectors its baseline cannot describe"
+              description: "§20.5 serving/training skew at serving time — a wiring bug, since the boot-time check passed. Evidence produced now is measured against the wrong distribution."
+          - alert: ModelInferenceFailing
+            expr: |
+              sum by (model, reason) (rate(model_inference_failures_total[10m]))
+              /
+              clamp_min(sum by (model) (rate(model_inference_calls_total[10m])), 1e-9) > 0.01
+            for: 10m
+            labels:
+              severity: page
+            annotations:
+              summary: "{{ $labels.model }} inference is failing ({{ $labels.reason }})"
+              description: ">1% of seam calls failing for 10m. Every InferenceErrorKind is permanent for its input, so the detector is silently skipping those candidates."
+          # Thresholds come from the exported `model_drift_threshold` gauge, not
+          # a literal: each deployment sets its own in anomaly.json, and a
+          # hard-coded number here would be a second definition of the policy.
+          - alert: ModelFeatureDriftHigh
+            expr: |
+              max by (model, feature) (model_feature_drift)
+              > on(model) group_left
+              max by (model) (model_drift_threshold)
+            for: 30m
+            labels:
+              severity: informational
+            annotations:
+              summary: "{{ $labels.model }}: feature {{ $labels.feature }} has drifted from its training snapshot"
+              description: "Past this deployment's own drift threshold for 30m (§20.5). Visible before precision decays — check the §18 backtest numbers and consider a retrain. The durable record is the ModelDriftDetected event."
+          - alert: ModelFeatureDriftSevere
+            expr: |
+              max by (model) (model_drift_max)
+              > on(model)
+              (max by (model) (model_drift_threshold) * 2.5)
+            for: 15m
+            labels:
+              severity: page
+            annotations:
+              summary: "{{ $labels.model }} is serving on a distribution it was not trained for"
+              description: "Worst feature >2.5x its own threshold for 15m. Its registry precision/recall no longer mean what they say. Roll back via `deprecated_at` — there is no hot-swap path (§20.5)."
+          # Monitoring the monitor: a stalled drift monitor looks exactly like a
+          # model with no drift, because the gauges just hold their last value.
+          - alert: ModelDriftMonitoringSilent
+            expr: |
+              sum by (model) (rate(model_inference_vectors_total[1h])) > 0
+              unless
+              sum by (model) (rate(model_drift_windows_total[1h])) > 0
+            for: 2h
+            labels:
+              severity: informational
+            annotations:
+              summary: "{{ $labels.model }} is serving but publishing no drift readings"
+              description: "An hour of inference with no closed drift window. Expected briefly after a deploy and on a low-traffic chain; sustained it means monitoring is off. Check drift.disabled in anomaly.json and model_drift_skipped_total."
+          - alert: ModelDriftObservationsDropped
+            expr: sum by (model, reason) (rate(model_drift_skipped_total[30m])) > 0
+            for: 30m
+            labels:
+              severity: informational
+            annotations:
+              summary: "{{ $labels.model }} drift observations are being dropped ({{ $labels.reason }})"
+              description: "The monitor fails open by design, but it is losing data. contended = the concurrency model changed; poisoned = something panicked in the accumulator; undrained = readings evicted before the scheduler drained them, so ModelDriftDetected events are being lost."
 ---
 apiVersion: v1
 kind: Service

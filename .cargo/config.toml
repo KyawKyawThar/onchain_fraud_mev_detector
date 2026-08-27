@@ -5,6 +5,19 @@
 # installing the linker. CI enables mold via the rui314/setup-mold action,
 # so it doesn't depend on this file.
 
+# ── Environment ──────────────────────────────────────────────────
+# The justfile already exports this for every recipe (see its comment near the
+# top), so `just check` has always worked without a database. This makes *bare*
+# cargo behave the same — `cargo clippy`, `cargo test`, and the aliases below
+# otherwise try to verify every `sqlx::query!` against a live Postgres and fail
+# with "error communicating with database" on a machine that isn't running one.
+#
+# `force` is left at its default (false), so an explicit `SQLX_OFFLINE=false` in
+# the shell still wins — the deliberate live-verification override the justfile
+# documents keeps working.
+[env]
+SQLX_OFFLINE = "true"
+
 [alias]
 # `cargo t` → nextest; `cargo ta` includes #[ignore] integration tests.
 t  = "nextest run --workspace --all-features"

@@ -225,9 +225,10 @@ pub enum DomainEvent {
     RuleTriggered(rule_engine::RuleTriggered),
     RuleAlertCreated(rule_engine::RuleAlertCreated),
 
-    // System (§13)
+    // System (§13, §20.5)
     UsageRecorded(system::UsageRecorded),
     ScreeningDecisionRecorded(system::ScreeningDecisionRecorded),
+    ModelDriftDetected(system::ModelDriftDetected),
 
     // Predictive (§16)
     PredictedAlert(predictive::PredictedAlert),
@@ -308,7 +309,9 @@ impl DomainEvent {
             | RiskScoreUpdated(_)
             | SanctionHit(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
-            UsageRecorded(_) | ScreeningDecisionRecorded(_) => EventFamily::System,
+            UsageRecorded(_) | ScreeningDecisionRecorded(_) | ModelDriftDetected(_) => {
+                EventFamily::System
+            }
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
@@ -364,7 +367,11 @@ impl DomainEvent {
             | LiquidationCascadeWarned(_)
             | BridgeMevDetected(_)
             | CrossChainMevDetected(_)
-            | CrossChainFindingRetracted(_) => None,
+            | CrossChainFindingRetracted(_)
+            // A drift reading is about a model, not an incident. (If a future
+            // change wants "which incidents were produced under drifted
+            // weights?", that is a join on the detector triple, not a field.)
+            | ModelDriftDetected(_) => None,
         }
     }
 
@@ -449,7 +456,11 @@ impl DomainEvent {
             | RuleAlertCreated(_)
             | PredictedAlert(_)
             | LiquidationRiskPredicted(_)
-            | LiquidationCascadeWarned(_) => None,
+            | LiquidationCascadeWarned(_)
+            // Deliberately chain-keyed (the `None` fallback): drift is per
+            // detection instance, and a per-chain instance's readings must stay
+            // ordered against that chain's other events.
+            | ModelDriftDetected(_) => None,
         }
     }
 
@@ -498,7 +509,12 @@ impl DomainEvent {
             | RuleTriggered(_)
             | RuleAlertCreated(_)
             | UsageRecorded(_)
-            | CrossChainFindingRetracted(_) => Vec::new(),
+            | CrossChainFindingRetracted(_)
+            // Attribution-blind by construction: §20.1 features are structural
+            // and statistical, never "which address did something" (there is a
+            // property test in `ml-features` for exactly this), so a drift
+            // reading over them cannot name an address either.
+            | ModelDriftDetected(_) => Vec::new(),
         }
     }
 }

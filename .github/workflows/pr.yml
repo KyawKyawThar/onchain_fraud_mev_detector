@@ -51,7 +51,8 @@ jobs:
       - name: cargo build (locked)
         run: cargo build --workspace --all-features --locked
 
-  # ── Backtest gate: precision/recall must not regress (§18) ───────
+  # ── Backtest gates: no regression (§18), nothing live below the
+  # promotion floor (§20.2) ────────────────────────────────────────
   backtest:
     name: Backtest P/R gate
     runs-on: ubuntu-latest
@@ -60,12 +61,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
-      - name: Replay fixtures, compare to committed baseline
+      - name: Replay fixtures, compare to both committed gates
         run: cargo run -p backtest --all-features --locked
-        # Fails the PR if any detector's measured precision/recall drops
-        # below crates/backtest/baseline.json. An intentional change to a
-        # detector's numbers updates the baseline in the same PR via
-        # `just backtest-update-baseline` (reviewed like any other diff).
+        # Fails the PR on either of two independent conditions:
+        #   * a detector's measured precision/recall dropped below
+        #     crates/backtest/baseline.json (the regression gate). An
+        #     intentional change updates the baseline in the same PR via
+        #     `just backtest-update-baseline`, reviewed like any other diff.
+        #   * a `LifecycleStatus::Active` detector sits below
+        #     crates/backtest/promotion_gate.json, or has no measurement at
+        #     all (the promotion gate, §20.2). That file has no --update
+        #     flag on purpose: moving a governance floor is a hand edit.
+        # Shadowed detectors that clear the promotion gate are reported as
+        # promotable and never fail the build — promotion is a human step.
 
   # ── Coverage → Codecov ───────────────────────────────────────────
   coverage:

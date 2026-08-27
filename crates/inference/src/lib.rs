@@ -90,6 +90,7 @@
 
 mod artifact;
 mod descriptor;
+mod drift;
 mod engine;
 mod observe;
 
@@ -114,6 +115,7 @@ mod test_support;
 
 pub use artifact::{ArtifactDigest, ArtifactError, DigestParseError, ModelArtifact};
 pub use descriptor::{FeatureSkew, ModelDescriptor, SkewError};
+pub use drift::{DriftConfig, DriftEngine, DriftSource, DEFAULT_DRIFT_THRESHOLD};
 pub use engine::{InferenceEngine, InferenceError, InferenceErrorKind, Score, ScoreOutOfRange};
 pub use observe::ObservedEngine;
 

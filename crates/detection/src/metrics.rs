@@ -38,6 +38,21 @@ pub const FINDINGS_TOTAL: &str = "detector_findings_total";
 /// Histogram: `detect` call wall-clock latency, in seconds.
 pub const DETECT_SECONDS: &str = "detector_detect_duration_seconds";
 
+/// Counter: `ModelDriftDetected` events published, labeled by `model` (§20.5).
+///
+/// The bridge between the drift *gauges* (continuous, ephemeral) and the drift
+/// *record* (discrete, durable): `inference`'s `model_drift_windows_total`
+/// counts every reading, this counts the ones that breached and became an
+/// event. The two together answer "is drift being measured?" and "is it being
+/// recorded?" — which fail independently, and only the first has a gauge.
+pub const DRIFT_EVENTS_TOTAL: &str = "detection_drift_events_total";
+
+/// Record one published drift event. Called from the single site that renders
+/// them ([`crate::drift::DriftPublisher`]).
+pub fn record_drift_event(model_id: &str) {
+    metrics::counter!(DRIFT_EVENTS_TOTAL, "model" => model_id.to_owned()).increment(1);
+}
+
 /// Record one detector invocation: its `detect` latency and how many findings it
 /// produced (`0` for the common no-op case — still a run, not a hit).
 ///

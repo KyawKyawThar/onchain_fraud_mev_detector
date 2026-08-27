@@ -1006,9 +1006,119 @@ Mechanics:
   against the training snapshot (population-stability metrics per feature);
   drift past threshold raises an alert and flags the model version in the
   registry — visible before precision decays, not after.
+
+  Delivered as a **second decorator over the serving seam** (`DriftEngine`
+  outside `ObservedEngine`, so the inference-latency histogram the < 1s budget
+  is checked against measures inference and not bookkeeping). It sees exactly
+  the vectors a model is served, and measures them against the same
+  `FeatureBaseline` the explanations are written from — one owner of "what
+  normal was", or the alert and the evidence would disagree in precisely the
+  situation both exist for.
+
+  The statistic is **not** a population-stability index, and the deviation is
+  the interesting part. A PSI needs the training distribution's *shape*; a
+  baseline carries robust summary statistics and deliberately not a histogram,
+  because the export has to stay small, comparable across versions, and
+  hashable into a deployment's identity. Binning against an assumed shape
+  would be worse than nothing here — §20.1 features are heavy-tailed by
+  construction, so a normality assumption reports drift on the quietest
+  possible day. What ships instead is the robust two-sample analogue of what
+  the baseline can honestly support: over a tumbling window of served vectors,
+  each feature's clamped z-scores are summarised by their own median (**shift**
+  — how far the serving window has moved, in training spreads) and σ-scaled MAD
+  (**spread** — whether it still varies as much as training did). One
+  magnitude, `max(|shift|, |ln spread|)`, is what a threshold is set on.
+  Tumbling and not sliding, so one drifted condition is one alert rather than a
+  stream of identical ones. A feature that never varied in training reports
+  shift alone: its spread is a floor, not an observation, and reading `ln 0`
+  off it would page on the quietest possible traffic.
+
+  Serving/training skew reappears here as its own counter rather than as a
+  statistic: a vector the baseline cannot describe is *refused*, not folded in,
+  because one foreign vector would corrupt every subsequent reading and the
+  skew is the more urgent signal anyway. It pages — the boot-time check already
+  passed, so a rejection at serving time is a wiring bug, not a data condition.
+
+  **The durable flag is an event, not a mutable registry.** A breaching window
+  publishes `ModelDriftDetected` — the model, the drifted features with their
+  numbers, and the exact `(id, version, config_hash)` triple that was serving —
+  into the same event store as everything else (§4). That is what §20.5's "flag
+  the model version" means here, and it is stronger than a mutable flag would
+  be: metrics answer "is it drifting now?" and expire with Prometheus retention,
+  while the question an incident review asks months later is *which weights were
+  serving when it drifted, and could anyone have known?* Keyed by the same
+  triple the findings carry, the two join without a heuristic.
+
+  The registry itself is deliberately **not** mutated at runtime. It is linked
+  once at boot and immutable for the process's life (§6), which is what makes a
+  triple mean the same thing for every event that process emits; a flag that
+  changed mid-run would make the triple a function of *when* an event was
+  emitted. The registry-level response stays the one §20.5 already prescribes:
+  a new version, or `deprecated_at` on this one.
+
+  Emission is a **block-boundary concern**, not the seam's. `inference` is
+  forbidden `event-bus` by the architecture rules — a serving seam that could
+  publish would be a serving seam with an opinion about topology — and a
+  detector cannot publish either, being a pure function of its context. So a
+  reading leaves through a plain `DriftSource` trait and the scheduler appends
+  it to the events that block was publishing anyway: same producer, same retry,
+  same DLQ, no second failure mode for a handful of events per hour.
+
+  **Two bounds, because they answer different questions.** A window closes at N
+  vectors *or* T elapsed, whichever comes first, never below a sample floor. The
+  count bound decides how *good* a reading is; the age bound decides how *soon*
+  there is one — and at one block-level vector per block, a count-only window is
+  blind for roughly the first 100 minutes after a deploy, which is precisely
+  when new weights are most likely to be wrong. A model too quiet to reach the
+  floor within the age bound keeps accumulating rather than publishing
+  statistics over a handful of samples, and its silence is visible as a flat
+  window counter rather than as an absence of drift.
+
+  **The monitor fails open, loudly.** A watcher must never be why the fast path
+  stops scoring blocks, so a contended or poisoned accumulator drops the
+  observation instead of blocking or panicking (and a poisoned one discards its
+  partial window and resumes, rather than going silent for the process's life).
+  What it does not do is drop anything quietly: every skipped observation, every
+  evicted undrained reading, and every vector refused for schema skew is
+  counted, because a monitor that has stopped monitoring reads exactly like a
+  model with no drift.
+
+  The breach threshold is per-model config and is **exported as a gauge**, so the
+  alert rules compare against the number each model was actually judged by
+  instead of restating it in PromQL — where a literal would be a second
+  definition of the same policy, wrong for any model that tuned its own.
 - **Retraining is a release:** a retrained model is a new registry version and
   walks the same Shadow → backtest → Live gate. There is no "hot-swap the
   weights" path.
+
+  The gate is a **committed floor, separate from the regression baseline**, and
+  the separation is load-bearing. The baseline answers "did this change make
+  something worse?" and every intentional change is allowed to rewrite it; a
+  promotion bar that a change could rewrite would let a detector ratchet its own
+  floor down one merge at a time and arrive at `Active` with a precision of 0.2,
+  each step "no regression". So `promotion_gate.json` has no `--update` flag:
+  moving it is a hand edit, which is the friction a governance threshold should
+  have. The gate reads the *live* rollout staging rather than restating it, and
+  the asymmetry is deliberate — it can **block a release** (an `Active` detector
+  below its floor, or one promoted and no longer measured, fails CI) but it can
+  only **recommend a promotion** (a `Shadow` detector that clears reports as
+  promotable; leaving `Shadow` stays a human edit). A detector with too few
+  ground-truthed incidents reads `Unmeasured`, not `pass` — a model can be fit
+  to one fixture, and a gate that promoted on it would be measuring
+  memorisation. The gate prints the corpus its verdicts rest on, because at the
+  shipped fixture set's size `PROMOTABLE` means "not disqualified by the
+  evidence we have", not "proven" — and the number to grow is the corpus (§20.1
+  replay over a production window, whose labels the flywheel already produces),
+  not the thresholds.
+
+  **Demotion is config; promotion is a merge.** `DETECTION_SHADOW_DETECTORS`
+  can force any detector to `Shadow` at boot, and `DETECTION_DISABLED_DETECTORS`
+  can stop one running at all. Neither can promote, and that asymmetry is the
+  point: shadowing a detector that is melting down at 03:00 should need nothing
+  but a config change, while making one customer-facing is a claim about
+  evidence and stays a reviewed diff with a backtest run in it. A general
+  per-environment override would be a path around the gate — the exact thing
+  "ML gets no special path" forbids, available to every heuristic detector too.
 - **The registry is the single source of truth** for what is deployed: model
   cards gain `artifact_hash` and `feature_version` fields, and the
   serving/training skew check (deployed `feature_version` == artifact's

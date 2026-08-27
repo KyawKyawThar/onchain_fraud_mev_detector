@@ -325,6 +325,21 @@ impl DetectionPlan {
         Ok(Self { detectors })
     }
 
+    /// The resolved `(id, version, config_hash)` triple this plan linked for
+    /// `id` — the same one every event that detector produces is stamped with.
+    ///
+    /// A lookup by `id` alone rather than `(id, version)`: two builds of one
+    /// detector coexist only during a staged rollout (§6), and a caller asking
+    /// this question ("which triple is `anomaly` emitting under?") wants the
+    /// one that is linked, not to restate a version it would have to keep in
+    /// step by hand. `None` when the detector is not in this build's roster.
+    pub fn detector_ref(&self, id: DetectorId) -> Option<&DetectorRef> {
+        self.detectors
+            .iter()
+            .find(|linked| linked.detector_ref.id == id.as_str())
+            .map(|linked| &linked.detector_ref)
+    }
+
     /// How many detectors the plan will fan out over.
     pub fn len(&self) -> usize {
         self.detectors.len()

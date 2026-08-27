@@ -345,8 +345,70 @@ pub fn clean_block() -> Fixture {
     )
 }
 
+/// A structurally strange block no heuristic has a signature for (§20.2,
+/// Sprint 18 t5) — the ML detector's ground truth.
+///
+/// Deliberately built from *nothing any other detector matches*: no
+/// frontrun/backrun bracket, no closed cycle, no borrow-repay pair, no
+/// liquidation transfer shape, no near-miss address. What is left is pure
+/// structure — one sender issuing every transaction in an unusually large
+/// block, each a swap through the same pool, in a shape the training window's
+/// blocks (ordinary mixed traffic) would not contain.
+///
+/// The point is exactly that a rule detector cannot express "this is odd" and
+/// an ML detector can. Whether the *deployed* model actually catches it is
+/// what the promotion gate measures — a bundle that misses this fixture reads
+/// as a recall of 0 and stays in `Shadow`, which is the correct outcome for a
+/// model that is not ready.
+///
+/// Only replayed when an ML detector is loaded — see [`ml`].
+pub fn anomalous_bundle() -> Fixture {
+    const WETH: u8 = 0xAA;
+    const TKN: u8 = 0xBB;
+    const POOL: u8 = 0xCC;
+    const BOT: u8 = 0x77;
+    let block = 1_000;
+
+    let mut ctx = at(block)
+        .priced_token(addr(WETH), 18, 2000.0)
+        .priced_token(addr(TKN), 18, 1.0)
+        .pool(addr(POOL), addr(WETH), addr(TKN), 1_000, 1_000);
+    // One sender, 24 transactions, monotonically growing size — a top-sender
+    // share of 1.0 and a value distribution nothing in ordinary traffic has.
+    for i in 1..=24u8 {
+        ctx = ctx.tx(
+            b256(i),
+            addr(BOT),
+            vec![swap(
+                addr(POOL),
+                addr(WETH),
+                addr(TKN),
+                u128::from(i) * ETH,
+                u128::from(i) * 1_900,
+            )],
+        );
+    }
+
+    Fixture::single(
+        "anomaly: one sender saturating a block with escalating same-pool swaps",
+        ctx.build(),
+        vec![ExpectedIncident::new(
+            block,
+            DetectorId::new("anomaly"),
+            AlertKind::Anomaly,
+            "structurally unlike ordinary traffic, and matching no heuristic signature",
+        )],
+    )
+}
+
 /// Every fixture the backtest replays: one known incident per built-in
 /// detector, plus the clean block.
+///
+/// Deliberately excludes [`anomalous_bundle`]: the ML detector is only in the
+/// roster when a deployment mounts a model bundle, and ground-truthing an
+/// incident for a detector that is not linked would score it as a false
+/// negative for *every* run — turning "no model deployed" into "the model is
+/// broken". See [`ml`].
 pub fn all() -> Vec<Fixture> {
     vec![
         sandwich(),
@@ -358,4 +420,16 @@ pub fn all() -> Vec<Fixture> {
         poisoning(),
         clean_block(),
     ]
+}
+
+/// The fixtures that only mean something with an ML detector in the roster.
+///
+/// Appended to [`all`] by the CLI when — and only when — a model bundle was
+/// loaded. Keeping them out of `all` is what lets the committed baseline and
+/// `model_performance.json` stay reproducible on a machine with no ONNX
+/// Runtime: the numbers in those files are measured over `all`, and a run that
+/// replays more blocks than they were derived from is refused the right to
+/// rewrite them (see `main.rs`).
+pub fn ml() -> Vec<Fixture> {
+    vec![anomalous_bundle()]
 }

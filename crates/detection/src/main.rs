@@ -20,9 +20,10 @@ use detection::config::Config;
 use detection::model::{default_performance_store_path, load_performance_store, RolloutPolicy};
 use detection::registry::{register_builtins_with, register_cross_block_builtins};
 use detection::scheduler::{
-    build_consumer, run_committer, run_consumer, BlockEvent, Offsets, Scheduler,
+    build_consumer, run_committer, run_consumer, BlockBoundaryEvents, BlockEvent, Offsets,
+    Scheduler,
 };
-use detection::{DetectorId, FeatureFlags};
+use detection::FeatureFlags;
 use event_bus::KafkaEventSink;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -123,26 +124,20 @@ async fn run(cfg: Config) -> Result<()> {
     // boot — `link` fails fast if any live detector is uncatalogued, so the hot
     // path never has to fabricate a config_hash (the link-or-fail discipline).
     // Shared with the backtest harness via `detection::boot` — see its docs.
-    let flags = FeatureFlags::all_enabled();
+    // The runtime on/off switch (§6): every linked detector on, minus anything
+    // `DETECTION_DISABLED_DETECTORS` names. Disable-only by design — see
+    // `FeatureFlags::from_env`.
+    let flags = FeatureFlags::from_env();
 
     // Staged rollout (§6, §18, Sprint 10 t4): a detector that hasn't earned its
-    // place yet starts `Shadow` — it runs and is scored, and its
-    // `DetectorTriggered` is recorded so backtests and metrics see it, but no
-    // customer-facing alert is raised. Promote one by dropping its
-    // `.shadow(...)` line here, once the backtest gate clears it.
-    //
-    // `anomaly` (§20.2) is on this list for the same reason as the rest, and
-    // that sameness is deliberate: an ML detector walks Shadow → backtest gate
-    // → Live like any heuristic change, with no special path around the gates.
-    // It is also the detector where shadowing matters most — its evidence names
-    // no known pattern, so a false positive is expensive to explain.
-    let rollout = RolloutPolicy::new()
-        .shadow(DetectorId::new("flashloan"))
-        .shadow(DetectorId::new("liquidation"))
-        .shadow(DetectorId::new("rugpull"))
-        .shadow(DetectorId::new("wash-trading"))
-        .shadow(DetectorId::new("address-poisoning"))
-        .shadow(DetectorId::new("anomaly"));
+    // place yet starts `Shadow`. The list itself lives in
+    // `RolloutPolicy::builtin` so the backtest harness's promotion gate (§18,
+    // Sprint 18 t5) reports on the *same* staging this service applies — see
+    // its docs for how to promote one.
+    // `DETECTION_SHADOW_DETECTORS` may demote further, never promote: shadowing
+    // is an incident response, promotion is a claim about evidence and stays a
+    // reviewed diff gated on the backtest (§20.2).
+    let rollout = RolloutPolicy::builtin().with_env_demotions();
 
     // Measured precision/recall/hit_rate from the backtest harness (§18, Sprint 10
     // t4), committed at `crates/detection/model_performance.json`. A missing file
@@ -155,9 +150,16 @@ async fn run(cfg: Config) -> Result<()> {
     // link-or-fail (§20.2). Everything after this line treats it as an ordinary
     // plugin — flag-gated, catalogued, staged — which is why it goes through
     // `register_builtins_with` rather than a parallel path.
-    let registry = register_builtins_with(&flags, ml_detectors()?);
+    let mut ml = ml_boot::load()?;
+    let registry = register_builtins_with(&flags, ml_boot::detectors(&mut ml));
     let plan = link_roster(&registry, &rollout, &performance)
         .context("linking the detector roster to its model cards")?;
+
+    // The drift publisher (§20.5) is built *after* linking, because a drift
+    // record is only useful if it names the same `(id, version, config_hash)`
+    // triple the model's findings carry — and that triple exists only once the
+    // roster is linked.
+    let boundary = ml_boot::boundary_events(ml, &plan);
 
     // The cross-block roster (wash-trading is the first `Scope::CrossBlock`
     // detector, §22 Sprint 10 t1). Each slot is paired with its resolved
@@ -219,7 +221,8 @@ async fn run(cfg: Config) -> Result<()> {
         cross_block,
         sink,
         shutdown.clone(),
-    );
+    )
+    .with_boundary_events(boundary);
     let scheduler_task = tokio::spawn(scheduler.run(work_rx, done_tx));
     let committer_task = tokio::spawn(run_committer(consumer, done_rx));
     health.set_ready(true);
@@ -233,26 +236,83 @@ async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// The ML detector (§20.2), if this build links it *and* the deployment
-/// configures one — empty otherwise, which is the default and leaves the
-/// service behaving exactly as it did before ML landed.
+/// Booting the ML deployment (§20.2) and its drift monitors (§20.5).
+///
+/// Two implementations of one three-function interface, selected by the
+/// `anomaly` feature, rather than `#[cfg]`s sprinkled through `run`. A build
+/// without the feature links neither `inference` nor `ml-features`, so the
+/// *types* differ and not just the behaviour — which is exactly the case a
+/// module boundary handles cleanly and inline `#[cfg]`s do not.
 #[cfg(feature = "anomaly")]
-fn ml_detectors() -> Result<Vec<Arc<dyn detection::DetectorPlugin>>> {
-    detection::ml::anomaly_detector_from_env().context("loading the ML detector (§20.2)")
+mod ml_boot {
+    use super::*;
+    use detection::drift::DriftPublisher;
+    use detection::ml::MlDeployment;
+    use detection::DetectorId;
+
+    pub type Deployment = MlDeployment;
+
+    pub fn load() -> Result<Deployment> {
+        detection::ml::anomaly_detector_from_env().context("loading the ML detector (§20.2)")
+    }
+
+    pub fn detectors(deployment: &mut Deployment) -> Vec<Arc<dyn detection::DetectorPlugin>> {
+        std::mem::take(&mut deployment.detectors)
+    }
+
+    /// The drift publisher, attributed to the linked `anomaly` triple.
+    ///
+    /// `None` when there is no ML deployment, no monitored model, or — the
+    /// defensive case — no linked `anomaly` detector to attribute readings to.
+    /// Publishing drift under a fabricated identity would be worse than not
+    /// publishing it: the whole value of the record is that it joins to the
+    /// findings those weights produced.
+    pub fn boundary_events(
+        deployment: Deployment,
+        plan: &detection::DetectionPlan,
+    ) -> Option<Arc<dyn BlockBoundaryEvents>> {
+        let detector = plan.detector_ref(DetectorId::new("anomaly")).cloned()?;
+        let publisher = DriftPublisher::new(detector, deployment.drift_sources)?;
+        tracing::info!(
+            models = publisher.len(),
+            "drift monitoring active — serving-time feature distributions are compared \
+             against the training snapshot (§20.5)"
+        );
+        Some(Arc::new(publisher))
+    }
 }
 
 #[cfg(not(feature = "anomaly"))]
-fn ml_detectors() -> Result<Vec<Arc<dyn detection::DetectorPlugin>>> {
-    // Say so rather than ignoring it: a deployment that mounted model artifacts
-    // and set the variable, against a binary built without the feature, would
-    // otherwise run happily with no ML detection and no clue why.
-    if std::env::var_os("DETECTION_ANOMALY_CONFIG").is_some() {
-        tracing::warn!(
-            "DETECTION_ANOMALY_CONFIG is set but this binary was built without the \
-             `anomaly` feature — the ML detector is not linked"
-        );
+mod ml_boot {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct Deployment;
+
+    pub fn load() -> Result<Deployment> {
+        // Say so rather than ignoring it: a deployment that mounted model
+        // artifacts and set the variable, against a binary built without the
+        // feature, would otherwise run happily with no ML detection, no drift
+        // monitoring, and no clue why.
+        if std::env::var_os("DETECTION_ANOMALY_CONFIG").is_some() {
+            tracing::warn!(
+                "DETECTION_ANOMALY_CONFIG is set but this binary was built without the \
+                 `anomaly` feature — the ML detector is not linked"
+            );
+        }
+        Ok(Deployment)
     }
-    Ok(Vec::new())
+
+    pub fn detectors(_deployment: &mut Deployment) -> Vec<Arc<dyn detection::DetectorPlugin>> {
+        Vec::new()
+    }
+
+    pub fn boundary_events(
+        _deployment: Deployment,
+        _plan: &detection::DetectionPlan,
+    ) -> Option<Arc<dyn BlockBoundaryEvents>> {
+        None
+    }
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM.

@@ -47,6 +47,7 @@ configMapGenerator:
       - ../../grafana/dashboards/event-store.json
       - ../../grafana/dashboards/ingestion.json
       - ../../grafana/dashboards/intelligence.json
+      - ../../grafana/dashboards/model-serving.json
       - ../../grafana/dashboards/notification.json
       - ../../grafana/dashboards/pipeline-overview.json
       - ../../grafana/dashboards/rule-engine.json

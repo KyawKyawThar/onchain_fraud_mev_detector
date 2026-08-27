@@ -1,6 +1,7 @@
 //! Serving-side metrics for the inference seam (§19, §20.2, §20.5).
 //!
-//! One function, [`record_inference`], called from exactly one place —
+//! One function, [`record_inference`](crate::metrics::record_inference), called
+//! from exactly one place —
 //! [`crate::ObservedEngine`] — so the numbers cannot drift between backends or
 //! between the single-vector and batch call paths. That single-call-site
 //! discipline is the same one `detection::metrics::record_detector_run` uses,
@@ -12,6 +13,14 @@
 //! so the library — and its tests, replay and backtests — stays
 //! exporter-agnostic (conventions §8).
 //!
+//! The drift family ([`record_drift`](crate::metrics::record_drift)) is the same
+//! discipline one level out:
+//! its single call site is [`crate::DriftEngine`], and it adds exactly one
+//! label — `feature` — whose values are a frozen schema's feature names (24
+//! block-level, 19 per transaction). That is a *bounded, static* set, unlike
+//! the digests below: a new feature name means a new `FEATURE_VERSION`, which
+//! is a deliberate release, not a per-deploy churn.
+//!
 //! **Labels are `model` (plus `reason` on failures) and nothing else.** The
 //! artifact digest and `config_hash` deliberately stay off the labels: they
 //! change on every retrain, which would spawn a fresh time series per deploy
@@ -19,6 +28,8 @@
 //! — the same trade-off §18 already makes for `config_hash`.
 
 use std::time::Duration;
+
+use ml_features::DriftReport;
 
 use crate::engine::{InferenceError, Score};
 
@@ -44,6 +55,51 @@ pub const SECONDS: &str = "model_inference_duration_seconds";
 /// features. The per-feature population-stability statistics t5 adds sit on
 /// top of this, they don't replace it.
 pub const SCORE: &str = "model_inference_score";
+
+/// Gauge: one feature's serving-time drift magnitude, labeled `{model, feature}`
+/// — the §20.5 per-feature reading, in the units
+/// [`ml_features::FeatureDrift::magnitude`] defines.
+///
+/// A gauge and not a counter: it is the *current* state of one window, and the
+/// question a dashboard asks of it ("has this feature moved?") is about the
+/// latest reading, not an accumulation. Every feature is published on every
+/// window, including the unmoved ones — a feature whose series went missing
+/// and one that reads `0` mean opposite things, and only publishing the
+/// interesting ones would make them indistinguishable.
+pub const FEATURE_DRIFT: &str = "model_feature_drift";
+/// Gauge: the worst feature's magnitude for a model — the one series a drift
+/// alert rule needs, without fanning out over `feature`.
+pub const DRIFT_MAX: &str = "model_drift_max";
+/// Counter: windows in which a feature was at or past the configured
+/// threshold, labeled `{model, feature}`. The rate over this is "how often is
+/// this feature drifted", which a gauge alone cannot answer.
+pub const DRIFT_BREACHES_TOTAL: &str = "model_drift_breaches_total";
+/// Counter: completed drift windows per model — the denominator that says
+/// whether [`FEATURE_DRIFT`] means anything yet (a model that has served fewer
+/// vectors than its window has published nothing).
+pub const DRIFT_WINDOWS_TOTAL: &str = "model_drift_windows_total";
+/// Gauge: the magnitude at which a model reports a breach, labeled `{model}`.
+///
+/// Exported so an alert rule can compare against it — `model_drift_max >
+/// on(model) model_drift_threshold` — instead of restating the number in
+/// PromQL. The threshold is per-model *config*, so a rule with a literal in it
+/// is both a duplicate definition and silently wrong for any model that tuned
+/// its own. Published alongside the readings it applies to, so the two series
+/// always appear and disappear together.
+pub const DRIFT_THRESHOLD: &str = "model_drift_threshold";
+/// Counter: observations the drift monitor dropped without measuring, by
+/// `reason` (`contended`, `poisoned`).
+///
+/// A monitor is allowed to fail open — it must never be why the fast path
+/// stops scoring blocks — but failing open silently is how a dashboard comes
+/// to show a confident zero for something nobody is watching any more. This is
+/// the difference between the two.
+pub const DRIFT_SKIPPED_TOTAL: &str = "model_drift_skipped_total";
+/// Counter: vectors the drift monitor refused because they did not match its
+/// baseline's schema — serving/training skew (§20.5) at *serving* time rather
+/// than at boot. Any nonzero rate here is a wiring bug: it means a model is
+/// being fed vectors its own training snapshot cannot describe.
+pub const DRIFT_REJECTED_TOTAL: &str = "model_drift_rejected_total";
 
 /// Record one seam call: its latency, how many vectors it covered, and either
 /// the scores served or the reason it failed.
@@ -78,6 +134,67 @@ pub fn record_inference(
             .increment(1);
         }
     }
+}
+
+/// Record one completed drift window (§20.5): a gauge per feature, the
+/// model-level worst, and a breach counter for everything at or past
+/// `threshold`.
+///
+/// Called from exactly one place, [`crate::DriftEngine`] — the same
+/// single-call-site rule as [`record_inference`], and for the same reason.
+pub fn record_drift(model_id: &str, report: &DriftReport, threshold: f64) {
+    let model = model_id.to_owned();
+    metrics::counter!(
+        DRIFT_WINDOWS_TOTAL,
+        "model" => model.clone(),
+        "closed_by" => report.closed_by.as_str(),
+    )
+    .increment(1);
+    metrics::gauge!(DRIFT_MAX, "model" => model.clone()).set(report.max_magnitude());
+    // Published here rather than once at boot so it cannot outlive, or precede,
+    // the readings an alert compares it against.
+    metrics::gauge!(DRIFT_THRESHOLD, "model" => model.clone()).set(threshold);
+
+    for feature in &report.features {
+        let magnitude = feature.magnitude();
+        metrics::gauge!(
+            FEATURE_DRIFT,
+            "model" => model.clone(),
+            "feature" => feature.name(),
+        )
+        .set(magnitude);
+        if magnitude >= threshold {
+            metrics::counter!(
+                DRIFT_BREACHES_TOTAL,
+                "model" => model.clone(),
+                "feature" => feature.name(),
+            )
+            .increment(1);
+        }
+    }
+}
+
+/// Record vectors the drift monitor could not measure — serving/training skew.
+///
+/// Separate from [`record_drift`] because it happens *without* a completed
+/// window: a model fed nothing but foreign vectors would otherwise report
+/// silence, which is the one thing this counter exists to prevent.
+pub fn record_drift_rejected(model_id: &str, vectors: u64) {
+    metrics::counter!(DRIFT_REJECTED_TOTAL, "model" => model_id.to_owned()).increment(vectors);
+}
+
+/// Record observations the monitor could not take at all.
+///
+/// `reason` is a `&'static str` from a closed set, never a formatted message —
+/// the label-cardinality rule this module already applies to
+/// `InferenceErrorKind::as_str`.
+pub fn record_drift_skipped(model_id: &str, reason: &'static str, vectors: u64) {
+    metrics::counter!(
+        DRIFT_SKIPPED_TOTAL,
+        "model" => model_id.to_owned(),
+        "reason" => reason,
+    )
+    .increment(vectors);
 }
 
 #[cfg(test)]
