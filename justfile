@@ -519,8 +519,10 @@ backtest-accept-snapshot:
 # ── Kubernetes (deploy/k8s, §20) ─────────────────────────────────
 
 # The deployable service binaries — one GHCR image each (matches ci.yml's
-# docker matrix). detection carries its feature flag inline.
-k8s_bins := "server ingestion detection:detection/detectors event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive"
+# docker matrix). Each entry is `bin[:features[:runtime]]`; detection carries
+# its feature flags inline and builds on the `onnx` runtime flavour, which adds
+# the pinned ONNX Runtime the ML detector loads (§20.2, deploy/Dockerfile).
+k8s_bins := "server ingestion detection:detection/detectors,detection/anomaly:onnx event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive"
 k8s_image := "ghcr.io/kyawkyawthar/onchain_fraud_mev_detector"
 
 # Build every service image locally (:dev) and load it into the kind cluster —
@@ -531,14 +533,76 @@ k8s-build-images cluster="kind":
     set -eu
     for entry in {{k8s_bins}}; do
         bin="${entry%%:*}"
-        features="${entry#*:}"; [ "$features" = "$entry" ] && features=""
-        echo "── building ${bin}${features:+ (features: $features)}"
+        rest="${entry#"$bin"}"; rest="${rest#:}"
+        features="${rest%%:*}"
+        runtime="${rest#"$features"}"; runtime="${runtime#:}"
+        [ -n "$runtime" ] || runtime="plain"
+        echo "── building ${bin}${features:+ (features: $features)} [runtime: $runtime]"
         docker build -f deploy/Dockerfile \
             --build-arg BIN="$bin" \
             --build-arg FEATURES="$features" \
+            --build-arg RUNTIME="$runtime" \
             -t "{{k8s_image}}/${bin}:dev" .
         kind load docker-image "{{k8s_image}}/${bin}:dev" --name "{{cluster}}"
     done
+
+# Build a model-bundle image for the ML detector (§20.2) and load it into kind.
+# `bundle` is a directory laid out per deploy/models/README.md; the build fails
+# if its anomaly.json references a file the bundle doesn't contain.
+k8s-build-model-image bundle tag="dev" cluster="kind":
+    docker build -f deploy/models/Dockerfile --build-arg BUNDLE=. \
+        -t "{{k8s_image}}/detection-models:{{tag}}" "{{bundle}}"
+    kind load docker-image "{{k8s_image}}/detection-models:{{tag}}" --name "{{cluster}}"
+
+# ── ML model training (§20.1/§20.2, deploy/training) ─────────────
+
+train_image := "mev-training"
+
+# Build the pinned training image (Python + scikit-learn + skl2onnx + the same
+# onnxruntime version production serves, so an export verifies against it).
+train-build:
+    docker build -f deploy/training/Dockerfile -t "{{train_image}}" deploy/training
+
+# Train one role from a `dataset export` Parquet file into a bundle directory.
+# Run it twice — supervised from a tx export, novelty from a block export — into
+# the same `out` to compose one bundle.
+#
+#   just train supervised out/tx-rows.parquet out/bundle
+train role dataset out="out/bundle" *ARGS:
+    mkdir -p "{{out}}"
+    docker run --rm --user "$(id -u):$(id -g)" \
+        -v "$(cd $(dirname {{dataset}}) && pwd)":/data:ro \
+        -v "$(cd {{out}} && pwd)":/bundle \
+        "{{train_image}}" \
+        --role "{{role}}" --dataset "/data/$(basename {{dataset}})" --out /bundle {{ARGS}}
+
+# End-to-end check of the training image on synthetic rows carrying the real
+# frozen v1 feature names — no dataset, no cluster. The bundle it writes is
+# servable, so `check-models-image` accepts it.
+train-self-test out="out/self-test":
+    mkdir -p "{{out}}"
+    docker run --rm --user "$(id -u):$(id -g)" -v "$(cd {{out}} && pwd)":/bundle \
+        "{{train_image}}" self-test --out /bundle
+
+# Validate a bundle with the *real* loader, inside the detection image — the
+# gate a bundle must pass before it is packaged. Needs the ML detection image
+# (`just k8s-build-images`).
+check-models-image bundle="out/bundle" tag="dev":
+    docker run --rm -v "$(cd {{bundle}} && pwd)":/models:ro \
+        "{{k8s_image}}/detection:{{tag}}" check-models /models/anomaly.json
+
+# Pre-flight a model bundle against the *real* loader before it is deployed —
+# artifact digests, pinned-digest check, feature-version skew, graph
+# conformance, the probe inference, and the baseline/schema pairing. Prints the
+# `config_hash` the bundle will stamp on every event, which is what you record
+# when promoting a model and paste into `expected_artifact` to pin it.
+#
+# Needs the ONNX Runtime locally (the image ships it, your laptop doesn't):
+#   macOS  brew install onnxruntime && export ORT_DYLIB_PATH="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
+#   Linux  download the release tarball pinned in deploy/Dockerfile and point
+#          ORT_DYLIB_PATH at its lib/libonnxruntime.so
+check-models config:
+    cargo run -p detection --features detectors,anomaly -- check-models {{config}}
 
 # The Grafana dashboards/datasources configMapGenerator (§19, Sprint 13 t4)
 # reads deploy/grafana/... directly, outside deploy/k8s/base's own tree — one

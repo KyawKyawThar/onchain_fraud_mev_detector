@@ -30,6 +30,7 @@ pub struct MockDetector {
     kind: ModelKind,
     scope: Scope,
     findings: Vec<Evidence>,
+    model_digest: Option<[u8; 32]>,
 }
 
 impl MockDetector {
@@ -42,6 +43,7 @@ impl MockDetector {
             kind: ModelKind::Rule,
             scope: Scope::Block,
             findings: Vec::new(),
+            model_digest: None,
         }
     }
 
@@ -63,6 +65,16 @@ impl MockDetector {
         self.findings = findings;
         self
     }
+
+    /// Serve a learned model with this identity digest (§20.2) — for exercising
+    /// the composing service's "weights are config" fold without a real model.
+    /// The byte is repeated to fill the digest so two mocks are easy to tell
+    /// apart in an assertion.
+    #[must_use]
+    pub fn with_model_digest(mut self, byte: u8) -> Self {
+        self.model_digest = Some([byte; 32]);
+        self
+    }
 }
 
 impl DetectorPlugin for MockDetector {
@@ -80,6 +92,9 @@ impl DetectorPlugin for MockDetector {
     }
     fn detect(&self, _ctx: &DetectionCtx) -> Vec<Evidence> {
         self.findings.clone()
+    }
+    fn model_digest(&self) -> Option<[u8; 32]> {
+        self.model_digest
     }
 }
 

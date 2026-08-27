@@ -587,9 +587,9 @@ impl ModelRegistryBuilder {
     }
 }
 
-/// Build one detector's [`ModelCard`], layering the rollout status and any
-/// measured performance from `performance` on top of a fresh boot-placeholder
-/// card (§18, Sprint 10 t4). Shared by the `Block` catalogue
+/// Build one detector's [`ModelCard`], layering the rollout status, any
+/// measured performance from `performance`, and any served model's identity
+/// on top of a fresh boot-placeholder card (§18, Sprint 10 t4; §20.2). Shared by the `Block` catalogue
 /// ([`crate::boot`]) and cross-block registration
 /// ([`crate::registry::register_cross_block_builtins`]) so both stamp a
 /// detector's card the same way regardless of which roster it lives in.
@@ -598,18 +598,21 @@ pub(crate) fn card_for(
     version: SemVer,
     kind: ModelKind,
     scope: Scope,
+    model_digest: Option<[u8; 32]>,
     rollout: &RolloutPolicy,
     performance: &PerformanceStore,
 ) -> ModelCard {
-    let mut card = ModelCard::new(
-        id,
-        version,
-        kind,
-        scope,
-        ConfigHash::boot_placeholder(id, version),
-        Utc::now(),
-    )
-    .with_status(rollout.status_of(id));
+    // Weights are config (§20.2): a detector serving a learned model folds its
+    // model identity — artifact SHA-256 + trained `feature_version` + schema
+    // digest — into the same hash a threshold change would move, so a retrain
+    // is a new `(id, version, config_hash)` triple and rollback stays
+    // `deprecated_at`. A rule detector returns `None` and is unaffected.
+    let config_hash = match model_digest {
+        Some(digest) => ConfigHash::boot_placeholder(id, version).with_model_artifact(&digest),
+        None => ConfigHash::boot_placeholder(id, version),
+    };
+    let mut card = ModelCard::new(id, version, kind, scope, config_hash, Utc::now())
+        .with_status(rollout.status_of(id));
 
     if let Some(record) = performance.get(id.as_str()) {
         let perf = record
@@ -1002,6 +1005,7 @@ mod tests {
             SemVer::new(2, 1, 0),
             ModelKind::Rule,
             Scope::Block,
+            None,
             &rollout,
             &performance,
         );
@@ -1017,11 +1021,38 @@ mod tests {
             SemVer::new(1, 2, 0),
             ModelKind::Rule,
             Scope::Block,
+            None,
             &RolloutPolicy::default(),
             &PerformanceStore::new(),
         );
 
         assert_eq!(card.status, LifecycleStatus::Active);
         assert!(!card.performance.is_measured());
+    }
+
+    #[test]
+    fn card_for_folds_a_served_models_identity_into_the_config_hash() {
+        let card = |digest: Option<[u8; 32]>| {
+            card_for(
+                DetectorId::new("anomaly"),
+                SemVer::new(1, 0, 0),
+                ModelKind::Ml,
+                Scope::Block,
+                digest,
+                &RolloutPolicy::default(),
+                &PerformanceStore::new(),
+            )
+            .config_hash
+        };
+        // The fold is `with_model_artifact` and nothing else — stated as an
+        // equality so the two can't drift into different compositions of the
+        // same inputs (§20.2: one fold, one way).
+        assert_eq!(
+            card(Some([0x11; 32])),
+            ConfigHash::boot_placeholder(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
+                .with_model_artifact(&[0x11; 32])
+        );
+        assert_ne!(card(Some([0x11; 32])), card(Some([0x22; 32])));
+        assert_ne!(card(Some([0x11; 32])), card(None));
     }
 }

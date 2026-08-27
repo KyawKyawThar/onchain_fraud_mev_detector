@@ -42,6 +42,11 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
             for forbidden in [
                 "detection",
+                // The crate that owns labels, entities and risk scores. A
+                // detector names *behaviour*, never an actor (§6) — and the
+                // ctx it is handed physically carries no labels, so an edge
+                // here could only exist to reach around that.
+                "intelligence",
                 "event-bus",
                 "rdkafka",
                 "lapin",
@@ -56,6 +61,22 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
                          storage are the composing service's job"
                     ));
                 }
+            }
+
+            // ── An ML detector executes its model behind the seam (§20.2) ──
+            // `inference` is where a runtime lives, which is what keeps a
+            // detector's logic — thresholds, evidence, top contributing
+            // features — testable with no native library in the test binary,
+            // and what keeps the *serving* side attribution-blind (the seam
+            // scores a `FeatureVector`, never a `DetectionCtx`). A detector
+            // holding `ort` directly would give all of that back.
+            if has("ort") {
+                out.push(format!(
+                    "{krate}: a detector crate must not depend on ort — a model is \
+                     executed behind the `inference` seam (§20.2), so the detector's \
+                     logic stays testable without an ONNX Runtime and cannot see \
+                     anything but a feature vector"
+                ));
             }
         }
 
@@ -291,6 +312,10 @@ mod tests {
             ("events", &[]),
             ("detector-api", &["events"]),
             ("sandwich-detector", &["detector-api", "events"]),
+            (
+                "anomaly-detector",
+                &["detector-api", "events", "ml-features", "inference", "sha2"],
+            ),
             ("ml-features", &["detector-api", "serde", "sha2"]),
             ("event-bus", &["events", "rdkafka", "metrics"]),
             ("detection", &["detector-api", "event-bus", "rdkafka"]),
@@ -341,6 +366,16 @@ mod tests {
                 "must not depend on detection",
             ),
             ("evil-detector", &["events"], "no detector-api dependency"),
+            (
+                "evil-detector",
+                &["detector-api", "intelligence"],
+                "must not depend on intelligence",
+            ),
+            (
+                "evil-detector",
+                &["detector-api", "ml-features", "ort"],
+                "executed behind the `inference` seam",
+            ),
             (
                 "reporting",
                 &["detection"],

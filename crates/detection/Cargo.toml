@@ -74,6 +74,16 @@ washtrading-detector = { workspace = true, optional = true }
 poisoning-detector = { workspace = true, optional = true }
 # Dev/test-only synthetic detector behind the `demo` feature (§19) — see below.
 demo-detector = { workspace = true, optional = true }
+# The ML detector (§20.2) and the serving seam it programs against, behind the
+# `anomaly` feature. Unlike the detectors above it cannot be constructed by
+# `register_builtins`: its weights and its training-window baselines are files
+# a deployment mounts, so this crate's `ml` module loads them at boot and hands
+# the built detector to `register_builtins_with`. `inference` is pulled in with
+# its `onnx` backend because *this* is the composing binary — the layer allowed
+# to know which backend serves a model.
+anomaly-detector = { workspace = true, optional = true }
+inference = { workspace = true, optional = true }
+ml-features = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -98,6 +108,12 @@ detectors = [
     "washtrading",
     "poisoning",
 ]
+# Link the ML detector (§20.2). Off by default: it costs an ONNX Runtime
+# dependency at *deploy* time (`ort` is loaded dynamically, so the image must
+# ship `libonnxruntime` and set `ORT_DYLIB_PATH`), and a build with no model
+# artifacts to serve has no use for it. Enabled, the detector still only runs
+# when `DETECTION_ANOMALY_CONFIG` names a deployment — see `src/ml.rs`.
+anomaly = ["dep:anomaly-detector", "dep:inference", "dep:ml-features", "inference/onnx"]
 # Link the synthetic `demo` detector (§19): fires on a deterministic schedule
 # regardless of tx content, so the per-detector metrics (hit rate/findings/
 # latency) and the emit path can be exercised end-to-end while the live source is

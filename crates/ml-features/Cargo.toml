@@ -29,6 +29,9 @@ sha2 = { workspace = true }
 strum = { workspace = true }
 # Bit-identical `log10` on every platform — see the workspace manifest note.
 libm = { workspace = true }
+# Typed, non-retriable boot errors for `FeatureBaseline` — a baseline that
+# does not bind to a live schema is a refused deploy, never a warning.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Shared fixtures (`CtxBuilder`, `addr`/`b256`/`swap`) for the extraction tests.

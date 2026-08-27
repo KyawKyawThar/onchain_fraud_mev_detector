@@ -133,12 +133,64 @@ CI (`ci.yml` docker matrix) publishes one image per binary to
 `ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/<bin>` on merge to `main`,
 tagged by branch, semver, and `sha-<commit>`; prod pins tags in its
 `images:` block. The detection image is built with
-`FEATURES=detection/detectors` — without it the binary links **zero**
-detectors and boots happily doing nothing.
+`FEATURES=detection/detectors,detection/anomaly` — without the first the binary
+links **zero** detectors and boots happily doing nothing — and on the `onnx`
+runtime flavour (`RUNTIME=onnx`), which adds the pinned, checksum-verified ONNX
+Runtime library and sets `ORT_DYLIB_PATH`. See "ML detection" below for why
+that is one image rather than two.
 
 Not deployed here: `backtest` (a dev/CI tool, not a service) and
 `ingestion-exex-node` (embeds reth — its own node deployment with its own
 lockfile, out of workspace).
+
+## ML detection (§20.2) — opt-in
+
+Base is deliberately ML-free. The detection image always links the
+`anomaly-v1.0` detector and always carries the ONNX Runtime, but the detector
+is **constructed only** when `DETECTION_ANOMALY_CONFIG` names a model bundle —
+so no environment gets a model it did not ask for, and enabling ML detection in
+a cluster is a config + model-image change rather than an image rebuild. One
+detection artifact, one thing to reason about, ~28 MB for the runtime on an
+image that is already ~100 MB.
+
+Turn it on from an overlay:
+
+```yaml
+components:
+  - ../../components/anomaly-detection
+
+images:
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection-models
+    newTag: 2026-08-27      # ← the deployed model version, in the diff
+```
+
+The component patches every Deployment labelled
+`app.kubernetes.io/component=detection` (so a new per-chain instance picks it up
+by being labelled, not by being listed) with an initContainer that unpacks the
+bundle image into an `emptyDir`, the env var, and CPU/memory headroom for the
+ONNX session pool. Kubernetes cannot mount an OCI image as a volume in stable
+APIs, so the initContainer is the portable form of "the model is an immutable,
+tagged artifact" — and it means a missing or malformed bundle is an *init*
+failure with a clear message rather than a half-started service.
+
+Three properties worth knowing before you enable it:
+
+- **The bundle image tag is the model version.** Rollback is editing it back.
+  There is deliberately no hot-swap path (§20.5): a retrained model is a new
+  pod, walking the same Shadow → backtest → Live gate as any detector change,
+  because evidence that cannot be tied to the exact weights that produced it is
+  not evidence.
+- **The detector ships `Shadow`.** It runs and is scored — its
+  `DetectorTriggered` is recorded so backtests and metrics see it — but it
+  raises no customer-facing alert until the backtest gate promotes it in
+  `main.rs`. Enabling the component does not put ML findings in front of a
+  customer.
+- **Bad bundles fail before they deploy, if you let them.** Run
+  `detection check-models <path>` (or `just check-models`) against the bundle in
+  CI: it is the same loader boot uses — artifact digests, pinned-digest check,
+  feature-version skew, graph conformance, a probe inference, and the
+  baseline/schema pairing — and it prints the `config_hash` those weights will
+  stamp on every event. See [deploy/models/README.md](../models/README.md).
 
 ## What deliberately stayed behind
 

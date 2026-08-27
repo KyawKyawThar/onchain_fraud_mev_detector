@@ -118,11 +118,60 @@ jobs:
       - name: cargo deny (advisories, licenses, bans, sources)
         run: cargo deny check
 
+  # ── the ML training pipeline still works (§20.1/§20.2) ───────────
+  # Trains both §20.2 models on synthetic rows carrying the real frozen v1
+  # feature names, exports both to ONNX, and verifies each against the same
+  # onnxruntime version production serves. Nothing here needs a dataset or a
+  # cluster; what it catches is the class of failure that otherwise waits until
+  # someone has real data in front of them — a pin that no longer converts, an
+  # opset the runtime cannot execute, a bundle in the wrong shape.
+  #
+  # It does not gate on model *quality*: that is the backtest harness's job
+  # (§18), measured on a real replay.
+  ml-training:
+    name: ml training self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the training image
+        run: docker build -f deploy/training/Dockerfile -t mev-training deploy/training
+      - name: Train, export and verify both models
+        run: |
+          mkdir -p out/self-test
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD/out/self-test":/bundle mev-training self-test --out /bundle
+      - name: The bundle is well-formed
+        run: |
+          set -euo pipefail
+          bundle=out/self-test
+          for role in supervised novelty; do
+            baseline=$(jq -r ".${role}.baseline" "$bundle/anomaly.json")
+            artifact=$(jq -r ".${role}.model.artifact_path" "$bundle/anomaly.json")
+            pinned=$(jq -r ".${role}.model.expected_artifact // empty" "$bundle/anomaly.json")
+            # Every path anomaly.json names has to resolve once the bundle is
+            # mounted at /models — the same check the bundle image build makes.
+            for referenced in "$baseline" "$artifact"; do
+              test -s "$bundle/$(basename "$referenced")" \
+                || { echo "::error::anomaly.json references missing $referenced" >&2; exit 1; }
+            done
+            test -n "$pinned" \
+              || { echo "::error::$role has no expected_artifact — bundles ship pinned" >&2; exit 1; }
+          done
+          echo "bundle references resolve, both artifacts pinned"
+
   # ── build + push service images to GHCR (cargo-chef Dockerfile) ──
   # Only after the gates pass, and only on push (not manual dry-runs).
   # One image per deployable binary — the K8s manifests (deploy/k8s) pull
   # ghcr.io/<repo>/<bin>. detection MUST carry FEATURES=detection/detectors
   # or the image links no built-in detectors.
+  #
+  # detection also links `detection/anomaly` (§20.2's ML detector) and builds on
+  # the `onnx` runtime flavour, which adds the pinned, checksum-verified ONNX
+  # Runtime library (deploy/Dockerfile). One image, not two: the detector is
+  # inert unless DETECTION_ANOMALY_CONFIG names a deployment, so turning ML
+  # detection on in a cluster is a config + model-image change rather than an
+  # image rebuild — and there is only ever one detection artifact to reason
+  # about. Cost is ~28 MB on an image that is already ~100 MB.
   docker:
     name: docker (${{ matrix.bin }} → GHCR)
     runs-on: ubuntu-latest
@@ -138,7 +187,8 @@ jobs:
           - bin: server
           - bin: ingestion
           - bin: detection
-            features: detection/detectors
+            features: detection/detectors,detection/anomaly
+            runtime: onnx
           - bin: event-store
           - bin: simulation
           - bin: simulation-worker
@@ -171,14 +221,64 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
-      - uses: docker/build-push-action@v6
+      # Build → smoke → push, in that order, so a broken image is never
+      # published. The build itself is done once: the push step below is served
+      # entirely from BuildKit's cache and takes seconds.
+      - name: Build (load locally)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./deploy/Dockerfile
           build-args: |
             BIN=${{ matrix.bin }}
             FEATURES=${{ matrix.features || '' }}
+            RUNTIME=${{ matrix.runtime || 'plain' }}
+          platforms: linux/amd64
+          load: true
+          tags: ci-smoke:${{ matrix.bin }}
+          labels: ${{ steps.meta.outputs.labels }}
+      # The cheapest check that catches the most embarrassing failure: an image
+      # whose binary cannot exec at all. Every dynamic dependency must resolve
+      # inside the runtime image — this is what a builder/runtime glibc
+      # mismatch looks like (`version 'GLIBC_2.xx' not found`), and it is
+      # invisible to `cargo test`, to `docker build`, and to any check that
+      # doesn't actually start the thing. It needs no Kafka, no database and no
+      # config, so it costs a second and runs for every binary.
+      - name: Smoke — the image's binary can actually start
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --entrypoint sh "ci-smoke:${{ matrix.bin }}" \
+                  -c 'ldd /usr/local/bin/service' 2>&1)
+          echo "$out"
+          if grep -q "not found" <<<"$out"; then
+            echo "::error::${{ matrix.bin }} image has unresolved dynamic dependencies" >&2
+            exit 1
+          fi
+      # The ML image additionally has to be able to *load* the ONNX Runtime it
+      # ships (§20.2) — `ort` resolves it at boot via ORT_DYLIB_PATH, so a
+      # missing or ABI-incompatible library is otherwise discovered by the
+      # first pod that tries to serve a model.
+      - name: Smoke — the ONNX Runtime in the image resolves
+        if: matrix.runtime == 'onnx'
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh "ci-smoke:${{ matrix.bin }}" -c '
+            set -eu
+            test -n "${ORT_DYLIB_PATH:-}" || { echo "ORT_DYLIB_PATH unset" >&2; exit 1; }
+            ldd "$ORT_DYLIB_PATH" | grep "not found" && exit 1
+            echo "ONNX Runtime resolves: $ORT_DYLIB_PATH"'
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./deploy/Dockerfile
+          build-args: |
+            BIN=${{ matrix.bin }}
+            FEATURES=${{ matrix.features || '' }}
+            RUNTIME=${{ matrix.runtime || 'plain' }}
           # Add linux/arm64 here once you need it (slower — uses QEMU emulation).
+          # Note: a multi-platform build cannot `load`, so the smoke steps above
+          # would need reworking (build per-platform, then a manifest push).
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

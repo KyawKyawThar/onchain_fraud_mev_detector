@@ -1,0 +1,51 @@
+[package]
+name = "anomaly-detector"
+version = "1.0.0"        # mirrors the detector's `SemVer` build version (§6, §22).
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# ML anomaly detector — `anomaly-v1.0` (§20.2, Sprint 18 t4). The first
+# `ModelKind::Ml` detector: a supervised GBDT scorer over per-transaction
+# feature vectors and an isolation-forest novelty model over block vectors,
+# both served through the `inference` seam and both explaining themselves
+# against a training-window baseline.
+#
+# Held to the detector seam rule like every other detector crate: it implements
+# `detector_api::DetectorPlugin` and depends on the small `detector-api` seam,
+# never on the `detection` service. Its three dependencies are the three halves
+# of the ML contract, each independently held to detector purity by
+# arch-conformance — the ctx it reads (`detector-api`), the vectors it extracts
+# (`ml-features`), and the models it scores them with (`inference`). It reaches
+# no store, broker, or `intelligence`: an ML detector is exactly as
+# attribution-blind as a heuristic one (§6).
+
+[dependencies]
+detector-api = { workspace = true }
+events = { workspace = true }
+# The versioned feature contract (§20.1) — the same vectors the training rows
+# were built from, plus the `FeatureBaseline` an explanation measures against.
+ml-features = { workspace = true }
+# The model-serving seam (§20.2). The detector holds `Arc<dyn InferenceEngine>`
+# and never learns which backend is behind it — so every threshold, evidence
+# and explanation path here is unit-testable with no ONNX Runtime present.
+inference = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+alloy-primitives = { workspace = true }
+thiserror = { workspace = true }
+# The detector's own identity digest: its thresholds folded together with each
+# served model's descriptor and baseline hash, so a retrain, a re-exported
+# baseline, or a threshold change each produce a new registry triple (§20.2).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+detector-api = { workspace = true, features = ["test-util"] }
+# `StubEngine` — a fixed score, a vector-derived score, and a failing runtime:
+# everything the detector's logic needs to be tested against, with no native
+# library in the test binary.
+inference = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
