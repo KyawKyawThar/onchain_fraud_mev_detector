@@ -752,9 +752,15 @@ full engineering discipline.
 `thiserror`/`anyhow`, `criterion`, `proptest`, cargo-nextest, cargo-deny +
 cargo-audit, cargo-chef, `just`, lefthook, Renovate.
 
-**AI/ML (§20):** `ort` (ONNX Runtime inference), `linfa` (isolation forest),
-ClickHouse vector search, Claude API (Messages + Batches, via a thin internal
-HTTP client — no official Rust SDK).
+**AI/ML (§20):** `ort` (ONNX Runtime inference — dynamically loaded, not
+linked or downloaded), `libm` (bit-identical feature extraction across
+platforms), ClickHouse vector search, Claude API (Messages + Batches, via a
+thin internal HTTP client — no official Rust SDK). No in-process training
+stack: models — the supervised GBDT and the isolation forest alike — are
+trained offline in whatever stack fits and cross the boundary as an ONNX
+artifact plus its `feature_version`, so serving needs one runtime rather than
+one library per model family. (The plan named `linfa` for the isolation
+forest; ONNX serving made it unnecessary.)
 
 ---
 
@@ -868,6 +874,30 @@ Serving mechanics:
   policy) → backtest gate (precision/recall ≥ committed baseline) → Live.
   Identical lifecycle to a heuristic detector change — ML gets no special
   path around the gates.
+  The Python half of that boundary is a pinned **training image**
+  (`deploy/training`) that reads a `dataset export` Parquet file and writes a
+  serving bundle. Three of its choices are load-bearing rather than
+  conventional: the feature order comes from the file (which `dataset` writes
+  in schema order) rather than from a list, because a mis-ordered matrix
+  produces a model that is wrong in a way nothing downstream can detect — the
+  arity still matches; the train/test split is time-ordered, because several
+  rows commonly describe one block and shuffling reports a precision the model
+  does not have; and every export is **verified by running it** through the
+  same ONNX Runtime version production serves, so a converter bug or an opset
+  mismatch fails in a batch job rather than at a pod's first block.
+- **Deployment:** the runtime is loaded, so it is a deployment fact. The
+  detection image carries a pinned, SHA-256-verified ONNX Runtime and sets
+  `ORT_DYLIB_PATH`; the model **bundle** — artifacts, baselines and the config
+  naming them — is a separate immutable image whose tag *is* the model version,
+  unpacked at pod start. Two artifacts, because models and code move on
+  different clocks: a retrain must not require a code build, and a code deploy
+  must not silently change which weights are serving. There is one detection
+  image, not an ML and a non-ML variant: the detector is linked always and
+  constructed only when a bundle is configured, so enabling ML detection in a
+  cluster is a config change rather than a rebuild. `detection check-models`
+  runs the real loader over a bundle before it is deployed and prints the
+  `config_hash` those weights will stamp — so a bad bundle fails in CI, not as
+  a crashloop.
 - **Latency budget:** inference must fit the < 1s fast path (§6). ONNX GBDT /
   isolation-forest inference is microseconds per candidate; the budget is
   enforced by the same per-detector latency metrics (§17).
@@ -885,6 +915,34 @@ Serving mechanics:
   output. The seam returns a score and nothing else, so a model format with no
   attribution support is still explainable and one subsystem owns the answer to
   "why did this fire?".
+
+  Delivered as the `anomaly-detector` crate. Those distribution statistics are
+  a `ml_features::FeatureBaseline` — a median centre and a MAD spread per
+  feature, exported by the training run beside its artifact and bound to the
+  schema it was exported under, so a mismatched snapshot is a refused boot
+  rather than an explanation quietly measured against the wrong distribution.
+  Robust statistics, not mean/σ: on-chain features are heavy-tailed, and the
+  point of a baseline is to make outliers *visible* rather than hide them
+  behind one $40M block's inflated variance. A contribution states the
+  observed value, the training centre and spread, the signed deviation, and
+  its **share** of the block's total deviation — so a thin explanation reads
+  as thin, and a finding no single feature explains reports nothing rather
+  than padding itself with its five least-boring features. The baseline hash
+  travels in the evidence and in the detector's `config_hash`: an explanation
+  is part of what a deployment claims, so re-deriving one is a new registry
+  triple like a retrain.
+
+  Two shapes the sketch above leaves open. The novelty model claims no known
+  behaviour, which no existing `AlertKind` could express — tagging an
+  unexplained bundle `Sandwich` because the model saw sandwiches in training
+  would put an accusation on the wire the evidence cannot support — so
+  `AlertKind::Anomaly` names the one behaviour that is "structurally unusual,
+  and here is what is unusual about it". And the supervised model does **not**
+  rewrite another detector's `raw_confidence`: a `DetectorPlugin` is a pure
+  function of the context and sees no other detector's findings, so the two
+  opinions stand side by side rather than being fused by a detector that
+  cannot see what it is fusing. Fusion is a composition concern above the
+  seam, and needs a ranking to prove it is an improvement.
 
 ### 20.3 Behavioral embeddings (intelligence service)
 

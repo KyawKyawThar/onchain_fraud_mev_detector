@@ -115,6 +115,19 @@ pub enum AlertKind {
     Rugpull,
     WashTrading,
     AddressPoisoning,
+    /// A structural anomaly with **no named pattern** — the ML detector's kind
+    /// (§20.2): "this looks like nothing we have seen before, and here are the
+    /// features that make it unusual."
+    ///
+    /// Every other variant claims a *known* behaviour, which is exactly what a
+    /// novel-pattern model cannot honestly claim; reusing one of them (tagging
+    /// an unexplained bundle `Sandwich` because that model was trained partly
+    /// on sandwiches) would put a specific accusation on the wire that the
+    /// evidence does not support. The claim degrades gracefully instead: the
+    /// behaviour is "anomalous", and the `evidence` document carries the
+    /// feature-level contributions that justify it. Still attribution-blind —
+    /// it names a shape, not an actor.
+    Anomaly,
 }
 
 /// What a label claims about an address (§8.1) — the platform's shared label

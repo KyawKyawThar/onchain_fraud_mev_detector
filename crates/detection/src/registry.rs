@@ -106,7 +106,19 @@ impl RegistryBuilder {
     /// Register a detector. Takes the concrete plugin and boxes it behind the
     /// trait object the registry stores.
     pub fn register<P: DetectorPlugin + 'static>(&mut self, plugin: P) -> &mut Self {
-        self.registered.push(Arc::new(plugin));
+        self.register_arc(Arc::new(plugin))
+    }
+
+    /// Register a detector already behind the trait object.
+    ///
+    /// The seam for a detector the *binary* has to construct rather than
+    /// `register_builtins` (§20.2's ML detector needs a loaded model artifact
+    /// and a baseline, which are boot-time I/O, not a compile-time constant).
+    /// Such a detector arrives here already built, so it is registered,
+    /// catalogued, flag-gated and staged exactly like every other one — the
+    /// point being that "needs a file at boot" is the *only* way it differs.
+    pub fn register_arc(&mut self, plugin: Arc<dyn DetectorPlugin>) -> &mut Self {
+        self.registered.push(plugin);
         self
     }
 
@@ -163,11 +175,37 @@ impl RegistryBuilder {
 /// recoverable runtime condition (fail fast, mirroring the service's config
 /// loading).
 pub fn register_builtins(flags: &FeatureFlags) -> Registry {
+    register_builtins_with(flags, Vec::new())
+}
+
+/// [`register_builtins`] plus detectors the *binary* constructed at boot.
+///
+/// One detector cannot be a compile-time constant: the ML detector (§20.2)
+/// holds a model artifact and a training-window baseline, both files read at
+/// boot, so the binary builds it and hands it in here. Everything downstream
+/// is unchanged — it is flag-gated by its own id like any other detector,
+/// catalogued into a [`ModelCard`](crate::model::ModelCard) with its
+/// `config_hash` folding its
+/// [`model_digest`](detector_api::DetectorPlugin::model_digest), and staged
+/// through the same [`RolloutPolicy`](crate::model::RolloutPolicy). ML gets no
+/// path around the gates (§20.2).
+pub fn register_builtins_with(
+    flags: &FeatureFlags,
+    extra: Vec<std::sync::Arc<dyn DetectorPlugin>>,
+) -> Registry {
     // `flags` goes unread only in a build that links *no* detector feature; each
     // `#[cfg]` arm below consumes it via `register_if`.
     let _ = flags;
     #[allow(unused_mut)] // stays `mut`-free only when no detector feature is on.
     let mut b = Registry::builder();
+
+    // Boot-constructed detectors first, so a duplicate `(id, version)` against
+    // a compiled-in one is still caught by `build` below.
+    for plugin in extra {
+        if flags.is_enabled(plugin.id()) {
+            b.register_arc(plugin);
+        }
+    }
 
     // ── built-in detectors plug in here (task 4) ──
     #[cfg(feature = "sandwich")]
@@ -259,6 +297,11 @@ pub fn register_cross_block_builtins(
             detector_api::Scope::CrossBlock {
                 window_blocks: detector.window_blocks(),
             },
+            // No cross-block detector serves a learned model today; the
+            // `CrossBlockDetector` trait has no `model_digest` because
+            // nothing needs one yet (§20.1's cross-block feature family is
+            // still a future `FEATURE_VERSION`).
+            None,
             rollout,
             performance,
         );
@@ -372,6 +415,36 @@ mod tests {
         // … and a flags-all-off policy yields an empty roster no matter which
         // detector features are compiled in (the runtime gate beats the link).
         assert!(register_builtins(&FeatureFlags::all_disabled()).is_empty());
+    }
+
+    #[test]
+    fn a_boot_constructed_detector_joins_the_roster_and_obeys_its_flag() {
+        // The ML detector's one asymmetry (§20.2): the binary builds it,
+        // because its weights are mounted files. From here on it is an
+        // ordinary plugin — including being turned off by config.
+        let ml = || -> Arc<dyn DetectorPlugin> {
+            Arc::new(MockDetector::new("anomaly", SemVer::new(1, 0, 0)))
+        };
+        let reg = register_builtins_with(&FeatureFlags::all_enabled(), vec![ml()]);
+        assert!(reg
+            .get(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
+            .is_some());
+
+        let disabled = register_builtins_with(
+            &FeatureFlags::all_enabled().disable(DetectorId::new("anomaly")),
+            vec![ml()],
+        );
+        assert!(disabled
+            .get(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
+            .is_none());
+    }
+
+    #[test]
+    fn register_builtins_is_register_builtins_with_nothing_extra() {
+        assert_eq!(
+            register_builtins(&FeatureFlags::all_enabled()).len(),
+            register_builtins_with(&FeatureFlags::all_enabled(), Vec::new()).len()
+        );
     }
 
     #[test]

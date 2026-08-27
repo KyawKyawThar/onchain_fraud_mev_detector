@@ -38,9 +38,27 @@ pub fn link_builtin_roster(
     rollout: &RolloutPolicy,
     performance: &PerformanceStore,
 ) -> Result<DetectionPlan, UnlinkedDetector> {
-    let registry = register_builtins(flags);
-    let models = catalogue(&registry, rollout, performance);
-    DetectionPlan::link(&registry, &models)
+    link_roster(&register_builtins(flags), rollout, performance)
+}
+
+/// [`link_builtin_roster`] over an already-assembled [`Registry`] — for a
+/// binary whose roster includes a detector it had to *construct* at boot
+/// rather than one `register_builtins` compiles in.
+///
+/// The ML detector (§20.2) is the case: it holds a loaded model artifact and a
+/// training-window baseline, so the binary builds it, adds it through
+/// [`register_builtins_with`](crate::registry::register_builtins_with), and
+/// links the result here. Cataloguing is identical either way — same
+/// `config_hash` derivation, same rollout status, same link-or-fail — which is
+/// exactly the property §20.2 asks for: ML walks the same gates as a heuristic
+/// change, with no path around them.
+pub fn link_roster(
+    registry: &Registry,
+    rollout: &RolloutPolicy,
+    performance: &PerformanceStore,
+) -> Result<DetectionPlan, UnlinkedDetector> {
+    let models = catalogue(registry, rollout, performance);
+    DetectionPlan::link(registry, &models)
 }
 
 /// Catalogue every live detector into a [`ModelRegistry`] so the plan can `link`.
@@ -51,6 +69,12 @@ pub fn link_builtin_roster(
 /// hash is enough to make the link total. Computing the real config hash (the §18
 /// reproducibility identifier) remains a follow-up; kept private to this module in
 /// the meantime (see the module docs).
+///
+/// The one part that is *not* a placeholder is a detector's
+/// [`model_digest`](detector_api::DetectorPlugin::model_digest): an ML detector
+/// (§20.2) folds the identity of the weights and feature contract it serves
+/// into the hash, so a retrain is already a new `(id, version, config_hash)`
+/// triple today, ahead of the general config-hashing follow-up.
 fn catalogue(
     registry: &Registry,
     rollout: &RolloutPolicy,
@@ -63,6 +87,10 @@ fn catalogue(
             plugin.version(),
             plugin.kind(),
             plugin.scope(),
+            // `None` for every rule detector; an ML detector returns the
+            // digest of the weights + feature contract it serves, which is
+            // folded into its `config_hash` (§20.2).
+            plugin.model_digest(),
             rollout,
             performance,
         ));
@@ -76,7 +104,8 @@ fn catalogue(
 mod tests {
     use super::*;
     use crate::model::{LifecycleStatus, PerformanceRecord};
-    use detector_api::DetectorId;
+    use detector_api::test_util::MockDetector;
+    use detector_api::{DetectorId, SemVer};
     use std::num::NonZeroU64;
 
     #[test]
@@ -103,6 +132,76 @@ mod tests {
         )
         .expect("an empty roster has nothing to fail linking");
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn a_served_models_identity_lands_in_the_detectors_config_hash() {
+        // "Weights are config" (§20.2), end to end through the boot path: two
+        // deployments of the same detector build that differ *only* in the
+        // model they serve must emit different `(id, version, config_hash)`
+        // triples, or historical evidence cannot be attributed to the weights
+        // that produced it.
+        let card_for = |plugin: MockDetector| {
+            let registry = Registry::builder().register(plugin).build().unwrap();
+            catalogue(
+                &registry,
+                &RolloutPolicy::default(),
+                &PerformanceStore::new(),
+            )
+            .card(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
+            .expect("catalogued")
+            .clone()
+        };
+        let plain = MockDetector::new("anomaly", SemVer::new(1, 0, 0));
+        let march = card_for(plain.with_model_digest(0x11));
+        let april =
+            card_for(MockDetector::new("anomaly", SemVer::new(1, 0, 0)).with_model_digest(0x22));
+        let redeploy =
+            card_for(MockDetector::new("anomaly", SemVer::new(1, 0, 0)).with_model_digest(0x11));
+        let rule_only = card_for(MockDetector::new("anomaly", SemVer::new(1, 0, 0)));
+
+        assert_ne!(
+            march.config_hash, april.config_hash,
+            "a retrain is a new triple"
+        );
+        assert_eq!(
+            march.config_hash, redeploy.config_hash,
+            "an unchanged redeploy is not"
+        );
+        assert_ne!(
+            march.config_hash, rule_only.config_hash,
+            "serving a model is itself part of the identity"
+        );
+        // A detector serving no model is untouched by the fold.
+        assert_eq!(
+            rule_only.config_hash,
+            crate::model::ConfigHash::boot_placeholder(
+                DetectorId::new("anomaly"),
+                SemVer::new(1, 0, 0)
+            )
+        );
+    }
+
+    #[test]
+    fn a_boot_constructed_detector_is_staged_by_the_same_rollout_policy() {
+        // §20.2's "ML gets no special path around the gates", as a test: a
+        // detector the *binary* built is registered, catalogued and staged
+        // exactly like a compiled-in one.
+        let ml: std::sync::Arc<dyn detector_api::DetectorPlugin> = std::sync::Arc::new(
+            MockDetector::new("anomaly", SemVer::new(1, 0, 0))
+                .with_kind(detector_api::ModelKind::Ml)
+                .with_model_digest(0x11),
+        );
+        let registry =
+            crate::registry::register_builtins_with(&FeatureFlags::all_enabled(), vec![ml]);
+        let rollout = RolloutPolicy::new().shadow(DetectorId::new("anomaly"));
+
+        let models = catalogue(&registry, &rollout, &PerformanceStore::new());
+        let card = models
+            .card(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
+            .expect("the boot-constructed detector is catalogued like any other");
+        assert_eq!(card.status, LifecycleStatus::Shadow);
+        assert!(link_roster(&registry, &rollout, &PerformanceStore::new()).is_ok());
     }
 
     #[cfg(feature = "sandwich")]

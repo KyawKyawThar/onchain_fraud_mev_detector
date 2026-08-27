@@ -1,0 +1,32 @@
+# ── ML detection (§20.2) — opt-in ─────────────────────────────────────
+#
+# A kustomize **Component**, not a base resource, because ML detection is a
+# capability an environment turns on rather than part of the platform topology.
+# The detection image always links the detector and always carries the ONNX
+# Runtime, but the detector is inert until DETECTION_ANOMALY_CONFIG names a
+# bundle — so enabling it is exactly this: mount a model bundle, point the
+# variable at it.
+#
+# Turn it on from an overlay:
+#
+#   components:
+#     - ../../components/anomaly-detection
+#
+#   images:
+#     - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection-models
+#       newTag: 2026-08-27     # ← the deployed model version, in the diff
+#
+# The bundle image tag *is* the model version. Rollback is editing it back.
+# See deploy/models/README.md for the bundle contract and the pre-flight
+# `check-models` run that should gate the tag ever being written here.
+#
+# The patch targets every Deployment labelled `component: detection`, so a new
+# per-chain instance picks the capability up without editing this file.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - path: detection-models.yaml
+    target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/component=detection

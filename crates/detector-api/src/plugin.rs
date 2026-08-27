@@ -267,6 +267,30 @@ pub trait DetectorPlugin: Send + Sync {
     /// vec means "nothing here" — the overwhelmingly common case on the hot
     /// path, so it must stay cheap.
     fn detect(&self, ctx: &DetectionCtx) -> Vec<Evidence>;
+
+    /// A digest of the *learned* configuration this build serves — weights, and
+    /// the feature contract they were trained against (§20.2). `None`, the
+    /// default, for a detector whose behaviour is fixed by code and thresholds.
+    ///
+    /// **Weights are config.** A retrained model changes what a detector says
+    /// about a block exactly as a lowered threshold does, so it has to change
+    /// the detector's identity the same way: the composing service folds this
+    /// into the `config_hash` of the `(id, version, config_hash)` triple
+    /// stamped onto every `DetectorTriggered`
+    /// (`detection::model::ConfigHash::with_model_artifact`). Historical
+    /// evidence then stays attributable to the exact weights that produced it,
+    /// and rolling a bad model back is the model registry's existing
+    /// `deprecated_at`, not an archaeology exercise.
+    ///
+    /// Raw bytes rather than a typed model descriptor deliberately: this seam
+    /// stays as thin as it is today — no `inference`, no `ml-features` on a
+    /// rule detector's dependency edge — and an ML detector that serves
+    /// *several* models (§20.2 runs a supervised classifier alongside an
+    /// isolation forest) folds them into one digest itself, so a detector's
+    /// identity can only be composed one way.
+    fn model_digest(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 #[cfg(test)]

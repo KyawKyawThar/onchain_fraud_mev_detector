@@ -51,9 +51,17 @@
 //!   (type-erased) state and rewinds all of them to the common ancestor on a reorg
 //!   (§15). The consumer layer over the `state` primitive that the scheduler calls.
 //!
+//! - [`ml`] — **ML boot wiring** (§20.2, behind the `anomaly` feature): the
+//!   effectful shell that turns a deployment's mounted ONNX artifacts and
+//!   training-window baselines into the `anomaly-v1.0` detector. It is the one
+//!   detector that can't be a compile-time constant; everything after
+//!   construction — registration, cataloguing, rollout staging — is identical
+//!   to a heuristic detector's, which is the point.
+//!
 //! Built-in detectors (`sandwich-v1.2`, `arb-v1.0`; task 4) are optional
 //! dependencies linked through [`registry::register_builtins`] behind their Cargo
-//! features.
+//! features. The ML detector joins the same roster through
+//! [`registry::register_builtins_with`], since the binary constructs it.
 //!
 //! [`DetectorRef`]: events::primitives::DetectorRef
 
@@ -62,6 +70,8 @@ pub mod config;
 pub mod emit;
 pub mod flags;
 pub mod metrics;
+#[cfg(feature = "anomaly")]
+pub mod ml;
 pub mod model;
 pub mod registry;
 pub mod reorg;
@@ -77,7 +87,7 @@ pub use detector_api::{
     SemVerParseError, Swap, TokenMeta, TokenTransfer, TxActions, UsdPrice,
 };
 
-pub use boot::link_builtin_roster;
+pub use boot::{link_builtin_roster, link_roster};
 pub use emit::{
     detector_triggered, implicated_addresses, preliminary_alert, DetectionPlan, UnlinkedDetector,
 };
@@ -88,7 +98,8 @@ pub use model::{
     Performance, PerformanceRecord, PerformanceStore, PerformanceStoreError, RolloutPolicy,
 };
 pub use registry::{
-    register_builtins, register_cross_block_builtins, Registry, RegistryBuilder, RegistryError,
+    register_builtins, register_builtins_with, register_cross_block_builtins, Registry,
+    RegistryBuilder, RegistryError,
 };
 pub use reorg::{
     apply_reverts, CrossBlockSlot, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind,

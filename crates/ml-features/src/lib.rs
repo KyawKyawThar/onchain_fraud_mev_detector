@@ -61,6 +61,15 @@
 //! # assert_eq!(per_tx.len(), ctx.txs().len());
 //! ```
 
+//! # What "normal" looked like
+//!
+//! A score explains nothing on its own. [`FeatureBaseline`] carries a model's
+//! training-window distribution per feature — median centre, MAD spread —
+//! bound to the schema it was exported under, so the serving-side explainer
+//! (§20.2's "top contributing features") and the drift monitor (§20.5) measure
+//! *unusual* against the same reference instead of each keeping their own.
+//!
+mod baseline;
 mod registry;
 mod schema;
 mod stats;
@@ -70,6 +79,10 @@ mod vector;
 use alloy_primitives::B256;
 use detector_api::DetectionCtx;
 
+pub use baseline::{
+    BaselineError, BaselineSnapshot, Deviation, FeatureBaseline, FeatureStats, MAD_TO_SIGMA,
+    MAX_DEVIATION, MIN_SPREAD,
+};
 pub use registry::{current, extractor_for, VersionedExtractor};
 pub use schema::{FeatureDef, FeatureKind, FeatureSchema, FeatureVersion, Granularity};
 pub use v1::BlockFeatureView;

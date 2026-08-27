@@ -81,6 +81,23 @@ pub(crate) fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+/// Median absolute deviation about `center` (sorts its input in place, so it
+/// is caller-order independent); `0.0` on empty.
+///
+/// The robust twin of [`std_dev`], and the spread a [`crate::FeatureBaseline`]
+/// carries: on-chain feature columns are heavy-tailed, and one extreme sample
+/// inflates a standard deviation enough to hide every subsequent outlier
+/// behind it. A MAD is unmoved by up to half the samples being extreme.
+pub(crate) fn mad(values: &mut [f64], center: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    for value in values.iter_mut() {
+        *value = (*value - center).abs();
+    }
+    median(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +132,21 @@ mod tests {
         assert!((std_dev(&[1.0, 3.0]) - 1.0).abs() < 1e-12);
         assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median(&mut [4.0, 1.0, 2.0, 3.0]), 2.5);
+    }
+
+    #[test]
+    fn mad_is_robust_and_order_independent() {
+        // Absolute deviations about 3.0 are {2,1,0,1,2} → median 1.0 …
+        assert_eq!(mad(&mut [1.0, 2.0, 3.0, 4.0, 5.0], 3.0), 1.0);
+        // … and stay 1.0 when one sample explodes, which is the whole point.
+        assert_eq!(mad(&mut [1.0, 2.0, 3.0, 4.0, 1e12], 3.0), 1.0);
+        assert_eq!(
+            mad(&mut [5.0, 1.0, 4.0, 2.0, 3.0], 3.0),
+            mad(&mut [3.0, 2.0, 1.0, 5.0, 4.0], 3.0)
+        );
+        assert_eq!(mad(&mut [], 0.0), 0.0);
+        // A column that never varied has no spread at all.
+        assert_eq!(mad(&mut [7.0, 7.0, 7.0], 7.0), 0.0);
     }
 
     #[test]

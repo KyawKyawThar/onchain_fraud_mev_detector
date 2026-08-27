@@ -666,6 +666,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anomaly-detector"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "detector-api",
+ "events",
+ "inference",
+ "ml-features",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2568,6 +2583,7 @@ name = "detection"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anomaly-detector",
  "anyhow",
  "arb-detector",
  "async-trait",
@@ -2577,9 +2593,11 @@ dependencies = [
  "event-bus",
  "events",
  "flashloan-detector",
+ "inference",
  "liquidation-detector",
  "metrics",
  "metrics-util",
+ "ml-features",
  "poisoning-detector",
  "rayon",
  "rdkafka",
@@ -4528,6 +4546,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "strum",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1,0 +1,74 @@
+# Patched into every `component: detection` Deployment by the component's
+# kustomization. `metadata.name` is required syntactically and ignored — the
+# target selector decides what this applies to.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detection
+spec:
+  template:
+    spec:
+      # Kubernetes cannot mount an OCI image as a volume in stable APIs, so the
+      # bundle image is unpacked once, at pod start, into an emptyDir the
+      # detection container reads. The copy is cheap (tens of MB, node-local)
+      # and it happens before the app container starts — so a missing or
+      # unreadable bundle is an init failure with a clear message, not a
+      # half-started service.
+      initContainers:
+        - name: fetch-models
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/detection-models:latest
+          # `cp -R /models/.` copies the *contents*, so the paths inside the pod
+          # match the paths inside the image — which is what lets anomaly.json
+          # use one set of absolute paths in both places.
+          command: ["/bin/sh", "-c", "cp -R /models/. /mnt/models/"]
+          securityContext:
+            runAsUser: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: models
+              mountPath: /mnt/models
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      containers:
+        - name: detection
+          env:
+            # The one switch that turns ML detection on. Unset (the base) means
+            # the detector is linked but never constructed, and the service
+            # behaves exactly as it did before §20.2 landed.
+            #
+            # ORT_DYLIB_PATH is NOT set here: the image already carries it
+            # (deploy/Dockerfile, `onnx` runtime flavour), so where the runtime
+            # lives stays a property of the image rather than something every
+            # overlay has to keep in sync.
+            - name: DETECTION_ANOMALY_CONFIG
+              value: /models/anomaly.json
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          # Inference is CPU work on the < 1s fast path, running inside the
+          # scheduler's rayon fan-out (§17) — so the headroom that matters is
+          # cores, and the per-detector latency histogram (§19) is what these
+          # numbers should be tuned from, not guesswork. Memory grows with the
+          # ONNX session pool (`sessions` in anomaly.json): sessions are small
+          # for tree ensembles but not free, and the pool exists so inference
+          # doesn't serialise the fan-out.
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "3"
+              memory: 2Gi
+      volumes:
+        - name: models
+          emptyDir: {}

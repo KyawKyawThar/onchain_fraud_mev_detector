@@ -6,12 +6,22 @@
 # *out* by adding chains. Recreate avoids two instances briefly sharing the
 # group mid-rollout. The image must be built with FEATURES=detection/detectors
 # (see deploy/Dockerfile) or no built-in detectors are linked.
+#
+# The ML detector (§20.2) is linked into that image too but stays inert here:
+# it is constructed only when DETECTION_ANOMALY_CONFIG names a model bundle,
+# which the opt-in `components/anomaly-detection` overlay supplies. Base is
+# deliberately ML-free — no environment gets a model it did not ask for.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: detection-eth
   labels:
     app.kubernetes.io/name: detection-eth
+    # On the Deployment itself, not just the pod template: it is what the
+    # optional ML component (deploy/k8s/components/anomaly-detection) selects
+    # on, so a new per-chain instance picks that capability up by being
+    # labelled correctly rather than by being listed somewhere.
+    app.kubernetes.io/component: detection
 spec:
   replicas: 1
   strategy:
@@ -79,6 +89,11 @@ metadata:
   name: detection-base
   labels:
     app.kubernetes.io/name: detection-base
+    # On the Deployment itself, not just the pod template: it is what the
+    # optional ML component (deploy/k8s/components/anomaly-detection) selects
+    # on, so a new per-chain instance picks that capability up by being
+    # labelled correctly rather than by being listed somewhere.
+    app.kubernetes.io/component: detection
 spec:
   replicas: 1
   strategy:
