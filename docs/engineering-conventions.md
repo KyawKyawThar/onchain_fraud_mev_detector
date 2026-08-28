@@ -27,6 +27,7 @@ A change is "done" when:
 - [ ] **At-least-once + idempotent** — commit/ack only after a durable downstream write; dedup by a stable key.
 - [ ] **Observability is wired through the seam** — a span that propagates, a metric, both no-op until the binary opts in.
 - [ ] **A cross-cutting concern (timing, a span) is a wrapper + `_inner` split**, not a call scattered across every return site (§14).
+- [ ] **Monitoring code fails open *and* counts that it did** — `try_lock`, bounded queues, a `reason`-labelled counter for every dropped observation (§15).
 - [ ] **Config is resolved once at boot**, fail-fast.
 - [ ] **Supply chain is deliberate** — heavy deps pinned `default-features = false` with a comment; `just deny` clean.
 - [ ] **The gates pass locally** — `just check` green (local == CI).
@@ -370,6 +371,57 @@ outer) / `process_inner` (the resolve → simulate → publish logic);
 **Anti-pattern.** A function with a metric recorded at its single `Ok` return but not
 at its three early `Err` returns — the classic way a "detector run" counter and a
 "detector error" counter drift out of sync with each other.
+
+**Variant: when the thing being wrapped is a *seam*, wrap the trait, not the
+function.** [`inference::ObservedEngine`](../crates/inference/src/observe.rs) is an
+`InferenceEngine` that records and delegates. That is strictly stronger than the
+`_inner` split for the same cost: it observes *any* backend (so a future engine
+cannot ship unmeasured), it observes the test double too (so a consumer's tests
+assert on what the dashboard will show), and it cannot miss a call path, because
+the trait's methods are the only call paths there are. Compose it **once**, at the
+boot site that owns the value — wrapping is not idempotent, and a nested decorator
+compiles while double-counting.
+
+**Stacking two of them is an ordering decision, not a formality.** `DriftEngine`
+(§20.5) wraps `ObservedEngine`, not the reverse, because
+`model_inference_duration_seconds` is the number a latency budget is checked
+against and so must measure the work, not the work plus the bookkeeping. Rule of
+thumb: **the decorator whose measurement must stay pure goes innermost**, and the
+cost of the outer ones lands in whatever histogram is already measuring the caller
+— which is where a monitor that has grown too expensive should show up anyway.
+
+---
+
+## 15. A monitor fails open — and says that it did
+
+**Rule.** Observability code on a request/block path must never be the reason
+that path stops working: take locks with `try_lock`, recover from poisoning
+rather than latching off, bound any queue it accumulates into, and never
+propagate its own errors into the work it is watching. **Every one of those
+degradations gets a counter**, with a `&'static str` reason from a closed set.
+
+**Why here.** The two halves are one rule, and shipping only the first is the
+trap. Failing open is obvious and easy; failing open *silently* produces the
+worst possible artifact — a dashboard that is confidently wrong. A drift
+monitor that stopped monitoring, a lag reporter whose lock is poisoned, a
+metering sink whose queue is full: all three render identically to "everything
+is fine" unless the degradation is itself a signal. If the only evidence that a
+monitor died is that its graph went flat, nobody will notice, because a flat
+graph is also what healthy looks like.
+
+Corollary for alerting: a metric that can go *stale* needs a liveness rule
+beside it (`model_drift_windows_total` flat while `model_inference_vectors_total`
+climbs), because a gauge holding its last value looks exactly like a gauge
+reporting a steady state.
+
+**Reference.** [`inference::DriftEngine::observe`](../crates/inference/src/drift.rs)
+— `try_lock` over `lock`, poison recovery with the partial window discarded, a
+bounded pending queue that drops oldest, and `model_drift_skipped_total{model,
+reason}` counting `contended` / `poisoned` / `undrained`.
+
+**Anti-pattern.** `let Ok(guard) = mutex.lock() else { return; }` — correct
+about not panicking, silent about having given up, and permanent once the lock
+is poisoned.
 
 ---
 

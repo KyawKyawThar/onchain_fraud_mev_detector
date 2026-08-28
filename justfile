@@ -497,12 +497,23 @@ test:
 test-integration:
     cargo nextest run --workspace --run-ignored all --no-tests=pass
 
-# ── Backtest / precision-recall gate (§18) ────────────────────────
+# ── Backtest / precision-recall gates (§18, §20.2) ────────────────
 
-# Replay the ground-truth fixtures and fail if any detector regressed below
-# its committed baseline (crates/backtest/baseline.json) — the CI merge gate.
+# Replay the ground-truth fixtures and fail on either committed gate — the CI
+# merge gate. Two distinct checks (see crates/backtest/src/gate.rs):
+#   regression — nothing dropped below crates/backtest/baseline.json
+#   promotion  — nothing Active sits below crates/backtest/promotion_gate.json,
+#                and shadowed detectors clearing it are reported as promotable
 backtest:
     cargo run -p backtest --all-features --locked
+
+# Score a real ML model bundle (§20.2) alongside the heuristics: loads the
+# bundle through detection's own boot path and adds the ML fixtures, so the
+# promotion gate reports whether those weights have earned their way out of
+# Shadow. Needs the ONNX Runtime on ORT_DYLIB_PATH, like the service does.
+#   just backtest-ml out/bundle/anomaly.json
+backtest-ml config:
+    cargo run -p backtest --all-features --locked -- --anomaly-config {{config}}
 
 # Overwrite the committed baseline with this run's numbers — the deliberate
 # step a detector/config change that intentionally moves precision/recall

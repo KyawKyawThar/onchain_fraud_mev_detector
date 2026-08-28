@@ -36,6 +36,10 @@ pub struct FeatureFlags {
     overrides: BTreeMap<DetectorId, bool>,
 }
 
+/// Comma-separated detector ids to turn off entirely at boot — the
+/// disable-only runtime switch. See [`FeatureFlags::from_env`].
+pub const DISABLED_DETECTORS_ENV: &str = "DETECTION_DISABLED_DETECTORS";
+
 impl FeatureFlags {
     /// Every linked detector on unless explicitly disabled — the production
     /// default (a detector compiled in is meant to run).
@@ -55,6 +59,48 @@ impl FeatureFlags {
             default_enabled,
             overrides: BTreeMap::new(),
         }
+    }
+
+    /// [`all_enabled`](Self::all_enabled), then turn off every detector named
+    /// in `DISABLED_DETECTORS_ENV`.
+    ///
+    /// This module has documented itself as "the runtime on/off switch" since
+    /// Sprint 3 — a detector linked but turned off by config, no recompile —
+    /// and until now nothing read config: the service binary called
+    /// `all_enabled()` and the seam was a promise. This is the promise being
+    /// kept, deliberately in the same *disable-only* shape as
+    /// [`RolloutPolicy::with_env_demotions`](crate::model::RolloutPolicy::with_env_demotions)
+    /// and for the same reason. Turning a detector **off** is an incident
+    /// response and should need nothing but a config change; turning one **on**
+    /// that the build's own default left off is a claim about a detector's
+    /// readiness, and belongs in a reviewed diff.
+    ///
+    /// An id this build does not link is accepted and logged, not rejected: an
+    /// emergency lever must not turn a typo into a refused boot.
+    pub fn from_env() -> Self {
+        match std::env::var(DISABLED_DETECTORS_ENV) {
+            Ok(raw) => Self::all_enabled().disabling(&raw),
+            Err(_) => Self::all_enabled(),
+        }
+    }
+
+    /// The pure half of [`from_env`](Self::from_env).
+    #[must_use]
+    pub fn disabling(mut self, raw: &str) -> Self {
+        for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            // See `RolloutPolicy::with_demotions` for why the leak is bounded
+            // and deliberate: `DetectorId` wraps a `&'static str`, and this
+            // runs once at boot over a handful of operator-supplied ids.
+            let id = DetectorId::new(String::leak(id.to_owned()));
+            tracing::warn!(
+                detector = %id,
+                "{DISABLED_DETECTORS_ENV} disables this detector — it will not run at all \
+                 (§6). To keep it running but stop its customer-facing alerts, shadow it \
+                 with DETECTION_SHADOW_DETECTORS instead."
+            );
+            self.overrides.insert(id, false);
+        }
+        self
     }
 
     /// Force `id` on, overriding the default. Chainable.

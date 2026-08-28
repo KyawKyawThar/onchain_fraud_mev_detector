@@ -13,6 +13,10 @@ publish.workspace = true
 # feature for the same `CtxBuilder` fixture-building helpers the detectors' own
 # regression tests use — a fixture here is built the same way, just replayed
 # through the whole roster instead of one detector in isolation.
+#
+# It is also where the §20.2 rollout gate lives: the promotion floor a detector
+# must clear to leave `Shadow`, evaluated against the same `RolloutPolicy` the
+# service applies (Sprint 18 t5).
 
 [[bin]]
 name = "backtest"
@@ -30,10 +34,27 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
 
+[features]
+default = []
+# Score the ML detector (§20.2) alongside the heuristics: links `detection`'s
+# own ML boot path so `--anomaly-config` can load a real model bundle. Off by
+# default for the same reason it is off in `detection` — it costs an ONNX
+# Runtime at *run* time (`ort` is loaded dynamically), and a machine with no
+# model artifacts has no use for it. CI's `--all-features` build links it; the
+# flag stays unused unless a bundle is passed.
+anomaly = ["detection/anomaly"]
+
 [dev-dependencies]
 # Snapshot test for the full report (see tests/baseline_snapshot.rs) — a
 # dev-review signal alongside, not instead of, the baseline.rs merge gate.
 insta = { workspace = true }
+# The ML rollout path (tests/ml_rollout.rs): a real `AnomalyDetector` behind
+# `inference`'s `StubEngine`, so the boot-constructed-detector wiring, the ML
+# fixture and the promotion gate are proven together — with no ONNX Runtime
+# anywhere near the test binary (see that file's docs for why that matters).
+anomaly-detector = { workspace = true }
+inference = { workspace = true, features = ["test-util"] }
+ml-features = { workspace = true }
 
 [lints]
 workspace = true

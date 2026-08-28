@@ -47,7 +47,9 @@ pub enum Granularity {
 }
 
 impl Granularity {
-    pub(crate) fn as_str(self) -> &'static str {
+    /// The wire form (`"block"`, `"tx"`) — the same string a model config,
+    /// a dataset manifest and a drift record all name a granularity with.
+    pub fn as_str(self) -> &'static str {
         match self {
             Granularity::Block => "block",
             Granularity::Tx => "tx",

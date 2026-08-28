@@ -111,3 +111,112 @@ groups:
         annotations:
           summary: "Block → notification latency (p95) is elevated"
           description: "notification_alert_end_to_end_seconds p95 has been above 30s for 10m — the §19 headline end-to-end panel. Placeholder threshold; tune once a real customer-facing SLA is set."
+
+  # ── Model serving + governance (§17, §20.2, §20.5; Sprint 18 t5) ──────
+  #
+  # These only produce series in a deployment that has an ML bundle mounted
+  # (`DETECTION_ANOMALY_CONFIG`); in a heuristic-only cluster every rule below
+  # is silent, which is correct — there is no model to govern.
+  - name: mevwatch-model-governance
+    rules:
+      # Recording rule, not an alert: hit rate is *derived* (hits / runs) rather
+      # than stored, because a ratio computed from two monotonic counters
+      # survives restarts and re-aggregates across instances where a gauge
+      # wouldn't (see detection::metrics). Recording it once here means the
+      # dashboard, the alerts below and any ad-hoc query all read the same
+      # definition instead of three hand-written divisions.
+      - record: detector:hit_rate:ratio_rate1h
+        expr: |
+          sum by (detector, version) (rate(detector_hits_total[1h]))
+          /
+          clamp_min(sum by (detector, version) (rate(detector_runs_total[1h])), 1e-9)
+
+      - alert: DetectorLatencyBudgetExceeded
+        expr: |
+          histogram_quantile(0.99,
+            sum by (detector, le) (rate(detector_detect_duration_seconds_bucket[5m]))
+          ) > 0.25
+        for: 10m
+        labels:
+          severity: informational
+        annotations:
+          summary: "{{ $labels.detector }} p99 detect latency is eating the fast-path budget"
+          description: "One detector's p99 has been above 250ms for 10m. The §6 SLO is <1s for the *whole* block → alert path, and every detector in the roster runs on it, so a single detector at a quarter of the budget is the early warning that FastPathLatencyHigh is coming. For the ML detector this is the §20.2 inference budget — cross-check model_inference_duration_seconds. Threshold is a share-of-budget judgement, not a measured baseline; tune with the roster size."
+
+      - alert: ModelServingSkew
+        expr: sum(rate(model_drift_rejected_total[15m])) by (model) > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.model }} is being served feature vectors its baseline cannot describe"
+          description: "model_drift_rejected_total is increasing: the drift monitor is refusing vectors whose feature_version/granularity/arity don't match the training snapshot bound to this model (§20.5 serving/training skew). This is a wiring bug, not a data condition — the boot-time skew check passed, so something is feeding this model the wrong vectors. Any anomaly evidence produced in this window is measured against the wrong distribution."
+
+      - alert: ModelInferenceFailing
+        expr: |
+          sum by (model, reason) (rate(model_inference_failures_total[10m]))
+          /
+          clamp_min(sum by (model) (rate(model_inference_calls_total[10m])), 1e-9) > 0.01
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.model }} inference is failing ({{ $labels.reason }})"
+          description: "More than 1% of seam calls to {{ $labels.model }} have failed for 10m with reason={{ $labels.reason }}. Every InferenceErrorKind is *permanent* for the input that caused it, so this is not a retry backlog — the detector is silently skipping those candidates (it never fabricates a score). `skew` is a wiring bug; `backend` points at the ONNX Runtime or a poisoned session; `malformed_output`/`score` mean the artifact does not match the output mapping the config declares."
+
+      # The threshold is NOT a literal here. Each deployment sets its own in
+      # `anomaly.json`, and the service exports it as `model_drift_threshold` so
+      # these rules compare against the number the model was actually judged by
+      # (`inference::metrics::DRIFT_THRESHOLD`). A hard-coded `> 3` would be a
+      # second definition of the same policy — wrong for any model that tuned
+      # its own, and silently stale the moment someone changes the default.
+      # Both sides are aggregated by model first, so several replicas of the
+      # detection service don't turn this into a many-to-many join.
+      - alert: ModelFeatureDriftHigh
+        expr: |
+          max by (model, feature) (model_feature_drift)
+          > on(model) group_left
+          max by (model) (model_drift_threshold)
+        for: 30m
+        labels:
+          severity: informational
+        annotations:
+          summary: "{{ $labels.model }}: feature {{ $labels.feature }} has drifted from its training snapshot"
+          description: "The serving-time distribution of {{ $labels.feature }} has sat past this deployment's drift threshold for 30m — its median has moved that many training spreads, or its variance has changed by e^that (see ml_features::drift). §20.5's point is that this is visible *before* precision decays: check the §18 backtest numbers for this model and consider a retrain on a recent window. The durable record is the `ModelDriftDetected` event in the event store, which names the exact (id, version, config_hash) triple that was serving."
+
+      - alert: ModelFeatureDriftSevere
+        expr: |
+          max by (model) (model_drift_max)
+          > on(model)
+          (max by (model) (model_drift_threshold) * 2.5)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.model }} is serving on a distribution it was not trained for"
+          description: "This model's worst feature has been more than 2.5x its own drift threshold for 15m — far outside ordinary traffic variation, and heading for the ±32 clamp where a reading saturates. Its scores are no longer measured against a population it has seen, so its precision/recall no longer mean what the registry says they do. Treat as a rollback candidate: a retrained model is a new registry version walking the same Shadow → backtest → Live gate (§20.5), so the fast path here is `deprecated_at` on the current version, not a hot-swap. The multiplier scales with whatever each deployment configured, so this stays 'well past your own line' rather than an absolute nobody tuned."
+
+      # ── Monitoring the monitor ───────────────────────────────────────
+      # A drift monitor that has stopped reporting looks exactly like a model
+      # with no drift: the gauges simply hold their last value. These two rules
+      # are the difference.
+      - alert: ModelDriftMonitoringSilent
+        expr: |
+          sum by (model) (rate(model_inference_vectors_total[1h])) > 0
+          unless
+          sum by (model) (rate(model_drift_windows_total[1h])) > 0
+        for: 2h
+        labels:
+          severity: informational
+        annotations:
+          summary: "{{ $labels.model }} is serving but publishing no drift readings"
+          description: "This model has scored vectors for an hour without closing a single drift window (§20.5). Expected briefly after a deploy and on a very low-traffic chain — a window needs ml_features::MIN_WINDOW samples before it will report at all, even past its age bound. Sustained for 2h it means monitoring is effectively off: check that `drift.disabled` isn't set in anomaly.json, and check model_drift_skipped_total."
+
+      - alert: ModelDriftObservationsDropped
+        expr: sum by (model, reason) (rate(model_drift_skipped_total[30m])) > 0
+        for: 30m
+        labels:
+          severity: informational
+        annotations:
+          summary: "{{ $labels.model }} drift observations are being dropped ({{ $labels.reason }})"
+          description: "The monitor is failing open — by design, it must never block the fast path — but it is losing data. `contended`: the accumulator lock was held, which today's one-block-at-a-time scheduler should make impossible, so this means the concurrency model changed. `poisoned`: something panicked inside the accumulator; the partial window was discarded and it recovered, but the panic is a bug. `undrained`: readings were evicted before the scheduler drained them, so `ModelDriftDetected` events are being lost."

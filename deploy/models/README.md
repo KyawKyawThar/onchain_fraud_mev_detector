@@ -30,6 +30,7 @@ iforest-baseline.json
   "detector": { "novelty_min_score": 0.93 },
   "supervised": {
     "baseline": "/models/gbdt-baseline.json",
+    "drift": { "window": 512, "max_age_seconds": 900, "threshold": 3.0 },
     "model": {
       "model_id": "anomaly-gbdt",
       "artifact_path": "/models/gbdt.onnx",
@@ -55,6 +56,36 @@ iforest-baseline.json
 
 Both halves are optional — a deployment may serve only the novelty model — but
 naming neither is a refused boot rather than a silently inert detector.
+
+`drift` is optional too, and an omitted section means **monitored with the
+shipped defaults**, not off (§20.5). A model's serving-time feature
+distribution is compared against the very baseline above, and anything past
+`threshold` is logged, counted, and published as a `ModelDriftDetected` event
+naming the exact `(id, version, config_hash)` triple that was serving. Turning
+it off takes saying so: `"drift": {"disabled": true}`.
+
+The same baseline file does double duty — it is what an anomaly finding's "top
+contributing features" are measured against *and* what drift is measured
+against — which is why re-deriving one changes the deployment's `config_hash`.
+
+The two window bounds answer different questions and you set both:
+
+| field | default | what it decides |
+|---|---|---|
+| `window` | 512 vectors | how **good** a reading is — the sample size behind the median and MAD |
+| `max_age_seconds` | 900 | how **soon** there is one — a partly-filled window reports anyway once it has at least 32 samples |
+
+The age bound is not a nicety. At one block-level vector per block, 512 vectors
+is roughly 100 minutes of Ethereum, so a count-only monitor is blind for the
+first hour and a half after every deploy — exactly when new weights are most
+likely to be wrong. A model too quiet to reach 32 samples inside `max_age`
+keeps accumulating rather than publishing statistics over a handful of points;
+that shows up as a flat `model_drift_windows_total`, which
+`ModelDriftMonitoringSilent` alerts on.
+
+`threshold` is exported as `model_drift_threshold{model}`, and the alert rules
+compare against that gauge rather than a literal — so tuning it here reaches
+the alerts without a Prometheus change.
 
 You do not have to write this by hand — [`deploy/training`](../training/)
 generates it, reading the values off the artifact it just exported. Three

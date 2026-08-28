@@ -69,7 +69,15 @@
 //! (§20.2's "top contributing features") and the drift monitor (§20.5) measure
 //! *unusual* against the same reference instead of each keeping their own.
 //!
+//! [`DriftMonitor`] is that second consumer: it folds the vectors a model is
+//! actually served into per-feature robust statistics and reports how far the
+//! serving distribution has moved from the training snapshot — the §20.5
+//! signal that is visible *before* precision decays. It measures against the
+//! very same [`FeatureBaseline`] the explanations are written from, which is
+//! the point of both living here.
+//!
 mod baseline;
+mod drift;
 mod registry;
 mod schema;
 mod stats;
@@ -82,6 +90,10 @@ use detector_api::DetectionCtx;
 pub use baseline::{
     BaselineError, BaselineSnapshot, Deviation, FeatureBaseline, FeatureStats, MAD_TO_SIGMA,
     MAX_DEVIATION, MIN_SPREAD,
+};
+pub use drift::{
+    DriftMonitor, DriftReport, FeatureDrift, WindowClose, DEFAULT_MAX_AGE, DEFAULT_WINDOW,
+    MIN_WINDOW, MIN_WINDOW_SPREAD,
 };
 pub use registry::{current, extractor_for, VersionedExtractor};
 pub use schema::{FeatureDef, FeatureKind, FeatureSchema, FeatureVersion, Granularity};

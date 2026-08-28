@@ -3,7 +3,7 @@
 //! screening access-audit trail (§11).
 
 use crate::intelligence::RiskFactor;
-use crate::primitives::{AccountAddress, CustomerId};
+use crate::primitives::{AccountAddress, CustomerId, DetectorRef};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -158,4 +158,90 @@ mod tests {
             "event_processed"
         );
     }
+}
+
+/// A deployed model's serving-time feature distribution has moved away from the
+/// training snapshot it was exported with (§20.5).
+///
+/// # Why this is an event and not only a gauge
+///
+/// Drift already exports metrics, and a metric answers "is it drifting now?".
+/// This answers the questions a metric structurally cannot: *which weights*
+/// were serving when it drifted, what the distribution looked like at the time,
+/// and — months later, during an audit of an incident those weights produced —
+/// whether anyone could have known. Prometheus retention is days; the event
+/// store is the audit trail (§4). §20.5 asks for drift to "flag the model
+/// version"; the durable, queryable flag is this record, keyed by the exact
+/// `(id, version, config_hash)` triple the model's findings were stamped with.
+///
+/// # Emitted per completed window, not per breach
+///
+/// One event when a window closes with at least one feature past the
+/// deployment's threshold — not one per drifted feature, and nothing at all for
+/// a quiet window. A drifted model usually moves several correlated features at
+/// once, so per-feature events would multiply one condition into a burst that
+/// buries the rest of the stream; and a quiet window is the normal case, which
+/// has no business in an audit log.
+///
+/// # Wire types, not `ml-features` types
+///
+/// `feature_version`, `granularity` and `window_closed_by` are a `u32` and two
+/// `String`s rather than the richer types the drift monitor works in. This
+/// crate is the schema everything else depends on, so it cannot depend on
+/// `ml-features` — and shouldn't: a consumer built against an older schema must
+/// still deserialize a newer producer's payload (§2), which a closed enum on
+/// the wire would break the first time a `FEATURE_VERSION` or a window policy
+/// gained a variant. The producer converts at the boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ModelDriftDetected {
+    /// The served model, as its descriptor names it (`anomaly-iforest`).
+    pub model_id: String,
+    /// The detector build serving it — the same `(id, version, config_hash)`
+    /// triple its `DetectorTriggered`s carry, which is what makes this record
+    /// joinable to the findings produced under the drifted distribution.
+    pub detector: DetectorRef,
+    /// The feature schema the observed vectors were extracted under.
+    pub feature_version: u32,
+    /// `"block"` or `"tx"`.
+    pub granularity: String,
+    /// Content hash of the training snapshot drift was measured against —
+    /// re-deriving a baseline changes what "normal" means, so a reading is only
+    /// interpretable against the one it used.
+    pub baseline_hash: String,
+    /// Vectors in the window behind these numbers.
+    pub samples: u64,
+    /// `"full"` (reached its configured vector count) or `"aged"` (hit the
+    /// latency bound with fewer). An aged window is a real reading over a
+    /// smaller sample, and a reader should weigh it accordingly.
+    pub window_closed_by: String,
+    /// The deployment's breach threshold at the time, so a historical record
+    /// stays interpretable after someone retunes it.
+    pub threshold: f64,
+    /// The worst feature's magnitude — including features *below* the
+    /// threshold, so this is the honest headline number and not just the max of
+    /// what happened to breach.
+    pub max_magnitude: f64,
+    /// The features at or past `threshold`, worst first. Only the breached
+    /// ones: the full vector is on the gauges, and an audit record wants the
+    /// finding, not the raw telemetry.
+    pub drifted: Vec<DriftedFeature>,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// One feature's drift, as carried on [`ModelDriftDetected`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DriftedFeature {
+    /// The schema's own name for it (`tx_count_log`), so a reader can look it
+    /// up in the frozen feature schema for that `feature_version`.
+    pub feature: String,
+    /// `max(|shift|, |ln spread|)` — the number compared against the threshold.
+    pub magnitude: f64,
+    /// Median deviation across the window, in training spreads. Positive means
+    /// the serving window sits above where training did.
+    pub shift: f64,
+    /// The window's own spread, relative to training's. `1.0` is unchanged;
+    /// below `1` the feature has collapsed, above it has fanned out.
+    pub spread: f64,
 }

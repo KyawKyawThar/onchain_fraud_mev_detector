@@ -42,7 +42,8 @@ tracing = { workspace = true }
 # call site `ObservedEngine` owns. A near-free no-op until the *binary*
 # installs the Prometheus exporter (`telemetry::metrics::init`), so this
 # library — and its tests, replay and backtests — stays exporter-agnostic
-# (conventions §8). The score histogram is also t5's cheapest drift signal.
+# (conventions §8). The score histogram is the cheapest drift signal; the
+# per-feature §20.5 gauges `DriftEngine` publishes sit on top of it.
 metrics = { workspace = true }
 # SHA-256 over the model artifact — "weights are config" (§20.2): the digest is
 # folded into the registry `config_hash`, so it is an audit identifier where

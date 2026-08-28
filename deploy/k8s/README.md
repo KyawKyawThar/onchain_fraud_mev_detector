@@ -173,7 +173,7 @@ APIs, so the initContainer is the portable form of "the model is an immutable,
 tagged artifact" — and it means a missing or malformed bundle is an *init*
 failure with a clear message rather than a half-started service.
 
-Three properties worth knowing before you enable it:
+Five properties worth knowing before you enable it:
 
 - **The bundle image tag is the model version.** Rollback is editing it back.
   There is deliberately no hot-swap path (§20.5): a retrained model is a new
@@ -185,6 +185,29 @@ Three properties worth knowing before you enable it:
   raises no customer-facing alert until the backtest gate promotes it in
   `main.rs`. Enabling the component does not put ML findings in front of a
   customer.
+- **A deployed model is watched, not just served — and the watching is
+  auditable.** The serving-time feature distribution is compared against the
+  training snapshot shipped in the bundle (§20.5), exported as
+  `model_feature_drift{model,feature}` / `model_drift_max{model}`, *and*
+  published as a `ModelDriftDetected` event naming the exact `(id, version,
+  config_hash)` triple that was serving — so months later an incident review
+  can ask which weights were live and whether anyone could have known, which a
+  gauge with a few days' retention cannot answer. `ModelFeatureDriftSevere` and
+  `ModelServingSkew` page; the *Model serving & drift* dashboard is provisioned
+  with the rest. Monitoring is on by default — an omitted `drift` section means
+  the shipped defaults, and turning it off takes writing
+  `"drift": {"disabled": true}`. The response to sustained drift is the same as
+  to any bad model: a new bundle tag, or `deprecated_at` on this version. There
+  is no runtime flag to flip.
+- **Two emergency levers, both one-way.** `DETECTION_SHADOW_DETECTORS` forces a
+  detector to `Shadow` (it still runs and is recorded, but raises no
+  customer-facing alert); `DETECTION_DISABLED_DETECTORS` stops one running at
+  all. Neither can *promote* or enable, deliberately: quieting a
+  misbehaving detector should need nothing but a config change and a restart,
+  while making one customer-facing is a claim about evidence that belongs in a
+  reviewed diff with a backtest run in it (§20.2). Unknown ids are logged and
+  ignored rather than refusing the boot — an emergency lever must not turn a
+  typo into an outage.
 - **Bad bundles fail before they deploy, if you let them.** Run
   `detection check-models <path>` (or `just check-models`) against the bundle in
   CI: it is the same loader boot uses — artifact digests, pinned-digest check,

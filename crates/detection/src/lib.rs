@@ -67,6 +67,15 @@
 
 pub mod boot;
 pub mod config;
+/// Turning §20.5 drift readings into `ModelDriftDetected` events — the
+/// publishing half of the drift monitor, in the layer that owns an `EventSink`.
+///
+/// Behind the `anomaly` feature with the rest of the ML wiring: a build with no
+/// models to serve links neither `inference` nor `ml-features`, and has nothing
+/// to publish. The scheduler stays feature-agnostic regardless — it takes a
+/// [`scheduler::BlockBoundaryEvents`], not a drift publisher.
+#[cfg(feature = "anomaly")]
+pub mod drift;
 pub mod emit;
 pub mod flags;
 pub mod metrics;
@@ -88,14 +97,17 @@ pub use detector_api::{
 };
 
 pub use boot::{link_builtin_roster, link_roster};
+#[cfg(feature = "anomaly")]
+pub use drift::DriftPublisher;
 pub use emit::{
     detector_triggered, implicated_addresses, preliminary_alert, DetectionPlan, UnlinkedDetector,
 };
-pub use flags::FeatureFlags;
+pub use flags::{FeatureFlags, DISABLED_DETECTORS_ENV};
 pub use model::{
     default_performance_store_path, load_performance_store, save_performance_store, ConfigHash,
     LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder, ModelRegistryError,
     Performance, PerformanceRecord, PerformanceStore, PerformanceStoreError, RolloutPolicy,
+    SHADOW_DETECTORS_ENV,
 };
 pub use registry::{
     register_builtins, register_builtins_with, register_cross_block_builtins, Registry,
@@ -104,5 +116,5 @@ pub use registry::{
 pub use reorg::{
     apply_reverts, CrossBlockSlot, CrossBlockStates, ReorgRewind, Rewindable, RosterRewind,
 };
-pub use scheduler::{BlockEvent, Scheduler};
+pub use scheduler::{BlockBoundaryEvents, BlockEvent, Scheduler};
 pub use state::CrossBlockState;

@@ -221,7 +221,124 @@ impl RolloutPolicy {
             .copied()
             .unwrap_or(LifecycleStatus::Active)
     }
+
+    /// [`status_of`](Self::status_of) for a detector named by a wire string.
+    ///
+    /// A [`DetectorId`] wraps a `&'static str` — a detector *build* names
+    /// itself with a compile-time constant — but a `DetectorTriggered`'s
+    /// `detector.id` came off the wire, and so does a backtest report's key.
+    /// This is the one adapter, so a consumer holding a `String` does not
+    /// have to leak the `'static` requirement (or, worse, `Box::leak` its way
+    /// around it).
+    pub fn status_of_name(&self, id: &str) -> LifecycleStatus {
+        self.overrides
+            .iter()
+            .find(|(key, _)| key.as_str() == id)
+            .map_or(LifecycleStatus::Active, |(_, status)| *status)
+    }
+
+    /// Every detector this policy stages away from `Active`, in id order.
+    ///
+    /// The rollout gate reads this: "which detectors are currently held back,
+    /// and have they earned promotion?" is a question about the *overrides*,
+    /// and enumerating them beats asking [`status_of`](Self::status_of) about
+    /// a roster the caller would have to already know.
+    pub fn staged(&self) -> impl Iterator<Item = (DetectorId, LifecycleStatus)> + '_ {
+        self.overrides.iter().map(|(id, status)| (*id, *status))
+    }
+
+    /// **The** shipped rollout staging (§6, §18, §20.2) — the one place the
+    /// live service's Shadow list is declared.
+    ///
+    /// It lives here rather than in `main.rs` for the same reason
+    /// [`link_builtin_roster`](crate::boot::link_builtin_roster) does: a
+    /// second reader arrived. The backtest harness's promotion gate (§18,
+    /// Sprint 18 t5) reports whether a *staged* detector has earned its way
+    /// to `Active`, which is meaningless if it is reading a different staging
+    /// than the service applies. Two hand-maintained lists would agree right
+    /// up until the release where it mattered.
+    ///
+    /// A detector on this list runs and is scored, and its `DetectorTriggered`
+    /// is recorded so backtests and metrics see it, but no customer-facing
+    /// alert is raised. **Promote one by deleting its line**, once
+    /// `cargo run -p backtest` reports it as clearing the committed gate.
+    ///
+    /// `anomaly` (§20.2) is on this list for the same reason as the rest, and
+    /// that sameness is deliberate: an ML detector walks Shadow → backtest
+    /// gate → Live like any heuristic change, with no special path around the
+    /// gates. It is also the detector where shadowing matters most — its
+    /// evidence names no known pattern, so a false positive is expensive to
+    /// explain.
+    pub fn builtin() -> Self {
+        Self::new()
+            .shadow(DetectorId::new("flashloan"))
+            .shadow(DetectorId::new("liquidation"))
+            .shadow(DetectorId::new("rugpull"))
+            .shadow(DetectorId::new("wash-trading"))
+            .shadow(DetectorId::new("address-poisoning"))
+            .shadow(DetectorId::new("anomaly"))
+    }
+
+    /// Apply **demotion-only** overrides from `DETECTION_SHADOW_DETECTORS`
+    /// (comma-separated detector ids) on top of this policy.
+    ///
+    /// # Why only demotions
+    ///
+    /// The obvious design is a general per-environment override — promote in
+    /// staging, shadow in prod, no rebuild. It is the wrong one, and the
+    /// asymmetry is the entire point:
+    ///
+    /// - **Demotion is an incident response.** A detector melting down at 03:00
+    ///   should be shadowable by whoever is awake, from a config change, in
+    ///   seconds. Requiring a merge and a rebuild for that is how a bad
+    ///   detector stays live for an hour.
+    /// - **Promotion is a claim about evidence.** §20.2's rollout is Shadow →
+    ///   *backtest gate* → Live. An env var that could promote would be a path
+    ///   around the gate — exactly the thing "ML gets no special path" forbids,
+    ///   and it would be available to every heuristic detector too. So the only
+    ///   way to make something customer-facing stays a reviewed diff to
+    ///   [`builtin`](Self::builtin), with `cargo run -p backtest` in the PR.
+    ///
+    /// A safety valve that can only make the system quieter, never louder.
+    /// Unknown ids are accepted rather than rejected: this is an emergency
+    /// lever, and refusing to boot because someone shadowed a detector that
+    /// this build does not link would turn a typo into an outage. It is logged.
+    #[must_use]
+    pub fn with_env_demotions(self) -> Self {
+        match std::env::var(SHADOW_DETECTORS_ENV) {
+            Ok(raw) => self.with_demotions(&raw),
+            Err(_) => self,
+        }
+    }
+
+    /// The pure half of [`with_env_demotions`](Self::with_env_demotions), so
+    /// the parsing is testable without touching the process environment.
+    #[must_use]
+    pub fn with_demotions(mut self, raw: &str) -> Self {
+        for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            // Leaked because `DetectorId` wraps a `&'static str` — a detector
+            // build names itself with a compile-time constant. This runs once
+            // at boot over a handful of operator-supplied ids, so the leak is
+            // bounded by the config file and lives as long as the process would
+            // have kept the string anyway.
+            let id = DetectorId::new(String::leak(id.to_owned()));
+            tracing::warn!(
+                detector = %id,
+                "{SHADOW_DETECTORS_ENV} demotes this detector to Shadow — its evidence is \
+                 recorded but raises no customer-facing alert (§6). Promotion is not \
+                 available here: it is a reviewed change to RolloutPolicy::builtin, gated \
+                 on the backtest (§20.2)."
+            );
+            self.overrides.insert(id, LifecycleStatus::Shadow);
+        }
+        self
+    }
 }
+
+/// Comma-separated detector ids to force to `Shadow` at boot — the
+/// demotion-only safety valve. See
+/// [`RolloutPolicy::with_env_demotions`].
+pub const SHADOW_DETECTORS_ENV: &str = "DETECTION_SHADOW_DETECTORS";
 
 /// A detector build's track record (§6) — either unscored or fully scored,
 /// never half.

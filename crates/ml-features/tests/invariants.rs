@@ -139,6 +139,108 @@ fn the_golden_tx_vector_is_frozen() {
     insta::assert_snapshot!("golden_tx_vector", render(&v));
 }
 
+/// The §20.5 drift statistic, frozen.
+///
+/// Not a nicety. Every deployed drift threshold, every alert rule and every
+/// `ModelDriftDetected` in the event store is denominated in the units
+/// `FeatureDrift::magnitude` returns. Retuning that formula — a different fold
+/// of shift and spread, a different clamp, a different floor — would silently
+/// change what all of them mean, with nothing failing to catch it. This is the
+/// test that fails.
+///
+/// Three windows over one baseline: the training distribution replayed (must
+/// read exactly zero), a pure location shift, and a collapsed feature. Reviewing
+/// a change to the snapshot is reviewing the numbers, which is the point.
+#[test]
+fn the_drift_statistic_is_frozen() {
+    use ml_features::{DriftMonitor, FeatureBaseline, MIN_SPREAD};
+    use std::time::Duration;
+
+    // Nine blocks of varying shape, four copies each — an exact multiple, so
+    // the window reproduces the sample distribution rather than truncating it.
+    let samples: Vec<FeatureVector> = (1..=9u8)
+        .map(|n| {
+            let mut b = CtxBuilder::new()
+                .priced_token(addr_b(0xAA), 18, 2000.0)
+                .priced_token(addr_b(0xBB), 18, 1.0)
+                .pool(addr_b(0xCC), addr_b(0xAA), addr_b(0xBB), 1_000, 1_000);
+            for i in 0..n {
+                b = b.tx(
+                    hash_b(n * 16 + i),
+                    addr_b(i),
+                    vec![swap(
+                        addr_b(0xCC),
+                        addr_b(0xAA),
+                        addr_b(0xBB),
+                        u128::from(i + 1) * 1_000_000_000_000_000_000,
+                        u128::from(n) * 90,
+                    )],
+                );
+            }
+            extract_block(&b.build())
+        })
+        .collect();
+    let baseline = FeatureBaseline::from_samples(&samples).expect("uniform block vectors");
+    let moved = baseline
+        .stats()
+        .iter()
+        .position(|s| s.spread > MIN_SPREAD)
+        .expect("a feature that varied in training");
+
+    let with = |transform: &dyn Fn(&FeatureVector) -> FeatureVector| -> String {
+        let window: Vec<FeatureVector> = samples
+            .iter()
+            .map(transform)
+            .flat_map(|v| std::iter::repeat_n(v, 4))
+            .collect();
+        let mut monitor = DriftMonitor::new(baseline.clone(), 36, Duration::from_secs(86_400));
+        let report = monitor
+            .observe_all(&window)
+            .pop()
+            .expect("36 vectors close one window");
+        report
+            .features
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} shift={:.6} spread={:.6} magnitude={:.6}\n",
+                    f.name(),
+                    f.shift,
+                    f.spread,
+                    f.magnitude()
+                )
+            })
+            .collect()
+    };
+
+    let rebuild = |v: &FeatureVector, values: Vec<f64>| -> FeatureVector {
+        serde_json::from_value(serde_json::json!({
+            "feature_version": v.feature_version(),
+            "granularity": v.granularity(),
+            "values": values,
+        }))
+        .expect("a well-formed vector")
+    };
+
+    insta::assert_snapshot!("drift_quiet", with(&|v| v.clone()));
+    insta::assert_snapshot!(
+        "drift_shifted",
+        with(&|v| {
+            let mut values = v.values().to_vec();
+            values[moved] += 2.0 * baseline.stats()[moved].spread;
+            rebuild(v, values)
+        })
+    );
+    insta::assert_snapshot!(
+        "drift_collapsed",
+        with(&|v| {
+            let mut values = v.values().to_vec();
+            values[moved] = baseline.stats()[moved].center;
+            rebuild(v, values)
+        })
+    );
+}
+
 // ── 2 + 3. Property tests over arbitrary blocks ──────────────────────────────
 
 fn addr_b(byte: u8) -> Address {

@@ -232,11 +232,42 @@ impl FeatureBaseline {
             && features.values().len() == self.stats.len()
     }
 
+    /// The bare clamped z-scores of `features`, in schema order, written into
+    /// `out` — the allocation-free half of [`deviations`](Self::deviations).
+    ///
+    /// `false` (leaving `out` untouched) iff [`accepts`](Self::accepts) is
+    /// false. `out` is cleared first, so a caller keeps one buffer for the
+    /// process's life.
+    ///
+    /// This exists because the drift monitor observes *every* served vector
+    /// and needs only the numbers, while an explanation is built rarely and
+    /// wants the names and training statistics alongside them. Both go through
+    /// the same [`deviation`] arithmetic — the buffer is the only difference,
+    /// so there is still exactly one definition of "how far is this from
+    /// normal" (which is the whole reason this type has two consumers).
+    pub fn fill_deviations(&self, features: &FeatureVector, out: &mut Vec<f64>) -> bool {
+        if !self.accepts(features) {
+            return false;
+        }
+        out.clear();
+        out.extend(
+            features
+                .values()
+                .iter()
+                .zip(&self.stats)
+                .map(|(&value, &stats)| deviation(value, stats)),
+        );
+        true
+    }
+
     /// How far each of `features`'s values sits from the training window, in
     /// schema order — the raw material an explanation ranks.
     ///
     /// `None` iff [`accepts`](Self::accepts) is false. Every yielded
     /// `deviation` is finite and within `±`[`MAX_DEVIATION`].
+    ///
+    /// Allocates. A caller on the per-vector hot path wants
+    /// [`fill_deviations`](Self::fill_deviations) instead.
     pub fn deviations(&self, features: &FeatureVector) -> Option<Vec<Deviation>> {
         if !self.accepts(features) {
             return None;

@@ -34,6 +34,7 @@
 //!   "detector": { "novelty_min_score": 0.93 },
 //!   "supervised": {
 //!     "baseline": "/models/gbdt-baseline.json",
+//!     "drift": { "window": 512, "max_age_seconds": 900, "threshold": 3.0 },
 //!     "model": {
 //!       "model_id": "anomaly-gbdt",
 //!       "artifact_path": "/models/gbdt.onnx",
@@ -65,7 +66,7 @@ use std::sync::Arc;
 use anomaly_detector::{AnomalyConfig, AnomalyDetector, ModelSlot};
 use detector_api::DetectorPlugin;
 use inference::onnx::{OrtConfig, OrtEngine};
-use inference::{InferenceEngine, ObservedEngine};
+use inference::{DriftConfig, DriftEngine, DriftSource, InferenceEngine, ObservedEngine};
 use ml_features::{BaselineSnapshot, FeatureBaseline};
 use serde::{Deserialize, Serialize};
 
@@ -82,8 +83,15 @@ pub struct ModelDeployment {
     pub model: OrtConfig,
     /// Path to the [`BaselineSnapshot`] JSON exported by the training run that
     /// produced `model` — the distribution its "top contributing features" are
-    /// measured against.
+    /// measured against, and the training snapshot the §20.5 drift monitor
+    /// compares serving-time vectors to.
     pub baseline: PathBuf,
+    /// Drift monitoring for this model (§20.5). Absent means monitored with
+    /// the shipped defaults — an omitted section must not be a quiet way to
+    /// stop watching a model, so turning it off takes an explicit
+    /// `"drift": {"disabled": true}`.
+    #[serde(default)]
+    pub drift: DriftConfig,
 }
 
 /// The ML detector's whole deployment.
@@ -147,19 +155,58 @@ pub enum MlBootError {
     NoModelsConfigured { path: PathBuf },
 }
 
-/// Build the ML detector from the config file `ANOMALY_CONFIG_ENV` names, or
-/// `Ok(None)` when it is unset.
+/// Everything a boot needs from one ML config file: the detector to register,
+/// and the drift monitors to drain (§20.5).
 ///
-/// The `Vec` return shape is what
-/// [`register_builtins_with`](crate::registry::register_builtins_with) takes,
-/// so a binary's boot path reads the same whether or not ML is deployed.
-pub fn anomaly_detector_from_env() -> Result<Vec<Arc<dyn DetectorPlugin>>, MlBootError> {
+/// The two travel together because they are two views of the *same* engines —
+/// the detector holds them as `Arc<dyn InferenceEngine>` to score with, the
+/// publisher holds them as `Arc<dyn DriftSource>` to drain, and both point at
+/// one allocation. Returning them separately would let a caller wire a detector
+/// whose monitors nobody reads, which is the silent-degradation case this whole
+/// task exists to close.
+///
+/// `Default` is the no-ML deployment: empty on both sides, so a binary's boot
+/// path reads identically whether or not a bundle is configured.
+#[derive(Default)]
+pub struct MlDeployment {
+    /// Ready for [`register_builtins_with`](crate::registry::register_builtins_with).
+    pub detectors: Vec<Arc<dyn DetectorPlugin>>,
+    /// One per served model with drift monitoring on, ready for
+    /// [`DriftPublisher`](crate::drift::DriftPublisher).
+    pub drift_sources: Vec<Arc<dyn DriftSource>>,
+}
+
+impl std::fmt::Debug for MlDeployment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn DetectorPlugin` isn't `Debug` (the same reason `Registry` and
+        // `DetectionPlan` hand-roll theirs); show what a boot log actually
+        // wants — how much was wired.
+        f.debug_struct("MlDeployment")
+            .field("detectors", &self.detectors.len())
+            .field(
+                "monitored_models",
+                &self
+                    .drift_sources
+                    .iter()
+                    .map(|s| s.model_id())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Build the ML deployment from the config file `ANOMALY_CONFIG_ENV` names, or
+/// an empty one when it is unset.
+pub fn anomaly_detector_from_env() -> Result<MlDeployment, MlBootError> {
     let Ok(path) = std::env::var(ANOMALY_CONFIG_ENV) else {
         tracing::info!("{ANOMALY_CONFIG_ENV} is unset — running without the ML detector (§20.2)");
-        return Ok(Vec::new());
+        return Ok(MlDeployment::default());
     };
-    let detector = load_anomaly_detector(Path::new(&path))?;
-    Ok(vec![Arc::new(detector)])
+    let (detector, drift_sources) = load_anomaly_deployment(Path::new(&path))?;
+    Ok(MlDeployment {
+        detectors: vec![Arc::new(detector)],
+        drift_sources,
+    })
 }
 
 /// Load, validate and wire the ML detector from one config file.
@@ -168,14 +215,29 @@ pub fn anomaly_detector_from_env() -> Result<Vec<Arc<dyn DetectorPlugin>>, MlBoo
 /// (and from a future `detection validate-models` arm) without touching the
 /// process environment.
 pub fn load_anomaly_detector(path: &Path) -> Result<AnomalyDetector, MlBootError> {
+    load_anomaly_deployment(path).map(|(detector, _)| detector)
+}
+
+/// [`load_anomaly_detector`], also returning the drift monitors to drain.
+///
+/// Separate from the above so `detection check-models` — which validates a
+/// bundle and exits — is not handed monitors nobody will ever drain.
+pub fn load_anomaly_deployment(
+    path: &Path,
+) -> Result<(AnomalyDetector, Vec<Arc<dyn DriftSource>>), MlBootError> {
     let config: MlConfig = read_json(path)?;
 
     let mut slots = Vec::new();
+    let mut drift_sources = Vec::new();
     if let Some(deployment) = config.supervised {
-        slots.push(load_slot("supervised", deployment, ModelSlot::supervised)?);
+        let loaded = load_slot("supervised", deployment, ModelSlot::supervised)?;
+        slots.push(loaded.slot);
+        drift_sources.extend(loaded.drift);
     }
     if let Some(deployment) = config.novelty {
-        slots.push(load_slot("novelty", deployment, ModelSlot::novelty)?);
+        let loaded = load_slot("novelty", deployment, ModelSlot::novelty)?;
+        slots.push(loaded.slot);
+        drift_sources.extend(loaded.drift);
     }
     if slots.is_empty() {
         return Err(MlBootError::NoModelsConfigured {
@@ -213,7 +275,14 @@ pub fn load_anomaly_detector(path: &Path) -> Result<AnomalyDetector, MlBootError
         );
     }
 
-    Ok(detector)
+    Ok((detector, drift_sources))
+}
+
+/// One model slot plus, unless the deployment turned it off, the drift monitor
+/// watching the same engine.
+struct LoadedSlot {
+    slot: ModelSlot,
+    drift: Option<Arc<dyn DriftSource>>,
 }
 
 fn load_slot(
@@ -223,17 +292,54 @@ fn load_slot(
         Arc<dyn InferenceEngine>,
         FeatureBaseline,
     ) -> Result<ModelSlot, anomaly_detector::WiringError>,
-) -> Result<ModelSlot, MlBootError> {
+) -> Result<LoadedSlot, MlBootError> {
     let baseline = load_baseline(&deployment.baseline)?;
-    // Wrapped **once**, here, in the observability decorator: conventions §14's
-    // thin observed outer expressed over the seam, so no backend and no call
-    // path can ship unmeasured — and nesting it twice would double-count.
     let engine = OrtEngine::load(deployment.model).map_err(|source| MlBootError::Engine {
         role,
         source: Box::new(source),
     })?;
-    let engine: Arc<dyn InferenceEngine> = Arc::new(ObservedEngine::new(engine));
-    build(engine, baseline).map_err(|source| MlBootError::Wiring { source })
+
+    // Two decorators, wrapped **once** each, here — this is the boot site that
+    // owns the engine, and nesting either twice would double-count.
+    //
+    //   DriftEngine      §20.5: the served vectors vs. the training snapshot
+    //     └ ObservedEngine  §19/§14: latency, throughput, failures, scores
+    //         └ OrtEngine   the runtime
+    //
+    // Drift on the outside so `model_inference_duration_seconds` measures
+    // inference and not inference-plus-bookkeeping — that histogram is what
+    // the < 1s fast-path budget is checked against (§6, §20.2). The drift
+    // monitor's own cost still lands inside the detector's
+    // `detector_detect_duration_seconds`, which is where it belongs.
+    let observed = ObservedEngine::new(engine);
+    let (engine, drift): (Arc<dyn InferenceEngine>, Option<Arc<dyn DriftSource>>) =
+        if deployment.drift.disabled {
+            tracing::warn!(
+                role,
+                "drift monitoring is disabled for this model — serving-time feature \
+                 distributions will not be compared against the training snapshot (§20.5)"
+            );
+            (Arc::new(observed), None)
+        } else {
+            // Both halves need the same baseline: the detector explains findings
+            // against it, the monitor measures drift against it — which is the
+            // point of it living in `ml-features` rather than in either. Cloned
+            // rather than `Arc`-shared because it is immutable and this is a
+            // one-off boot-time `Vec<FeatureStats>` copy, not a hot path.
+            let monitored = Arc::new(DriftEngine::new(
+                observed,
+                baseline.clone(),
+                deployment.drift,
+            ));
+            // ONE allocation, two views: the detector scores through
+            // `InferenceEngine`, the publisher drains through `DriftSource`.
+            // Building two objects here would monitor an engine nobody serves.
+            let engine: Arc<dyn InferenceEngine> = monitored.clone();
+            let drift: Arc<dyn DriftSource> = monitored;
+            (engine, Some(drift))
+        };
+    let slot = build(engine, baseline).map_err(|source| MlBootError::Wiring { source })?;
+    Ok(LoadedSlot { slot, drift })
 }
 
 fn load_baseline(path: &Path) -> Result<FeatureBaseline, MlBootError> {
@@ -298,6 +404,11 @@ mod tests {
 
         let supervised = config.supervised.expect("named in the config");
         assert_eq!(supervised.model.model_id, "anomaly-gbdt");
+        assert_eq!(
+            supervised.drift,
+            inference::DriftConfig::default(),
+            "an unstated drift section means monitored with the shipped defaults (§20.5)"
+        );
         assert_eq!(supervised.model.granularity, ml_features::Granularity::Tx);
         assert_eq!(supervised.model.output.element, 1);
         assert_eq!(
@@ -335,6 +446,9 @@ mod tests {
             r#"{"noveltie": {}}"#,
             r#"{"novelty": {"baselines": "b.json", "model": {}}}"#,
             r#"{"detector": {"novelty_min_scores": 0.9}}"#,
+            r#"{"novelty": {"baseline": "b.json", "drift": {"windows": 512}, "model": {
+                "model_id": "m", "artifact_path": "m.onnx",
+                "feature_version": 1, "granularity": "block"}}}"#,
         ] {
             assert!(serde_json::from_str::<MlConfig>(bad).is_err(), "{bad}");
         }
@@ -374,6 +488,11 @@ mod tests {
         // when ML is simply not deployed — would make every existing install
         // fail to boot on upgrade.
         std::env::remove_var(ANOMALY_CONFIG_ENV);
-        assert!(anomaly_detector_from_env().unwrap().is_empty());
+        let deployment = anomaly_detector_from_env().expect("an unset variable is not an error");
+        assert!(deployment.detectors.is_empty());
+        assert!(
+            deployment.drift_sources.is_empty(),
+            "no models means nothing to monitor either (§20.5)"
+        );
     }
 }
