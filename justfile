@@ -319,6 +319,29 @@ intel-embed address:
 intel-embedding-baseline:
     cargo run -p intelligence -- embedding-baseline
 
+# The §20.3 clustering signal: `AddressEmbeddingUpdated` in, behavioral
+# *candidate links* to directly-known actors out. It proposes; it never merges
+# (§8.2) — entity membership still comes only from on-chain evidence. Needs a
+# population baseline (`just intel-embedding-baseline`) or every subject is
+# skipped. Drains any proposal a previous run stored without announcing before
+# it takes new work. Its own Kafka consumer group
+# (INTELLIGENCE_LINK_SIGNAL_KAFKA_GROUP) — deploy/scale/stop independently of
+# the embedding job it reads from, which matters: the search it runs is the
+# most expensive read the platform serves.
+intel-link-signal:
+    cargo run -p intelligence -- link-signal
+
+# List candidate links: for one address, or — with no address — the open triage
+# queue, strongest first.
+intel-link-candidates address="":
+    cargo run -p intelligence -- link-candidates {{address}}
+
+# Record an operator's ruling on one proposal (`confirm` | `reject`). Store-only
+# by design: confirming says the evidence for a merge now exists, it does not
+# perform one — run `just intel-cluster` once the §8.2 on-chain evidence does.
+intel-link-decide id decision operator note="":
+    cargo run -p intelligence -- link-decide {{id}} {{decision}} {{operator}} {{note}}
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

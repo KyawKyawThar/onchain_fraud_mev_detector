@@ -57,6 +57,19 @@
 //!     a bounded sample of stored vectors. A periodic operator/cron action,
 //!     not part of the long-running job: the baseline moves on a much slower
 //!     clock than the vectors do.
+//!   - `link-signal` — drive the §20.3 clustering-signal consumer (Sprint 19
+//!     t3): `AddressEmbeddingUpdated` in (its own Kafka consumer group),
+//!     behavioral *candidate links* to directly-known actors into the
+//!     `entity_link_candidates` table and `EntityLinkProposed`/`LabelAdded`
+//!     out, until a shutdown signal. It never merges entities — see
+//!     [`intelligence::link_candidate`] for why that is a rule and not a
+//!     limitation.
+//!   - `link-candidates [address]` — list candidate links: for one address, or
+//!     (with no address) the open triage queue, strongest first.
+//!   - `link-decide <candidate-id> confirm|reject <operator> [note...]` —
+//!     record an operator's ruling on one proposal. Store-only by design: a
+//!     confirmation says the evidence for a merge now exists, it does not
+//!     perform one.
 //!   - `cross-chain-attribute` — drive the Sprint 17 t4 cross-chain
 //!     attribution consumer (§8, §24): `BridgeMevDetected`/
 //!     `CrossChainMevDetected` in (its own Kafka consumer group), each
@@ -77,7 +90,7 @@ use anyhow::{bail, Context, Result};
 use clickhouse::Client;
 use event_bus::{EventSink, KafkaEventSink, PUBLISH_BACKOFF};
 use events::intelligence::{EntitySplit, LabelRevoked, LabelUpdated};
-use events::primitives::{Chain, EntityId, LabelId};
+use events::primitives::{AccountAddress, Chain, EntityId, LabelId, LinkCandidateId};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::adjacency::{build_clickhouse_client, ClickhouseAdjacency};
 use intelligence::attribution::{build_consumer, Attributor};
@@ -93,6 +106,8 @@ use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
 use intelligence::embedding_sweep::EmbeddingSweep;
 use intelligence::grpc::{IntelligenceReadService, SimilaritySeams};
 use intelligence::leaderboard::ClickhouseLeaderboard;
+use intelligence::link_candidate::{Decision, LinkCandidateStore, LinkStatus};
+use intelligence::link_signal::{self, LinkSignal, LinkSignalConsumer, LinkSignalSeams};
 use intelligence::merge_actor::MergeActor;
 use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
 use intelligence::production::BookCapacity;
@@ -113,7 +128,8 @@ const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
                      `risk <address>`, `score`, `reorg`, `grpc`, `block-production`, \
                      `cross-chain-attribute`, `embed <address>`, `embedding`, \
-                     `embedding-baseline`, \
+                     `embedding-baseline`, `link-signal`, `link-candidates [address]`, \
+                     `link-decide <candidate-id> confirm|reject <operator> [note...]`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -146,6 +162,9 @@ async fn main() -> Result<()> {
         Some("embed") => address_embedding(&cfg, client, args).await,
         Some("embedding") => embedding(&cfg, client).await,
         Some("embedding-baseline") => embedding_baseline(&cfg, client).await,
+        Some("link-signal") => link_signal(&cfg, client).await,
+        Some("link-candidates") => link_candidates(&cfg, args).await,
+        Some("link-decide") => link_decide(&cfg, args).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -1046,6 +1065,320 @@ async fn block_production(cfg: &Config, client: Client) -> Result<()> {
 /// `GetRiskScore`/`GetLabels`/`GetBuilderLeaderboard` until shutdown.
 /// Independently deployable from `attribute`/`score`/`reorg` — pure reads, no
 /// Kafka consumer group of its own.
+/// The one §20.3 feature space this process compares in, resolved at boot.
+///
+/// Not per request and not per event: a similarity score only means anything
+/// inside a single feature space, so cutting over to a v2 is a deliberate
+/// config change. An unknown version name is a refused boot rather than a
+/// silent fallback to a different space — the roster's typed-miss rule. Shared
+/// by the `grpc` read path and the `link-signal` consumer so the two can never
+/// end up comparing in different units.
+fn resolve_similarity_schema(
+    cfg: &Config,
+) -> Result<&'static intelligence::embedding::BehaviorSchema> {
+    Ok(match cfg.similarity.version.as_deref() {
+        Some(version) => intelligence::embedding::embedder_for(version)
+            .with_context(|| {
+                format!(
+                    "INTEL_SIMILARITY_VERSION={version:?} is not a version this build ships; \
+                     known versions: {:?}",
+                    intelligence::embedding::embedders()
+                        .iter()
+                        .map(|e| e.version())
+                        .collect::<Vec<_>>()
+                )
+            })?
+            .schema(),
+        None => intelligence::embedding::default_embedder().schema(),
+    })
+}
+
+/// Load the population baseline once, then keep it fresh in the background.
+///
+/// A failed initial load is deliberately *not* a boot failure: the baseline job
+/// may legitimately not have run yet, and both consumers of this snapshot
+/// report that as an explained `no_baseline` rather than refusing to start.
+/// The refresher is a background task rather than a per-use read because the
+/// baseline is keyed by `(chain, version)` — every user on a chain wants the
+/// identical few hundred bytes.
+async fn start_baseline_snapshot(
+    cfg: &Config,
+    schema: &'static intelligence::embedding::BehaviorSchema,
+    embeddings: Arc<ClickhouseEmbeddingStore>,
+    shutdown: CancellationToken,
+) -> Arc<intelligence::baseline_cache::BaselineSnapshot> {
+    let baseline = Arc::new(intelligence::baseline_cache::BaselineSnapshot::new(
+        cfg.embedding.chain,
+        schema.version().to_owned(),
+        cfg.similarity.baseline,
+    ));
+    if let Err(err) = baseline
+        .refresh(embeddings.as_ref(), chrono::Utc::now())
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "initial population-baseline load failed; comparisons report no_baseline until a refresh succeeds",
+        );
+    }
+    tokio::spawn({
+        let baseline = baseline.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let mut ticker = tokio::time::interval(baseline.refresh_interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if let Err(err) = baseline.refresh(embeddings.as_ref(), chrono::Utc::now()).await {
+                            // Logged, not fatal: the snapshot keeps serving the
+                            // value it holds until `max_age` retires it.
+                            tracing::warn!(error = %err, "population-baseline refresh failed");
+                        }
+                    }
+                }
+            }
+            tracing::info!("population-baseline refresher shut down");
+        }
+    });
+    baseline
+}
+
+/// Run the §20.3 clustering-signal consumer (Sprint 19 t3): behavioral
+/// similarity to a directly-known actor, recorded as a *candidate link* for the
+/// flywheel (§8.5).
+///
+/// Its own process and its own consumer group, deliberately not folded into the
+/// `embedding` run mode it reads from: the search it runs is the most expensive
+/// read the platform serves, and pinning it to the embedding job's replica
+/// count would make "scale the sweep" and "scale the signal" the same lever. It
+/// also shares a ClickHouse with the p50-critical screening path, so having it
+/// separately scalable — and separately stoppable — is the point.
+async fn link_signal(cfg: &Config, client: Client) -> Result<()> {
+    tracing::info!(
+        group = %cfg.link_signal.group_id,
+        chain = %cfg.embedding.chain,
+        scope = <&str>::from(cfg.link_signal.policy.scope),
+        min_similarity = cfg.link_signal.policy.proposal.min_similarity.get(),
+        "starting intelligence clustering-signal consumer"
+    );
+
+    if let Some(addr) = cfg.metrics_addr {
+        telemetry::metrics::init(addr).context("starting the metrics exporter")?;
+        tracing::info!(%addr, "serving clustering-signal metrics");
+    }
+
+    let schema = resolve_similarity_schema(cfg)?;
+    tracing::info!(
+        version = schema.version(),
+        schema_hash = schema.content_hash(),
+        "comparing behavior under",
+    );
+
+    let shutdown = CancellationToken::new();
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool));
+    let cache = Arc::new(
+        RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+            .await
+            .context("connecting to Redis")?,
+    );
+    let embeddings = Arc::new(ClickhouseEmbeddingStore::new(client));
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+    let baseline = start_baseline_snapshot(cfg, schema, embeddings.clone(), shutdown.clone()).await;
+
+    let signal = LinkSignal::new(
+        cfg.embedding.chain,
+        LinkSignalSeams {
+            stores: StoreSeams::single(store.clone()),
+            links: store,
+            embeddings,
+            cache,
+            sink,
+            baseline,
+        },
+        schema,
+        cfg.similarity.limits,
+        cfg.link_signal.policy,
+        shutdown.clone(),
+        PUBLISH_BACKOFF,
+    );
+
+    // Close any crash window left by a previous run *before* taking delivery of
+    // new work: a proposal stored without its event is invisible to everything
+    // downstream, and the longer it stays that way the less likely the
+    // redelivery that would have fixed it is still in the topic.
+    match signal.recover_unannounced(RECOVERY_BATCH).await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::warn!(
+                recovered,
+                "announced proposals a previous run left unannounced"
+            )
+        }
+        // Not fatal: the consumer below is the primary path, and refusing to
+        // boot because a backstop failed turns a recoverable gap into an outage.
+        Err(err) => tracing::error!(error = %err, "the unannounced-proposal recovery sweep failed"),
+    }
+
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "intel-link-signal")
+            .await
+            .context("provisioning the clustering-signal DLQ topic")?;
+    let consumer = link_signal::build_consumer(&cfg.kafka.brokers, &cfg.link_signal.group_id)
+        .context("building the clustering-signal Kafka consumer")?;
+
+    health.set_ready(true);
+    LinkSignalConsumer::new(signal)
+        .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
+        .await
+        .context("clustering-signal consumer exited with error")?;
+
+    tracing::info!("intelligence clustering-signal consumer shut down");
+    Ok(())
+}
+
+/// List candidate links: every proposal touching one address, or — with no
+/// address — the open triage queue, strongest first.
+async fn link_candidates(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = PgIntelligenceStore::new(pool);
+
+    let rows = match args.next() {
+        Some(raw) => {
+            let address: AccountAddress = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("address {raw:?} is not 0x-hex; {USAGE}"))?;
+            store.links_for_address(&address, LINK_LIST_LIMIT).await?
+        }
+        None => store.open_links(LINK_LIST_LIMIT).await?,
+    };
+
+    if rows.is_empty() {
+        println!("no candidate links");
+        return Ok(());
+    }
+    for row in &rows {
+        let kinds: Vec<&str> = row
+            .anchor_labels
+            .iter()
+            .map(|kind| <&str>::from(*kind))
+            .collect();
+        println!(
+            "{}  {}  {:#x} ~ {:#x}  similarity {}  confidence {:.2}  anchor {:#x} [{}]",
+            row.candidate_id,
+            <&str>::from(row.status),
+            row.address_a,
+            row.address_b,
+            row.similarity,
+            row.confidence.get(),
+            row.anchor,
+            kinds.join(", "),
+        );
+        // The decomposition, not a second opinion beside it: these contributions
+        // sum to the similarity above.
+        for factor in row.factors.iter().take(3) {
+            println!(
+                "     {:>+8.4}  {:<28} {:.4} vs {:.4}",
+                factor.contribution, factor.feature, factor.subject_value, factor.candidate_value,
+            );
+        }
+    }
+    println!(
+        "\n{} candidate link(s). These are proposals, not merges.",
+        rows.len()
+    );
+    Ok(())
+}
+
+/// Record an operator's ruling on one candidate link.
+///
+/// Store-only, and that is the whole design: confirming a proposal records that
+/// the evidence for a merge now exists — it does not perform one. Merging stays
+/// where §8.2 put it, behind on-chain evidence and the `cluster` pass.
+async fn link_decide(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let Some(raw_id) = args.next() else {
+        bail!("missing candidate id; {USAGE}");
+    };
+    let candidate_id = LinkCandidateId(
+        raw_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("candidate id {raw_id:?} is not a UUID; {USAGE}"))?,
+    );
+    let status: LinkStatus = match args.next().as_deref() {
+        Some("confirm") => LinkStatus::Confirmed,
+        Some("reject") => LinkStatus::Rejected,
+        other => bail!("expected `confirm` or `reject`, got {other:?}; {USAGE}"),
+    };
+    let Some(operator) = args.next() else {
+        bail!("missing operator id; {USAGE}");
+    };
+    let note = args.collect::<Vec<_>>().join(" ");
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = PgIntelligenceStore::new(pool);
+
+    let before = store
+        .decide_link(
+            candidate_id,
+            status,
+            &Decision {
+                by: operator,
+                note: (!note.is_empty()).then_some(note),
+                at: chrono::Utc::now(),
+            },
+        )
+        .await?;
+    let Some(before) = before else {
+        bail!("no candidate link {candidate_id}");
+    };
+    println!(
+        "✅ {candidate_id}: {} → {} ({:#x} ~ {:#x})",
+        <&str>::from(before.status),
+        <&str>::from(status),
+        before.address_a,
+        before.address_b,
+    );
+    if status == LinkStatus::Confirmed {
+        println!(
+            "   Recorded as confirmed evidence. No entity was merged — run `cluster` \\
+             once the on-chain evidence (§8.2) exists."
+        );
+    }
+    Ok(())
+}
+
+/// How many candidate links one listing prints. A bounded operator read, not a
+/// paging API — the gRPC/HTTP surface is where a caller asks for more.
+const LINK_LIST_LIMIT: usize = 50;
+
+/// How many unannounced proposals the boot-time recovery sweep drains. Bounded
+/// because it runs before the consumer starts and must not turn a startup into
+/// an unbounded publish loop; a backlog past this drains on the next restart,
+/// and `intelligence_link_signal_recovered_total` says whether one exists.
+const RECOVERY_BATCH: usize = 500;
+
 async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     tracing::info!(addr = %cfg.grpc_addr, "starting intelligence gRPC server");
 
@@ -1076,25 +1409,7 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     let embeddings = Arc::new(ClickhouseEmbeddingStore::new(client.clone()));
     let leaderboard = Arc::new(ClickhouseLeaderboard::new(client));
 
-    // The one schema version this node serves comparisons under. Resolved at
-    // boot, not per request: an unknown version name is a refused boot rather
-    // than a read that silently falls back to a different feature space (the
-    // roster's typed-miss rule).
-    let similarity_schema = match cfg.similarity.version.as_deref() {
-        Some(version) => intelligence::embedding::embedder_for(version)
-            .with_context(|| {
-                format!(
-                    "INTEL_SIMILARITY_VERSION={version:?} is not a version this build ships; \
-                     known versions: {:?}",
-                    intelligence::embedding::embedders()
-                        .iter()
-                        .map(|e| e.version())
-                        .collect::<Vec<_>>()
-                )
-            })?
-            .schema(),
-        None => intelligence::embedding::default_embedder().schema(),
-    };
+    let similarity_schema = resolve_similarity_schema(cfg)?;
     tracing::info!(
         version = similarity_schema.version(),
         schema_hash = similarity_schema.content_hash(),
@@ -1117,47 +1432,10 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
         }
     });
 
-    // Load the population baseline once, then keep it fresh in the background.
-    // A failed initial load is *not* a boot failure: the baseline job may
-    // legitimately not have run yet, and searches report that as an explained
-    // `no_baseline` rather than the service refusing to start.
-    let baseline = Arc::new(intelligence::baseline_cache::BaselineSnapshot::new(
-        cfg.embedding.chain,
-        similarity_schema.version().to_owned(),
-        cfg.similarity.baseline,
-    ));
-    if let Err(err) = baseline
-        .refresh(embeddings.as_ref(), chrono::Utc::now())
-        .await
-    {
-        tracing::warn!(
-            error = %err,
-            "initial population-baseline load failed; similarity search will report no_baseline until a refresh succeeds",
-        );
-    }
-    tokio::spawn({
-        let baseline = baseline.clone();
-        let embeddings = embeddings.clone();
-        let shutdown = shutdown.clone();
-        async move {
-            let mut ticker = tokio::time::interval(baseline.refresh_interval());
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
-                        if let Err(err) = baseline.refresh(embeddings.as_ref(), chrono::Utc::now()).await {
-                            // Logged, not fatal: the snapshot keeps serving the
-                            // value it holds until `max_age` retires it.
-                            tracing::warn!(error = %err, "population-baseline refresh failed");
-                        }
-                    }
-                }
-            }
-            tracing::info!("population-baseline refresher shut down");
-        }
-    });
+    let baseline =
+        start_baseline_snapshot(cfg, similarity_schema, embeddings.clone(), shutdown.clone()).await;
 
+    let links = store.clone();
     let service = IntelligenceReadService::new(
         StoreSeams::single(store),
         cache,
@@ -1173,6 +1451,7 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
                 cfg.similarity.max_concurrent.max(1),
             )),
         },
+        links,
     );
     health.set_ready(true);
     tonic::transport::Server::builder()

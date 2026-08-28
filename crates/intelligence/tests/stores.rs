@@ -1655,3 +1655,170 @@ async fn batched_graph_and_embedding_reads_agree_and_shards_partition() {
         .expect("unknown version")
         .is_none());
 }
+
+/// The §20.3 candidate-link table against a real Postgres (Sprint 19 t3).
+///
+/// Every query over `entity_link_candidates` is **runtime-checked** — the table
+/// is new and `query_as!` would need a regenerated offline cache — so nothing
+/// in the unit suite proves the SQL parses, the check constraints hold, or that
+/// the three-way upsert distinguishes its outcomes. That is exactly the class
+/// of bug that only appears in production, which is what this test is for.
+///
+/// The load-bearing assertion is the last one: a re-proposal must **not**
+/// reopen a decided row. The `WHERE status = 'proposed'` on the upsert's
+/// `DO UPDATE` arm is what enforces it, and it is invisible to every in-memory
+/// double that reimplements the rule rather than executing it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn candidate_links_are_keyed_refreshable_and_never_reopen_a_decision() {
+    use intelligence::link_candidate::{
+        link_candidate_id, Decision, LinkCandidateStore, LinkFactor, LinkStatus, Proposal,
+        ProposalOutcome,
+    };
+    use intelligence::similarity::Similarity;
+
+    let (store, _pg) = pg_store().await;
+    let (subject, anchor) = (addr(0x11), addr(0x22));
+
+    let proposal = |similarity: f64, at_secs: i64| Proposal {
+        candidate_id: link_candidate_id(&subject, &anchor, "behavior-v1"),
+        // Canonically ordered, as the CHECK constraint requires: 0x11… < 0x22….
+        address_a: subject,
+        address_b: anchor,
+        anchor,
+        anchor_labels: vec![LabelKind::KnownScammer, LabelKind::SanctionedEntity],
+        entity_a: None,
+        entity_b: None,
+        similarity: Similarity::new(similarity),
+        confidence: events::primitives::Confidence::new(0.42),
+        embedding_version: "behavior-v1".into(),
+        schema_hash: "abc123".into(),
+        factors: vec![LinkFactor {
+            feature: "edge_count_log".into(),
+            subject_value: 1.5,
+            candidate_value: 1.6,
+            contribution: 0.25,
+        }],
+        proposed_at: at(at_secs),
+        last_seen_at: at(at_secs),
+    };
+
+    // First sighting: the row is inserted and owes an announcement.
+    let first = proposal(0.91, 1_000);
+    assert_eq!(
+        store.propose_link(&first).await.unwrap(),
+        ProposalOutcome::New
+    );
+
+    // THE CRASH WINDOW. The row committed; the process dies before the publish.
+    // Redelivery must re-announce, NOT fall through to `Refreshed` — that
+    // fall-through is exactly how the event would be lost permanently and
+    // silently, and it is invisible to every test that only exercises the
+    // happy path.
+    assert_eq!(
+        store.propose_link(&first).await.unwrap(),
+        ProposalOutcome::ReAnnounce,
+        "an unannounced row still owes its event, however many times it is stored"
+    );
+    assert_eq!(
+        store.unannounced_links(10).await.unwrap().len(),
+        1,
+        "and the recovery sweep can find it without a redelivery at all"
+    );
+
+    // The publish succeeds and is recorded.
+    store
+        .mark_announced(first.candidate_id, at(1_500))
+        .await
+        .expect("stamp");
+    assert!(store.unannounced_links(10).await.unwrap().is_empty());
+
+    // NOW the same link rediscovered — from the anchor's end, on a later sweep,
+    // scored a little differently. One row, re-scored, and silent.
+    assert_eq!(
+        store.propose_link(&proposal(0.94, 2_000)).await.unwrap(),
+        ProposalOutcome::Refreshed
+    );
+
+    let stored = store
+        .links_for_address(&anchor, 10)
+        .await
+        .expect("read by the other endpoint too");
+    assert_eq!(stored.len(), 1, "one row, not two mirror images");
+    let row = &stored[0];
+    assert_eq!(row.similarity.get(), Similarity::new(0.94).get());
+    assert_eq!(row.last_seen_at, at(2_000), "refreshed");
+    assert_eq!(row.proposed_at, at(1_000), "first sighting is preserved");
+    // The two JSONB columns survive the round trip as domain types.
+    assert_eq!(
+        row.anchor_labels,
+        vec![LabelKind::KnownScammer, LabelKind::SanctionedEntity]
+    );
+    assert_eq!(row.factors[0].feature, "edge_count_log");
+    assert_eq!(row.status, LinkStatus::Proposed);
+    assert!(row.decision.is_none());
+    assert_eq!(row.announced_at, Some(at(1_500)));
+
+    // The open queue picks it up…
+    assert_eq!(store.open_links(10).await.unwrap().len(), 1);
+
+    // …an operator rules on it, and is handed the row as it stood before.
+    let before = store
+        .decide_link(
+            row.candidate_id,
+            LinkStatus::Rejected,
+            &Decision {
+                by: "analyst-7".into(),
+                note: Some("same off-the-shelf strategy, unrelated operators".into()),
+                at: at(3_000),
+            },
+        )
+        .await
+        .expect("decide")
+        .expect("the row exists");
+    assert_eq!(before.status, LinkStatus::Proposed);
+
+    let decided = store
+        .link(row.candidate_id)
+        .await
+        .unwrap()
+        .expect("still stored");
+    assert_eq!(decided.status, LinkStatus::Rejected);
+    let ruling = decided.decision.as_ref().expect("a decided row has one");
+    assert_eq!(ruling.by, "analyst-7");
+    assert_eq!(ruling.at, at(3_000));
+    assert!(ruling.note.is_some());
+    assert!(store.open_links(10).await.unwrap().is_empty());
+
+    // THE RULE: the signal rediscovers the pair on the next sweep. The decision
+    // stands — untouched similarity, untouched timestamp, still rejected.
+    // Without this, a rejection would silently reopen and the triage queue
+    // could never be emptied.
+    assert_eq!(
+        store.propose_link(&proposal(0.99, 4_000)).await.unwrap(),
+        ProposalOutcome::Decided
+    );
+    let after = store
+        .link(row.candidate_id)
+        .await
+        .unwrap()
+        .expect("still stored");
+    assert_eq!(after.status, LinkStatus::Rejected);
+    assert_eq!(after.similarity.get(), Similarity::new(0.94).get());
+    assert_eq!(after.last_seen_at, at(2_000));
+
+    // An unknown id is a typed miss, not an error.
+    assert!(store
+        .decide_link(
+            link_candidate_id(&addr(0xAA), &addr(0xBB), "behavior-v1"),
+            LinkStatus::Confirmed,
+            &Decision {
+                by: "analyst-7".into(),
+                note: None,
+                at: at(5_000),
+            },
+        )
+        .await
+        .unwrap()
+        .is_none());
+}

@@ -220,6 +220,7 @@ pub enum DomainEvent {
     RiskScoreUpdated(intelligence::RiskScoreUpdated),
     SanctionHit(intelligence::SanctionHit),
     AddressEmbeddingUpdated(intelligence::AddressEmbeddingUpdated),
+    EntityLinkProposed(intelligence::EntityLinkProposed),
 
     // Rule engine (§9)
     RuleCreated(rule_engine::RuleCreated),
@@ -309,7 +310,8 @@ impl DomainEvent {
             | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
-            | AddressEmbeddingUpdated(_) => EventFamily::Intelligence,
+            | AddressEmbeddingUpdated(_)
+            | EntityLinkProposed(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
             UsageRecorded(_) | ScreeningDecisionRecorded(_) | ModelDriftDetected(_) => {
                 EventFamily::System
@@ -359,6 +361,7 @@ impl DomainEvent {
             | RiskScoreUpdated(_)
             | SanctionHit(_)
             | AddressEmbeddingUpdated(_)
+            | EntityLinkProposed(_)
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
@@ -455,6 +458,7 @@ impl DomainEvent {
             | RiskScoreUpdated(_)
             | SanctionHit(_)
             | AddressEmbeddingUpdated(_)
+            | EntityLinkProposed(_)
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
@@ -491,6 +495,11 @@ impl DomainEvent {
             RiskScoreUpdated(e) => vec![e.address],
             SanctionHit(e) => vec![e.address],
             AddressEmbeddingUpdated(e) => vec![e.address],
+            // Both sides: a candidate link is findable from either address —
+            // the investigator who pulls up the anchor's audit trail wants to
+            // see what behaviour was proposed against it just as much as the
+            // one who pulls up the subject.
+            EntityLinkProposed(e) => vec![e.subject, e.candidate],
             ScreeningDecisionRecorded(e) => vec![e.address],
             IncidentCreated(e) => e.victim_address.into_iter().collect(),
             WalletExposureReportReady(e) => vec![e.address],

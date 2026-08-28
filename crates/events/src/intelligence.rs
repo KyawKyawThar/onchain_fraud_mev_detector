@@ -3,7 +3,9 @@
 //! immutable incident facts: conflicting labels are stored, never overwritten
 //! (§8.1).
 
-use crate::primitives::{AccountAddress, Confidence, EntityId, IncidentId, LabelId};
+use crate::primitives::{
+    AccountAddress, Confidence, EntityId, IncidentId, LabelId, LinkCandidateId,
+};
 use serde::{Deserialize, Serialize};
 
 /// A label was attached to an address (§8.1). Carries provenance (`source`) and
@@ -183,4 +185,79 @@ pub struct AddressEmbeddingUpdated {
     /// its most *recent* activity window rather than all of it (§8.2's
     /// hub-node rule). A fidelity flag, marked rather than assumed (§20.1).
     pub observations_truncated: bool,
+}
+
+/// One feature's signed share of the behavioral similarity behind a proposed
+/// link (§20.3) — the pair-shaped sibling of [`BehaviorFactor`], which explains
+/// *one* address's vector rather than what two of them have in common.
+///
+/// The contributions of all features sum to
+/// [`EntityLinkProposed::similarity`]: cosine over baseline-standardized
+/// vectors decomposes exactly, so this is the score's decomposition and not an
+/// attribution heuristic beside it. A negative contribution means the two
+/// addresses sit on *opposite* sides of the population median on that feature
+/// — carried deliberately, because "alike except on X" is what tells an
+/// investigator whether to believe the link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LinkFactor {
+    pub feature: String,
+    /// The subject's value in the vector's own raw, interpretable units.
+    pub subject_value: f32,
+    /// The candidate's raw value.
+    pub candidate_value: f32,
+    /// This feature's signed share of the similarity score.
+    pub contribution: f32,
+}
+
+/// A behavioral **candidate link** between two addresses (§20.3, §8.1): the
+/// subject behaves like `candidate`, and `anchor` — one of the two — carries a
+/// directly-known actor label. The §20.3 clustering signal, published as an
+/// event so the flywheel (§8.5) has an auditable record of every link the
+/// graph was *offered*, not only the ones it accepted.
+///
+/// **This is not a merge, and consuming it as one is a bug.** Entity merges
+/// (`EntityMerged`) still require the §8.2 on-chain evidence heuristics —
+/// common funder, common deployer, same code hash, shared profit receiver.
+/// Behavioral similarity widens *recall* (it can see a freshly funded bot with
+/// no graph edges at all) at a confidence no clustering decision may be taken
+/// on alone, which is exactly how §8.1 treats every heuristic label. The
+/// `confidence` here is therefore capped strictly below the entity-derived
+/// band and scaled by the similarity that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct EntityLinkProposed {
+    pub candidate_id: LinkCandidateId,
+    /// The address whose recomputed vector triggered the search.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub subject: AccountAddress,
+    /// The subject's entity at proposal time, if the graph already placed it.
+    pub subject_entity: Option<EntityId>,
+    /// The behaviourally similar address.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub candidate: AccountAddress,
+    /// The candidate's entity at proposal time, if any. Both entities present
+    /// and different is the *merge*-candidate shape; still never an automatic
+    /// merge.
+    pub candidate_entity: Option<EntityId>,
+    /// Which of the two carried the directly-known actor label that made this
+    /// pair worth proposing.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub anchor: AccountAddress,
+    /// The anchor's label kinds (`known_scammer`, `sanctioned_entity`,
+    /// `mev_bot`, …) — wire strings, the same closed vocabulary
+    /// [`LabelAdded::kind`] carries.
+    pub anchor_labels: Vec<String>,
+    /// Cosine similarity between baseline-standardized vectors, in `[-1, 1]`.
+    pub similarity: f32,
+    /// The §8.1 reduced-confidence band this signal is worth — always below
+    /// the entity-derived 0.5, because a behavioral match is weaker evidence
+    /// than a graph one.
+    pub confidence: Confidence,
+    /// The feature space the comparison was made in. Two similarities are only
+    /// comparable if both match.
+    pub embedding_version: String,
+    pub schema_hash: String,
+    /// The largest-magnitude contributions behind `similarity`, bounded.
+    pub factors: Vec<LinkFactor>,
 }

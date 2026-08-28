@@ -481,3 +481,98 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+---
+# The §20.3 clustering signal (Sprint 19 t3): `AddressEmbeddingUpdated` in,
+# behavioral candidate links out. It proposes; it never merges (§8.2).
+#
+# **A Deployment, unlike its upstream — and single-replica by default anyway.**
+# The embedding job is a StatefulSet because its sweep is hash-sharded by pod
+# ordinal; this consumer has no keyspace of its own to partition. It is a plain
+# Kafka consumer group, so scaling it out is Kafka's partition assignment doing
+# the work and pods are interchangeable.
+#
+# **Its own deployment rather than a second process in the embedding pod**, for
+# one reason: the search it runs is the most expensive read the platform
+# serves, and it reaches the same ClickHouse that `GetScreeningFacts` (p50 <
+# 100ms, §19) does. Folding it into the embedding job would make "scale the
+# sweep" and "scale the signal" the same lever, and would leave no way to stop
+# the expensive half without stopping vector production too. Scaled to 0
+# replicas is a supported operating state: the proposals it has already written
+# stay readable, and the sweep keeps embedding.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-link-signal
+  labels:
+    app.kubernetes.io/name: intelligence-link-signal
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-link-signal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-link-signal
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          args: ["link-signal"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+            - name: INTELLIGENCE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

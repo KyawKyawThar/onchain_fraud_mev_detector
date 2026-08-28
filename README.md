@@ -214,7 +214,12 @@ population-standardized vectors, and each result carries the per-feature
 contributions that produced it — an exact decomposition of the score, not an
 attribution laid beside it.
 Similarity is a reduced-confidence clustering signal, never an auto-merge:
-the graph's correctness story stays intact.
+a strong match onto a *directly-known* actor becomes a **candidate link** in a
+table of its own (`GET /v1/address/{addr}/link-candidates`) for a human to
+confirm or reject, and a derived label capped strictly below the band a
+graph-evidence cluster earns. A label the system itself derived can never
+anchor a further match — one hop from something known, or nothing — so the
+graph's correctness story stays intact while its recall widens.
 
 **The LLM copilot is designed to be hallucination-safe by construction —
 and is not built yet.** No copilot crate exists; this paragraph describes
@@ -236,6 +241,7 @@ POST /v1/address/{addr}/screen        synchronous allow/review/block decision (p
 GET  /v1/address/{addr}/risk          risk score + confidence + factor breakdown
 GET  /v1/address/{addr}/labels        all labels with provenance
 GET  /v1/address/{addr}/similar       behaviorally similar addresses, with the factors driving each match
+GET  /v1/address/{addr}/link-candidates  proposed behavioral cluster links awaiting review (never auto-merged)
 GET  /v1/entity/{id}                  full entity profile
 GET  /v1/entity/{id}/graph?hops=2     connected addresses (degree-capped)
 GET  /v1/entity/{id}/timeline         curated milestone history

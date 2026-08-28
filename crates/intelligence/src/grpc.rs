@@ -29,13 +29,15 @@ use crate::embedding::BehaviorSchema;
 use crate::embedding_store::EmbeddingStore;
 use crate::graph::{self, GraphLimits, GraphSeams};
 use crate::leaderboard::{self, LeaderboardQuery, LeaderboardStore, Limit};
+use crate::link_candidate::{LinkCandidateStore, StoredLink};
 use crate::model::{self, LabelRecord, SanctionEntry};
 use crate::pb::intelligence_read_server::IntelligenceRead;
 use crate::pb::{
     BuilderLeaderboardReply, BuilderLeaderboardRequest, BuilderStats, EntityGraphReply,
     EntityGraphRequest, EntityTimelineReply, EntityTimelineRequest, GraphEdge, GraphNode, Label,
-    LabelsReply, LabelsRequest, RelayStats, RiskFactor as PbRiskFactor, RiskScoreReply,
-    RiskScoreRequest, SanctionMatch, ScreeningFactsReply, ScreeningFactsRequest,
+    LabelsReply, LabelsRequest, LinkCandidate as PbLinkCandidate, LinkCandidatesReply,
+    LinkCandidatesRequest, LinkFactor as PbLinkFactor, RelayStats, RiskFactor as PbRiskFactor,
+    RiskScoreReply, RiskScoreRequest, SanctionMatch, ScreeningFactsReply, ScreeningFactsRequest,
     SimilarAddress as PbSimilarAddress, SimilarAddressesReply, SimilarAddressesRequest,
     SimilarityFactor as PbSimilarityFactor, TimelineMilestone,
 };
@@ -44,6 +46,68 @@ use crate::risk_scorer;
 use crate::similarity::{self, SimilarityLimits};
 use crate::store::StoreSeams;
 use crate::timeline;
+
+/// One stored candidate link → its wire form.
+///
+/// A free function taking the value by move, not a closure inside the handler:
+/// [`StoredLink`] derefs to its [`Proposal`] for *reads*, which is what makes
+/// listings readable, but a wire mapping moves every `String` out — so it
+/// destructures explicitly rather than fighting the deref.
+fn link_candidate_to_wire(row: StoredLink) -> PbLinkCandidate {
+    let StoredLink {
+        proposal,
+        status,
+        decision,
+        // Not on the wire: whether the *event* went out is this service's
+        // internal delivery bookkeeping, not a fact about the link. A caller
+        // reading a proposal has already received it by another route.
+        announced_at: _,
+    } = row;
+    PbLinkCandidate {
+        candidate_id: proposal.candidate_id.to_string(),
+        address_a: model::address_key(&proposal.address_a),
+        address_b: model::address_key(&proposal.address_b),
+        anchor: model::address_key(&proposal.anchor),
+        anchor_labels: proposal
+            .anchor_labels
+            .iter()
+            .map(|kind| <&str>::from(*kind).to_owned())
+            .collect(),
+        // `''` is the wire's absent-entity flattening; a blank uuid string
+        // would read as an entity whose id happens to be empty.
+        entity_a: proposal
+            .entity_a
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        entity_b: proposal
+            .entity_b
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        similarity: proposal.similarity.get(),
+        confidence: proposal.confidence.get(),
+        embedding_version: proposal.embedding_version,
+        schema_hash: proposal.schema_hash,
+        factors: proposal
+            .factors
+            .into_iter()
+            .map(|factor| PbLinkFactor {
+                feature: factor.feature,
+                subject_value: factor.subject_value,
+                candidate_value: factor.candidate_value,
+                contribution: factor.contribution,
+            })
+            .collect(),
+        status: <&str>::from(status).to_owned(),
+        proposed_at_unix_millis: millis(proposal.proposed_at),
+        last_seen_at_unix_millis: millis(proposal.last_seen_at),
+        // One `Option<Decision>` flattens into the wire's three absent-value
+        // defaults — rather than three independently nullable fields that could
+        // disagree with each other about whether a decision exists.
+        decided_at_unix_millis: decision.as_ref().map(|d| millis(d.at)).unwrap_or_default(),
+        decided_by: decision.as_ref().map(|d| d.by.clone()).unwrap_or_default(),
+        decision_note: decision.and_then(|d| d.note).unwrap_or_default(),
+    }
+}
 
 /// Everything the §20.3 similarity read needs, bundled so the service
 /// constructor keeps one parameter per subsystem rather than three per one.
@@ -88,6 +152,10 @@ pub struct IntelligenceReadService {
     /// The §20.3 behavioral-similarity read: the embedding store, the schema
     /// version comparisons are served under, and the search bounds.
     similarity: SimilaritySeams,
+    /// The §20.3 clustering signal's proposal table — a plain keyed read, not
+    /// a computation: the expensive part already happened in the `link-signal`
+    /// consumer, which is exactly why the proposals are materialized.
+    links: Arc<dyn LinkCandidateStore>,
 }
 
 impl IntelligenceReadService {
@@ -98,6 +166,7 @@ impl IntelligenceReadService {
         graph: Arc<dyn AdjacencyStore>,
         graph_limits: GraphLimits,
         similarity: SimilaritySeams,
+        links: Arc<dyn LinkCandidateStore>,
     ) -> Self {
         Self {
             stores,
@@ -106,6 +175,7 @@ impl IntelligenceReadService {
             graph,
             graph_limits,
             similarity,
+            links,
         }
     }
 
@@ -193,6 +263,21 @@ const ENTITY_TIMELINE_MILESTONES: &str = "intelligence_entity_timeline_milestone
 /// (`no_baseline`/`no_signal`). `no_baseline` climbing is the alert that the
 /// `embedding-baseline` run mode has stopped — the one failure here that looks
 /// like a normal empty answer from the outside.
+/// Candidate-link listings served — cheap (a keyed read), counted anyway so
+/// the §20.3 investigation surface's usage is visible beside the search's.
+const LINK_CANDIDATE_REQUESTS: &str = "intelligence_link_candidate_requests_total";
+
+/// Proposals returned per listing. The distribution says whether the signal is
+/// producing a usable triage queue or a firehose.
+const LINK_CANDIDATE_RESULTS: &str = "intelligence_link_candidate_results";
+
+/// Proposals returned when the caller names no limit.
+const LINK_CANDIDATES_DEFAULT: u32 = 20;
+
+/// Hard ceiling on one listing — a bounded investigation read, not a dump of
+/// the proposal table.
+const LINK_CANDIDATES_MAX: u32 = 200;
+
 const SIMILARITY_REQUESTS: &str = "intelligence_similarity_requests_total";
 /// Distribution of the neighbour count a search returned.
 const SIMILARITY_RESULTS: &str = "intelligence_similarity_results";
@@ -665,6 +750,33 @@ impl IntelligenceRead for IntelligenceReadService {
         }))
     }
 
+    async fn list_link_candidates(
+        &self,
+        request: Request<LinkCandidatesRequest>,
+    ) -> Result<Response<LinkCandidatesReply>, Status> {
+        let request = request.into_inner();
+        let address = parse_address(&request.address)?;
+        // The [`Limit`] stance: a caller asking for more than the ceiling is
+        // served at the ceiling, not rejected.
+        let limit = match request.limit {
+            0 => LINK_CANDIDATES_DEFAULT,
+            n => n.min(LINK_CANDIDATES_MAX),
+        };
+
+        let rows = self
+            .links
+            .links_for_address(&address, limit as usize)
+            .await
+            .map_err(status_for)?;
+
+        metrics::counter!(LINK_CANDIDATE_REQUESTS).increment(1);
+        metrics::histogram!(LINK_CANDIDATE_RESULTS).record(rows.len() as f64);
+
+        Ok(Response::new(LinkCandidatesReply {
+            candidates: rows.into_iter().map(link_candidate_to_wire).collect(),
+        }))
+    }
+
     async fn get_entity_timeline(
         &self,
         request: Request<EntityTimelineRequest>,
@@ -719,7 +831,7 @@ mod tests {
     use crate::store::{EntityStore, LabelStore};
     use crate::test_util::{
         store_seams, FixedLeaderboard, InMemoryAdjacency, InMemoryHotCache,
-        InMemoryIntelligenceStore, RecordingEmbeddingStore,
+        InMemoryIntelligenceStore, InMemoryLinkCandidateStore, RecordingEmbeddingStore,
     };
 
     /// Similarity seams wired to an empty double — what every test that isn't
@@ -769,6 +881,7 @@ mod tests {
             graph,
             GraphLimits::default(),
             similarity_seams(),
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
         (service, store, cache)
     }
@@ -789,6 +902,7 @@ mod tests {
             graph,
             GraphLimits::default(),
             similarity_seams(),
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
         (service, leaderboard)
     }
@@ -811,6 +925,7 @@ mod tests {
             graph.clone(),
             GraphLimits::default(),
             similarity_seams(),
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
         (service, store, graph)
     }
@@ -880,6 +995,7 @@ mod tests {
             Arc::new(InMemoryAdjacency::new()),
             GraphLimits::default(),
             seams,
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
         (service, embeddings)
     }
@@ -969,6 +1085,94 @@ mod tests {
         assert_eq!(reply.embedding_version, crate::embedding::v1::VERSION);
     }
 
+    /// The candidate-link listing: proposals come back strongest-first, in
+    /// canonical pair order, with the anchor's evidence and the decision state
+    /// — including *decided* ones, which are part of the address's story.
+    #[tokio::test]
+    async fn link_candidates_are_listed_strongest_first_with_their_decision_state() {
+        use crate::link_candidate::{Decision, LinkFactor, LinkStatus, Proposal};
+        use crate::similarity::Similarity;
+        use events::primitives::{Confidence, LabelKind};
+
+        let links = Arc::new(InMemoryLinkCandidateStore::new());
+        let subject = Address::repeat_byte(0x11);
+        let candidate = |anchor: u8, similarity: f64| Proposal {
+            candidate_id: crate::link_candidate::link_candidate_id(
+                &subject,
+                &Address::repeat_byte(anchor),
+                "behavior-v1",
+            ),
+            address_a: subject,
+            address_b: Address::repeat_byte(anchor),
+            anchor: Address::repeat_byte(anchor),
+            anchor_labels: vec![LabelKind::KnownScammer],
+            entity_a: None,
+            entity_b: None,
+            similarity: Similarity::new(similarity),
+            confidence: Confidence::new(0.4),
+            embedding_version: "behavior-v1".into(),
+            schema_hash: "abc".into(),
+            factors: vec![LinkFactor {
+                feature: "edge_count_log".into(),
+                subject_value: 1.0,
+                candidate_value: 1.1,
+                contribution: 0.3,
+            }],
+            proposed_at: Utc::now(),
+            last_seen_at: Utc::now(),
+        };
+        links.propose_link(&candidate(0x22, 0.90)).await.unwrap();
+        links.propose_link(&candidate(0x33, 0.95)).await.unwrap();
+        links
+            .decide_link(
+                candidate(0x22, 0.90).candidate_id,
+                LinkStatus::Rejected,
+                &Decision {
+                    by: "analyst-7".into(),
+                    note: Some("same off-the-shelf arbitrage strategy".into()),
+                    at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let store = Arc::new(InMemoryIntelligenceStore::new());
+        let service = IntelligenceReadService::new(
+            store_seams(&store),
+            Arc::new(InMemoryHotCache::new()),
+            Arc::new(FixedLeaderboard::new(Leaderboard::default())),
+            Arc::new(InMemoryAdjacency::new()),
+            GraphLimits::default(),
+            similarity_seams(),
+            links,
+        );
+
+        let reply = service
+            .list_link_candidates(Request::new(LinkCandidatesRequest {
+                address: model::address_key(&subject),
+                limit: 0,
+            }))
+            .await
+            .expect("listing succeeds")
+            .into_inner();
+
+        assert_eq!(reply.candidates.len(), 2);
+        assert_eq!(reply.candidates[0].similarity, 0.95, "strongest first");
+        assert_eq!(reply.candidates[0].status, "proposed");
+        assert_eq!(reply.candidates[0].anchor_labels, vec!["known_scammer"]);
+        assert!(
+            reply.candidates[0].entity_a.is_empty(),
+            "an unclustered side is the empty-string flattening, not a blank uuid"
+        );
+        // The rejection is *kept and returned*: a pair that keeps being
+        // re-proposed after a human dismissed it is how a bad threshold makes
+        // itself visible.
+        let rejected = &reply.candidates[1];
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(rejected.decided_by, "analyst-7");
+        assert!(rejected.decided_at_unix_millis > 0);
+    }
+
     /// No baseline yet is a state, not a failure: the address exists, the
     /// comparison does not, and the reply says which.
     #[tokio::test]
@@ -997,6 +1201,7 @@ mod tests {
             Arc::new(InMemoryAdjacency::new()),
             GraphLimits::default(),
             similarity_seams_over(embeddings),
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
 
         let reply = similar(&service, 0x11, 0).await;
@@ -1066,6 +1271,7 @@ mod tests {
             Arc::new(InMemoryAdjacency::new()),
             GraphLimits::default(),
             seams,
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
 
         let status = saturated
@@ -1140,6 +1346,7 @@ mod tests {
                 baseline: expired,
                 ..seams_with_permits(embeddings.clone(), 4)
             },
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
 
         let reply = similar(&service, 0x11, 0).await;
@@ -1224,6 +1431,7 @@ mod tests {
             Arc::new(InMemoryAdjacency::new()),
             GraphLimits::default(),
             seams,
+            Arc::new(InMemoryLinkCandidateStore::new()),
         );
 
         let after = similar(&rebased, 0x11, 0).await;

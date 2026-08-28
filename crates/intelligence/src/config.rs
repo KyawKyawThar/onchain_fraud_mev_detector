@@ -47,6 +47,20 @@ pub struct Config {
     /// §20.3 behavioral-similarity search settings — read only by the `grpc`
     /// run mode.
     pub similarity: SimilarityConfig,
+    /// §20.3 clustering-signal settings — read by the `link-signal` run mode
+    /// and the `link-candidates`/`link-decide` operator commands.
+    pub link_signal: LinkSignalConfig,
+}
+
+/// Settings for the §20.3 clustering signal (Sprint 19 t3).
+#[derive(Debug, Clone)]
+pub struct LinkSignalConfig {
+    /// Consumer-group id — its own group, like every other consumer in this
+    /// service, so the signal is independently deployable and its lag is
+    /// separately visible.
+    pub group_id: String,
+    /// Gates and bounds for the pass, including the proposal-shaping policy.
+    pub policy: crate::link_signal::LinkSignalPolicy,
 }
 
 /// Settings for the §20.3 similarity search (Sprint 19 t2).
@@ -195,6 +209,7 @@ impl Config {
         let sweep_defaults = crate::embedding_sweep::SweepLimits::default();
         let similarity_defaults = crate::similarity::SimilarityLimits::default();
         let baseline_defaults = crate::baseline_cache::BaselineCacheConfig::default();
+        let link_defaults = crate::link_signal::LinkSignalPolicy::default();
 
         Ok(Self {
             postgres_url: SecretString::from(env("DATABASE_URL")?),
@@ -342,6 +357,46 @@ impl Config {
                     )?),
                 },
                 max_concurrent: env_parse("INTEL_SIMILARITY_MAX_CONCURRENT", 32usize)?,
+            },
+            link_signal: LinkSignalConfig {
+                group_id: env_or(
+                    "INTELLIGENCE_LINK_SIGNAL_KAFKA_GROUP",
+                    "intelligence-link-signal",
+                ),
+                policy: crate::link_signal::LinkSignalPolicy {
+                    // The cost gate. Off means every clustered address is
+                    // searched too — the merge-candidate mode — which an
+                    // operator should turn on deliberately after looking at
+                    // what the default already costs.
+                    scope: env_parse("INTEL_LINK_SIGNAL_SCOPE", link_defaults.scope)?,
+                    neighbors: env_parse("INTEL_LINK_SIGNAL_NEIGHBORS", link_defaults.neighbors)?,
+                    proposal: crate::link_candidate::SignalPolicy {
+                        // Parsed as the raw scalar the operator types, then
+                        // wrapped — the newtypes deliberately have no
+                        // `FromStr`, so a config value can never bypass the
+                        // constructor that bounds it.
+                        min_similarity: crate::similarity::Similarity::new(env_parse(
+                            "INTEL_LINK_MIN_SIMILARITY",
+                            f64::from(link_defaults.proposal.min_similarity.get()),
+                        )?),
+                        max_per_subject: env_parse(
+                            "INTEL_LINK_MAX_PER_SUBJECT",
+                            link_defaults.proposal.max_per_subject,
+                        )?,
+                        // Tunable *downward* in practice: §8.1's ladder is the
+                        // reason this exists, and raising it past the
+                        // entity-derived 0.5 band would make a behavioral
+                        // guess outrank a graph fact.
+                        confidence_ceiling: events::primitives::Confidence::new(env_parse(
+                            "INTEL_LINK_CONFIDENCE_CEILING",
+                            link_defaults.proposal.confidence_ceiling.get(),
+                        )?),
+                        truncated_discount: env_parse(
+                            "INTEL_LINK_TRUNCATED_DISCOUNT",
+                            link_defaults.proposal.truncated_discount,
+                        )?,
+                    },
+                },
             },
             graph_limits: crate::graph::GraphLimits {
                 degree_cap: env_parse(

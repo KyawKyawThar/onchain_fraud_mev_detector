@@ -40,14 +40,15 @@ use events::cross_chain::{
 };
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
-    AddressEmbeddingUpdated, AttributionUpdated, BehaviorFactor, EntityCreated, EntityMerged,
-    EntitySplit, LabelAdded, LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
+    AddressEmbeddingUpdated, AttributionUpdated, BehaviorFactor, EntityCreated, EntityLinkProposed,
+    EntityMerged, EntitySplit, LabelAdded, LabelRevoked, LabelUpdated, LinkFactor, RiskFactor,
+    RiskScoreUpdated, SanctionHit,
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AlertId, AlertKind, BlockRef, Chain, Confidence, CrossChainFindingId, CustomerId, DetectorRef,
-    EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId, Severity,
-    SuggestedAction, UsdAmount,
+    EntityId, IncidentId, LabelId, LendingProtocol, LinkCandidateId, PredictionId, RuleId,
+    Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -210,6 +211,9 @@ fn entity_id() -> impl Strategy<Value = EntityId> {
 }
 fn label_id() -> impl Strategy<Value = LabelId> {
     uuid().prop_map(LabelId)
+}
+fn link_candidate_id() -> impl Strategy<Value = LinkCandidateId> {
+    uuid().prop_map(LinkCandidateId)
 }
 fn rule_id() -> impl Strategy<Value = RuleId> {
     uuid().prop_map(RuleId)
@@ -554,7 +558,64 @@ fn intelligence_event() -> impl Strategy<Value = DomainEvent> {
                     })
                 },
             ),
+        (
+            link_candidate_id(),
+            address(),
+            prop::option::of(entity_id()),
+            address(),
+            prop::option::of(entity_id()),
+            prop::collection::vec(any::<String>(), 0..3),
+            finite_f32(),
+            confidence(),
+            any::<String>(),
+            any::<String>(),
+            prop::collection::vec(link_factor(), 0..4),
+        )
+            .prop_map(
+                |(
+                    candidate_id,
+                    subject,
+                    subject_entity,
+                    candidate,
+                    candidate_entity,
+                    anchor_labels,
+                    similarity,
+                    confidence,
+                    embedding_version,
+                    schema_hash,
+                    factors,
+                )| {
+                    DomainEvent::EntityLinkProposed(EntityLinkProposed {
+                        candidate_id,
+                        subject,
+                        subject_entity,
+                        // The anchor is always one of the pair — the invariant
+                        // the store's CHECK constraint enforces, honoured here
+                        // so a generated case is a *possible* event.
+                        anchor: candidate,
+                        candidate,
+                        candidate_entity,
+                        anchor_labels,
+                        similarity,
+                        confidence,
+                        embedding_version,
+                        schema_hash,
+                        factors,
+                    })
+                },
+            ),
     ]
+}
+
+fn link_factor() -> impl Strategy<Value = LinkFactor> {
+    (any::<String>(), finite_f32(), finite_f32(), finite_f32()).prop_map(
+        |(feature, subject_value, candidate_value, contribution)| LinkFactor {
+            feature,
+            subject_value,
+            candidate_value,
+            contribution,
+        },
+    )
 }
 
 fn behavior_factor() -> impl Strategy<Value = BehaviorFactor> {
