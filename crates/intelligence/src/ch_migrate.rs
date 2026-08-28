@@ -47,6 +47,16 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0006_create_behavior_baselines.up.sql"),
         down: include_str!("../migrations/0006_create_behavior_baselines.down.sql"),
     },
+    Migration {
+        version: "0007_index_address_embeddings_vector",
+        up: include_str!("../migrations/0007_index_address_embeddings_vector.up.sql"),
+        down: include_str!("../migrations/0007_index_address_embeddings_vector.down.sql"),
+    },
+    Migration {
+        version: "0008_create_address_neighbors",
+        up: include_str!("../migrations/0008_create_address_neighbors.up.sql"),
+        down: include_str!("../migrations/0008_create_address_neighbors.down.sql"),
+    },
 ];
 
 /// The intelligence service's migrator: apply on boot via

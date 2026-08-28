@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use events::primitives::CustomerId;
-use server::rate_limit::{Admission, RedisScreeningRateLimiter, ScreeningRateLimiter};
+use server::rate_limit::{scope, Admission, RedisScreeningRateLimiter, ScreeningRateLimiter};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerRequest;
 use testcontainers::ImageExt;
@@ -42,12 +42,21 @@ async fn admits_up_to_the_limit_then_rejects_and_isolates_per_customer() {
     let alice = customer(1);
     let bob = customer(2);
 
-    assert_eq!(limiter.admit(alice).await, Admission::Allowed);
-    assert_eq!(limiter.admit(alice).await, Admission::Allowed);
-    assert_eq!(limiter.admit(alice).await, Admission::Limited);
+    assert_eq!(
+        limiter.admit(scope::SCREEN, alice).await,
+        Admission::Allowed
+    );
+    assert_eq!(
+        limiter.admit(scope::SCREEN, alice).await,
+        Admission::Allowed
+    );
+    assert_eq!(
+        limiter.admit(scope::SCREEN, alice).await,
+        Admission::Limited
+    );
 
     // Bob's own budget is untouched by Alice exhausting hers — separate keys.
-    assert_eq!(limiter.admit(bob).await, Admission::Allowed);
+    assert_eq!(limiter.admit(scope::SCREEN, bob).await, Admission::Allowed);
 }
 
 #[tokio::test]
@@ -63,11 +72,11 @@ async fn the_window_expires_and_admits_again() {
     let limiter = RedisScreeningRateLimiter::new(conn, 1, Duration::from_millis(200));
 
     let who = customer(1);
-    assert_eq!(limiter.admit(who).await, Admission::Allowed);
-    assert_eq!(limiter.admit(who).await, Admission::Limited);
+    assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Allowed);
+    assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Limited);
 
     tokio::time::sleep(Duration::from_millis(350)).await;
 
     // A fresh window: the earlier rejection didn't leave a stuck counter.
-    assert_eq!(limiter.admit(who).await, Admission::Allowed);
+    assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Allowed);
 }

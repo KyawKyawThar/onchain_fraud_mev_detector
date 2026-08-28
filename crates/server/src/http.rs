@@ -66,7 +66,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, SimilarAddressesResponse, SimilarAddressResponse, SimilarityFactorResponse, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -152,9 +152,25 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
             rate_limit::enforce_screening_rate_limit,
         ));
 
+    // The §20.3 similarity read gets its own sub-router and its own ceiling,
+    // for the same reason screening has one — and more urgently. It is the
+    // most expensive read the platform serves (an ANN scan plus a bounded
+    // re-rank), and it reaches the *same* intelligence service and ClickHouse
+    // that `screen` does, so an unbounded burst here degrades a p50 < 100ms
+    // SLO on an endpoint that has nothing to do with it. Bounded separately
+    // rather than sharing screening's bucket: they have different costs and
+    // different SLOs, and one budget would let either starve the other.
+    let similarity = OpenApiRouter::new()
+        .routes(routes!(address_similar))
+        .route_layer(middleware::from_fn_with_state(
+            state.screening_rate_limit.clone(),
+            rate_limit::enforce_similarity_rate_limit,
+        ));
+
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
+        .merge(similarity)
         .merge(screening)
         .routes(routes!(list_policies))
         .routes(routes!(upsert_policy))
@@ -793,6 +809,192 @@ async fn builders(
         chain: query.chain,
         builders: reply.builders.into_iter().map(BuilderEntry::from).collect(),
         relays: reply.relays.into_iter().map(RelayEntry::from).collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SimilarAddressesQuery {
+    /// Chain id whose embedding population to search. Defaults to Ethereum.
+    #[serde(default = "default_chain")]
+    chain: u64,
+    /// How many neighbours to return; `0`/absent uses the intelligence
+    /// default, and the value is clamped to its ceiling.
+    #[serde(default)]
+    limit: u32,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct SimilarityFactorResponse {
+    /// The behavior feature's stable schema name (e.g. `busiest_day_share`).
+    feature: String,
+    /// The subject's value in the vector's own raw, interpretable units.
+    subject_value: f32,
+    /// The neighbour's raw value.
+    candidate_value: f32,
+    /// The subject's value in robust z-units against the population baseline.
+    subject_z: f32,
+    /// The neighbour's value in robust z-units.
+    candidate_z: f32,
+    /// Signed share of `similarity`. Positive: both sit on the same side of
+    /// the population median, pulling them together. Negative: opposite sides.
+    /// The factors of a result sum to its `similarity`.
+    contribution: f32,
+}
+
+impl From<intelligence::pb::SimilarityFactor> for SimilarityFactorResponse {
+    fn from(f: intelligence::pb::SimilarityFactor) -> Self {
+        Self {
+            feature: f.feature,
+            subject_value: f.subject_value,
+            candidate_value: f.candidate_value,
+            subject_z: f.subject_z,
+            candidate_z: f.candidate_z,
+            contribution: f.contribution,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct SimilarAddressResponse {
+    /// 0x-prefixed lowercase hex address.
+    address: String,
+    /// The neighbour's resolved entity at its compute time; absent when it
+    /// belongs to none.
+    entity_id: Option<String>,
+    /// Cosine similarity between baseline-standardized behavior vectors,
+    /// in `[-1, 1]`.
+    similarity: f32,
+    /// This neighbour's vector describes a recent activity window rather than
+    /// its whole history (§8.2's hub rule) — a weaker claim, marked.
+    observations_truncated: bool,
+    /// When the neighbour's vector was computed — how stale this match is.
+    computed_at_unix_millis: i64,
+    /// The behavioral factors driving the match, largest effect first.
+    factors: Vec<SimilarityFactorResponse>,
+}
+
+impl From<intelligence::pb::SimilarAddress> for SimilarAddressResponse {
+    fn from(a: intelligence::pb::SimilarAddress) -> Self {
+        Self {
+            address: a.address,
+            // `''` is the wire's absent-entity flattening; an empty string in
+            // JSON would read as an entity whose id happens to be blank.
+            entity_id: Some(a.entity_id).filter(|id| !id.is_empty()),
+            similarity: a.similarity,
+            observations_truncated: a.observations_truncated,
+            computed_at_unix_millis: a.computed_at_unix_millis,
+            factors: a
+                .factors
+                .into_iter()
+                .map(SimilarityFactorResponse::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct SimilarAddressesResponse {
+    address: String,
+    /// The schema version and hash every score here was computed under. Two
+    /// scores are only comparable when both match.
+    embedding_version: String,
+    schema_hash: String,
+    /// When the subject's own behavior vector was computed.
+    subject_computed_at_unix_millis: i64,
+    /// Most similar first.
+    results: Vec<SimilarAddressResponse>,
+    /// The candidate shortlist filled its cap, so a better neighbour may exist
+    /// outside it. `false` means the search saw the whole comparable
+    /// population and this ranking is exact.
+    approximate: bool,
+    /// How many rows the shortlist stage returned.
+    candidates_considered: u32,
+    /// Shortlisted rows dropped during the exact re-rank: a superseded row for
+    /// an address already seen, a vector from another schema version, or one
+    /// with no signal to compare against.
+    candidates_skipped: u32,
+    /// Absent when the search ran. Otherwise why it could not, as a state
+    /// rather than an error: `no_baseline` (the population baseline for this
+    /// version has not been computed yet) or `no_signal` (this address is at
+    /// the population median on essentially every feature, so there is no
+    /// behavioral direction to search along). `results` is empty in both cases.
+    unavailable_reason: Option<String>,
+}
+
+/// `GET /v1/address/{address}/similar?limit=20` — addresses that behave like
+/// this one (§20.3, §8.3), each with the behavioral factors that drove the
+/// match.
+///
+/// intelligence shortlists neighbours off the ClickHouse vector index over
+/// `address_embeddings.vector`, then re-ranks them exactly against the
+/// population baseline, so `similarity` is a cosine in **standardized** units
+/// and `approximate` says whether the shortlist could have missed a better
+/// neighbour.
+///
+/// A high score is an investigative lead and the §20.3 clustering signal's
+/// input — a reduced-confidence heuristic. It is never evidence that two
+/// addresses are the same entity: merges still require the §8.2 on-chain
+/// evidence heuristics.
+#[utoipa::path(
+    get,
+    path = "/v1/address/{address}/similar",
+    tag = "api-service",
+    params(
+        ("address" = String, Path, description = "On-chain address, 0x-prefixed hex (any case)"),
+        ("chain" = Option<u64>, Query, description = "Chain id (default 1 = Ethereum)"),
+        ("limit" = Option<u32>, Query, description = "Neighbours to return (0 = server default)"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Behaviorally similar addresses, most similar first", body = SimilarAddressesResponse),
+        (status = 400, description = "Address is not valid hex"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "This address has no behavior vector"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn address_similar(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path(address): Path<AccountAddress>,
+    Query(query): Query<SimilarAddressesQuery>,
+) -> Result<Json<SimilarAddressesResponse>, ApiError> {
+    let reply = state
+        .intelligence
+        .similar_addresses(address_key(&address), query.chain, query.limit)
+        .await
+        .map_err(intelligence_client::to_api_error)?;
+
+    if !reply.found {
+        return Err(ApiError::not_found(format!(
+            "address {} has no behavior vector under {}",
+            address_key(&address),
+            reply.embedding_version
+        )));
+    }
+
+    // Metered like the other investigation reads (§13). Deliberately the same
+    // SKU as the entity graph/timeline rather than a new one: a divergent
+    // event_type string is an unreconcilable billing line, and this is the
+    // same kind of question about the same graph.
+    state
+        .usage
+        .record(customer, events::system::UsageEventType::EntityQueried);
+
+    Ok(Json(SimilarAddressesResponse {
+        address: address_key(&address),
+        embedding_version: reply.embedding_version,
+        schema_hash: reply.schema_hash,
+        subject_computed_at_unix_millis: reply.subject_computed_at_unix_millis,
+        results: reply
+            .results
+            .into_iter()
+            .map(SimilarAddressResponse::from)
+            .collect(),
+        approximate: reply.approximate,
+        candidates_considered: reply.candidates_considered,
+        candidates_skipped: reply.candidates_skipped,
+        unavailable_reason: Some(reply.unavailable_reason).filter(|r| !r.is_empty()),
     }))
 }
 
@@ -1559,6 +1761,9 @@ mod tests {
             "BuildersResponse",
             "BuilderEntry",
             "RelayEntry",
+            "SimilarAddressesResponse",
+            "SimilarAddressResponse",
+            "SimilarityFactorResponse",
             "EntityGraphResponse",
             "GraphNodeResponse",
             "GraphEdgeResponse",
@@ -1581,6 +1786,7 @@ mod tests {
             ("/healthz", "get"),
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
+            ("/v1/address/{address}/similar", "get"),
             ("/v1/address/{address}/screen", "post"),
             ("/v1/policies", "get"),
             ("/v1/policies/{name}", "put"),
@@ -1633,6 +1839,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn address_similar_is_bearer_gated_and_proxies_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let path = "/v1/address/0x1111111111111111111111111111111111111111/similar?limit=5";
+
+        // No token → rejected by the JWT gate before the handler, so an
+        // unauthenticated call can never be metered.
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Authenticated, but the lazy intelligence channel has no server here,
+        // so the gRPC call fails → 502 (reached the handler, tried to proxy).
+        // This also proves the address path and `limit` query param parse.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // A malformed address is rejected by axum's path extractor, before any
+        // upstream call — the same boundary the other address routes hold.
+        let response = router
+            .oneshot(
+                Request::get("/v1/address/not-an-address/similar")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1882,7 +2137,7 @@ mod tests {
         use intelligence::store::SanctionsStore;
         use intelligence::test_util::{
             store_seams, FixedLeaderboard, InMemoryAdjacency, InMemoryHotCache,
-            InMemoryIntelligenceStore,
+            InMemoryIntelligenceStore, RecordingEmbeddingStore,
         };
         use tower::ServiceExt;
 
@@ -1907,6 +2162,22 @@ mod tests {
             std::sync::Arc::new(FixedLeaderboard::new(Default::default())),
             std::sync::Arc::new(InMemoryAdjacency::new()),
             Default::default(),
+            // This test is about screening; the similarity seam is wired to an
+            // empty double so it exists without affecting anything asserted.
+            intelligence::grpc::SimilaritySeams {
+                embeddings: std::sync::Arc::new(RecordingEmbeddingStore::new()),
+                schema: intelligence::embedding::default_embedder().schema(),
+                limits: Default::default(),
+                baseline: std::sync::Arc::new(intelligence::baseline_cache::BaselineSnapshot::new(
+                    events::primitives::Chain::ETHEREUM,
+                    intelligence::embedding::default_embedder()
+                        .schema()
+                        .version()
+                        .to_owned(),
+                    Default::default(),
+                )),
+                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            },
         );
         // Reserve an ephemeral port, then hand its address (not the listener
         // itself — `tonic::transport::Server::serve` binds its own) to the

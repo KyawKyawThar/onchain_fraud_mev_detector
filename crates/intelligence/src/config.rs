@@ -44,6 +44,31 @@ pub struct Config {
     /// §20.3 behavior-embedding settings — read by the `embedding` run mode
     /// and the `embed` inspection command.
     pub embedding: EmbeddingConfig,
+    /// §20.3 behavioral-similarity search settings — read only by the `grpc`
+    /// run mode.
+    pub similarity: SimilarityConfig,
+}
+
+/// Settings for the §20.3 similarity search (Sprint 19 t2).
+#[derive(Debug, Clone)]
+pub struct SimilarityConfig {
+    /// The one schema version comparisons are served under
+    /// (`INTEL_SIMILARITY_VERSION`), defaulting to the roster's newest. A
+    /// score only means something inside a single feature space, so cutting
+    /// the read over to a v2 is this deliberate config change — never a
+    /// per-request choice. An unknown version is a boot error, the same
+    /// typed-miss stance `embedder_for` takes.
+    pub version: Option<String>,
+    /// Search bounds.
+    pub limits: crate::similarity::SimilarityLimits,
+    /// Population-baseline snapshot bounds (refresh cadence + the age past
+    /// which a baseline is refused rather than served).
+    pub baseline: crate::baseline_cache::BaselineCacheConfig,
+    /// Concurrent similarity searches allowed in-process — the bulkhead that
+    /// keeps this expensive read from degrading the p50-critical screening
+    /// path it shares a service and a ClickHouse with. Beyond it, requests are
+    /// shed (`RESOURCE_EXHAUSTED`), never queued.
+    pub max_concurrent: usize,
 }
 
 /// Settings for the §20.3 behavior-embedding job (Sprint 19 t1).
@@ -168,6 +193,8 @@ impl Config {
 
         let defaults = crate::embedding_job::EmbeddingLimits::default();
         let sweep_defaults = crate::embedding_sweep::SweepLimits::default();
+        let similarity_defaults = crate::similarity::SimilarityLimits::default();
+        let baseline_defaults = crate::baseline_cache::BaselineCacheConfig::default();
 
         Ok(Self {
             postgres_url: SecretString::from(env("DATABASE_URL")?),
@@ -260,6 +287,61 @@ impl Config {
                     )
                     .context("INTEL_EMBEDDING_SHARD_INDEX/INTEL_EMBEDDING_SHARD_TOTAL")?,
                 },
+            },
+            similarity: SimilarityConfig {
+                version: std::env::var("INTEL_SIMILARITY_VERSION")
+                    .ok()
+                    .map(|raw| raw.trim().to_owned())
+                    .filter(|raw| !raw.is_empty()),
+                limits: crate::similarity::SimilarityLimits {
+                    max_results: env_parse(
+                        "INTEL_SIMILARITY_MAX_RESULTS",
+                        similarity_defaults.max_results,
+                    )?,
+                    default_results: env_parse(
+                        "INTEL_SIMILARITY_DEFAULT_RESULTS",
+                        similarity_defaults.default_results,
+                    )?,
+                    // The recall knob: stage 1 shortlists in raw cosine space
+                    // and stage 2 re-ranks in standardized space, so this is
+                    // how much slack a neighbour gets to survive a metric it
+                    // is not scored by. Raise it if
+                    // `intelligence_similarity_approximate_total` is a large
+                    // share of served searches.
+                    candidate_multiplier: env_parse(
+                        "INTEL_SIMILARITY_CANDIDATE_MULTIPLIER",
+                        similarity_defaults.candidate_multiplier,
+                    )?,
+                    max_candidates: env_parse(
+                        "INTEL_SIMILARITY_MAX_CANDIDATES",
+                        similarity_defaults.max_candidates,
+                    )?,
+                    // `0` disables the materialized read model — every search
+                    // runs live. An explicit off switch matters: this is a
+                    // cache in front of a correctness-sensitive ranking, and
+                    // "turn it off" must not require a redeploy of new code.
+                    cache_max_age: match env_parse(
+                        "INTEL_SIMILARITY_CACHE_MAX_AGE_SECS",
+                        similarity_defaults
+                            .cache_max_age
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    )? {
+                        0 => None,
+                        secs => Some(Duration::from_secs(secs)),
+                    },
+                },
+                baseline: crate::baseline_cache::BaselineCacheConfig {
+                    refresh_interval: Duration::from_secs(env_parse(
+                        "INTEL_SIMILARITY_BASELINE_REFRESH_SECS",
+                        baseline_defaults.refresh_interval.as_secs(),
+                    )?),
+                    max_age: Duration::from_secs(env_parse(
+                        "INTEL_SIMILARITY_BASELINE_MAX_AGE_SECS",
+                        baseline_defaults.max_age.as_secs(),
+                    )?),
+                },
+                max_concurrent: env_parse("INTEL_SIMILARITY_MAX_CONCURRENT", 32usize)?,
             },
             graph_limits: crate::graph::GraphLimits {
                 degree_cap: env_parse(

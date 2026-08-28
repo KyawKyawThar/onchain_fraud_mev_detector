@@ -1,0 +1,54 @@
+-- An HNSW vector-similarity index over `address_embeddings.vector` (§20.3,
+-- Sprint 19 t2): what makes "addresses that behave like this one" a top-k
+-- lookup instead of a scan of the whole address space.
+--
+-- **The index is an accelerator, never a correctness dependency.** The read
+-- behind it (`EmbeddingStore::nearest_candidates`) is a plain
+-- `ORDER BY cosineDistance(vector, <query>) LIMIT n`, which returns the same
+-- rows with or without this index — the index only lets ClickHouse skip
+-- granules while doing it. A deployment that has not applied this migration
+-- serves identical results, more slowly. Nothing above reads the index.
+--
+-- **The distance function is part of the index, and it is the raw-space one.**
+-- Comparison in this subsystem is standardized against a population baseline
+-- (see `embedding::baseline`), and standardization is an affine shift the
+-- index cannot express. So this index generates *candidates* in raw cosine
+-- space, and the caller re-ranks them exactly in standardized space; the
+-- over-fetch factor that buys back the recall lost in that gap is
+-- `INTEL_SIMILARITY_CANDIDATE_MULTIPLIER`. A different distance function in
+-- the query (L2Distance, say) simply would not use this index.
+--
+-- **A vector index locks the column to one arity.** ClickHouse rejects an
+-- insert whose array length differs from the dimension declared here:
+--
+--   Array values in column with vector similarity index have N elements,
+--   expects 33 elements. (INCORRECT_DATA)
+--
+-- That collides with the one property this table was designed for — v1 and v2
+-- vectors living side by side during a shadow rollout (see the 0004 comment).
+-- A v2 whose dimension differs from v1 therefore needs a migration that DROPs
+-- this index before its first write, and re-adds it (per version, on a split
+-- table) afterwards. This is not left to be discovered in production: the
+-- dimension below is pinned by `similarity`'s
+-- `every_shipped_version_fits_the_vector_index` test, which fails the build
+-- with that instruction the moment a roster version disagrees with it.
+--
+-- Like every other index migration here, this affects parts written from here
+-- on. Applying it to existing data is an operator step, deliberately not part
+-- of the migration -- MATERIALIZE INDEX builds an HNSW graph over every
+-- existing part, which on a production-sized table is a maintenance window,
+-- not a boot-time action. Until it is run, older parts are simply scanned
+-- exhaustively, which is correct and slower:
+--
+--   ALTER TABLE address_embeddings MATERIALIZE INDEX idx_embedding_vector
+--
+-- The trailing SETTINGS clause is required: `vector_similarity` is still an
+-- experimental index type in ClickHouse 25.6, and the DDL is rejected without
+-- it. It is a query-level setting, so it applies to this statement alone.
+--
+-- NOTE: no literal question mark may appear anywhere in this file (even in a
+-- comment) — the clickhouse client parses each one as a bind placeholder.
+ALTER TABLE address_embeddings
+    ADD INDEX IF NOT EXISTS idx_embedding_vector vector
+        TYPE vector_similarity('hnsw', 'cosineDistance', 33) GRANULARITY 4
+    SETTINGS allow_experimental_vector_similarity_index = 1

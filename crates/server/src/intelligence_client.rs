@@ -19,7 +19,8 @@ use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
 use intelligence::pb::{
     BuilderLeaderboardReply, BuilderLeaderboardRequest, EntityGraphReply, EntityGraphRequest,
     EntityTimelineReply, EntityTimelineRequest, Label, LabelsRequest, RiskScoreReply,
-    RiskScoreRequest, ScreeningFactsReply, ScreeningFactsRequest,
+    RiskScoreRequest, ScreeningFactsReply, ScreeningFactsRequest, SimilarAddressesReply,
+    SimilarAddressesRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
@@ -233,6 +234,26 @@ impl IntelligenceClient {
                 entity_id,
                 chain,
                 hops,
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Addresses that behave like this one (§20.3/§8.3), each with the
+    /// behavioral factors that drove the match (`0` = the server's default
+    /// result count, clamped to its ceiling).
+    pub async fn similar_addresses(
+        &self,
+        address: String,
+        chain: u64,
+        limit: u32,
+    ) -> Result<SimilarAddressesReply, Status> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_similar_addresses(SimilarAddressesRequest {
+                address,
+                chain,
+                limit,
             })
             .await?;
         Ok(response.into_inner())

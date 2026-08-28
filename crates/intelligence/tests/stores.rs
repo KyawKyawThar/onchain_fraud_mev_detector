@@ -34,6 +34,45 @@ use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::{Redis, REDIS_PORT};
 
+/// ClickHouse image tag these tests run against — pinned to the tag the K8s
+/// manifests deploy (`deploy/k8s/base/infra/clickhouse.yaml`), not the
+/// testcontainers module's default.
+///
+/// The default is `23.3`, which predates the `vector_similarity` index type
+/// entirely: migration 0007 would fail to apply and take *every* ClickHouse
+/// test here down with it. Testing schema migrations against an older server
+/// than production runs is how a migration that cannot apply ships green.
+const CLICKHOUSE_TAG: &str = "25.6";
+
+/// Start a ClickHouse matching the deployed version and hand back a client for
+/// it. The container is returned so the caller keeps it alive for the test.
+///
+/// `CLICKHOUSE_SKIP_USER_SETUP` is required from 25.x on: newer images refuse
+/// to start a passwordless `default` user without it, and the failure surfaces
+/// as an authentication error on the first query rather than a startup one.
+async fn start_clickhouse() -> (
+    testcontainers::ContainerAsync<ClickHouse>,
+    clickhouse::Client,
+) {
+    use testcontainers::ImageExt;
+
+    let container = ClickHouse::default()
+        .with_tag(CLICKHOUSE_TAG)
+        .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+    (container, client)
+}
+
 fn at(secs: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
 }
@@ -823,18 +862,7 @@ async fn label_batch_insert_is_keyed_idempotent_and_coexists() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers ClickHouse)"]
 async fn adjacency_neighborhoods_are_degree_capped_and_direction_blind() {
-    let container = ClickHouse::default()
-        .start()
-        .await
-        .expect("start ClickHouse container");
-    let http_port = container
-        .get_host_port_ipv4(CLICKHOUSE_PORT)
-        .await
-        .expect("ClickHouse port");
-    let client = clickhouse::Client::default()
-        .with_url(format!("http://127.0.0.1:{http_port}"))
-        .with_user("default")
-        .with_database("default");
+    let (_container, client) = start_clickhouse().await;
 
     intelligence::ch_migrate::MIGRATOR
         .run(&client)
@@ -942,18 +970,7 @@ async fn adjacency_neighborhoods_are_degree_capped_and_direction_blind() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers ClickHouse)"]
 async fn adjacency_edge_history_and_active_addresses_back_the_embedding_job() {
-    let container = ClickHouse::default()
-        .start()
-        .await
-        .expect("start ClickHouse container");
-    let http_port = container
-        .get_host_port_ipv4(CLICKHOUSE_PORT)
-        .await
-        .expect("ClickHouse port");
-    let client = clickhouse::Client::default()
-        .with_url(format!("http://127.0.0.1:{http_port}"))
-        .with_user("default")
-        .with_database("default");
+    let (_container, client) = start_clickhouse().await;
 
     intelligence::ch_migrate::MIGRATOR
         .run(&client)
@@ -1078,18 +1095,7 @@ async fn embedding_store_reads_back_the_latest_vector_per_version() {
     use intelligence::embedding::{default_embedder, BehaviorInputs};
     use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
 
-    let container = ClickHouse::default()
-        .start()
-        .await
-        .expect("start ClickHouse container");
-    let http_port = container
-        .get_host_port_ipv4(CLICKHOUSE_PORT)
-        .await
-        .expect("ClickHouse port");
-    let client = clickhouse::Client::default()
-        .with_url(format!("http://127.0.0.1:{http_port}"))
-        .with_user("default")
-        .with_database("default");
+    let (_container, client) = start_clickhouse().await;
 
     intelligence::ch_migrate::MIGRATOR
         .run(&client)
@@ -1153,6 +1159,164 @@ async fn embedding_store_reads_back_the_latest_vector_per_version() {
         .expect("read latest again")
         .expect("still present");
     assert_eq!(again.values, newer.values);
+}
+
+/// The §20.3 similarity search against a real ClickHouse — the one place the
+/// `vector_similarity` index, the query that must use it, and the exact
+/// re-rank above it are exercised together.
+///
+/// Three things here cannot be checked anywhere else:
+///
+/// 1. **Migration 0007 applies at all.** `vector_similarity` is an
+///    experimental index type whose DDL is rejected without a query-level
+///    setting, and the setting rides in the migration's own SQL. A unit test
+///    cannot tell whether ClickHouse accepted it.
+/// 2. **The index does not reject the embedding job's writes.** An indexed
+///    vector column hard-refuses any array of a different length, so an
+///    ordinary `append` after the index exists is the regression this guards.
+/// 3. **The candidate query is the one the index can serve.** The float
+///    rendering in `vector_literal` is the difference between an
+///    index-accelerated read and a silent full scan that returns the same
+///    rows — so the plan itself is asserted, not just the answer.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn similarity_search_ranks_against_a_real_clickhouse_vector_index() {
+    use intelligence::embedding::v1::VERSION as EMBEDDING_VERSION;
+    use intelligence::embedding::{baseline, default_embedder, BehaviorInputs};
+    use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
+    use intelligence::similarity::{self, SimilarityLimits, INDEXED_DIMENSION};
+
+    let (_container, client) = start_clickhouse().await;
+    intelligence::ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .expect("apply intelligence migrations (0007 adds the vector index)");
+
+    // The index really is on the column, with the arity the code believes.
+    let create: String = client
+        .query("SHOW CREATE TABLE address_embeddings")
+        .fetch_one()
+        .await
+        .expect("read the table definition");
+    assert!(
+        create.contains("idx_embedding_vector"),
+        "migration 0007 did not add the vector index: {create}"
+    );
+    assert!(
+        create.contains(&format!("cosineDistance', {INDEXED_DIMENSION}")),
+        "the index arity must match INDEXED_DIMENSION: {create}"
+    );
+
+    let store = ClickhouseEmbeddingStore::new(client.clone());
+    let embedder = default_embedder();
+    let schema = embedder.schema();
+
+    // A population varying along one legible axis: the subject at 5.0, its
+    // nearest behavioral neighbour at 4.0, and an opposite at -5.0.
+    let population: Vec<(u8, f32)> = vec![
+        (0xB1, 5.0),
+        (0xB2, 4.0),
+        (0xB3, -5.0),
+        (0xB4, 1.0),
+        (0xB5, 2.5),
+        (0xB6, -1.0),
+    ];
+    let vectors: Vec<_> = population
+        .iter()
+        .map(|(byte, first)| {
+            let mut vector =
+                embedder.embed(addr(*byte), None, &BehaviorInputs::default(), at(1_000));
+            vector.values[0] = *first;
+            vector
+        })
+        .collect();
+    // Writing through an indexed column at all is assertion (2).
+    store
+        .append(Chain::ETHEREUM, &vectors)
+        .await
+        .expect("append into the indexed column");
+
+    let sample: Vec<Vec<f32>> = vectors.iter().map(|v| v.values.clone()).collect();
+    let mut population_baseline =
+        baseline::compute(schema, &sample, at(0)).expect("a baseline over the sample");
+    population_baseline.sample_count = baseline::MIN_SAMPLES;
+    store
+        .put_baseline(Chain::ETHEREUM, &population_baseline)
+        .await
+        .expect("store the baseline");
+
+    let baseline_now = Utc::now();
+    let found = similarity::similar_addresses(similarity::SearchRequest {
+        store: &store,
+        chain: Chain::ETHEREUM,
+        address: &addr(0xB1),
+        schema,
+        baseline: Some(std::sync::Arc::new(population_baseline.clone())),
+        limits: SimilarityLimits::default(),
+        requested_results: 3,
+        now: baseline_now,
+    })
+    .await
+    .expect("the search runs")
+    .expect("the subject is embedded");
+
+    assert_eq!(found.embedding_version, EMBEDDING_VERSION);
+    assert_eq!(found.results.len(), 3);
+    assert_eq!(
+        found.results[0].address,
+        addr(0xB2),
+        "the nearest behavior wins"
+    );
+    assert!(
+        found.results.iter().all(|hit| hit.address != addr(0xB1)),
+        "an address is not its own neighbour"
+    );
+    let scores: Vec<f32> = found.results.iter().map(|h| h.similarity.get()).collect();
+    assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+
+    // Every hit explains itself, and the explanation is the score's exact
+    // decomposition — the property the whole endpoint rests on, re-checked
+    // here on values that came back out of ClickHouse rather than out of a
+    // constructor.
+    for hit in &found.results {
+        assert!(!hit.factors.is_empty());
+        let summed: f32 = hit.factors.iter().map(|f| f.contribution).sum();
+        assert!(
+            (summed - hit.similarity.get()).abs() < 1e-4,
+            "factors {summed} must sum to similarity {}",
+            hit.similarity
+        );
+    }
+    assert!(
+        !found.approximate,
+        "a population this small fits inside the shortlist cap, so the ranking is exact"
+    );
+
+    // (3) The plan. `vector_literal`'s float rendering is what keeps this in
+    // the plan at all: an integer-typed array literal returns the same rows
+    // with the index skipped entirely, which no assertion on the *answer*
+    // could ever catch.
+    let query_vector = vectors[0]
+        .values
+        .iter()
+        .map(|v| format!("{v:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let plan: Vec<String> = client
+        .query(&format!(
+            "EXPLAIN indexes = 1 SELECT address FROM address_embeddings \
+             WHERE chain = 1 AND embedding_version = ? \
+             ORDER BY cosineDistance(vector, [{query_vector}]) ASC LIMIT 3"
+        ))
+        .bind(EMBEDDING_VERSION)
+        .fetch_all()
+        .await
+        .expect("explain the candidate query");
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("idx_embedding_vector"),
+        "the candidate query must use the vector index, not scan:\n{plan}"
+    );
 }
 
 /// The **batched** reads the embedding sweep depends on, against real stores.
@@ -1325,18 +1489,7 @@ async fn batched_graph_and_embedding_reads_agree_and_shards_partition() {
     use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
     use std::collections::BTreeSet;
 
-    let container = ClickHouse::default()
-        .start()
-        .await
-        .expect("start ClickHouse container");
-    let http_port = container
-        .get_host_port_ipv4(CLICKHOUSE_PORT)
-        .await
-        .expect("ClickHouse port");
-    let client = clickhouse::Client::default()
-        .with_url(format!("http://127.0.0.1:{http_port}"))
-        .with_user("default")
-        .with_database("default");
+    let (_container, client) = start_clickhouse().await;
 
     intelligence::ch_migrate::MIGRATOR
         .run(&client)

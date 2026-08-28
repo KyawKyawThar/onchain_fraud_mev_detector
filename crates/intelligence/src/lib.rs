@@ -136,6 +136,7 @@
 pub mod adjacency;
 pub mod association;
 pub mod attribution;
+pub mod baseline_cache;
 pub mod cache;
 pub mod ch_migrate;
 pub mod cluster;
@@ -160,6 +161,7 @@ pub mod reorg;
 pub mod risk;
 pub mod risk_scorer;
 pub mod seed;
+pub mod similarity;
 pub mod store;
 pub mod timeline;
 

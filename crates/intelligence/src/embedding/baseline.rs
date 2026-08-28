@@ -107,6 +107,38 @@ impl BehaviorBaseline {
         self.embedding_version == schema.version() && self.schema_hash == schema.content_hash()
     }
 
+    /// A content fingerprint of the *numbers this baseline standardizes with*
+    /// — version, schema hash, centre, spread and sample count.
+    ///
+    /// This is what makes a materialized ranking safe to reuse. §20.3's
+    /// contract is that a **re-derived baseline changes rankings without
+    /// rewriting history**; anything that caches a ranking therefore has to
+    /// know which baseline produced it, or it silently serves yesterday's
+    /// ordering forever and quietly repeals that contract. Stamping the
+    /// fingerprint on a cached result turns "is this still valid" into an
+    /// equality check.
+    ///
+    /// Hashes the float **bit patterns**, not their decimal forms: this is an
+    /// identity check, and two baselines that differ in the last ulp
+    /// standardize differently. `computed_at` is deliberately excluded — two
+    /// recomputations that land on identical statistics *are* the same
+    /// baseline, and invalidating on a timestamp would throw away every cached
+    /// ranking on each harmless refresh.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(self.embedding_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.schema_hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.sample_count.to_be_bytes());
+        for value in self.centre.iter().chain(self.spread.iter()) {
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Standardize `values` into robust z-units: `(x - median) / (1.4826 * MAD)`,
     /// with a zero-spread feature contributing `0.0`.
     ///
@@ -365,6 +397,57 @@ mod tests {
             baseline.standardize(&schema, &[1.0, 1.0]),
             Err(BaselineError::TooFewSamples { samples: 2, .. })
         ));
+    }
+
+    /// The fingerprint is what lets a materialized ranking be reused safely,
+    /// so it must move exactly when the standardization does — and not when
+    /// something irrelevant does.
+    #[test]
+    fn the_fingerprint_tracks_the_numbers_and_ignores_the_clock() {
+        let schema = schema();
+        let baseline = compute(
+            &schema,
+            &sample(&[[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]),
+            at(0),
+        )
+        .expect("a baseline");
+
+        // Same statistics, different time: the *same* baseline. Invalidating
+        // on the clock would discard every cached ranking on each harmless
+        // refresh.
+        let mut later = baseline.clone();
+        later.computed_at = at(999_999);
+        assert_eq!(baseline.fingerprint(), later.fingerprint());
+
+        // A moved centre is a different standardization.
+        let mut shifted = baseline.clone();
+        shifted.centre[0] += 0.5;
+        assert_ne!(baseline.fingerprint(), shifted.fingerprint());
+
+        // So is a moved spread, a different schema, and a different sample.
+        let mut respread = baseline.clone();
+        respread.spread[0] += 0.5;
+        assert_ne!(baseline.fingerprint(), respread.fingerprint());
+
+        let mut reschema = baseline.clone();
+        reschema.schema_hash = "other".into();
+        assert_ne!(baseline.fingerprint(), reschema.fingerprint());
+
+        let mut resampled = baseline.clone();
+        resampled.sample_count += 1;
+        assert_ne!(baseline.fingerprint(), resampled.fingerprint());
+    }
+
+    /// An ulp of difference standardizes differently, so it must fingerprint
+    /// differently — hence hashing bit patterns rather than decimal forms.
+    #[test]
+    fn the_fingerprint_separates_baselines_differing_by_one_ulp() {
+        let schema = schema();
+        let baseline =
+            compute(&schema, &sample(&[[1.0, 1.0], [2.0, 1.0]]), at(0)).expect("a baseline");
+        let mut nudged = baseline.clone();
+        nudged.centre[0] = f32::from_bits(nudged.centre[0].to_bits() + 1);
+        assert_ne!(baseline.fingerprint(), nudged.fingerprint());
     }
 
     #[test]

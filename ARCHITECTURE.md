@@ -1041,6 +1041,47 @@ family rolls back (the consumer reads `AttributionRetracted`, §15), but the
 adjacency graph has no reversal, so the cadence and flow families describe every
 observation ever appended, canonical or not.
 
+*Similarity search re-ranks what the index shortlists, and says so.* The
+`vector_similarity` (HNSW) index over `address_embeddings.vector` can only
+accelerate the distance function baked into it, and standardization is an
+affine shift no such index expresses. So `GET /v1/address/{addr}/similar` is
+the two-stage ANN shape: ClickHouse shortlists candidates by **raw** cosine
+distance off the index, then `intelligence::similarity` standardizes every
+candidate against the population baseline and scores it exactly in that space.
+Only the shortlist is approximate, and only in recall — nothing it does can
+make a returned score or explanation wrong — so the response carries
+`approximate` and `candidates_considered` rather than presenting an
+approximation as an exact answer, the same mark-the-fidelity rule as
+`observations_truncated`. The candidate over-fetch is the knob that buys the
+recall back.
+
+*The explanation is the score's decomposition, not an attribution laid beside
+it.* Cosine similarity over standardized vectors splits exactly into one signed
+term per feature, `z_subject[i] * z_candidate[i] / (|z_subject| |z_candidate|)`,
+and those terms sum to the score. A positive term means both addresses sit on
+the same side of the population median on that feature; a negative one means
+they sit on opposite sides and it is pushing them apart. Both are surfaced,
+ranked by magnitude — "these two look alike *except* on X" is the sentence an
+investigator needs, and an explanation that only ever agrees with its own
+conclusion is not one.
+
+*Two absences are answers, not failures.* An address at the population median
+on essentially every feature has no direction to search along, and cosine
+against it is 0/0; a chain whose baseline job has not run yet cannot be ranked
+in the right units at all. Both come back as an explained empty result
+(`no_signal` / `no_baseline`) with the address still `found` — a 500 would be
+wrong and an unexplained empty list would be worse, and `no_baseline` is
+counted so the one failure that looks like a normal empty answer from outside
+is visible to ops from inside.
+
+*The index locks the column to one arity.* ClickHouse rejects an insert whose
+array length differs from the dimension the index declares, which collides
+head-on with the property this table was built for: v1 and v2 vectors living
+side by side during a shadow rollout. That is not left to be discovered in
+production — a unit test pins every roster version's dimension to the
+migration's, and fails the build with the required operator sequence the moment
+one disagrees.
+
 Finally, one fan-out is deliberately refused. Labelling an address also changes
 the counterparty-type distribution of everyone who ever transacted with it, and
 a `LabelAdded` on a router would invalidate millions of addresses off a single

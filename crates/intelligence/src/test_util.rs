@@ -789,7 +789,10 @@ fn shard_contains(shard: crate::adjacency::Shard, address: &AccountAddress) -> b
 
 use crate::embedding::baseline::BehaviorBaseline;
 use crate::embedding::BehaviorVector;
-use crate::embedding_store::{EmbeddingRow, EmbeddingStore, EmbeddingStoreError, StoredEmbedding};
+use crate::embedding_store::{
+    CachedNeighbors, EmbeddingRow, EmbeddingStore, EmbeddingStoreError, NeighborsRow,
+    StoredEmbedding,
+};
 
 /// [`EmbeddingStore`] double: an append-only log of everything written, plus a
 /// transient-failure toggle for retry tests.
@@ -803,6 +806,8 @@ use crate::embedding_store::{EmbeddingRow, EmbeddingStore, EmbeddingStoreError, 
 pub struct RecordingEmbeddingStore {
     appended: Mutex<Vec<(Chain, BehaviorVector)>>,
     baselines: Mutex<Vec<(Chain, BehaviorBaseline)>>,
+    /// Materialized neighbour rankings, keyed like the real table.
+    neighbors: Mutex<HashMap<(u64, String, String), CachedNeighbors>>,
     fail_next: Mutex<bool>,
 }
 
@@ -824,6 +829,12 @@ impl RecordingEmbeddingStore {
     /// Make the next `append` fail transiently.
     pub fn fail_next(&self) {
         *self.fail_next.lock().expect("embedding lock") = true;
+    }
+
+    /// How many neighbour rankings have been materialized — lets a test prove
+    /// a cache hit did no write, and a miss did exactly one.
+    pub fn materialized_count(&self) -> usize {
+        self.neighbors.lock().expect("embedding lock").len()
     }
 }
 
@@ -868,6 +879,87 @@ impl EmbeddingStore for RecordingEmbeddingStore {
                 StoredEmbedding::try_from(EmbeddingRow::from_vector(*chain, vector))
             })
             .transpose()
+    }
+
+    async fn nearest_candidates(
+        &self,
+        chain: Chain,
+        embedding_version: &str,
+        query: &[f32],
+        exclude: &AccountAddress,
+        limit: usize,
+    ) -> Result<Vec<StoredEmbedding>, EmbeddingStoreError> {
+        // Brute-force raw cosine over everything appended — the *exact* answer
+        // the ClickHouse read approximates. Deliberately: a double that only
+        // promised the same shape would let a ranking bug hide behind "well,
+        // it's approximate". Rows are returned uncollapsed, superseded ones
+        // included, because collapsing them here would hide the caller's
+        // latest-wins rule from every unit test that uses this double.
+        let appended = self.appended.lock().expect("embedding lock");
+        let mut scored: Vec<(f64, StoredEmbedding)> = Vec::new();
+        for (stored_chain, vector) in appended.iter() {
+            if *stored_chain != chain
+                || vector.embedding_version() != embedding_version
+                || vector.address == *exclude
+            {
+                continue;
+            }
+            let stored = StoredEmbedding::try_from(EmbeddingRow::from_vector(chain, vector))?;
+            scored.push((cosine_distance(query, &stored.values), stored));
+        }
+        // Nearest first, ties broken by address so the shortlist is stable.
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.address.cmp(&b.1.address))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, stored)| stored)
+            .collect())
+    }
+
+    async fn cached_neighbors(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        embedding_version: &str,
+    ) -> Result<Option<CachedNeighbors>, EmbeddingStoreError> {
+        let key = (
+            chain.id(),
+            crate::model::address_key(address),
+            embedding_version.to_owned(),
+        );
+        let stored = self
+            .neighbors
+            .lock()
+            .expect("embedding lock")
+            .get(&key)
+            .cloned();
+        // Round-tripped through the row form so an encoding bug surfaces in a
+        // unit test rather than only against a real ClickHouse — the same
+        // stance the vector double takes.
+        stored
+            .map(|entry| CachedNeighbors::try_from(NeighborsRow::from_entry(chain, &entry)))
+            .transpose()
+    }
+
+    async fn put_neighbors(
+        &self,
+        chain: Chain,
+        entry: &CachedNeighbors,
+    ) -> Result<(), EmbeddingStoreError> {
+        let key = (
+            chain.id(),
+            crate::model::address_key(&entry.address),
+            entry.embedding_version.clone(),
+        );
+        self.neighbors
+            .lock()
+            .expect("embedding lock")
+            .insert(key, entry.clone());
+        Ok(())
     }
 
     async fn sample_vectors(
@@ -930,6 +1022,25 @@ impl EmbeddingStore for RecordingEmbeddingStore {
             .max_by_key(|(_, baseline)| baseline.computed_at)
             .map(|(_, baseline)| baseline.clone()))
     }
+}
+
+/// ClickHouse's `cosineDistance` (`1 - cos`), for the double's brute-force
+/// shortlist. A zero-norm operand yields `NaN` there too — kept faithful
+/// rather than clamped, so the caller's own zero-vector guard is what tests
+/// exercise, not a kindness the real store does not perform.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let norm = |v: &[f32]| -> f64 {
+        v.iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum::<f64>()
+            .sqrt()
+    };
+    1.0 - dot / (norm(a) * norm(b))
 }
 
 // ── Block-production doubles (§10, Sprint 11 t1) ─────────────────────────────
