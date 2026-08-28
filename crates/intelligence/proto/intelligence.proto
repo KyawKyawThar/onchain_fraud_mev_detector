@@ -45,6 +45,14 @@ service IntelligenceRead {
   // history projected from intelligence's own stores, distinct from the
   // incident-level audit trail.
   rpc GetEntityTimeline(EntityTimelineRequest) returns (EntityTimelineReply);
+
+  // Addresses that behave like this one (§20.3, §8.3), each with the
+  // behavioral factors that drove the match. Shortlists neighbours off the
+  // ClickHouse vector index over `address_embeddings.vector`, then re-ranks
+  // them exactly against the population baseline — so the score is in
+  // standardized units, and `approximate` says whether the shortlist could
+  // have missed a better neighbour.
+  rpc GetSimilarAddresses(SimilarAddressesRequest) returns (SimilarAddressesReply);
 }
 
 message RiskScoreRequest {
@@ -241,4 +249,82 @@ message EntityTimelineReply {
   bool found = 1;
   // Milestones oldest first.
   repeated TimelineMilestone milestones = 2;
+}
+
+message SimilarAddressesRequest {
+  // 0x-prefixed hex address, any case — the subject to find neighbours for.
+  string address = 1;
+  // Chain id whose embedding population to search (e.g. 1 = Ethereum mainnet).
+  uint64 chain = 2;
+  // How many neighbours to return; 0 means the server default. Clamped to the
+  // server's ceiling rather than rejected.
+  uint32 limit = 3;
+}
+
+// One feature's exact, signed share of a similarity score. The contributions
+// of all features sum to `similarity` — this is the score's decomposition, not
+// an attribution heuristic beside it.
+message SimilarityFactor {
+  // The feature's stable schema name (e.g. `busiest_day_share`).
+  string feature = 1;
+  // The subject's value in the vector's own raw, interpretable units.
+  float subject_value = 2;
+  // The neighbour's raw value.
+  float candidate_value = 3;
+  // The subject's value in robust z-units against the population baseline.
+  float subject_z = 4;
+  // The neighbour's value in robust z-units.
+  float candidate_z = 5;
+  // Signed share of the score. Positive: both sit on the same side of the
+  // population median, pulling them together. Negative: opposite sides.
+  float contribution = 6;
+}
+
+message SimilarAddress {
+  // 0x-prefixed lowercase hex address.
+  string address = 1;
+  // The neighbour's resolved entity at its compute time; empty when it belongs
+  // to none. A hit whose entity is known is the §20.3 clustering signal's
+  // input — a reduced-confidence heuristic, never a merge (§8.2).
+  string entity_id = 2;
+  // Cosine similarity between baseline-standardized vectors, in [-1, 1].
+  float similarity = 3;
+  // This neighbour's vector describes a recent activity window rather than its
+  // whole history (§8.2's hub rule) — a weaker claim, marked not assumed.
+  bool observations_truncated = 4;
+  // When the neighbour's vector was computed. Unix milliseconds.
+  int64 computed_at_unix_millis = 5;
+  // The largest-magnitude contributions, most significant first.
+  repeated SimilarityFactor factors = 6;
+}
+
+message SimilarAddressesReply {
+  // False when the subject has never been embedded under this version (the
+  // edge maps this to a 404).
+  bool found = 1;
+  // The schema version and hash every vector in this reply was compared under.
+  // Two scores are only comparable if both match.
+  string embedding_version = 2;
+  string schema_hash = 3;
+  // When the subject's own vector was computed. Unix milliseconds.
+  int64 subject_computed_at_unix_millis = 4;
+  // Most similar first.
+  repeated SimilarAddress results = 5;
+  // How many rows the shortlist stage returned.
+  uint32 candidates_considered = 6;
+  // Shortlisted rows dropped during the re-rank: a superseded row for an
+  // address already seen, a vector from another schema version, or one with no
+  // signal to compare against.
+  uint32 candidates_skipped = 7;
+  // The shortlist filled its cap, so a better neighbour may exist outside it.
+  // False means the search saw the whole comparable population and the ranking
+  // is exact.
+  bool approximate = 8;
+  // Empty when the search ran. Otherwise why it could not, as a state rather
+  // than an error: `no_baseline` (the population baseline for this version has
+  // not been computed yet) or `no_signal` (the subject is at the population
+  // median on essentially every feature, so there is no behavioral direction
+  // to search along). `results` is empty in both cases and `found` is true —
+  // the address exists, the comparison does not.
+  string unavailable_reason = 9;
 }

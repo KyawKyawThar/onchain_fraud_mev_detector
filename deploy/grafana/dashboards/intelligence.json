@@ -8,7 +8,7 @@
   "timezone": "",
   "title": "Intelligence — cache hit rate, score recompute, reads (§19)",
   "uid": "intelligence-reads",
-  "version": 1,
+  "version": 3,
   "panels": [
     {
       "id": 1,
@@ -130,6 +130,126 @@
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(increase(intel_seed_addresses_evicted_total[$__range]))",
           "legendFormat": "addresses evicted"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Similarity searches, by outcome",
+      "description": "§20.3 behavioral similarity. `no_baseline` climbing is the alert — it is the one failure that looks like a normal empty answer from outside the service, and it means the `intelligence embedding-baseline` run mode has stopped. `no_signal` is a property of the queried addresses, not of the system.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(intelligence_similarity_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Similarity searches hitting the shortlist cap",
+      "description": "Share of served searches whose candidate shortlist filled its cap, so a better neighbour may exist outside it. The shortlist ranks in raw cosine space and the score re-ranks in baseline-standardized space, so this is the recall knob's feedback signal — a high share means raising INTEL_SIMILARITY_CANDIDATE_MULTIPLIER.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intelligence_similarity_approximate_total[$__rate_interval])) / clamp_min(sum(rate(intelligence_similarity_requests_total{outcome=\"served\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "approximate share"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Population baseline age (§20.3)",
+      "description": "How old the baseline every similarity score is standardized against actually is. THIS IS THE SILENT FAILURE: if the `intelligence embedding-baseline` run mode dies, nothing errors — searches keep returning confident rankings against a population that is drifting away from reality. Alert above roughly two refresh intervals; past INTEL_SIMILARITY_BASELINE_MAX_AGE_SECS the search is refused outright (outcome=no_baseline on the panel above).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (chain, embedding_version) (intelligence_similarity_baseline_age_seconds)",
+          "legendFormat": "chain {{chain}} / {{embedding_version}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Baseline refresh outcomes",
+      "description": "Refreshes of the process-wide baseline snapshot. A sustained `error` rate alongside a climbing age is the signature of 'ClickHouse is up but behavior_baselines is not readable'. Sustained `missing` means the baseline job has never produced one for this (chain, version).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(intelligence_similarity_baseline_refresh_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Neighbour cache outcomes (materialized rankings)",
+      "description": "The address_neighbors read model. `stale_baseline` spiking ONCE right after a baseline re-derivation is correct — that is the fingerprint invalidation doing its job. A SUSTAINED stale_baseline rate means baselines are being rewritten faster than the working set refills, and the cache is costing more than it saves: widen INTEL_SIMILARITY_BASELINE_REFRESH_SECS or disable the cache with INTEL_SIMILARITY_CACHE_MAX_AGE_SECS=0. A high `error` rate is harmless to correctness (a cache that cannot be read is treated as a miss) but means the live path is carrying all traffic.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(intelligence_similarity_neighbor_cache_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Similarity shed rate (bulkhead saturation)",
+      "description": "Share of similarity searches rejected by the in-process concurrency bulkhead (RESOURCE_EXHAUSTED). Non-zero means INTEL_SIMILARITY_MAX_CONCURRENT is saturating. Raise it ONLY after confirming ClickHouse and the screening p50 have headroom — the ceiling exists precisely to stop this endpoint degrading GetScreeningFacts, which shares the same service and store and carries a p50 < 100ms SLO (§19). Shedding here is the system working, not failing.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intelligence_similarity_requests_total{outcome=\"shed\"}[$__rate_interval])) / clamp_min(sum(rate(intelligence_similarity_requests_total[$__rate_interval])), 1e-9)",
+          "legendFormat": "shed share"
         }
       ]
     }

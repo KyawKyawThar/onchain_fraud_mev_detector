@@ -68,6 +68,19 @@ pub const SCREENING_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// docs). A non-zero rate is a Redis health signal, not a billing gap.
 pub const SCREENING_RATE_LIMIT_ERRORS_TOTAL: &str = "screening_rate_limit_errors_total";
 
+/// The endpoint families that carry their own ceiling. A closed set of
+/// `&'static str`, never caller-derived: a scope taken from the request path
+/// would let a caller mint unlimited Redis buckets.
+pub mod scope {
+    /// `POST /v1/address/{addr}/screen` — the §19 p50-critical path.
+    pub const SCREEN: &str = "screen";
+    /// `GET /v1/address/{addr}/similar` — the §20.3 similarity read. Bounded
+    /// separately and more tightly: it is the most expensive read the platform
+    /// serves (an ANN scan plus a bounded re-rank in intelligence), and it
+    /// shares a service and a ClickHouse with `screen`.
+    pub const SIMILAR: &str = "similar";
+}
+
 /// The outcome of a rate-limit check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
@@ -79,9 +92,15 @@ pub enum Admission {
 /// it as `Arc<dyn ScreeningRateLimiter>`, same shape as `PolicyStore`/`RuleStore`.
 #[async_trait]
 pub trait ScreeningRateLimiter: Send + Sync {
-    /// Count one request for `customer` against the window; `Limited` means
-    /// the caller must not proceed to the handler this call.
-    async fn admit(&self, customer: CustomerId) -> Admission;
+    /// Count one request for `(scope, customer)` against the window;
+    /// `Limited` means the caller must not proceed to the handler this call.
+    ///
+    /// `scope` names the endpoint family the ceiling applies to, so one
+    /// limiter backs several independently-bounded routes without their counts
+    /// bleeding together. It is a `&'static str` from [`scope`] rather than
+    /// caller input — a scope derived from a request path would let a caller
+    /// mint unlimited fresh buckets, and would blow up Redis key cardinality.
+    async fn admit(&self, scope: &'static str, customer: CustomerId) -> Admission;
 
     /// How long a rejected caller should wait before retrying — the value the
     /// middleware puts in the `Retry-After` header on a 429. A fixed-window
@@ -116,16 +135,16 @@ impl RedisScreeningRateLimiter {
         }
     }
 
-    fn key(customer: CustomerId) -> String {
-        format!("screen_rl:{customer}")
+    fn key(scope: &str, customer: CustomerId) -> String {
+        format!("rl:{scope}:{customer}")
     }
 }
 
 #[async_trait]
 impl ScreeningRateLimiter for RedisScreeningRateLimiter {
-    async fn admit(&self, customer: CustomerId) -> Admission {
+    async fn admit(&self, scope: &'static str, customer: CustomerId) -> Admission {
         let mut conn = self.conn.clone();
-        let key = Self::key(customer);
+        let key = Self::key(scope, customer);
 
         // One pipelined round-trip (not a transaction — see module docs on
         // why `PEXPIRE ... NX` needs no atomicity with the `INCR` to be
@@ -176,10 +195,33 @@ pub async fn enforce_screening_rate_limit(
     req: Request,
     next: Next,
 ) -> Response {
-    match limiter.admit(customer).await {
+    enforce(scope::SCREEN, limiter, customer, req, next).await
+}
+
+/// The §20.3 similarity read's ceiling — same mechanism, its own bucket.
+pub async fn enforce_similarity_rate_limit(
+    State(limiter): State<Arc<dyn ScreeningRateLimiter>>,
+    Extension(customer): Extension<CustomerId>,
+    req: Request,
+    next: Next,
+) -> Response {
+    enforce(scope::SIMILAR, limiter, customer, req, next).await
+}
+
+/// The shared decision seam. The 429 counter is emitted **here**, labelled by
+/// scope, so the count is identical whichever adapter is behind the trait and
+/// each endpoint's rejection rate is separable in PromQL.
+async fn enforce(
+    scope: &'static str,
+    limiter: Arc<dyn ScreeningRateLimiter>,
+    customer: CustomerId,
+    req: Request,
+    next: Next,
+) -> Response {
+    match limiter.admit(scope, customer).await {
         Admission::Allowed => next.run(req).await,
         Admission::Limited => {
-            metrics::counter!(SCREENING_RATE_LIMITED_TOTAL).increment(1);
+            metrics::counter!(SCREENING_RATE_LIMITED_TOTAL, "scope" => scope).increment(1);
             too_many_requests_response(limiter.retry_after())
         }
     }
@@ -213,9 +255,11 @@ pub mod test_util {
 
     use super::*;
 
+    /// Keyed by `(scope, customer)` like the Redis impl, so a test can prove
+    /// one endpoint's ceiling does not consume another's budget.
     pub struct InMemoryRateLimiter {
         limit: u32,
-        counts: Mutex<HashMap<CustomerId, u32>>,
+        counts: Mutex<HashMap<(&'static str, CustomerId), u32>>,
     }
 
     impl InMemoryRateLimiter {
@@ -235,9 +279,9 @@ pub mod test_util {
 
     #[async_trait]
     impl ScreeningRateLimiter for InMemoryRateLimiter {
-        async fn admit(&self, customer: CustomerId) -> Admission {
+        async fn admit(&self, scope: &'static str, customer: CustomerId) -> Admission {
             let mut counts = self.counts.lock().expect("rate limiter lock");
-            let count = counts.entry(customer).or_insert(0);
+            let count = counts.entry((scope, customer)).or_insert(0);
             *count += 1;
             if *count > self.limit {
                 Admission::Limited
@@ -262,19 +306,28 @@ mod tests {
         let limiter = InMemoryRateLimiter::new(2);
         let who = customer(1);
 
-        assert_eq!(limiter.admit(who).await, Admission::Allowed);
-        assert_eq!(limiter.admit(who).await, Admission::Allowed);
-        assert_eq!(limiter.admit(who).await, Admission::Limited);
+        assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Allowed);
+        assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Allowed);
+        assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Limited);
     }
 
     #[tokio::test]
     async fn limits_are_isolated_per_customer() {
         let limiter = InMemoryRateLimiter::new(1);
 
-        assert_eq!(limiter.admit(customer(1)).await, Admission::Allowed);
+        assert_eq!(
+            limiter.admit(scope::SCREEN, customer(1)).await,
+            Admission::Allowed
+        );
         // A different customer's own budget is untouched by customer 1's use.
-        assert_eq!(limiter.admit(customer(2)).await, Admission::Allowed);
-        assert_eq!(limiter.admit(customer(1)).await, Admission::Limited);
+        assert_eq!(
+            limiter.admit(scope::SCREEN, customer(2)).await,
+            Admission::Allowed
+        );
+        assert_eq!(
+            limiter.admit(scope::SCREEN, customer(1)).await,
+            Admission::Limited
+        );
     }
 
     #[tokio::test]
@@ -282,7 +335,50 @@ mod tests {
         let limiter = InMemoryRateLimiter::unbounded();
         let who = customer(1);
         for _ in 0..1000 {
-            assert_eq!(limiter.admit(who).await, Admission::Allowed);
+            assert_eq!(limiter.admit(scope::SCREEN, who).await, Admission::Allowed);
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::test_util::InMemoryRateLimiter;
+    use super::*;
+
+    fn customer() -> CustomerId {
+        CustomerId(uuid::Uuid::from_u128(7))
+    }
+
+    /// The reason `/similar` has its own scope rather than sharing screening's
+    /// bucket: exhausting one endpoint's ceiling must not spend the other's.
+    /// They have different costs and different SLOs, and a shared budget lets
+    /// either starve the other.
+    #[tokio::test]
+    async fn scopes_hold_independent_budgets() {
+        let limiter = InMemoryRateLimiter::new(1);
+
+        assert_eq!(
+            limiter.admit(scope::SIMILAR, customer()).await,
+            Admission::Allowed
+        );
+        assert_eq!(
+            limiter.admit(scope::SIMILAR, customer()).await,
+            Admission::Limited,
+            "the similarity ceiling is spent"
+        );
+
+        assert_eq!(
+            limiter.admit(scope::SCREEN, customer()).await,
+            Admission::Allowed,
+            "screening must still have its own full budget"
+        );
+    }
+
+    /// Scopes are a closed set of `&'static str`, never caller-derived — a
+    /// scope taken from a request path would let a caller mint unlimited Redis
+    /// buckets. Distinctness is what makes them separate keys at all.
+    #[test]
+    fn the_scope_vocabulary_is_distinct() {
+        assert_ne!(scope::SCREEN, scope::SIMILAR);
     }
 }

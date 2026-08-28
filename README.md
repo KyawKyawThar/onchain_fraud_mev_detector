@@ -9,9 +9,12 @@
 MEVWatch monitors Ethereum and EVM-compatible chains block by block, detects
 sandwich attacks, flash loan exploits, rug pulls, wash trading, and address
 poisoning — then confirms every detection through EVM simulation before
-surfacing it to customers. The result is simulation-backed threat intelligence
-with a false positive rate below 4%, served through a REST/WebSocket API, a
-live dashboard, and a configurable alert rule engine.
+surfacing it to customers. The result is simulation-backed threat intelligence,
+served through a REST/WebSocket API, a live dashboard, and a configurable alert
+rule engine. A false-positive rate below 4% is the **product target**; what is
+*measured* today is a CI-enforced precision/recall gate over ground-truth
+fixtures — see [Measurement: what the numbers cover](#measurement-what-the-numbers-cover)
+for exactly what that does and does not establish.
 
 ---
 
@@ -164,13 +167,29 @@ backed only by heuristic labels.
 
 ---
 
-## AI layer
+## ML layer
 
 Full design: [ARCHITECTURE.md §20](./ARCHITECTURE.md#20-aiml-layer) · build-out: Sprints 18–20.
 
+What is **built** here is classical ML — a gradient-boosted classifier and an
+isolation forest, served as ONNX through an in-process inference seam. The
+LLM copilot (§20.4) is **designed, not built**; it is marked as such below.
+Being explicit about the line, because "AI" is doing a lot of work in most
+repos and none of it is doing any here.
+
+| §20 component | Crate | Status |
+|---|---|---|
+| Frozen, versioned feature schema | `ml-features` | Shipped |
+| Training-set export + provenance | `dataset` | Shipped |
+| ONNX inference seam (`ort`) | `inference` | Shipped |
+| Isolation-forest anomaly detector | `anomaly-detector` | Shipped, Shadow-staged |
+| Rollout gate · drift · governance | `backtest`, `detection` | Shipped |
+| Behavioral embeddings + similarity search | `intelligence` | Shipped |
+| LLM investigation copilot (SAR drafts, NL rules) | — | **Designed only** |
+
 The platform's event-sourced core makes it an unusually good substrate for
-ML — and the AI layer is designed to exploit exactly that, under the same
-governance as everything else:
+ML, and the layer is built to exploit exactly that, under the same governance
+as everything else:
 
 **The training data is free.** Every detection is confirmed or refuted by EVM
 simulation with a measured profit/loss — so the event store continuously
@@ -188,19 +207,25 @@ with feature-level evidence, because unexplainable detection doesn't ship
 here.
 
 **Behavioral embeddings widen the moat.** Per-address behavior vectors +
-ClickHouse vector search answer "which addresses behave like this known
-attacker" — surfacing cluster candidates a fresh-funded bot can't hide from.
+a ClickHouse HNSW vector index answer "which addresses behave like this known
+attacker" — surfacing cluster candidates a fresh-funded bot can't hide from,
+via `GET /v1/address/{addr}/similar`. Scores are cosine similarity over
+population-standardized vectors, and each result carries the per-feature
+contributions that produced it — an exact decomposition of the score, not an
+attribution laid beside it.
 Similarity is a reduced-confidence clustering signal, never an auto-merge:
 the graph's correctness story stays intact.
 
-**The LLM copilot is hallucination-safe by construction.** SAR narrative
-drafts are grounded in the audit trail — every factual claim carries the
-event ids it derives from, so reviewers verify against the store, not the
-model. Natural-language rule creation ("alert when a wallet within 2 hops of
-a sanctioned address moves > $10K") emits the rule engine's wire form, which
-must compile through the existing parse boundary — a hallucinated rule fails
-compilation and can never run. LLM output is a proposal, never a fact:
-nothing it produces enters the event store as evidence.
+**The LLM copilot is designed to be hallucination-safe by construction —
+and is not built yet.** No copilot crate exists; this paragraph describes
+§20.4's design, not shipped behavior. The intended construction: SAR narrative
+drafts grounded in the audit trail, every factual claim carrying the event ids
+it derives from, so reviewers verify against the store rather than the model.
+Natural-language rule creation ("alert when a wallet within 2 hops of a
+sanctioned address moves > $10K") would emit the rule engine's existing wire
+form and must compile through the existing parse boundary — so a hallucinated
+rule fails compilation and can never run. LLM output stays a proposal, never a
+fact: nothing it produces would enter the event store as evidence.
 
 ---
 
@@ -210,6 +235,7 @@ nothing it produces enters the event store as evidence.
 POST /v1/address/{addr}/screen        synchronous allow/review/block decision (pre-tx screening)
 GET  /v1/address/{addr}/risk          risk score + confidence + factor breakdown
 GET  /v1/address/{addr}/labels        all labels with provenance
+GET  /v1/address/{addr}/similar       behaviorally similar addresses, with the factors driving each match
 GET  /v1/entity/{id}                  full entity profile
 GET  /v1/entity/{id}/graph?hops=2     connected addresses (degree-capped)
 GET  /v1/entity/{id}/timeline         curated milestone history
@@ -337,20 +363,36 @@ binary/container.
 │   ├── event-bus/               Kafka produce/consume seams (EventSink, run_consumer)
 │   ├── event-store/             immutable audit log service (ClickHouse)
 │   ├── ingestion/               reorg-aware block assembly, chain events
+│   ├── ingestion-exex-node/     Reth ExEx in-process ingestion node
 │   ├── detection/               fast-path detector scheduler (< 1s)
-│   ├── sandwich-detector/       │
-│   ├── arb-detector/            ├─ detector plugin crates
-│   ├── demo-detector/           │
 │   ├── detector-api/            the DetectorPlugin seam detector crates implement
+│   ├── sandwich-detector/       │
+│   ├── arb-detector/            │
+│   ├── flashloan-detector/      │
+│   ├── liquidation-detector/    ├─ detector plugin crates (one per attack class)
+│   ├── rugpull-detector/        │
+│   ├── washtrading-detector/    │
+│   ├── poisoning-detector/      │
+│   ├── anomaly-detector/        │  ML: isolation forest over frozen features (§20.2)
+│   ├── demo-detector/           │
+│   ├── cross-chain-correlator/  bridge-crossing MEV correlation (§24)
 │   ├── simulation/              slow-path revm confirmation (RabbitMQ workers)
-│   ├── intelligence/            labels · entities · attribution · risk scores
+│   ├── intelligence/            labels · entities · attribution · risk · embeddings
 │   ├── rule-engine/             customer rules: compiler, temporal windows, webhooks
 │   ├── predictive/              pre-harm forecasts: mempool + liquidation cascade risk (§16)
+│   ├── notification/            multi-channel delivery, dedup ledger, retraction re-targeting
 │   ├── server/                  public API: REST · WebSocket · JWT · usage metering
+│   ├── usage/                   metering sink + daily rollups (§13)
+│   ├── ml-features/             frozen, versioned feature schema (§20.1)
+│   ├── dataset/                 training-set export with provenance + manifests (§20.1)
+│   ├── inference/               ONNX runtime seam (`ort`) behind InferenceEngine (§20.2)
+│   ├── backtest/                replay ground truth → precision/recall; the CI gate
 │   ├── db/ · ch-migrate/        shared Postgres pool + ClickHouse migration runner
 │   ├── telemetry/               tracing + metrics boot, W3C trace propagation
+│   ├── bounded-map/             bounded-memory collections for long-lived consumers
+│   ├── arch-conformance/        enforces the dependency seam rules in CI
 │   └── api-error/               shared API error vocabulary
-├── deploy/                      docker-compose infra (Kafka, ClickHouse, Postgres, …)
+├── deploy/                      docker-compose · k8s kustomize · Grafana dashboards
 ├── docs/                        engineering conventions
 └── justfile                     `just check` reproduces the CI gate locally
 ```
@@ -395,10 +437,44 @@ are written up in [docs/engineering-conventions.md](./docs/engineering-conventio
 
 ---
 
+## Measurement: what the numbers cover
+
+Being precise about this, because a detection claim is only as good as the set
+it was measured on.
+
+**What is enforced.** Every PR runs a precision/recall backtest
+([`.github/workflows/pr.yml`](./.github/workflows/pr.yml) → *Backtest P/R
+gate*). It replays ground-truth fixtures through the whole detector roster and
+fails the build on either of two independent conditions: a detector dropping
+below [`crates/backtest/baseline.json`](./crates/backtest/baseline.json) (the
+regression gate), or an `Active` detector sitting below
+[`crates/backtest/promotion_gate.json`](./crates/backtest/promotion_gate.json)
+(the governance floor — no `--update` flag, on purpose). Moving a baseline is a
+reviewed diff, not a side effect.
+
+**What the current numbers are.** The committed baseline is precision 1.0 /
+recall 1.0 for all seven detectors — measured over **one hand-built scenario per
+detector plus one clean block**. Each scenario is mainnet-shaped, and because
+every detector runs over every fixture's blocks, an unexpected alert from any
+detector on any fixture counts against its precision.
+
+**What that does *not* establish.** A perfect score on ~8 curated scenarios is a
+*regression* signal, not a field accuracy measurement — with a single negative
+block in the set, the sample cannot resolve a 4% false-positive rate at all.
+The `< 4%` figure in the intro is the product target the gate exists to
+eventually enforce, not a result this repo has demonstrated. Closing that gap
+needs adversarial negatives and replayed mainnet windows — tracked under
+Epic E in [production_readiness.md](./production_readiness.md).
+
+The harness itself is the point: the fixtures are cheap to add, the gate is
+already wired, and the numbers move under review rather than silently.
+
+---
+
 ## Contact
 
 Built by **Nicholas** — senior backend engineer, distributed systems,
 Go + Rust.
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/kyawkyaw-thar-210602185/)
-[![Email](https://img.shields.io/badge/Email-Contact-grey?style=flat-square)](kyawkyaw.thar84@gmail.com)
+[![Email](https://img.shields.io/badge/Email-Contact-grey?style=flat-square)](mailto:kyawkyaw.thar84@gmail.com)

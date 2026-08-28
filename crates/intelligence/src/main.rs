@@ -91,7 +91,7 @@ use intelligence::embedding_consumer::{self, EmbeddingConsumer};
 use intelligence::embedding_job::{self, Embedder, EmbedderSeams};
 use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
 use intelligence::embedding_sweep::EmbeddingSweep;
-use intelligence::grpc::IntelligenceReadService;
+use intelligence::grpc::{IntelligenceReadService, SimilaritySeams};
 use intelligence::leaderboard::ClickhouseLeaderboard;
 use intelligence::merge_actor::MergeActor;
 use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
@@ -1073,7 +1073,33 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     // entity-graph hop query (§8.2) reads the `address_adjacency` table in the
     // same ClickHouse — the client is `Arc`-cheap to clone, so both share it.
     let graph = Arc::new(ClickhouseAdjacency::new(client.clone()));
+    let embeddings = Arc::new(ClickhouseEmbeddingStore::new(client.clone()));
     let leaderboard = Arc::new(ClickhouseLeaderboard::new(client));
+
+    // The one schema version this node serves comparisons under. Resolved at
+    // boot, not per request: an unknown version name is a refused boot rather
+    // than a read that silently falls back to a different feature space (the
+    // roster's typed-miss rule).
+    let similarity_schema = match cfg.similarity.version.as_deref() {
+        Some(version) => intelligence::embedding::embedder_for(version)
+            .with_context(|| {
+                format!(
+                    "INTEL_SIMILARITY_VERSION={version:?} is not a version this build ships; \
+                     known versions: {:?}",
+                    intelligence::embedding::embedders()
+                        .iter()
+                        .map(|e| e.version())
+                        .collect::<Vec<_>>()
+                )
+            })?
+            .schema(),
+        None => intelligence::embedding::default_embedder().schema(),
+    };
+    tracing::info!(
+        version = similarity_schema.version(),
+        schema_hash = similarity_schema.content_hash(),
+        "serving behavioral similarity",
+    );
 
     let shutdown = CancellationToken::new();
     // K8s probes (§20): /livez immediately; /readyz flips on below, once this
@@ -1091,12 +1117,62 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
         }
     });
 
+    // Load the population baseline once, then keep it fresh in the background.
+    // A failed initial load is *not* a boot failure: the baseline job may
+    // legitimately not have run yet, and searches report that as an explained
+    // `no_baseline` rather than the service refusing to start.
+    let baseline = Arc::new(intelligence::baseline_cache::BaselineSnapshot::new(
+        cfg.embedding.chain,
+        similarity_schema.version().to_owned(),
+        cfg.similarity.baseline,
+    ));
+    if let Err(err) = baseline
+        .refresh(embeddings.as_ref(), chrono::Utc::now())
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "initial population-baseline load failed; similarity search will report no_baseline until a refresh succeeds",
+        );
+    }
+    tokio::spawn({
+        let baseline = baseline.clone();
+        let embeddings = embeddings.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let mut ticker = tokio::time::interval(baseline.refresh_interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if let Err(err) = baseline.refresh(embeddings.as_ref(), chrono::Utc::now()).await {
+                            // Logged, not fatal: the snapshot keeps serving the
+                            // value it holds until `max_age` retires it.
+                            tracing::warn!(error = %err, "population-baseline refresh failed");
+                        }
+                    }
+                }
+            }
+            tracing::info!("population-baseline refresher shut down");
+        }
+    });
+
     let service = IntelligenceReadService::new(
         StoreSeams::single(store),
         cache,
         leaderboard,
         graph,
         cfg.graph_limits,
+        SimilaritySeams {
+            embeddings,
+            schema: similarity_schema,
+            limits: cfg.similarity.limits,
+            baseline,
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                cfg.similarity.max_concurrent.max(1),
+            )),
+        },
     );
     health.set_ready(true);
     tonic::transport::Server::builder()

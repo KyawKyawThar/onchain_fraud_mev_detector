@@ -89,7 +89,9 @@ Run these *after* the MVP path is green, sequenced by the exit gates below — n
 
 **Goal:** detections and scores are accurate, regression-gated, and defensible.
 
-- [ ] **Backtest harness as a CI gate** (§18): detector changes blocked unless precision/recall ≥ baseline for the `(id, version, config_hash)` triple.
+- [x] **Backtest harness as a CI gate** (§18): wired in `.github/workflows/pr.yml` (*Backtest P/R gate*). A PR fails if any detector drops below `crates/backtest/baseline.json`, or if an `Active` detector sits below the `crates/backtest/promotion_gate.json` floor. Baselines move only via `just backtest-update-baseline`, as a reviewed diff.
+- [ ] **Gate keyed on the full `(id, version, config_hash)` triple** (§18): today `baseline.json` and `model_performance.json` key on detector **id alone**, so a config change that moves precision is not distinguishable from a regression of the same detector.
+- [ ] **Fixture set adequate to support an FP-rate claim** (§18): the gate currently replays 8 curated fixtures (7 scenarios + 1 clean block) at precision 1.0. That is a regression signal, not a field measurement — a single negative block cannot resolve the < 4% FP target. Needs adversarial negatives and replayed mainnet windows before the README's target can be stated as a result.
 - [ ] **Shadow / A-B detector deploys** (§6 model registry already supports this) + one-click rollback via `deprecated_at`.
 - [ ] **False-positive feedback loop** wired to the FP-rate panel (§19); track it as an SLO.
 - [ ] **Sanctions freshness SLA:** OFAC/EU lists ingested within a bounded window; `SanctionHit` is a hard alert (§8.5) — staleness is a compliance failure.
