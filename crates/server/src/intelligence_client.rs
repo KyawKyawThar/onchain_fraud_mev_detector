@@ -18,9 +18,9 @@ use intelligence::model::address_key;
 use intelligence::pb::intelligence_read_client::IntelligenceReadClient;
 use intelligence::pb::{
     BuilderLeaderboardReply, BuilderLeaderboardRequest, EntityGraphReply, EntityGraphRequest,
-    EntityTimelineReply, EntityTimelineRequest, Label, LabelsRequest, RiskScoreReply,
-    RiskScoreRequest, ScreeningFactsReply, ScreeningFactsRequest, SimilarAddressesReply,
-    SimilarAddressesRequest,
+    EntityTimelineReply, EntityTimelineRequest, Label, LabelsRequest, LinkCandidatesReply,
+    LinkCandidatesRequest, RiskScoreReply, RiskScoreRequest, ScreeningFactsReply,
+    ScreeningFactsRequest, SimilarAddressesReply, SimilarAddressesRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
@@ -255,6 +255,20 @@ impl IntelligenceClient {
                 chain,
                 limit,
             })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// The §20.3 clustering signal's candidate links touching this address
+    /// (`0` = the server's default count, clamped to its ceiling).
+    pub async fn link_candidates(
+        &self,
+        address: String,
+        limit: u32,
+    ) -> Result<LinkCandidatesReply, Status> {
+        let mut client = self.inner.clone();
+        let response = client
+            .list_link_candidates(LinkCandidatesRequest { address, limit })
             .await?;
         Ok(response.into_inner())
     }

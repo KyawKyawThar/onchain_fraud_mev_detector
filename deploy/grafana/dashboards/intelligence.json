@@ -252,6 +252,92 @@
           "legendFormat": "shed share"
         }
       ]
+    },
+    {
+      "id": 12,
+      "title": "Clustering signal: what happened to each subject",
+      "description": "§20.3 t3. Every AddressEmbeddingUpdated the signal saw, by what it did with it. `searched` is the only outcome that costs a ClickHouse ANN scan — every other value is a gate refusing to run one. `already_clustered` dominating is the EXPECTED healthy shape with INTEL_LINK_SIGNAL_ONLY_UNCLUSTERED=true: the entity graph reached those addresses first, and the signal exists for the ones it cannot. `no_baseline` is the failure that looks like silence — nothing errors, the queue simply stops filling.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(intelligence_link_signal_subjects_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Candidate links written",
+      "description": "By store outcome. `new` and `re_announce` are the two that publish EntityLinkProposed. `re_announce` is the CRASH WINDOW being covered: the row committed, the process died before the publish, and redelivery found it still owing its event — a small steady rate around deploys is the mechanism working, a sustained one means the pod is dying mid-pass. `refreshed` is the same link rediscovered and already announced (stronger evidence than a one-off, which is why last_seen_at is stored); `decided` is a proposal an operator already ruled on, left untouched so a rejection can never be reopened by a re-run. A healthy steady state is mostly `refreshed`.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(intelligence_link_candidates_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Why neighbours were not proposed",
+      "description": "The tuning panel for INTEL_LINK_MIN_SIMILARITY and label coverage. `below_threshold` is the overwhelming majority by design. `no_anchor` dominating means §8.1 label coverage is too thin for the signal to have anything to anchor on. `capped` dominating means the per-subject bound has become the actual selection criterion — raise the threshold, not the cap: the cap protects the queue, the threshold decides what deserves to be in it. `derived_anchor_only` is the second-order-taint refusal — a match onto a label the system itself guessed, never allowed to propose a further hop.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason) (rate(intelligence_link_signal_suppressed_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Candidate-link listings served",
+      "description": "Reads of the proposal queue (GET /v1/address/{addr}/link-candidates, gRPC ListLinkCandidates) and how many proposals each returned. A cheap keyed read: the expensive work already happened in the link-signal consumer, which is exactly why the proposals are materialized rather than searched for on demand. Listings near zero while `new` proposals climb means the flywheel is writing leads nobody is triaging — the signal's value is realized by a human looking at it.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(intelligence_link_candidate_requests_total[$__rate_interval]))",
+          "legendFormat": "listings/s"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.9, sum(rate(intelligence_link_candidate_results_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p90 proposals per listing"
+        }
+      ]
     }
   ]
 }

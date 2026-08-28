@@ -53,6 +53,12 @@ service IntelligenceRead {
   // standardized units, and `approximate` says whether the shortlist could
   // have missed a better neighbour.
   rpc GetSimilarAddresses(SimilarAddressesRequest) returns (SimilarAddressesReply);
+
+  // The §20.3 clustering signal's proposals touching this address: behavioral
+  // links to directly-known actors, each a reduced-confidence heuristic
+  // awaiting a human (§8.1). Never a merge — an entity link still requires the
+  // §8.2 on-chain evidence heuristics.
+  rpc ListLinkCandidates(LinkCandidatesRequest) returns (LinkCandidatesReply);
 }
 
 message RiskScoreRequest {
@@ -327,4 +333,63 @@ message SimilarAddressesReply {
   // to search along). `results` is empty in both cases and `found` is true —
   // the address exists, the comparison does not.
   string unavailable_reason = 9;
+}
+
+message LinkCandidatesRequest {
+  // 0x-prefixed hex address, any case — the address whose proposals to list.
+  string address = 1;
+  // How many to return; 0 means the server default. Clamped to the ceiling
+  // rather than rejected.
+  uint32 limit = 2;
+}
+
+// One feature's signed share of the similarity behind a proposal. The
+// contributions sum to `similarity` — the score's decomposition, not an
+// attribution heuristic beside it.
+message LinkFactor {
+  string feature = 1;
+  float subject_value = 2;
+  float candidate_value = 3;
+  float contribution = 4;
+}
+
+// One proposed behavioral link. The pair is unordered (`address_a` sorts before
+// `address_b`); `anchor` names whichever side carried the directly-known actor
+// label that made the pair worth proposing.
+message LinkCandidate {
+  string candidate_id = 1;
+  string address_a = 2;
+  string address_b = 3;
+  string anchor = 4;
+  // The anchor's label kinds at proposal time (`known_scammer`,
+  // `sanctioned_entity`, `mev_bot`), frozen — a later revocation does not
+  // rewrite why the proposal exists.
+  repeated string anchor_labels = 5;
+  // Each side's entity at proposal time; empty when unclustered. Both set and
+  // different is the merge-candidate shape — still never a merge.
+  string entity_a = 6;
+  string entity_b = 7;
+  // Cosine similarity between baseline-standardized vectors, in [-1, 1].
+  float similarity = 8;
+  // The §8.1 reduced-confidence band this signal is worth — always below the
+  // entity-derived 0.5.
+  double confidence = 9;
+  string embedding_version = 10;
+  string schema_hash = 11;
+  repeated LinkFactor factors = 12;
+  // `proposed` | `confirmed` | `rejected`. Only an operator moves it off
+  // `proposed`.
+  string status = 13;
+  int64 proposed_at_unix_millis = 14;
+  // Refreshed every time the proposal is rediscovered — "still true on every
+  // sweep" is the strongest triage signal there is.
+  int64 last_seen_at_unix_millis = 15;
+  // Set once decided; empty/0 while the proposal is open.
+  int64 decided_at_unix_millis = 16;
+  string decided_by = 17;
+  string decision_note = 18;
+}
+
+message LinkCandidatesReply {
+  repeated LinkCandidate candidates = 1;
 }

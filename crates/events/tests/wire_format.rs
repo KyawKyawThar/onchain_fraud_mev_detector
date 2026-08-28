@@ -37,14 +37,14 @@ use events::cross_chain::{
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
     AddressEmbeddingUpdated, AttributionRetracted, AttributionUpdated, BehaviorFactor,
-    EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked, LabelUpdated, RiskFactor,
-    RiskScoreUpdated, SanctionHit,
+    EntityCreated, EntityLinkProposed, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
+    LabelUpdated, LinkFactor, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
     AccountAddress, AlertId, AlertKind, BlockRef, Chain, Confidence, CrossChainFindingId,
-    CustomerId, DetectorRef, EntityId, IncidentId, LabelId, LendingProtocol, PredictionId, RuleId,
-    Severity, SuggestedAction, UsdAmount,
+    CustomerId, DetectorRef, EntityId, IncidentId, LabelId, LendingProtocol, LinkCandidateId,
+    PredictionId, RuleId, Severity, SuggestedAction, UsdAmount,
 };
 use events::rule_engine::{RuleAlertCreated, RuleCreated, RuleTriggered};
 use events::simulation::{
@@ -118,6 +118,10 @@ fn prediction_id() -> PredictionId {
 
 fn finding_id() -> CrossChainFindingId {
     CrossChainFindingId(uuid::Uuid::from_u128(0xFD))
+}
+
+fn link_candidate_id() -> LinkCandidateId {
+    LinkCandidateId(uuid::Uuid::from_u128(0x11C))
 }
 
 /// One representative value for every [`DomainEvent`] variant. The exhaustiveness
@@ -276,6 +280,27 @@ fn sample_events() -> Vec<DomainEvent> {
                 share: 0.75,
             }],
             observations_truncated: false,
+        }),
+        DomainEvent::EntityLinkProposed(EntityLinkProposed {
+            candidate_id: link_candidate_id(),
+            subject: addr(),
+            subject_entity: None,
+            candidate: Address::repeat_byte(0x55),
+            candidate_entity: Some(entity_id()),
+            anchor: Address::repeat_byte(0x55),
+            anchor_labels: vec!["known_scammer".into()],
+            // Exactly-representable f32s — a golden must not depend on the
+            // shortest-repr float printer's rounding.
+            similarity: 0.9375,
+            confidence: Confidence::new(0.4),
+            embedding_version: "behavior-v1".into(),
+            schema_hash: "a1b2c3".into(),
+            factors: vec![LinkFactor {
+                feature: "edge_count_log".into(),
+                subject_value: 0.5,
+                candidate_value: 0.25,
+                contribution: 0.125,
+            }],
         }),
         // Rule engine (§9)
         DomainEvent::RuleCreated(RuleCreated {
@@ -519,6 +544,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "AddressEmbeddingUpdated",
         r#"{"type":"AddressEmbeddingUpdated","payload":{"address":"0x3333333333333333333333333333333333333333","entity_id":"00000000-0000-0000-0000-0000000000e1","embedding_version":"behavior-v1","schema_hash":"a1b2c3","vector":[0.5,0.25,0.0],"top_factors":[{"feature":"edge_count_log","value":0.5,"share":0.75}],"observations_truncated":false}}"#,
+    ),
+    (
+        "EntityLinkProposed",
+        r#"{"type":"EntityLinkProposed","payload":{"candidate_id":"00000000-0000-0000-0000-00000000011c","subject":"0x3333333333333333333333333333333333333333","subject_entity":null,"candidate":"0x5555555555555555555555555555555555555555","candidate_entity":"00000000-0000-0000-0000-0000000000e1","anchor":"0x5555555555555555555555555555555555555555","anchor_labels":["known_scammer"],"similarity":0.9375,"confidence":0.4,"embedding_version":"behavior-v1","schema_hash":"a1b2c3","factors":[{"feature":"edge_count_log","subject_value":0.5,"candidate_value":0.25,"contribution":0.125}]}}"#,
     ),
     (
         "RuleCreated",

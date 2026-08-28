@@ -21,11 +21,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, Confidence, EntityId, IncidentId, LabelId};
+use events::primitives::{
+    AccountAddress, Confidence, EntityId, IncidentId, LabelId, LinkCandidateId,
+};
 use sqlx::PgPool;
 
 use sqlx::types::Uuid;
 
+use crate::link_candidate::{
+    Decision, LinkCandidateStore, LinkStatus, Proposal, ProposalOutcome, StoredLink,
+};
 use crate::model::{
     address_key, parse_address_key, plan_reversal, AddressKeyError, AttributionRecord,
     EntityRecord, EntityStatus, LabelRecord, MergeId, MergeLogEntry, ReversalPlan, SanctionEntry,
@@ -1685,6 +1690,321 @@ impl SanctionsStore for PgIntelligenceStore {
             out.entry(record.address).or_default().push(record);
         }
         Ok(out)
+    }
+}
+
+/// An `entity_link_candidates` row as stored (§20.3, Sprint 19 t3). Every
+/// query over this table is runtime-checked (`FromRow`, mapping by column
+/// name) rather than `query_as!`: the table is new, and the offline `.sqlx`
+/// cache is regenerated only against a live database — the `labels_for_many`
+/// precedent.
+#[derive(sqlx::FromRow)]
+struct LinkCandidateRow {
+    candidate_id: Uuid,
+    address_a: String,
+    address_b: String,
+    anchor: String,
+    anchor_labels: serde_json::Value,
+    entity_a: Option<Uuid>,
+    entity_b: Option<Uuid>,
+    similarity: f64,
+    confidence: f64,
+    embedding_version: String,
+    schema_hash: String,
+    factors: serde_json::Value,
+    status: String,
+    proposed_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    announced_at: Option<DateTime<Utc>>,
+    decided_at: Option<DateTime<Utc>>,
+    decided_by: Option<String>,
+    decision_note: Option<String>,
+}
+
+impl TryFrom<LinkCandidateRow> for StoredLink {
+    type Error = StoreError;
+
+    fn try_from(row: LinkCandidateRow) -> Result<Self, StoreError> {
+        // The two JSONB columns are the only place a stored *document* becomes
+        // domain types. A malformed one is `Malformed`, not `Postgres`: it is
+        // permanent for that row, and retrying re-reads the same bytes.
+        let anchor_labels: Vec<String> = serde_json::from_value(row.anchor_labels)
+            .map_err(|err| StoreError::malformed(format!("anchor_labels: {err}")))?;
+        let anchor_labels = anchor_labels
+            .iter()
+            .map(|kind| parse_enum(kind, "label kind"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let factors: Vec<crate::link_candidate::LinkFactor> =
+            serde_json::from_value(row.factors)
+                .map_err(|err| StoreError::malformed(format!("link factors: {err}")))?;
+
+        // The three decision columns collapse into one `Option<Decision>`:
+        // they are written together and mean nothing apart, and the domain type
+        // is what says so. A decided row missing its `decided_at` is a corrupt
+        // row, not a decision without a time — so it is rejected here rather
+        // than papered over with a default.
+        let status: LinkStatus = parse_enum(&row.status, "link status")?;
+        let decision = match (status, row.decided_at) {
+            (LinkStatus::Proposed, _) => None,
+            (_, Some(at)) => Some(Decision {
+                by: row.decided_by.unwrap_or_default(),
+                note: row.decision_note,
+                at,
+            }),
+            (_, None) => {
+                return Err(StoreError::malformed(format!(
+                    "link {} is decided ({}) with no decided_at",
+                    row.candidate_id, row.status
+                )))
+            }
+        };
+
+        Ok(StoredLink {
+            proposal: Proposal {
+                candidate_id: LinkCandidateId(row.candidate_id),
+                address_a: parse_address_key(&row.address_a)?,
+                address_b: parse_address_key(&row.address_b)?,
+                anchor: parse_address_key(&row.anchor)?,
+                anchor_labels,
+                entity_a: row.entity_a.map(EntityId),
+                entity_b: row.entity_b.map(EntityId),
+                similarity: crate::similarity::Similarity::new(row.similarity),
+                confidence: parse_confidence(row.confidence)?,
+                embedding_version: row.embedding_version,
+                schema_hash: row.schema_hash,
+                factors,
+                proposed_at: row.proposed_at,
+                last_seen_at: row.last_seen_at,
+            },
+            status,
+            decision,
+            announced_at: row.announced_at,
+        })
+    }
+}
+
+/// The columns every candidate-link read selects, in `LinkCandidateRow`'s
+/// field order. One definition rather than four copies: `FromRow` maps by
+/// name, so a drift here is a runtime decode error on a read path — exactly
+/// the kind of thing that only shows up in production.
+///
+/// A macro rather than a `const` because `sqlx::query_as` takes a `&'static
+/// str` by design (a runtime-formatted query is refused as a possible
+/// injection site, and rightly). Expanding to a literal keeps every query
+/// statically known while still having one source of truth for the list.
+macro_rules! link_candidate_columns {
+    () => {
+        "candidate_id, address_a, address_b, anchor, anchor_labels, entity_a, entity_b, \
+         similarity, confidence, embedding_version, schema_hash, factors, status, \
+         proposed_at, last_seen_at, announced_at, decided_at, decided_by, decision_note"
+    };
+}
+
+#[async_trait]
+impl LinkCandidateStore for PgIntelligenceStore {
+    async fn propose_link(&self, proposal: &Proposal) -> Result<ProposalOutcome, StoreError> {
+        let (a, b) =
+            crate::link_candidate::canonical_pair(&proposal.address_a, &proposal.address_b);
+        let kinds: Vec<&str> = proposal
+            .anchor_labels
+            .iter()
+            .map(|kind| <&str>::from(*kind))
+            .collect();
+        let anchor_labels = serde_json::to_value(&kinds)
+            .map_err(|err| StoreError::malformed(format!("anchor_labels: {err}")))?;
+        let factors = serde_json::to_value(&proposal.factors)
+            .map_err(|err| StoreError::malformed(format!("link factors: {err}")))?;
+
+        // Four outcomes in one statement. Two facts come back and each answers
+        // a different question:
+        //
+        //   `xmax = 0`            — was this tuple inserted rather than updated?
+        //                           (Postgres' folk tell; `announced_at` below
+        //                           is what the decision actually rests on.)
+        //   `announced_at IS NULL` — does this row still owe its event?
+        //
+        //   - no row                            → New        (announce)
+        //   - existed, never announced          → ReAnnounce (announce; the
+        //                                         crash window — see
+        //                                         `ProposalOutcome`)
+        //   - existed, announced, still open    → Refreshed  (re-score, stay
+        //                                         silent)
+        //   - decided                           → Decided    (touch nothing)
+        //
+        // Two clauses are load-bearing and neither is obvious:
+        //
+        //   `WHERE ... status = 'proposed'` on the update arm — without it a
+        //   re-proposal quietly reopens a rejection and the triage queue can
+        //   never be emptied.
+        //
+        //   `announced_at` is read but never *written* here. It is stamped only
+        //   by `mark_announced`, after the publish returns. A path that could
+        //   set it alongside the row would recreate exactly the silent loss
+        //   this column exists to close.
+        let row: Option<(bool, bool, String)> = sqlx::query_as(
+            r#"INSERT INTO entity_link_candidates (
+                   candidate_id, address_a, address_b, anchor, anchor_labels,
+                   entity_a, entity_b, similarity, confidence, embedding_version,
+                   schema_hash, factors, status, proposed_at, last_seen_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'proposed', $13, $13)
+               ON CONFLICT (candidate_id) DO UPDATE
+                   SET similarity    = EXCLUDED.similarity,
+                       confidence    = EXCLUDED.confidence,
+                       anchor        = EXCLUDED.anchor,
+                       anchor_labels = EXCLUDED.anchor_labels,
+                       entity_a      = EXCLUDED.entity_a,
+                       entity_b      = EXCLUDED.entity_b,
+                       factors       = EXCLUDED.factors,
+                       last_seen_at  = EXCLUDED.last_seen_at
+                   WHERE entity_link_candidates.status = 'proposed'
+               RETURNING (xmax = 0) AS inserted,
+                         (announced_at IS NULL) AS needs_announce,
+                         status"#,
+        )
+        .bind(proposal.candidate_id.0)
+        .bind(&a)
+        .bind(&b)
+        .bind(address_key(&proposal.anchor))
+        .bind(anchor_labels)
+        .bind(proposal.entity_a.map(|id| id.0))
+        .bind(proposal.entity_b.map(|id| id.0))
+        .bind(f64::from(proposal.similarity.get()))
+        .bind(proposal.confidence.get())
+        .bind(&proposal.embedding_version)
+        .bind(&proposal.schema_hash)
+        .bind(factors)
+        .bind(proposal.last_seen_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(match row {
+            Some((true, _, _)) => ProposalOutcome::New,
+            Some((false, true, _)) => ProposalOutcome::ReAnnounce,
+            Some((false, false, _)) => ProposalOutcome::Refreshed,
+            // `RETURNING` yields nothing when the `DO UPDATE ... WHERE`
+            // filtered the row out — precisely the already-decided case.
+            None => ProposalOutcome::Decided,
+        })
+    }
+
+    async fn mark_announced(
+        &self,
+        id: LinkCandidateId,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        // Unconditional rather than `WHERE announced_at IS NULL`: re-stamping
+        // an already-stamped row is harmless, and a conditional here would
+        // make a duplicate publish look like a failure to record one.
+        sqlx::query("UPDATE entity_link_candidates SET announced_at = $2 WHERE candidate_id = $1")
+            .bind(id.0)
+            .bind(at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn unannounced_links(&self, limit: usize) -> Result<Vec<Proposal>, StoreError> {
+        let rows = sqlx::query_as::<_, LinkCandidateRow>(concat!(
+            "SELECT ",
+            link_candidate_columns!(),
+            " FROM entity_link_candidates
+              WHERE announced_at IS NULL
+              ORDER BY proposed_at
+              LIMIT $1"
+        ))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| StoredLink::try_from(row).map(|link| link.proposal))
+            .collect()
+    }
+
+    async fn links_for_address(
+        &self,
+        address: &AccountAddress,
+        limit: usize,
+    ) -> Result<Vec<StoredLink>, StoreError> {
+        let rows = sqlx::query_as::<_, LinkCandidateRow>(concat!(
+            "SELECT ",
+            link_candidate_columns!(),
+            " FROM entity_link_candidates
+              WHERE address_a = $1 OR address_b = $1
+              ORDER BY similarity DESC, candidate_id
+              LIMIT $2"
+        ))
+        .bind(address_key(address))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(StoredLink::try_from).collect()
+    }
+
+    async fn link(&self, id: LinkCandidateId) -> Result<Option<StoredLink>, StoreError> {
+        let row = sqlx::query_as::<_, LinkCandidateRow>(concat!(
+            "SELECT ",
+            link_candidate_columns!(),
+            " FROM entity_link_candidates WHERE candidate_id = $1"
+        ))
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(StoredLink::try_from).transpose()
+    }
+
+    async fn decide_link(
+        &self,
+        id: LinkCandidateId,
+        status: LinkStatus,
+        decision: &Decision,
+    ) -> Result<Option<StoredLink>, StoreError> {
+        // Read-then-write inside one transaction: the caller is handed the row
+        // as it stood *before* the decision (an operator overriding an earlier
+        // ruling needs to see what they overrode), and a concurrent second
+        // decision can't interleave between the read and the update.
+        let mut tx = self.pool.begin().await?;
+        let before = sqlx::query_as::<_, LinkCandidateRow>(concat!(
+            "SELECT ",
+            link_candidate_columns!(),
+            " FROM entity_link_candidates WHERE candidate_id = $1 FOR UPDATE"
+        ))
+        .bind(id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "UPDATE entity_link_candidates
+             SET status = $2, decided_by = $3, decision_note = $4, decided_at = $5
+             WHERE candidate_id = $1",
+        )
+        .bind(id.0)
+        .bind(<&str>::from(status))
+        .bind(&decision.by)
+        .bind(decision.note.as_deref())
+        .bind(decision.at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        StoredLink::try_from(before).map(Some)
+    }
+
+    async fn open_links(&self, limit: usize) -> Result<Vec<StoredLink>, StoreError> {
+        let rows = sqlx::query_as::<_, LinkCandidateRow>(concat!(
+            "SELECT ",
+            link_candidate_columns!(),
+            " FROM entity_link_candidates
+              WHERE status = 'proposed'
+              ORDER BY similarity DESC, candidate_id
+              LIMIT $1"
+        ))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(StoredLink::try_from).collect()
     }
 }
 

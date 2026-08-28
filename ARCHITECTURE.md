@@ -447,7 +447,16 @@ Sources: public feeds (Etherscan tags, OFAC SDN, community MEV-bot lists,
 protocol registries), heuristic auto-labeling (builder feeRecipients,
 code-hash matching, funding-source clustering), entity-graph derivation
 (clustering with a known actor yields `ScammerAssociate` at reduced
-confidence), and manual curation.
+confidence), behavioral similarity to a directly-known actor (§20.3's
+clustering signal, at a *further* reduced band than the graph-derived one),
+and manual curation.
+
+A derived label may never anchor a further derivation. Both derivation paths
+above read only labels a direct source produced — a feed, a heuristic, a
+curator — so an association is always exactly one hop from something known.
+Allowing a second hop would let the system's own guesses become its evidence,
+which is how taint-by-association (§8.3) goes from a documented, contested
+signal to an unbounded one.
 
 ### 8.2 Entity clustering
 
@@ -1089,6 +1098,92 @@ event — the same collapse the §8.2 hub cap exists to prevent. That drift is l
 to the sweep, and its staleness bound is one sweep interval. This is the
 concrete reason the job is scheduled *as well as* event-driven rather than
 either alone.
+
+*The clustering signal proposes into a table of its own, and that separation is
+the design.* `intelligence::link_signal` consumes `AddressEmbeddingUpdated`,
+runs the same search, and writes a **candidate link**
+(`entity_link_candidates` + `EntityLinkProposed`) whenever a strong match
+lands on an address some *direct* source has identified. It never touches
+`entity_addresses`. That table's primary key on `address` — one address, one
+entity — is the invariant attribution, risk scoring and the rule engine are all
+allowed to assume, and everything that writes it does so off facts the chain
+recorded. A behavioral match is a different kind of claim: it says two addresses
+look alike under one feature space, against one baseline, at one moment. It can
+be right about a freshly funded bot with no graph edges at all — the recall this
+whole section exists to widen — and it can equally be two unrelated arbitrage
+bots running the same off-the-shelf strategy. Merging on it would let a learned
+score rewrite the graph's correctness story, and the failure would be silent: a
+wrong merge produces a plausible entity, not an error.
+
+*The anchor must be directly known, and refusing the second hop is the most
+important rule in the module.* Only labels a manual curator, a public feed or an
+on-chain heuristic put there can anchor a proposal; a label whose source is
+`EntityDerived` cannot. Without that, taint spreads transitively — A is a known
+scammer, B behaves like A and earns a derived `ScammerAssociate`, C behaves like
+*B* and earns one off B's derived label — and within a few hops the system is
+confidently accusing addresses on the strength of its own guesses. §8.3 already
+names taint-by-association as legally contested and reduced-confidence;
+second-order taint is that problem squared, and no confidence discount is small
+enough to make it honest. The refusal is counted, not silent: a sustained
+`derived_anchor_only` rate means the derived labels are pooling into a cluster
+of their own, which is worth an investigator's attention rather than a code
+change.
+
+*The confidence ladder holds numerically.* A proposal's confidence is a ceiling
+(0.45 by default) scaled by the similarity that produced it, discounted again
+when the neighbour's vector describes a truncated hub window — so it is always
+strictly below `EntityDerived`'s 0.5 band, which is itself below the heuristic
+0.7. A behavioral guess can never outrank a graph fact, at any similarity. When
+the anchor is a *bad actor* specifically (not merely an identified `MevBot`, the
+task's own example), the proposal also mints one reduced-confidence
+`ScammerAssociate` on the other address, under its own `source_detail` so an
+auditor can tell a behavioral claim from a clustering one without leaving the
+row.
+
+*The flywheel's cycle is a fixpoint, by construction.* A proposal can mint a
+label; the label invalidates the subject's embedding; the recomputed embedding
+returns to the signal. That loop is the §8.5 flywheel working, and it terminates
+because every artifact is keyed on content rather than on time: the label id is
+seeded from the claim, the proposal id from the unordered address pair and the
+feature space, and the embedding job republishes only a vector that actually
+moved. A rediscovered proposal *refreshes* rather than duplicating, and one an
+operator already decided is left alone entirely — a rejection cannot be reopened
+by a re-run, or the triage queue could never be emptied.
+
+*The row and its announcement are two writes, and the gap between them is
+closed explicitly.* The obvious rule — announce exactly what was just inserted
+— is wrong under a crash: Postgres commits, the process dies before Kafka, the
+consumer offset was never committed, the event redelivers, the row now exists,
+and an insert-keyed rule stays silent. The announcement would be lost
+permanently and invisibly. So the question the store answers is not "did I
+insert this?" but **"does this row still owe an announcement?"** —
+`announced_at IS NULL`, a column stamped only *after* a publish returns. That
+makes delivery at-least-once rather than at-most-once, which every downstream
+write already tolerates because each is keyed; a boot-time sweep drains
+anything redelivery itself cannot reach (a group reset forward, a compacted
+topic). It is `rule_outbox`'s trade in the cheaper shape this workload allows:
+no second table to drain, because the proposal row *is* the durable record the
+announcement belongs to.
+
+*The decision is pure, and so is everything that follows from it.* `propose`
+turns a search into claims; `plan` turns the store's answer into an ordered
+list of effects — announce this, mint that — and a thin executor performs them.
+The rule that most needed to be assertable is the one that only exists across a
+whole pass: a subject matching three known actors earns three proposals and
+**one** label, and as a plan that is an equality check on a `Vec` rather than a
+count of events on a recording sink. The same split is why the write model and
+the read model are different types: a `Proposal` has no status field to express
+a decision with, so no caller can hand the store a "confirmed" proposal for it
+to silently ignore.
+
+*The expensive half is gated, and the gate is the honest reading of the task.*
+The search is the most expensive read the platform serves and the sweep
+recomputes the whole address space, so pairing them naively is one ANN scan per
+address per lap. Three gates need no store read at all (wrong chain, wrong
+feature space, an all-zero vector), and the fourth — on by default — skips any
+address the entity graph has already placed. The signal is for widening recall
+where evidence cannot reach; searching addresses the graph already resolved is a
+merge-candidate mode an operator turns on by name.
 
 ### 20.4 LLM investigation copilot (copilot-service)
 

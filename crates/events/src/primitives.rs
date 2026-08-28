@@ -305,6 +305,15 @@ id_newtype!(
     RuleId
 );
 id_newtype!(
+    /// Behavioral candidate-link id (§20.3, Sprint 19 task 3): one *proposed*
+    /// entity link between two addresses that behave alike, one of which is a
+    /// directly-known actor. Deliberately its own id rather than a
+    /// [`LabelId`]: a candidate link is a claim about a **pair**, has an
+    /// operator decision attached, and — unlike a label — never asserts
+    /// anything about either address on its own.
+    LinkCandidateId
+);
+id_newtype!(
     /// Cross-chain correlated-finding id, minted by the cross-chain
     /// correlator's windowed join (§24, Sprint 17 task 2/3) so a later
     /// `BlockReverted` on any of the finding's legs' chains can retract it by

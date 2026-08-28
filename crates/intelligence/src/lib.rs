@@ -150,6 +150,8 @@ pub mod embedding_sweep;
 pub mod graph;
 pub mod grpc;
 pub mod leaderboard;
+pub mod link_candidate;
+pub mod link_signal;
 pub mod merge_actor;
 pub mod model;
 pub mod pb;

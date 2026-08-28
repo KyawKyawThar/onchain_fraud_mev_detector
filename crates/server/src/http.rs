@@ -177,6 +177,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(builders))
         .routes(routes!(entity_graph))
         .routes(routes!(entity_timeline))
+        .routes(routes!(address_link_candidates))
         .routes(routes!(audit_incident))
         .routes(routes!(list_incidents))
         .routes(routes!(wallet_mev_exposure))
@@ -998,6 +999,175 @@ async fn address_similar(
     }))
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct LinkCandidatesQuery {
+    /// How many proposals to return; `0`/absent uses the intelligence default,
+    /// and the value is clamped to its ceiling.
+    #[serde(default)]
+    limit: u32,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct LinkFactorResponse {
+    /// The behavior feature's stable schema name.
+    feature: String,
+    /// The subject's value in the vector's own raw, interpretable units.
+    subject_value: f32,
+    /// The other address's raw value.
+    candidate_value: f32,
+    /// Signed share of `similarity`; the factors of a proposal sum to it.
+    contribution: f32,
+}
+
+impl From<intelligence::pb::LinkFactor> for LinkFactorResponse {
+    fn from(f: intelligence::pb::LinkFactor) -> Self {
+        Self {
+            feature: f.feature,
+            subject_value: f.subject_value,
+            candidate_value: f.candidate_value,
+            contribution: f.contribution,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct LinkCandidateResponse {
+    candidate_id: String,
+    /// The pair, canonically ordered — a candidate link is symmetric, so
+    /// neither address is "the subject". `anchor` carries the direction that
+    /// matters.
+    address_a: String,
+    address_b: String,
+    /// Whichever of the pair carried the directly-known actor label that made
+    /// the proposal worth making.
+    anchor: String,
+    /// The anchor's label kinds at proposal time (`known_scammer`,
+    /// `sanctioned_entity`, `mev_bot`), frozen — a later revocation does not
+    /// rewrite why the proposal exists.
+    anchor_labels: Vec<String>,
+    /// Each side's entity at proposal time; absent when unclustered.
+    entity_a: Option<String>,
+    entity_b: Option<String>,
+    /// Cosine similarity between baseline-standardized behavior vectors.
+    similarity: f32,
+    /// The §8.1 reduced-confidence band this signal is worth. Always below the
+    /// entity-derived 0.5 band: a behavioral match is weaker evidence than a
+    /// graph one.
+    confidence: f64,
+    /// The feature space the comparison was made in.
+    embedding_version: String,
+    schema_hash: String,
+    /// The behavioral factors behind the score, largest effect first.
+    factors: Vec<LinkFactorResponse>,
+    /// `proposed` | `confirmed` | `rejected`. Only an operator moves it off
+    /// `proposed` — nothing in the pipeline does.
+    status: String,
+    proposed_at_unix_millis: i64,
+    /// Refreshed every time the proposal is rediscovered: "still true on the
+    /// latest recomputation" is a materially stronger claim than "seen once".
+    last_seen_at_unix_millis: i64,
+    decided_at_unix_millis: Option<i64>,
+    decided_by: Option<String>,
+    decision_note: Option<String>,
+}
+
+impl From<intelligence::pb::LinkCandidate> for LinkCandidateResponse {
+    fn from(c: intelligence::pb::LinkCandidate) -> Self {
+        Self {
+            candidate_id: c.candidate_id,
+            address_a: c.address_a,
+            address_b: c.address_b,
+            anchor: c.anchor,
+            anchor_labels: c.anchor_labels,
+            // `''`/`0` are the wire's absent flattening; passing them through
+            // as JSON would read as a blank entity id and a 1970 decision.
+            entity_a: Some(c.entity_a).filter(|id| !id.is_empty()),
+            entity_b: Some(c.entity_b).filter(|id| !id.is_empty()),
+            similarity: c.similarity,
+            confidence: c.confidence,
+            embedding_version: c.embedding_version,
+            schema_hash: c.schema_hash,
+            factors: c
+                .factors
+                .into_iter()
+                .map(LinkFactorResponse::from)
+                .collect(),
+            status: c.status,
+            proposed_at_unix_millis: c.proposed_at_unix_millis,
+            last_seen_at_unix_millis: c.last_seen_at_unix_millis,
+            decided_at_unix_millis: Some(c.decided_at_unix_millis).filter(|at| *at != 0),
+            decided_by: Some(c.decided_by).filter(|by| !by.is_empty()),
+            decision_note: Some(c.decision_note).filter(|note| !note.is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct LinkCandidatesResponse {
+    address: String,
+    /// Strongest first. Includes decided proposals: that a link was proposed
+    /// *and rejected* is as much a part of this address's story as an open one.
+    candidates: Vec<LinkCandidateResponse>,
+}
+
+/// `GET /v1/address/{address}/link-candidates?limit=20` — the §20.3 clustering
+/// signal's proposals touching this address.
+///
+/// Each is a behavioral link to a **directly-known** actor, entered into entity
+/// clustering as a reduced-confidence heuristic exactly the way §8.1 treats
+/// every heuristic label. A proposal is a lead, not a finding: entity merges
+/// still require the §8.2 on-chain evidence heuristics, and nothing in the
+/// pipeline moves a proposal past `proposed` — only an operator does.
+///
+/// Unlike `/similar`, this is a plain keyed read of already-computed rows, so
+/// it carries no separate rate-limit bucket: the expensive work happened in the
+/// `link-signal` consumer, which is why the proposals are materialized at all.
+#[utoipa::path(
+    get,
+    path = "/v1/address/{address}/link-candidates",
+    tag = "api-service",
+    params(
+        ("address" = String, Path, description = "On-chain address, 0x-prefixed hex (any case)"),
+        ("limit" = Option<u32>, Query, description = "Proposals to return (0 = server default)"),
+    ),
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Candidate links touching this address, strongest first", body = LinkCandidatesResponse),
+        (status = 400, description = "Address is not valid hex"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 502, description = "intelligence is unreachable"),
+    ),
+)]
+async fn address_link_candidates(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path(address): Path<AccountAddress>,
+    Query(query): Query<LinkCandidatesQuery>,
+) -> Result<Json<LinkCandidatesResponse>, ApiError> {
+    let reply = state
+        .intelligence
+        .link_candidates(address_key(&address), query.limit)
+        .await
+        .map_err(intelligence_client::to_api_error)?;
+
+    // No 404 arm, deliberately: an address with no proposals is a *complete*
+    // answer ("nothing has been proposed about this address"), not a missing
+    // resource. `/similar` 404s because a subject with no vector cannot be
+    // compared at all; here there is nothing to be missing.
+    state
+        .usage
+        .record(customer, events::system::UsageEventType::EntityQueried);
+
+    Ok(Json(LinkCandidatesResponse {
+        address: address_key(&address),
+        candidates: reply
+            .candidates
+            .into_iter()
+            .map(LinkCandidateResponse::from)
+            .collect(),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct EntityGraphQuery {
     /// Chain id to walk within. Defaults to Ethereum mainnet.
@@ -1764,6 +1934,9 @@ mod tests {
             "SimilarAddressesResponse",
             "SimilarAddressResponse",
             "SimilarityFactorResponse",
+            "LinkCandidatesResponse",
+            "LinkCandidateResponse",
+            "LinkFactorResponse",
             "EntityGraphResponse",
             "GraphNodeResponse",
             "GraphEdgeResponse",
@@ -1787,6 +1960,7 @@ mod tests {
             ("/v1/address/{address}/risk", "get"),
             ("/v1/address/{address}/labels", "get"),
             ("/v1/address/{address}/similar", "get"),
+            ("/v1/address/{address}/link-candidates", "get"),
             ("/v1/address/{address}/screen", "post"),
             ("/v1/policies", "get"),
             ("/v1/policies/{name}", "put"),
@@ -1881,6 +2055,50 @@ mod tests {
         let response = router
             .oneshot(
                 Request::get("/v1/address/not-an-address/similar")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn address_link_candidates_is_bearer_gated_and_proxies_intelligence() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let path = "/v1/address/0x1111111111111111111111111111111111111111/link-candidates?limit=5";
+
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Authenticated, but the lazy intelligence channel has no server here,
+        // so the gRPC call fails → 502 (reached the handler, tried to proxy).
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let response = router
+            .oneshot(
+                Request::get("/v1/address/not-an-address/link-candidates")
                     .header(header::AUTHORIZATION, &bearer)
                     .body(Body::empty())
                     .unwrap(),
@@ -2178,6 +2396,7 @@ mod tests {
                 )),
                 permits: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             },
+            std::sync::Arc::new(intelligence::test_util::InMemoryLinkCandidateStore::new()),
         );
         // Reserve an ephemeral port, then hand its address (not the listener
         // itself — `tonic::transport::Server::serve` binds its own) to the

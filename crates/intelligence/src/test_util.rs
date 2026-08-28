@@ -1043,6 +1043,197 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
     1.0 - dot / (norm(a) * norm(b))
 }
 
+// ── Clustering-signal doubles (§20.3, Sprint 19 t3) ──────────────────────────
+
+use crate::link_candidate::{
+    canonical_pair, Decision, LinkCandidateStore, LinkStatus, Proposal, ProposalOutcome, StoredLink,
+};
+use events::primitives::LinkCandidateId;
+
+/// In-memory [`LinkCandidateStore`]. Honours the four semantics the Postgres
+/// impl promises — keyed by the deterministic `candidate_id`, a refresh that
+/// re-scores an open proposal, a **decided** proposal left untouched, and an
+/// unannounced row that still owes its event — so a consumer test that passes
+/// here means the idempotency *and* the crash-recovery argument hold, not just
+/// the happy path.
+#[derive(Default)]
+pub struct InMemoryLinkCandidateStore {
+    inner: Mutex<HashMap<LinkCandidateId, StoredLink>>,
+}
+
+impl InMemoryLinkCandidateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many proposals are stored — the "one row, not two" assertion.
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("link lock").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every stored proposal, strongest first.
+    pub fn all(&self) -> Vec<StoredLink> {
+        let mut all: Vec<StoredLink> = self
+            .inner
+            .lock()
+            .expect("link lock")
+            .values()
+            .cloned()
+            .collect();
+        sort_strongest_first(&mut all);
+        all
+    }
+
+    /// Clear `announced_at` on every row — simulating the crash window: the
+    /// proposal committed, the process died before the event went out. Lets a
+    /// test drive the `ReAnnounce` path without a real crash.
+    pub fn forget_announcements(&self) {
+        for link in self.inner.lock().expect("link lock").values_mut() {
+            link.announced_at = None;
+        }
+    }
+}
+
+fn sort_strongest_first(rows: &mut [StoredLink]) {
+    rows.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.candidate_id.0.cmp(&b.candidate_id.0))
+    });
+}
+
+#[async_trait]
+impl LinkCandidateStore for InMemoryLinkCandidateStore {
+    async fn propose_link(&self, proposal: &Proposal) -> Result<ProposalOutcome, StoreError> {
+        let mut stored = self.inner.lock().expect("link lock");
+        match stored.get_mut(&proposal.candidate_id) {
+            None => {
+                // Canonicalized on the way in, like the table's CHECK
+                // constraint — a double that accepted a mis-ordered pair would
+                // let a bug through that Postgres would reject.
+                let (a, b) = canonical_pair(&proposal.address_a, &proposal.address_b);
+                assert_eq!(
+                    (
+                        crate::model::address_key(&proposal.address_a),
+                        crate::model::address_key(&proposal.address_b)
+                    ),
+                    (a, b),
+                    "candidate pair is not canonically ordered"
+                );
+                stored.insert(
+                    proposal.candidate_id,
+                    StoredLink {
+                        proposal: proposal.clone(),
+                        status: LinkStatus::Proposed,
+                        decision: None,
+                        announced_at: None,
+                    },
+                );
+                Ok(ProposalOutcome::New)
+            }
+            Some(existing) if existing.status == LinkStatus::Proposed => {
+                let owed = existing.announced_at.is_none();
+                let announced_at = existing.announced_at;
+                existing.proposal = Proposal {
+                    // The claim is re-scored; its identity and first sighting
+                    // are not (the Postgres upsert leaves `proposed_at` alone).
+                    proposed_at: existing.proposal.proposed_at,
+                    ..proposal.clone()
+                };
+                existing.announced_at = announced_at;
+                Ok(if owed {
+                    ProposalOutcome::ReAnnounce
+                } else {
+                    ProposalOutcome::Refreshed
+                })
+            }
+            Some(_) => Ok(ProposalOutcome::Decided),
+        }
+    }
+
+    async fn mark_announced(
+        &self,
+        id: LinkCandidateId,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        if let Some(link) = self.inner.lock().expect("link lock").get_mut(&id) {
+            link.announced_at = Some(at);
+        }
+        Ok(())
+    }
+
+    async fn unannounced_links(&self, limit: usize) -> Result<Vec<Proposal>, StoreError> {
+        let mut rows: Vec<StoredLink> = self
+            .inner
+            .lock()
+            .expect("link lock")
+            .values()
+            .filter(|row| row.announced_at.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.proposed_at);
+        rows.truncate(limit);
+        Ok(rows.into_iter().map(|row| row.proposal).collect())
+    }
+
+    async fn links_for_address(
+        &self,
+        address: &AccountAddress,
+        limit: usize,
+    ) -> Result<Vec<StoredLink>, StoreError> {
+        let mut rows: Vec<StoredLink> = self
+            .inner
+            .lock()
+            .expect("link lock")
+            .values()
+            .filter(|row| row.address_a == *address || row.address_b == *address)
+            .cloned()
+            .collect();
+        sort_strongest_first(&mut rows);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn link(&self, id: LinkCandidateId) -> Result<Option<StoredLink>, StoreError> {
+        Ok(self.inner.lock().expect("link lock").get(&id).cloned())
+    }
+
+    async fn decide_link(
+        &self,
+        id: LinkCandidateId,
+        status: LinkStatus,
+        decision: &Decision,
+    ) -> Result<Option<StoredLink>, StoreError> {
+        let mut stored = self.inner.lock().expect("link lock");
+        let Some(existing) = stored.get_mut(&id) else {
+            return Ok(None);
+        };
+        let before = existing.clone();
+        existing.status = status;
+        existing.decision = Some(decision.clone());
+        Ok(Some(before))
+    }
+
+    async fn open_links(&self, limit: usize) -> Result<Vec<StoredLink>, StoreError> {
+        let mut rows: Vec<StoredLink> = self
+            .inner
+            .lock()
+            .expect("link lock")
+            .values()
+            .filter(|row| row.status == LinkStatus::Proposed)
+            .cloned()
+            .collect();
+        sort_strongest_first(&mut rows);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
 // ── Block-production doubles (§10, Sprint 11 t1) ─────────────────────────────
 
 use alloy_primitives::B256;

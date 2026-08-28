@@ -261,3 +261,51 @@ groups:
         annotations:
           summary: "Over a quarter of behavior vectors are computed over a truncated history"
           description: "INTEL_EMBEDDING_HISTORY_CAP is biting on more of the graph than it was sized for: those vectors describe a recent activity window rather than an address's whole life (the §8.2 hub rule at edge granularity), and they carry `is_hub = 1` to say so. That is correct behavior, not a fault — but at this share the cadence features are measuring the cap more than the addresses, so raise the cap or accept the narrower window deliberately. Threshold is a placeholder with no production graph to calibrate against."
+
+      # ── The §20.3 clustering signal (Sprint 19 t3) ────────────────────
+      - alert: ClusteringSignalProposingNothing
+        expr: |
+          sum(rate(intelligence_link_signal_subjects_total{outcome="searched"}[6h])) > 0
+            and sum(rate(intelligence_link_candidates_total{outcome="new"}[24h])) == 0
+        for: 24h
+        labels:
+          severity: informational
+        annotations:
+          summary: "The clustering signal is searching but proposing nothing"
+          description: "Searches are running (the expensive part) and producing zero new candidate links over a day. Usually one of three things, and intelligence_link_signal_suppressed_total{reason} says which: `below_threshold` dominating means INTEL_LINK_MIN_SIMILARITY is set above what this population actually produces; `no_anchor` dominating means the label coverage is too thin for the signal to have anything to anchor on (seed more feeds — §8.1); `already_clustered` dominating means the graph is reaching these addresses first, which is the good outcome and means the signal is buying little here. A silent zero is worth an alert precisely because a signal that proposes nothing looks identical to one that is working."
+      - alert: ClusteringSignalSkippingEveryBaseline
+        expr: |
+          sum(rate(intelligence_link_signal_subjects_total{outcome="no_baseline"}[1h]))
+            / clamp_min(sum(rate(intelligence_link_signal_subjects_total[1h])), 1e-9) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The clustering signal cannot standardize: no population baseline"
+          description: "Over half of subjects are being skipped because no usable population baseline exists for this (chain, embedding_version) — run `intelligence embedding-baseline`, and check intelligence_similarity_baseline_age_seconds. Until it resolves the signal is consuming its topic and proposing nothing, which the queue makes look like 'no links exist' rather than 'nothing was compared'."
+      - alert: ClusteringSignalProposalFlood
+        expr: |
+          sum(rate(intelligence_link_signal_suppressed_total{reason="capped"}[1h]))
+            / clamp_min(sum(rate(intelligence_link_candidates_total{outcome="new"}[1h])), 1e-9) > 5
+        for: 2h
+        labels:
+          severity: informational
+        annotations:
+          summary: "The per-subject proposal cap is doing most of the filtering"
+          description: "Subjects are routinely matching far more anchors than INTEL_LINK_MAX_PER_SUBJECT will accept, so the cap — a safety bound — has become the actual selection criterion. That usually means INTEL_LINK_MIN_SIMILARITY is too low for a dense behavioral neighbourhood (every sandwich bot resembles every other), and the queue is being filled by the same few clusters. Raise the threshold rather than the cap: the cap protects the queue, the threshold decides what deserves to be in it."
+      - alert: ClusteringSignalSecondOrderTaint
+        expr: sum(rate(intelligence_link_signal_suppressed_total{reason="derived_anchor_only"}[6h])) > 0.05
+        for: 6h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Behavioral matches are landing on derived labels"
+          description: "Neighbours are being refused as anchors because the only actor-kind labels they carry are themselves entity-derived — the refusal that stops taint spreading transitively (a guess about a guess). Sustained non-zero means the derived labels are pooling into a behavioral cluster of their own, which is worth looking at: either a genuine cluster the graph has not merged, or the signal repeatedly circling the same neighbourhood. It is NOT a reason to relax the rule; there is no confidence discount that makes second-order taint honest."
+      - alert: ClusteringSignalRecoveringLostAnnouncements
+        expr: sum(rate(intelligence_link_signal_recovered_total[1h])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Candidate links were stored without their event reaching the bus"
+          description: "The boot-time recovery sweep found proposals whose `EntityLinkProposed` was never published and announced them itself. The ordinary crash — commit, then die before publishing — is covered by redelivery and shows up as `intelligence_link_candidates_total{outcome=\"re_announce\"}` instead; reaching *this* counter means redelivery could not have fixed it (a consumer group reset forward, a topic compacted past the event, offsets moved by hand). Not data loss — the row is durable and the sweep published it — but it means something moved the consumer's position, and that is worth understanding before it happens to a topic with no such backstop."
