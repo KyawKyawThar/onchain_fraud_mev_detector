@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ClickhouseConfig;
 use crate::model::{
-    address_key, parse_address_key, AddressKeyError, AdjacencyEdge, EdgeKind, Neighborhood,
+    address_key, parse_address_key, AddressEdge, AddressKeyError, AdjacencyEdge, EdgeHistory,
+    EdgeKind, Neighborhood,
 };
 
 /// A failure appending to or querying the graph. ClickHouse faults are I/O —
@@ -51,6 +52,92 @@ impl event_bus::Transience for GraphError {
     /// contract.
     fn is_transient(&self) -> bool {
         matches!(self, GraphError::Clickhouse(_))
+    }
+}
+
+/// One slice of the address keyspace — how the §20.3 embedding sweep scales
+/// horizontally.
+///
+/// The sweep carries in-process cursor state, so replicas cannot simply be
+/// added: two of them would each walk the *whole* active set and do identical
+/// work twice. A hash shard partitions the keyspace instead, with **no
+/// coordination and no rebalancing protocol** — each replica is handed its
+/// index and owns exactly the addresses that hash into it. `cityHash64` is
+/// evaluated inside ClickHouse, so a shard reads only its own rows rather than
+/// filtering someone else's in Rust.
+///
+/// Declaring this up front matters more than using it: retrofitting a shard
+/// key onto a keyspace that is already being walked means a flag day, while an
+/// unsharded deployment is just [`Shard::SINGLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shard {
+    index: u32,
+    total: u32,
+}
+
+/// An out-of-range shard — a deployment misconfiguration, caught at boot
+/// rather than as a silently empty sweep.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ShardError {
+    #[error("shard total must be at least 1")]
+    ZeroTotal,
+    #[error("shard index {index} is outside 0..{total}")]
+    IndexOutOfRange { index: u32, total: u32 },
+}
+
+impl Shard {
+    /// The whole keyspace — an unsharded deployment.
+    pub const SINGLE: Shard = Shard { index: 0, total: 1 };
+
+    /// Parse, don't validate: an out-of-range shard cannot be constructed, so
+    /// no read has to re-check it. An index at or past `total` would select
+    /// nothing at all — a deployment that silently embeds no addresses, which
+    /// is the failure this rejects at boot.
+    pub fn new(index: u32, total: u32) -> Result<Self, ShardError> {
+        if total == 0 {
+            return Err(ShardError::ZeroTotal);
+        }
+        if index >= total {
+            return Err(ShardError::IndexOutOfRange { index, total });
+        }
+        Ok(Self { index, total })
+    }
+
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    pub fn total(self) -> u32 {
+        self.total
+    }
+
+    /// Whether this shard covers the whole keyspace (so a read can skip the
+    /// predicate entirely).
+    pub fn is_single(self) -> bool {
+        self.total == 1
+    }
+
+    /// The SQL predicate selecting this shard's slice of `column`, or an
+    /// always-true clause for [`Self::SINGLE`]. Both operands are integers we
+    /// constructed, so there is no injection surface.
+    fn predicate(self, column: &str) -> String {
+        if self.is_single() {
+            "1".to_owned()
+        } else {
+            format!("cityHash64({column}) % {} = {}", self.total, self.index)
+        }
+    }
+}
+
+impl Default for Shard {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+
+impl std::fmt::Display for Shard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.index, self.total)
     }
 }
 
@@ -116,6 +203,76 @@ pub trait AdjacencyStore: Send + Sync {
         kinds: &[EdgeKind],
         cap: u32,
     ) -> Result<Neighborhood, GraphError>;
+
+    /// The address's own observations — both directions, resolved into
+    /// subject-relative [`AddressEdge`]s — most recent first, capped at `cap`
+    /// rows ([`EdgeHistory::truncated`] says the cap was hit). The §20.3
+    /// behavior embedding reads exactly this.
+    ///
+    /// Where [`Self::neighbors`] answers "who", this answers "what, in which
+    /// direction, and when" — cadence and flow shape are properties of the
+    /// *observations*, not of the distinct neighbor set, so collapsing to
+    /// neighbors first would erase the signal.
+    ///
+    /// Redelivered appends are collapsed (the store is append-only and a
+    /// duplicated write is a legal extra row): an observation is distinct by
+    /// its full `(counterparty, kind, direction, evidence, block, time)`
+    /// tuple, so two genuine interactions in different transactions stay two
+    /// rows while a re-appended one stays one.
+    async fn edge_history(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        cap: u32,
+    ) -> Result<EdgeHistory, GraphError>;
+
+    /// The capped observation histories of *many* addresses at once — the
+    /// batched form of [`Self::edge_history`], and the read the embedding
+    /// sweep actually issues.
+    ///
+    /// The sweep processes a *page* of addresses, so one query per address is
+    /// a round trip per address on the hot path of the largest job this
+    /// service runs. The default loops (correct, N round trips) so a double
+    /// gets a working implementation for free; the ClickHouse impl overrides
+    /// it with a single `LIMIT cap BY subject` query — exactly the shape
+    /// [`Self::neighbors_many`] already uses for the entity-graph frontier.
+    ///
+    /// Returns one entry per input address (an address with no observations
+    /// maps to an empty, un-truncated history), so a caller can look each up
+    /// unconditionally.
+    async fn edge_history_many(
+        &self,
+        chain: Chain,
+        addresses: &[AccountAddress],
+        cap: u32,
+    ) -> Result<std::collections::HashMap<AccountAddress, EdgeHistory>, GraphError> {
+        let mut out = std::collections::HashMap::with_capacity(addresses.len());
+        for address in addresses {
+            out.insert(*address, self.edge_history(chain, address, cap).await?);
+        }
+        Ok(out)
+    }
+
+    /// Addresses with at least one observation at/after `since`, in ascending
+    /// address order, starting strictly after `after` — the paged candidate
+    /// list the scheduled embedding sweep walks.
+    ///
+    /// Cursor-paged rather than offset-paged so a sweep that runs out of
+    /// budget resumes where it stopped instead of re-reading the same prefix
+    /// forever (the starvation this shape exists to prevent); `limit` bounds
+    /// each page, and the caller bounds how many pages one tick takes.
+    ///
+    /// `shard` restricts the page to one slice of the keyspace so several
+    /// sweep replicas can walk disjoint sets with no coordination; an
+    /// unsharded deployment passes [`Shard::SINGLE`].
+    async fn active_addresses(
+        &self,
+        chain: Chain,
+        since: DateTime<Utc>,
+        after: Option<AccountAddress>,
+        limit: u32,
+        shard: Shard,
+    ) -> Result<Vec<AccountAddress>, GraphError>;
 }
 
 /// One stored edge row. Field order mirrors the `address_adjacency` columns;
@@ -153,6 +310,51 @@ impl EdgeRow {
 struct NeighborRow {
     source: String,
     neighbor: String,
+}
+
+/// One observation from [`ClickhouseAdjacency::edge_history`], already
+/// resolved to the subject's point of view by the query's `1 AS outbound` /
+/// `0 AS outbound` projection.
+#[derive(Debug, clickhouse::Row, Deserialize)]
+struct EdgeHistoryRow {
+    counterparty: String,
+    kind: String,
+    outbound: u8,
+    block_number: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    observed_at: DateTime<Utc>,
+}
+
+/// One observation from the *batched* history read, carrying which subject it
+/// belongs to so the flat result can be grouped.
+#[derive(Debug, clickhouse::Row, Deserialize)]
+struct SubjectEdgeRow {
+    subject: String,
+    counterparty: String,
+    kind: String,
+    outbound: u8,
+    block_number: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    observed_at: DateTime<Utc>,
+}
+
+impl TryFrom<EdgeHistoryRow> for AddressEdge {
+    type Error = GraphError;
+
+    /// Fallible in exactly the two ways a stored row can be corrupt: an
+    /// address that no longer parses, and a `kind` outside the closed enum
+    /// (a row written by a build that knew a variant this one doesn't).
+    fn try_from(row: EdgeHistoryRow) -> Result<Self, GraphError> {
+        Ok(AddressEdge {
+            counterparty: parse_address_key(&row.counterparty)?,
+            kind: row.kind.parse().map_err(|_| GraphError::Malformed {
+                what: format!("edge kind {:?} is not a known EdgeKind", row.kind),
+            })?,
+            outbound: row.outbound != 0,
+            block_number: row.block_number,
+            observed_at: row.observed_at,
+        })
+    }
 }
 
 /// Both directions of a neighborhood, as one indexed subquery: the outbound
@@ -352,6 +554,176 @@ impl AdjacencyStore for ClickhouseAdjacency {
             .map(|raw| Ok(parse_address_key(&raw)?))
             .collect::<Result<Vec<_>, GraphError>>()
             .map(|neighbors| Neighborhood { neighbors, capped })
+    }
+
+    async fn edge_history(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        cap: u32,
+    ) -> Result<EdgeHistory, GraphError> {
+        let key = address_key(address);
+        // `DISTINCT` inside, projection outside: the distinctness that matters
+        // is the *observation* (evidence included), while `evidence` itself is
+        // not a feature, so it is selected only to make the de-duplication
+        // right and dropped before it reaches the caller.
+        //
+        // `cap + 1` rows so "there was more" is observable without a second
+        // count query (the same trick `neighbors` uses), and the full ORDER BY
+        // — down to the tie-breakers — makes *which* observations survive the
+        // cap deterministic, which is what lets a truncated history still be a
+        // well-defined recency window.
+        let sql = format!(
+            "SELECT counterparty, kind, outbound, block_number, observed_at FROM ( \
+                SELECT DISTINCT dst AS counterparty, kind, 1 AS outbound, evidence, \
+                       block_number, observed_at \
+                  FROM address_adjacency WHERE chain = {chain} AND src = ? \
+                UNION ALL \
+                SELECT DISTINCT src AS counterparty, kind, 0 AS outbound, evidence, \
+                       block_number, observed_at \
+                  FROM address_adjacency WHERE chain = {chain} AND dst = ? \
+             ) ORDER BY observed_at DESC, block_number DESC, counterparty ASC, \
+                        kind ASC, outbound DESC \
+               LIMIT ?",
+            chain = chain.id()
+        );
+
+        let rows: Vec<EdgeHistoryRow> = self
+            .client
+            .query(&sql)
+            .bind(&key)
+            .bind(&key)
+            .bind(u64::from(cap) + 1)
+            .fetch_all()
+            .await?;
+
+        let truncated = rows.len() > cap as usize;
+        let edges = rows
+            .into_iter()
+            .take(cap as usize)
+            .map(AddressEdge::try_from)
+            .collect::<Result<Vec<_>, GraphError>>()?;
+        Ok(EdgeHistory { edges, truncated })
+    }
+
+    async fn edge_history_many(
+        &self,
+        chain: Chain,
+        addresses: &[AccountAddress],
+        cap: u32,
+    ) -> Result<std::collections::HashMap<AccountAddress, EdgeHistory>, GraphError> {
+        use std::collections::HashMap;
+
+        if addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Subject addresses are canonical lowercase 0x-hex produced by
+        // `address_key` — never user free-text — so inlining them as an
+        // `IN (...)` list is injection-safe, the same stance `neighbors_many`
+        // takes. `LIMIT cap + 1 BY subject` keeps "there was more" observable
+        // per subject without a second count query, and the full ORDER BY
+        // makes *which* observations survive the cap deterministic per
+        // subject — the property that lets a truncated history still be a
+        // well-defined recency window.
+        let keys: Vec<String> = addresses.iter().map(address_key).collect();
+        let in_list = keys
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let per_subject = u64::from(cap) + 1;
+        let sql = format!(
+            "SELECT subject, counterparty, kind, outbound, block_number, observed_at FROM ( \
+                SELECT DISTINCT src AS subject, dst AS counterparty, kind, 1 AS outbound, \
+                       evidence, block_number, observed_at \
+                  FROM address_adjacency WHERE chain = {chain} AND src IN ({in_list}) \
+                UNION ALL \
+                SELECT DISTINCT dst AS subject, src AS counterparty, kind, 0 AS outbound, \
+                       evidence, block_number, observed_at \
+                  FROM address_adjacency WHERE chain = {chain} AND dst IN ({in_list}) \
+             ) ORDER BY subject, observed_at DESC, block_number DESC, counterparty ASC, \
+                        kind ASC, outbound DESC \
+               LIMIT {per_subject} BY subject",
+            chain = chain.id()
+        );
+
+        let rows: Vec<SubjectEdgeRow> = self.client.query(&sql).fetch_all().await?;
+
+        // Group the flat rows by subject; per-subject order is preserved by the
+        // query's ORDER BY, so the cap selects a deterministic prefix.
+        let mut grouped: HashMap<String, Vec<AddressEdge>> = HashMap::new();
+        for row in rows {
+            let subject = row.subject.clone();
+            grouped.entry(subject).or_default().push(AddressEdge {
+                counterparty: parse_address_key(&row.counterparty)?,
+                kind: row.kind.parse().map_err(|_| GraphError::Malformed {
+                    what: format!("edge kind {:?} is not a known EdgeKind", row.kind),
+                })?,
+                outbound: row.outbound != 0,
+                block_number: row.block_number,
+                observed_at: row.observed_at,
+            });
+        }
+
+        // One history per *input* address, whether or not it had any rows.
+        let mut out = HashMap::with_capacity(addresses.len());
+        for (address, key) in addresses.iter().zip(keys.iter()) {
+            let mut edges = grouped.remove(key).unwrap_or_default();
+            let truncated = edges.len() as u64 > u64::from(cap);
+            edges.truncate(cap as usize);
+            out.insert(*address, EdgeHistory { edges, truncated });
+        }
+        Ok(out)
+    }
+
+    async fn active_addresses(
+        &self,
+        chain: Chain,
+        since: DateTime<Utc>,
+        after: Option<AccountAddress>,
+        limit: u32,
+        shard: Shard,
+    ) -> Result<Vec<AccountAddress>, GraphError> {
+        // The cursor is our own canonical lowercase 0x-hex (never user
+        // free-text), so inlining it is injection-safe — the same stance
+        // `neighbors_many` takes for its address `IN` list. An absent cursor
+        // becomes `''`, which sorts below every real key, so the first page
+        // needs no second query shape.
+        let cursor = after.as_ref().map(address_key).unwrap_or_default();
+        // The recency floor is bound as **epoch milliseconds** through
+        // `fromUnixTimestamp64Milli`, not as a `DateTime<Utc>`: the crate would
+        // serialize that through chrono's default `Serialize`, which is
+        // RFC3339 (`…T…Z`) — a format ClickHouse's `DateTime64` literal parser
+        // does not reliably accept. An integer has one interpretation.
+        // The shard predicate is pushed into *both* branches rather than
+        // filtered outside them: a replica must read only its own slice, not
+        // read everyone's and discard.
+        let sql = format!(
+            "SELECT DISTINCT address FROM ( \
+                SELECT src AS address FROM address_adjacency \
+                  WHERE chain = {chain} AND observed_at >= fromUnixTimestamp64Milli(?) \
+                    AND src > '{cursor}' AND {src_shard} \
+                UNION DISTINCT \
+                SELECT dst AS address FROM address_adjacency \
+                  WHERE chain = {chain} AND observed_at >= fromUnixTimestamp64Milli(?) \
+                    AND dst > '{cursor}' AND {dst_shard} \
+             ) ORDER BY address LIMIT ?",
+            chain = chain.id(),
+            src_shard = shard.predicate("src"),
+            dst_shard = shard.predicate("dst"),
+        );
+
+        let since_millis = since.timestamp_millis();
+        let rows: Vec<String> = self
+            .client
+            .query(&sql)
+            .bind(since_millis)
+            .bind(since_millis)
+            .bind(u64::from(limit))
+            .fetch_all()
+            .await?;
+
+        rows.iter().map(|raw| Ok(parse_address_key(raw)?)).collect()
     }
 }
 

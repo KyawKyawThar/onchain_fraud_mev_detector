@@ -43,6 +43,20 @@
 //!     ClickHouse (apply the `block_production` table first via `migrate up`)
 //!     and heuristic `BuilderAddress` `LabelAdded`s out, until a shutdown
 //!     signal — see [`intelligence::production_consumer`].
+//!   - `embed <address>` — compute and print one address's §20.3 behavior
+//!     vector (Sprint 19 t1): read-only inspection, no store write and no
+//!     event published.
+//!   - `embedding` — drive the §20.3 behavior-embedding job: the scheduled
+//!     sweep ([`intelligence::embedding_sweep`]) and the invalidation consumer
+//!     ([`intelligence::embedding_consumer`]) over one shared compute core
+//!     ([`intelligence::embedding_job`]), appending vectors to the
+//!     `address_embeddings` ClickHouse table and publishing
+//!     `AddressEmbeddingUpdated`, until a shutdown signal.
+//!   - `embedding-baseline` — recompute the §20.3 population baseline (the
+//!     per-feature median/MAD a similarity search standardizes against) from
+//!     a bounded sample of stored vectors. A periodic operator/cron action,
+//!     not part of the long-running job: the baseline moves on a much slower
+//!     clock than the vectors do.
 //!   - `cross-chain-attribute` — drive the Sprint 17 t4 cross-chain
 //!     attribution consumer (§8, §24): `BridgeMevDetected`/
 //!     `CrossChainMevDetected` in (its own Kafka consumer group), each
@@ -72,6 +86,11 @@ use intelligence::ch_migrate;
 use intelligence::cluster::{cluster_address, ClusterLimits, ClusterSeams};
 use intelligence::config::Config;
 use intelligence::cross_chain_attribution::{self, CrossChainAttributor};
+use intelligence::embedding::{self, baseline, BehaviorEmbedder};
+use intelligence::embedding_consumer::{self, EmbeddingConsumer};
+use intelligence::embedding_job::{self, Embedder, EmbedderSeams};
+use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
+use intelligence::embedding_sweep::EmbeddingSweep;
 use intelligence::grpc::IntelligenceReadService;
 use intelligence::leaderboard::ClickhouseLeaderboard;
 use intelligence::merge_actor::MergeActor;
@@ -93,7 +112,8 @@ const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
                      `risk <address>`, `score`, `reorg`, `grpc`, `block-production`, \
-                     `cross-chain-attribute`, \
+                     `cross-chain-attribute`, `embed <address>`, `embedding`, \
+                     `embedding-baseline`, \
                      `label-update <chain-id> <label-id> <new-value>`, \
                      `label-revoke <chain-id> <label-id> <reason...>`, or \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
@@ -123,6 +143,9 @@ async fn main() -> Result<()> {
         Some("grpc") => grpc_serve(&cfg, client).await,
         Some("block-production") => block_production(&cfg, client).await,
         Some("cross-chain-attribute") => cross_chain_attribute(&cfg, client).await,
+        Some("embed") => address_embedding(&cfg, client, args).await,
+        Some("embedding") => embedding(&cfg, client).await,
+        Some("embedding-baseline") => embedding_baseline(&cfg, client).await,
         Some("label-update") => label_update(&cfg, args).await,
         Some("label-revoke") => label_revoke(&cfg, args).await,
         Some("entity-split") => entity_split(&cfg, args).await,
@@ -320,6 +343,309 @@ async fn address_risk(cfg: &Config, mut args: impl Iterator<Item = String>) -> R
     }
     Ok(())
 }
+
+/// Compute and print one address's behavior vector (§20.3, Sprint 19 t1):
+/// read the adjacency history and the store seams, hand them to each enabled
+/// version's pure kernel, and print the vectors with the factors that dominate
+/// them. Read-only — nothing is appended and no
+/// `AddressEmbeddingUpdated` is published; that is the `embedding` run mode's
+/// job. The one-shot analogue of `risk <address>`, and the operator's way to
+/// ask "what does the system think this address *behaves* like" before
+/// trusting a similarity result built on it.
+async fn address_embedding(
+    cfg: &Config,
+    client: Client,
+    mut args: impl Iterator<Item = String>,
+) -> Result<()> {
+    let Some(raw_address) = args.next() else {
+        bail!("missing address; {USAGE}");
+    };
+    let address = raw_address
+        .parse()
+        .map_err(|_| anyhow::anyhow!("address {raw_address:?} is not 0x-hex; {USAGE}"))?;
+
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let stores = StoreSeams::single(Arc::new(PgIntelligenceStore::new(pool)));
+    let graph = ClickhouseAdjacency::new(client);
+
+    let as_of = chrono::Utc::now();
+    let (entity_id, inputs) = embedding_job::load_behavior_inputs(
+        &stores,
+        &graph,
+        cfg.embedding.chain,
+        &address,
+        as_of,
+        cfg.embedding.limits.history_cap,
+    )
+    .await
+    .context("loading behavior inputs")?;
+
+    println!(
+        "chain {}   observations {}{}",
+        cfg.embedding.chain,
+        inputs.history.edges.len(),
+        if inputs.history.truncated {
+            " (TRUNCATED — this is a hub; the vector describes its recent window)"
+        } else {
+            ""
+        }
+    );
+    if inputs.history.edges.is_empty() {
+        println!("(no observations on record for this address on this chain)");
+    }
+
+    // Every enabled version, so an operator mid-rollout can see what each one
+    // makes of the same address rather than only the default.
+    for embedder in resolve_versions(&cfg.embedding.versions)? {
+        let vector = embedder.embed(address, entity_id, &inputs, as_of);
+        println!(
+            "\n{} dims (model {}, schema {})",
+            vector.values.len(),
+            vector.embedding_version(),
+            &vector.schema_hash()[..12],
+        );
+        for factor in vector.top_factors(embedding::MAX_VISIBLE_FACTORS) {
+            println!(
+                "{:>10.4}  {:5.1}%  {}",
+                factor.value,
+                factor.share * 100.0,
+                factor.feature
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the schema versions this deployment computes, failing at boot on an
+/// unknown one.
+///
+/// An empty config means "the newest registered version". A named version that
+/// this build does not ship is a *refused boot*, never a silent fallback to the
+/// default: embedding under a different version than the operator asked for is
+/// exactly the drift the version stamp exists to prevent, and it would only
+/// surface much later as two incomparable vectors that look comparable.
+fn resolve_versions(names: &[String]) -> Result<Vec<&'static dyn BehaviorEmbedder>> {
+    if names.is_empty() {
+        return Ok(vec![embedding::default_embedder()]);
+    }
+    names
+        .iter()
+        .map(|name| {
+            embedding::embedder_for(name).with_context(|| {
+                let known: Vec<&str> = embedding::embedders()
+                    .iter()
+                    .map(|embedder| embedder.version())
+                    .collect();
+                format!(
+                    "INTEL_EMBEDDING_VERSIONS names {name:?}, which this build does not ship \
+                     (known versions: {})",
+                    known.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
+/// Build the shared §20.3 compute core the sweep, the consumer and the
+/// one-shot commands all run through — so no entry point can read a different
+/// set of seams than the long-running job does.
+async fn build_embedder(
+    cfg: &Config,
+    client: Client,
+    shutdown: CancellationToken,
+) -> Result<Embedder> {
+    let embed_cfg = &cfg.embedding;
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let stores = StoreSeams::single(Arc::new(PgIntelligenceStore::new(pool)));
+
+    let graph = Arc::new(ClickhouseAdjacency::new(client.clone()));
+    graph
+        .ping()
+        .await
+        .context("probing ClickHouse (the adjacency graph the embedding reads)")?;
+    let embeddings = Arc::new(ClickhouseEmbeddingStore::new(client));
+
+    let sink =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+
+    Ok(Embedder::new(
+        embed_cfg.chain,
+        EmbedderSeams {
+            stores,
+            graph,
+            embeddings,
+            sink,
+        },
+        shutdown,
+        embed_cfg.limits,
+        resolve_versions(&embed_cfg.versions)?,
+    ))
+}
+
+/// Run the §20.3 behavior-embedding job (Sprint 19 t1): the scheduled sweep and
+/// the invalidation consumer, supervised together over one shared compute core.
+///
+/// Neither trigger is sufficient alone — the sweep catches cadence drift and
+/// counterparty relabeling that no event names for this address, the consumer
+/// catches the incident/label changes that must not wait a whole sweep
+/// interval (see [`intelligence::embedding_consumer`]'s module docs). They run
+/// in one process because they share one bounded compute path against one
+/// connection pool: splitting them would double the store load and silently
+/// double the configured page concurrency.
+///
+/// The `address_embeddings` ClickHouse table must be applied first
+/// (`intelligence migrate up`), the same out-of-band migration convention as
+/// the adjacency graph.
+async fn embedding(cfg: &Config, client: Client) -> Result<()> {
+    let embed_cfg = &cfg.embedding;
+    tracing::info!(
+        group = %embed_cfg.group_id,
+        chain = %embed_cfg.chain,
+        shard = %embed_cfg.sweep.shard,
+        sweep_interval_s = embed_cfg.sweep.interval.as_secs(),
+        history_cap = embed_cfg.limits.history_cap,
+        "starting intelligence behavior-embedding job"
+    );
+
+    // Export the §19 embedding counters (computed/written-by-reason/skipped,
+    // sweep budget and lap time) — the data behind "is the sweep keeping up".
+    // A no-op if the addr is unset.
+    if let Some(addr) = cfg.metrics_addr {
+        telemetry::metrics::init(addr).context("starting the metrics exporter")?;
+        tracing::info!(%addr, "serving embedding metrics");
+    }
+
+    let shutdown = CancellationToken::new();
+    // K8s probes (§20): /livez immediately; /readyz flips on below, once this
+    // mode's wiring completes. Opt-in via HEALTH_ADDR.
+    let health = telemetry::health::HealthState::new();
+    telemetry::health::spawn_from_env(health.clone(), shutdown.clone())
+        .await
+        .context("starting the health endpoints")?;
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received");
+            shutdown.cancel();
+        }
+    });
+
+    let embedder = build_embedder(cfg, client, shutdown.clone()).await?;
+    tracing::info!(
+        versions = ?embedder.versions().iter().map(|v| v.version()).collect::<Vec<_>>(),
+        "embedding versions enabled"
+    );
+
+    let dlq =
+        event_bus::dlq::DeadLetterQueue::ensure_from_env(&cfg.kafka.brokers, "intel-embedding")
+            .await
+            .context("provisioning the embedding DLQ topic")?;
+    let kafka_consumer =
+        embedding_consumer::build_consumer(&cfg.kafka.brokers, &embed_cfg.group_id)
+            .context("building the embedding Kafka consumer")?;
+
+    // The sweep is supervised, not fire-and-forget: if its task dies the
+    // process must not keep serving a half-job that silently stops refreshing
+    // dormant addresses while the consumer still looks healthy.
+    let sweep =
+        tokio::spawn(EmbeddingSweep::new(embedder.clone(), embed_cfg.sweep).run(shutdown.clone()));
+
+    health.set_ready(true);
+    let consumer_result = EmbeddingConsumer::new(embedder)
+        .run(kafka_consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
+        .await;
+
+    // Either half exiting takes the other down — a drain, not a leak.
+    shutdown.cancel();
+    if let Err(err) = sweep.await {
+        tracing::error!(error = %err, "the embedding sweep task did not shut down cleanly");
+    }
+    consumer_result.context("embedding consumer exited with error")?;
+
+    tracing::info!("intelligence behavior-embedding job shut down");
+    Ok(())
+}
+
+/// Recompute the §20.3 population baseline: the per-feature median and scaled
+/// MAD a similarity search standardizes against (§20.3 — without it a raw
+/// distance is dominated by the log-magnitude family, and "behaviorally
+/// similar" degrades into "similar transaction count").
+///
+/// A periodic operator action rather than part of the long-running job: the
+/// population statistics move on a much slower clock than individual vectors
+/// do, and re-deriving one is a *ranking* change that an operator should make
+/// deliberately. Read-only with respect to `address_embeddings` — it samples
+/// them and writes one `behavior_baselines` row.
+async fn embedding_baseline(cfg: &Config, client: Client) -> Result<()> {
+    let embed_cfg = &cfg.embedding;
+    let store = ClickhouseEmbeddingStore::new(client);
+
+    for embedder in resolve_versions(&embed_cfg.versions)? {
+        let schema = embedder.schema();
+        let sample = store
+            .sample_vectors(embed_cfg.chain, embedder.version(), BASELINE_SAMPLE_SIZE)
+            .await
+            .with_context(|| format!("sampling {} vectors", embedder.version()))?;
+
+        let Some(computed) = baseline::compute(schema, &sample, chrono::Utc::now()) else {
+            println!(
+                "⚠️  {}: no vectors stored yet on chain {} — nothing to baseline",
+                embedder.version(),
+                embed_cfg.chain
+            );
+            continue;
+        };
+
+        if computed.sample_count < baseline::MIN_SAMPLES {
+            // Stored anyway, and refused at *use* time by `standardize`: an
+            // operator should be able to see the thin baseline that exists
+            // rather than wonder whether the command ran.
+            println!(
+                "⚠️  {}: only {} vectors sampled (minimum {}) — stored, but too thin to \
+                 standardize against",
+                embedder.version(),
+                computed.sample_count,
+                baseline::MIN_SAMPLES
+            );
+        }
+
+        store
+            .put_baseline(embed_cfg.chain, &computed)
+            .await
+            .with_context(|| format!("storing the {} baseline", embedder.version()))?;
+
+        println!(
+            "✅ {} baseline over {} vectors (schema {})",
+            computed.embedding_version,
+            computed.sample_count,
+            &computed.schema_hash[..12],
+        );
+        // The widest-spread features are the ones that will dominate a
+        // standardized distance — worth seeing at a glance.
+        let mut ranked: Vec<(&str, f32)> = schema
+            .features()
+            .iter()
+            .zip(computed.spread.iter().copied())
+            .map(|(def, spread)| (def.name, spread))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, spread) in ranked.iter().take(5) {
+            println!("   spread {spread:>10.4}  {name}");
+        }
+    }
+    Ok(())
+}
+
+/// How many stored vectors a baseline refresh samples. A population median
+/// does not get materially better past a few tens of thousands of addresses,
+/// and reading the whole table to compute one would be the most expensive
+/// query this service issues.
+const BASELINE_SAMPLE_SIZE: u32 = 50_000;
 
 /// Prove all three stores are reachable and schema'd — the boot-time fail-fast
 /// probe, runnable on its own for deploy smoke checks.

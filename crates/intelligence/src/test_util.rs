@@ -18,8 +18,8 @@ use events::primitives::{AccountAddress, Chain, EntityId, IncidentId, LabelId};
 use crate::adjacency::{AdjacencyStore, GraphError};
 use crate::cache::{CacheError, CachedScore, CachedScreeningFacts, HotCache};
 use crate::model::{
-    plan_reversal, AdjacencyEdge, AttributionRecord, EntityRecord, EntityStatus, LabelRecord,
-    MergeId, MergeLogEntry, Neighborhood, ReversalPlan, SanctionEntry,
+    plan_reversal, AddressEdge, AdjacencyEdge, AttributionRecord, EdgeHistory, EntityRecord,
+    EntityStatus, LabelRecord, MergeId, MergeLogEntry, Neighborhood, ReversalPlan, SanctionEntry,
 };
 use crate::store::{
     AttributionStore, CreateOutcome, EntityStore, LabelStore, LinkOutcome, MergeOutcome,
@@ -675,6 +675,260 @@ impl AdjacencyStore for InMemoryAdjacency {
             neighbors: set.into_iter().take(cap as usize).collect(),
             capped,
         })
+    }
+
+    /// Mirrors the ClickHouse query's contract exactly: subject-relative,
+    /// de-duplicated by whole observation, most recent first with the same
+    /// tie-breakers, and `truncated` when more existed than the cap.
+    async fn edge_history(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        cap: u32,
+    ) -> Result<EdgeHistory, GraphError> {
+        let edges = self.edges.lock().expect("graph lock");
+        // De-duplicate on the full observation (evidence included) the same way
+        // the store's `SELECT DISTINCT` does, so a re-appended edge is one
+        // observation here too — otherwise a double would let a bug through
+        // that production collapses.
+        // A `HashSet` rather than a `BTreeSet`: `EdgeKind` is `Hash` but
+        // deliberately not `Ord` (its variants have no ranking), and inventing
+        // one here just to de-duplicate would be a meaning the enum doesn't
+        // have.
+        let mut seen = HashSet::new();
+        let mut history: Vec<AddressEdge> = Vec::new();
+        for edge in edges.iter().filter(|e| e.chain == chain) {
+            let outbound = if edge.src == *address {
+                true
+            } else if edge.dst == *address {
+                false
+            } else {
+                continue;
+            };
+            let key = (
+                if outbound { edge.dst } else { edge.src },
+                edge.kind,
+                outbound,
+                edge.evidence.clone(),
+                edge.block_number,
+                edge.observed_at,
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            history.push(AddressEdge {
+                counterparty: if outbound { edge.dst } else { edge.src },
+                kind: edge.kind,
+                outbound,
+                block_number: edge.block_number,
+                observed_at: edge.observed_at,
+            });
+        }
+        history.sort_by(|a, b| {
+            b.observed_at
+                .cmp(&a.observed_at)
+                .then_with(|| b.block_number.cmp(&a.block_number))
+                .then_with(|| a.counterparty.cmp(&b.counterparty))
+                .then_with(|| <&str>::from(a.kind).cmp(<&str>::from(b.kind)))
+                .then_with(|| b.outbound.cmp(&a.outbound))
+        });
+        let truncated = history.len() > cap as usize;
+        history.truncate(cap as usize);
+        Ok(EdgeHistory {
+            edges: history,
+            truncated,
+        })
+    }
+
+    async fn active_addresses(
+        &self,
+        chain: Chain,
+        since: DateTime<Utc>,
+        after: Option<AccountAddress>,
+        limit: u32,
+        shard: crate::adjacency::Shard,
+    ) -> Result<Vec<AccountAddress>, GraphError> {
+        let edges = self.edges.lock().expect("graph lock");
+        let mut set = BTreeSet::new();
+        for edge in edges
+            .iter()
+            .filter(|e| e.chain == chain && e.observed_at >= since)
+        {
+            set.insert(edge.src);
+            set.insert(edge.dst);
+        }
+        Ok(set
+            .into_iter()
+            .filter(|address| after.is_none_or(|cursor| *address > cursor))
+            .filter(|address| shard_contains(shard, address))
+            .take(limit as usize)
+            .collect())
+    }
+}
+
+/// Stand-in for the ClickHouse `cityHash64(address) % total = index` predicate.
+///
+/// A double cannot reproduce ClickHouse's hash, and pretending otherwise would
+/// make a sharded test assert against a partition production doesn't use. What
+/// *is* reproducible — and is what the sharding contract actually promises — is
+/// that the shards **partition** the keyspace: every address lands in exactly
+/// one, and their union is the whole set. So the double uses its own stable
+/// hash and the tests assert that partition property, not which specific shard
+/// an address falls in.
+fn shard_contains(shard: crate::adjacency::Shard, address: &AccountAddress) -> bool {
+    if shard.is_single() {
+        return true;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut hasher);
+    (hasher.finish() % u64::from(shard.total())) == u64::from(shard.index())
+}
+
+// ── Behavior-embedding double (§20.3, Sprint 19 t1) ──────────────────────────
+
+use crate::embedding::baseline::BehaviorBaseline;
+use crate::embedding::BehaviorVector;
+use crate::embedding_store::{EmbeddingRow, EmbeddingStore, EmbeddingStoreError, StoredEmbedding};
+
+/// [`EmbeddingStore`] double: an append-only log of everything written, plus a
+/// transient-failure toggle for retry tests.
+///
+/// `latest` answers off the same log rather than a second map, so the double
+/// cannot disagree with itself about what was written — and it round-trips
+/// each vector through [`EmbeddingRow`] on the way out, so an encoding bug
+/// (a factor blob that doesn't decode, an entity id that doesn't parse) fails
+/// in a unit test instead of only against a live ClickHouse.
+#[derive(Default)]
+pub struct RecordingEmbeddingStore {
+    appended: Mutex<Vec<(Chain, BehaviorVector)>>,
+    baselines: Mutex<Vec<(Chain, BehaviorBaseline)>>,
+    fail_next: Mutex<bool>,
+}
+
+impl RecordingEmbeddingStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything appended so far, in write order.
+    pub fn appended(&self) -> Vec<BehaviorVector> {
+        self.appended
+            .lock()
+            .expect("embedding lock")
+            .iter()
+            .map(|(_, vector)| vector.clone())
+            .collect()
+    }
+
+    /// Make the next `append` fail transiently.
+    pub fn fail_next(&self) {
+        *self.fail_next.lock().expect("embedding lock") = true;
+    }
+}
+
+#[async_trait]
+impl EmbeddingStore for RecordingEmbeddingStore {
+    async fn append(
+        &self,
+        chain: Chain,
+        vectors: &[BehaviorVector],
+    ) -> Result<(), EmbeddingStoreError> {
+        let mut fail = self.fail_next.lock().expect("embedding lock");
+        if *fail {
+            *fail = false;
+            return Err(EmbeddingStoreError::Clickhouse(
+                clickhouse::error::Error::Custom("injected".into()),
+            ));
+        }
+        let mut appended = self.appended.lock().expect("embedding lock");
+        for vector in vectors {
+            appended.push((chain, vector.clone()));
+        }
+        Ok(())
+    }
+
+    async fn latest(
+        &self,
+        chain: Chain,
+        address: &AccountAddress,
+        embedding_version: &str,
+    ) -> Result<Option<StoredEmbedding>, EmbeddingStoreError> {
+        let appended = self.appended.lock().expect("embedding lock");
+        let latest = appended
+            .iter()
+            .filter(|(stored_chain, vector)| {
+                *stored_chain == chain
+                    && vector.address == *address
+                    && vector.embedding_version() == embedding_version
+            })
+            .max_by_key(|(_, vector)| vector.computed_at);
+        latest
+            .map(|(chain, vector)| {
+                StoredEmbedding::try_from(EmbeddingRow::from_vector(*chain, vector))
+            })
+            .transpose()
+    }
+
+    async fn sample_vectors(
+        &self,
+        chain: Chain,
+        embedding_version: &str,
+        limit: u32,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingStoreError> {
+        use std::collections::BTreeMap;
+
+        // Latest per address, then a deterministic address-ordered prefix —
+        // the same collapse-then-bound the ClickHouse read performs.
+        let appended = self.appended.lock().expect("embedding lock");
+        let mut latest: BTreeMap<AccountAddress, &BehaviorVector> = BTreeMap::new();
+        for (stored_chain, vector) in appended.iter() {
+            if *stored_chain != chain || vector.embedding_version() != embedding_version {
+                continue;
+            }
+            latest
+                .entry(vector.address)
+                .and_modify(|current| {
+                    if vector.computed_at >= current.computed_at {
+                        *current = vector;
+                    }
+                })
+                .or_insert(vector);
+        }
+        Ok(latest
+            .into_values()
+            .take(limit as usize)
+            .map(|vector| vector.values.clone())
+            .collect())
+    }
+
+    async fn put_baseline(
+        &self,
+        chain: Chain,
+        baseline: &BehaviorBaseline,
+    ) -> Result<(), EmbeddingStoreError> {
+        self.baselines
+            .lock()
+            .expect("embedding lock")
+            .push((chain, baseline.clone()));
+        Ok(())
+    }
+
+    async fn latest_baseline(
+        &self,
+        chain: Chain,
+        embedding_version: &str,
+    ) -> Result<Option<BehaviorBaseline>, EmbeddingStoreError> {
+        Ok(self
+            .baselines
+            .lock()
+            .expect("embedding lock")
+            .iter()
+            .filter(|(stored_chain, baseline)| {
+                *stored_chain == chain && baseline.embedding_version == embedding_version
+            })
+            .max_by_key(|(_, baseline)| baseline.computed_at)
+            .map(|(_, baseline)| baseline.clone()))
     }
 }
 

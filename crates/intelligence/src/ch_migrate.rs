@@ -1,6 +1,6 @@
 //! ClickHouse schema migrations for the intelligence service's analytical
-//! tables (§8.2, §10, §14): the address-adjacency graph and the
-//! block-production records.
+//! tables (§8.2, §10, §14, §20.3): the address-adjacency graph, the
+//! block-production records, and the per-address behavior embeddings.
 //!
 //! The runner logic lives in the shared [`ch_migrate`](ch_migrate_lib) crate;
 //! this module owns only what is service-specific: the migration set and the
@@ -31,6 +31,21 @@ const MIGRATIONS: &[Migration] = &[
         version: "0003_add_cross_chain_columns",
         up: include_str!("../migrations/0003_add_cross_chain_columns.up.sql"),
         down: include_str!("../migrations/0003_add_cross_chain_columns.down.sql"),
+    },
+    Migration {
+        version: "0004_create_address_embeddings",
+        up: include_str!("../migrations/0004_create_address_embeddings.up.sql"),
+        down: include_str!("../migrations/0004_create_address_embeddings.down.sql"),
+    },
+    Migration {
+        version: "0005_index_adjacency_observed_at",
+        up: include_str!("../migrations/0005_index_adjacency_observed_at.up.sql"),
+        down: include_str!("../migrations/0005_index_adjacency_observed_at.down.sql"),
+    },
+    Migration {
+        version: "0006_create_behavior_baselines",
+        up: include_str!("../migrations/0006_create_behavior_baselines.up.sql"),
+        down: include_str!("../migrations/0006_create_behavior_baselines.down.sql"),
     },
 ];
 
