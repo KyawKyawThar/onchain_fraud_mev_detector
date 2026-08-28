@@ -19,7 +19,7 @@
 use alloy_primitives::Address;
 use chrono::{DateTime, Utc};
 use events::primitives::{Chain, EntityId, IncidentId, LabelId};
-use intelligence::adjacency::{AdjacencyStore, ClickhouseAdjacency};
+use intelligence::adjacency::{AdjacencyStore, ClickhouseAdjacency, Shard};
 use intelligence::cache::{CachedScore, HotCache, RedisHotCache};
 use intelligence::model::{
     AdjacencyEdge, AttributionRecord, EdgeKind, EntityStatus, LabelKind, LabelRecord, LabelSource,
@@ -927,4 +927,578 @@ async fn adjacency_neighborhoods_are_degree_capped_and_direction_blind() {
         !batched[&addr(0xEE)].capped && batched[&addr(0xEE)].neighbors.is_empty(),
         "an edgeless address maps to an empty, un-capped neighborhood"
     );
+}
+
+/// The two §20.3 adjacency reads the behavior embedding is built on, against a
+/// real ClickHouse — the queries the in-memory double only *promises* to
+/// mirror.
+///
+/// What's proven here and cannot be by a double: the `DISTINCT`-inside/
+/// project-outside shape actually collapses a re-appended observation while
+/// keeping two genuine ones; the `UNION ALL` direction projection really does
+/// resolve `src`/`dst` into subject-relative `outbound`; the truncation order
+/// is the one the SQL declares; and the cursor-paged sweep read makes
+/// monotonic progress rather than re-serving its own prefix.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn adjacency_edge_history_and_active_addresses_back_the_embedding_job() {
+    let container = ClickHouse::default()
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+
+    intelligence::ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .expect("apply intelligence migrations");
+    let graph = ClickhouseAdjacency::new(client);
+
+    let subject = addr(0xAA);
+    let edge = |src: Address, dst: Address, kind: EdgeKind, block: u64| AdjacencyEdge {
+        chain: Chain::ETHEREUM,
+        src,
+        dst,
+        kind,
+        evidence: format!("0xtx{block:02x}"),
+        block_number: block,
+        observed_at: at(block as i64 * 3_600),
+    };
+
+    let mut edges = vec![
+        edge(subject, addr(1), EdgeKind::Funded, 1),
+        edge(addr(2), subject, EdgeKind::ProfitReceiver, 2),
+        edge(subject, addr(1), EdgeKind::Interacted, 3),
+    ];
+    // A *re-appended* observation (identical in every column) — one fact.
+    edges.push(edge(subject, addr(1), EdgeKind::Funded, 1));
+    // Another chain, and an edge that doesn't touch the subject.
+    edges.push(AdjacencyEdge {
+        chain: Chain(10),
+        ..edge(subject, addr(0x77), EdgeKind::Funded, 4)
+    });
+    edges.push(edge(addr(3), addr(4), EdgeKind::Interacted, 5));
+    graph.append(&edges).await.expect("append edges");
+
+    let history = graph
+        .edge_history(Chain::ETHEREUM, &subject, 10)
+        .await
+        .expect("read edge history");
+    assert!(!history.truncated);
+    assert_eq!(
+        history.edges.len(),
+        3,
+        "the re-appended observation collapsed; the other chain is invisible"
+    );
+    // Most recent first — the truncation order the cap depends on.
+    assert!(history.edges[0].observed_at >= history.edges[1].observed_at);
+    assert!(history.edges[1].observed_at >= history.edges[2].observed_at);
+    // Direction is resolved relative to the subject, not to src/dst.
+    let inbound = history
+        .edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::ProfitReceiver)
+        .expect("the inbound edge is present");
+    assert!(!inbound.outbound);
+    assert_eq!(inbound.counterparty, addr(2));
+    assert!(history
+        .edges
+        .iter()
+        .any(|e| e.outbound && e.counterparty == addr(1)));
+
+    // The cap reports truncation and keeps the *most recent* window.
+    let capped = graph
+        .edge_history(Chain::ETHEREUM, &subject, 2)
+        .await
+        .expect("read capped history");
+    assert!(capped.truncated);
+    assert_eq!(capped.edges.len(), 2);
+    assert_eq!(capped.edges[0].observed_at, history.edges[0].observed_at);
+
+    // The sweep read: every address with an observation in the window, paged
+    // by cursor, making monotonic progress.
+    let all = graph
+        .active_addresses(Chain::ETHEREUM, at(0), None, 100, Shard::SINGLE)
+        .await
+        .expect("active addresses");
+    assert!(all.contains(&subject) && all.contains(&addr(3)) && all.contains(&addr(4)));
+    assert!(
+        !all.contains(&addr(0x77)),
+        "the other chain's addresses are invisible"
+    );
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(
+        all, sorted,
+        "ascending address order — the cursor's ordering"
+    );
+
+    let first_page = graph
+        .active_addresses(Chain::ETHEREUM, at(0), None, 2, Shard::SINGLE)
+        .await
+        .expect("first page");
+    assert_eq!(first_page.len(), 2);
+    let next_page = graph
+        .active_addresses(
+            Chain::ETHEREUM,
+            at(0),
+            first_page.last().copied(),
+            2,
+            Shard::SINGLE,
+        )
+        .await
+        .expect("second page");
+    assert!(
+        next_page.iter().all(|a| a > first_page.last().unwrap()),
+        "the cursor advances strictly — a sweep cannot re-serve its own prefix"
+    );
+
+    // The recency floor is what bounds a sweep's work.
+    let recent = graph
+        .active_addresses(Chain::ETHEREUM, at(5 * 3_600), None, 100, Shard::SINGLE)
+        .await
+        .expect("recent-only");
+    assert_eq!(recent, vec![addr(3), addr(4)]);
+}
+
+/// The §20.3 embedding store against a real ClickHouse: an append-only table
+/// whose latest-per-`(chain, address, version)` read is what a similarity
+/// search and a recompute both stand on.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn embedding_store_reads_back_the_latest_vector_per_version() {
+    use intelligence::embedding::v1::{SCHEMA as V1_SCHEMA, VERSION as EMBEDDING_VERSION};
+    use intelligence::embedding::{default_embedder, BehaviorInputs};
+    use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
+
+    let container = ClickHouse::default()
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+
+    intelligence::ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .expect("apply intelligence migrations");
+    let store = ClickhouseEmbeddingStore::new(client);
+
+    let subject = addr(0xBB);
+    let entity_id = EntityId(uuid::Uuid::from_u128(0xE1));
+
+    // Two computations of the same address, and one of a different address —
+    // the older one first, so "latest" cannot be "last inserted by accident".
+    let newer = default_embedder().embed(
+        subject,
+        Some(entity_id),
+        &BehaviorInputs::default(),
+        at(2_000),
+    );
+    let older = default_embedder().embed(subject, None, &BehaviorInputs::default(), at(1_000));
+    let other = default_embedder().embed(addr(0xCC), None, &BehaviorInputs::default(), at(3_000));
+    store
+        .append(Chain::ETHEREUM, &[newer.clone(), older, other])
+        .await
+        .expect("append vectors");
+
+    let latest = store
+        .latest(Chain::ETHEREUM, &subject, EMBEDDING_VERSION)
+        .await
+        .expect("read latest")
+        .expect("the address has been embedded");
+
+    assert_eq!(latest.computed_at, newer.computed_at);
+    assert_eq!(latest.values, newer.values);
+    assert_eq!(latest.entity_id, Some(entity_id));
+    assert_eq!(latest.top_factors, newer.to_event().top_factors);
+    assert!(latest.matches(EMBEDDING_VERSION, newer.schema_hash()));
+    assert_eq!(latest.values.len(), V1_SCHEMA.dimension());
+
+    // A version nobody has written under is a miss, not a wrong-space answer.
+    assert!(store
+        .latest(Chain::ETHEREUM, &subject, "behavior-v99")
+        .await
+        .expect("read unknown version")
+        .is_none());
+    // …and so is an address nobody has embedded.
+    assert!(store
+        .latest(Chain::ETHEREUM, &addr(0xDD), EMBEDDING_VERSION)
+        .await
+        .expect("read unknown address")
+        .is_none());
+
+    // Append-only: re-appending the identical vector is a harmless extra row
+    // the latest-per-key read collapses (an idempotent recompute).
+    store
+        .append(Chain::ETHEREUM, std::slice::from_ref(&newer))
+        .await
+        .expect("re-append");
+    let again = store
+        .latest(Chain::ETHEREUM, &subject, EMBEDDING_VERSION)
+        .await
+        .expect("read latest again")
+        .expect("still present");
+    assert_eq!(again.values, newer.values);
+}
+
+/// The **batched** reads the embedding sweep depends on, against real stores.
+///
+/// These matter more than most integration tests: the Postgres batch queries are
+/// *runtime-checked* (`query_as`, not `query_as!`) because they were added
+/// without regenerating the offline `.sqlx` cache — exactly like the
+/// pre-existing `labels_for_many`. That means the compiler never sees them, and
+/// this test is the only thing standing between a typo'd column and production.
+///
+/// What is asserted is agreement, not shape: for every input, the batched read
+/// must return exactly what looping the single read returns. A batch that
+/// silently disagreed with its single-address sibling would make a page-computed
+/// vector differ from a CLI-computed one for the same address — the kind of bug
+/// that surfaces as "similarity search gives different answers than the
+/// inspector" months later.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn batched_store_reads_agree_with_their_single_address_siblings() {
+    let (store, _pg) = pg_store().await;
+
+    let members = [addr(0xB1), addr(0xB2), addr(0xB3)];
+    let loner = addr(0xB4);
+    let unknown = addr(0xB5);
+
+    let entity_id = EntityId(uuid::Uuid::from_u128(0xBEEF));
+    assert_eq!(
+        store
+            .create_entity(entity_id, &members[0], "batch-test", at(10))
+            .await
+            .expect("create"),
+        CreateOutcome::Created
+    );
+    for member in &members[1..] {
+        assert_eq!(
+            store
+                .link_address(entity_id, member, "batch-test", at(11))
+                .await
+                .expect("link"),
+            LinkOutcome::Linked
+        );
+    }
+    let lone_entity = EntityId(uuid::Uuid::from_u128(0xCAFE));
+    store
+        .create_entity(lone_entity, &loner, "batch-test", at(12))
+        .await
+        .expect("create loner");
+
+    for (n, incident) in [0xA1u128, 0xA2].into_iter().enumerate() {
+        store
+            .record_attribution(&AttributionRecord {
+                incident_id: IncidentId(uuid::Uuid::from_u128(incident)),
+                entity_id,
+                confidence: events::primitives::Confidence::new(0.9),
+                evidence: format!("batch-test-{n}"),
+                attributed_at: at(20 + n as i64),
+            })
+            .await
+            .expect("record attribution");
+    }
+
+    store
+        .seed_sanctions(&[
+            SanctionEntry {
+                address: members[0],
+                list_name: "ofac_sdn".into(),
+                entry: "Evil Corp".into(),
+                listed_at: None,
+            },
+            SanctionEntry {
+                address: members[0],
+                list_name: "eu_consolidated".into(),
+                entry: "Evil Corp".into(),
+                listed_at: None,
+            },
+        ])
+        .await
+        .expect("seed sanctions");
+
+    let all: Vec<Address> = members.iter().copied().chain([loner, unknown]).collect();
+
+    // entities_for_addresses
+    let batched = store
+        .entities_for_addresses(&all)
+        .await
+        .expect("batched entity lookup");
+    for address in &all {
+        let single = store
+            .entity_for_address(address)
+            .await
+            .expect("single entity lookup");
+        assert_eq!(batched.get(address).copied(), single, "for {address}");
+    }
+    assert!(
+        !batched.contains_key(&unknown),
+        "an unclustered address is absent, not mapped to a placeholder"
+    );
+
+    // entities — including membership *order*, which decides the vector
+    let batched = store
+        .entities(&[
+            entity_id,
+            lone_entity,
+            EntityId(uuid::Uuid::from_u128(0xDEAD)),
+        ])
+        .await
+        .expect("batched entities");
+    for id in [entity_id, lone_entity] {
+        let single = store
+            .entity(id)
+            .await
+            .expect("single entity")
+            .expect("exists");
+        let from_batch = batched.get(&id).expect("present in batch");
+        assert_eq!(from_batch, &single, "batched and single entity must agree");
+    }
+    assert!(
+        !batched.contains_key(&EntityId(uuid::Uuid::from_u128(0xDEAD))),
+        "an unknown entity is simply absent"
+    );
+
+    // attributions_for_entities
+    let batched = store
+        .attributions_for_entities(&[entity_id, lone_entity])
+        .await
+        .expect("batched attributions");
+    for id in [entity_id, lone_entity] {
+        let single = store
+            .attributions_for_entity(id)
+            .await
+            .expect("single attributions");
+        let from_batch = batched.get(&id).cloned().unwrap_or_default();
+        assert_eq!(from_batch, single, "batched and single attributions differ");
+    }
+
+    // sanction_matches_many
+    let batched = store
+        .sanction_matches_many(&all)
+        .await
+        .expect("batched sanctions");
+    for address in &all {
+        let single = store
+            .sanction_matches(address)
+            .await
+            .expect("single sanctions");
+        let from_batch = batched.get(address).cloned().unwrap_or_default();
+        assert_eq!(from_batch, single, "for {address}");
+    }
+    assert_eq!(batched.get(&members[0]).map(Vec::len), Some(2));
+
+    // An empty input must not produce a malformed `= ANY(...)`.
+    assert!(store.entities_for_addresses(&[]).await.unwrap().is_empty());
+    assert!(store.entities(&[]).await.unwrap().is_empty());
+    assert!(store
+        .attributions_for_entities(&[])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.sanction_matches_many(&[]).await.unwrap().is_empty());
+}
+
+/// The batched ClickHouse reads: `edge_history_many` must agree with looping
+/// `edge_history` (including truncation), `latest_many` with looping `latest`,
+/// and the real `cityHash64` shard predicate must partition the keyspace.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn batched_graph_and_embedding_reads_agree_and_shards_partition() {
+    use intelligence::embedding::v1::VERSION as EMBEDDING_VERSION;
+    use intelligence::embedding::{default_embedder, BehaviorInputs};
+    use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
+    use std::collections::BTreeSet;
+
+    let container = ClickHouse::default()
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+
+    intelligence::ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .expect("apply intelligence migrations");
+    let graph = ClickhouseAdjacency::new(client.clone());
+    let store = ClickhouseEmbeddingStore::new(client);
+
+    // A spread of subjects with differing observation counts, so the cap bites
+    // some and not others.
+    let mut edges = Vec::new();
+    for subject in 1..=12u8 {
+        for n in 0..u64::from(subject) {
+            edges.push(AdjacencyEdge {
+                chain: Chain::ETHEREUM,
+                src: addr(subject),
+                dst: addr(0xF0 + (n % 4) as u8),
+                kind: EdgeKind::Interacted,
+                evidence: format!("0xtx{subject:02x}{n:02x}"),
+                block_number: n,
+                observed_at: at(n as i64 * 60),
+            });
+        }
+    }
+    graph.append(&edges).await.expect("append edges");
+
+    let subjects: Vec<Address> = (1..=12u8).map(addr).collect();
+
+    // edge_history_many == looping edge_history, uncapped and capped.
+    for cap in [100u32, 3] {
+        let batched = graph
+            .edge_history_many(Chain::ETHEREUM, &subjects, cap)
+            .await
+            .expect("batched history");
+        assert_eq!(
+            batched.len(),
+            subjects.len(),
+            "one entry per input address, even for one with no rows"
+        );
+        for subject in &subjects {
+            let single = graph
+                .edge_history(Chain::ETHEREUM, subject, cap)
+                .await
+                .expect("single history");
+            let from_batch = batched.get(subject).expect("present");
+            assert_eq!(
+                from_batch, &single,
+                "batched and single history disagree for {subject} at cap {cap}"
+            );
+        }
+    }
+    // An address with no observations at all still gets an entry.
+    let empty = graph
+        .edge_history_many(Chain::ETHEREUM, &[addr(0xEE)], 10)
+        .await
+        .expect("batched history");
+    assert_eq!(empty.get(&addr(0xEE)), Some(&Default::default()));
+
+    // The real cityHash64 shard predicate partitions the active set.
+    let unsharded: BTreeSet<Address> = graph
+        .active_addresses(Chain::ETHEREUM, at(0), None, 1_000, Shard::SINGLE)
+        .await
+        .expect("unsharded")
+        .into_iter()
+        .collect();
+    let total = 4u32;
+    let mut covered: Vec<Address> = Vec::new();
+    for index in 0..total {
+        let slice = graph
+            .active_addresses(
+                Chain::ETHEREUM,
+                at(0),
+                None,
+                1_000,
+                Shard::new(index, total).unwrap(),
+            )
+            .await
+            .expect("sharded");
+        covered.extend(slice);
+    }
+    let covered_set: BTreeSet<Address> = covered.iter().copied().collect();
+    assert_eq!(
+        covered.len(),
+        covered_set.len(),
+        "shards must not overlap — an address swept twice is wasted work"
+    );
+    assert_eq!(
+        covered_set, unsharded,
+        "shards must cover the whole keyspace — a gap is an address never embedded"
+    );
+
+    // latest_many == looping latest, and it collapses to the newest per address.
+    let embedder = default_embedder();
+    let mut written = Vec::new();
+    for (n, subject) in subjects.iter().enumerate() {
+        written.push(embedder.embed(*subject, None, &BehaviorInputs::default(), at(1_000)));
+        // A newer one for half of them, appended *before* the older in the
+        // slice so "latest" cannot be "last inserted".
+        if n % 2 == 0 {
+            written.push(embedder.embed(*subject, None, &BehaviorInputs::default(), at(2_000)));
+        }
+    }
+    store
+        .append(Chain::ETHEREUM, &written)
+        .await
+        .expect("append vectors");
+
+    let batched = store
+        .latest_many(Chain::ETHEREUM, &subjects, EMBEDDING_VERSION)
+        .await
+        .expect("batched latest");
+    for subject in &subjects {
+        let single = store
+            .latest(Chain::ETHEREUM, subject, EMBEDDING_VERSION)
+            .await
+            .expect("single latest");
+        assert_eq!(
+            batched.get(subject).cloned(),
+            single,
+            "batched and single latest disagree for {subject}"
+        );
+    }
+    assert_eq!(
+        batched.get(&subjects[0]).map(|v| v.computed_at),
+        Some(at(2_000)),
+        "latest_many must take the newest, not the first stored"
+    );
+    assert!(store
+        .latest_many(Chain::ETHEREUM, &[], EMBEDDING_VERSION)
+        .await
+        .expect("empty batch")
+        .is_empty());
+
+    // The baseline round-trip: sample -> compute -> store -> read back.
+    let sample = store
+        .sample_vectors(Chain::ETHEREUM, EMBEDDING_VERSION, 1_000)
+        .await
+        .expect("sample");
+    assert_eq!(
+        sample.len(),
+        subjects.len(),
+        "the sample is latest-per-address, not every stored row"
+    );
+
+    let baseline =
+        intelligence::embedding::baseline::compute(embedder.schema(), &sample, at(5_000))
+            .expect("a non-empty sample yields a baseline");
+    store
+        .put_baseline(Chain::ETHEREUM, &baseline)
+        .await
+        .expect("store baseline");
+
+    let read_back = store
+        .latest_baseline(Chain::ETHEREUM, EMBEDDING_VERSION)
+        .await
+        .expect("read baseline")
+        .expect("one was stored");
+    assert_eq!(read_back, baseline);
+    assert!(read_back.matches(embedder.schema()));
+    assert!(store
+        .latest_baseline(Chain::ETHEREUM, "behavior-v99")
+        .await
+        .expect("unknown version")
+        .is_none());
 }

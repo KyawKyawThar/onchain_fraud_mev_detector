@@ -371,3 +371,113 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+---
+# The §20.3 behavior-embedding job (Sprint 19 t1): the scheduled sweep and the
+# invalidation consumer over one shared compute core, writing per-address
+# behavior vectors to ClickHouse and publishing `AddressEmbeddingUpdated`.
+#
+# **A StatefulSet, not a Deployment, because the sweep is hash-sharded.** Each
+# replica walks one slice of the address keyspace and keeps its own in-process
+# cursor, so replicas must have *stable, distinct identities* — the pod ordinal
+# IS the shard index. A Deployment's interchangeable pods could not supply that,
+# and running two of them unsharded would not split the work: each would walk
+# the whole active set and do identical work twice.
+#
+# Scaling is therefore: raise `replicas` AND `INTEL_EMBEDDING_SHARD_TOTAL`
+# together. They must match — a total below the replica count leaves pods with
+# an out-of-range index, which is a refused boot (deliberately loud) rather than
+# a replica that silently embeds nothing. There is no rebalancing protocol and
+# none is needed: a changed total re-partitions the keyspace on the next tick,
+# and change detection makes the transient re-embedding nearly free.
+#
+# No PVC: the cursor is deliberately in-process and cheap to lose (a restart
+# re-opens a fresh window). The StatefulSet is here for stable identity alone.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: intelligence-embedding
+  labels:
+    app.kubernetes.io/name: intelligence-embedding
+spec:
+  serviceName: intelligence-embedding
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intelligence-embedding
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intelligence-embedding
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: intelligence
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intelligence
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+          # The pod ordinal is the shard index: `…-0` owns shard 0, `…-1`
+          # shard 1, and so on. Derived from the pod name rather than passed in,
+          # so adding a replica cannot forget to renumber it.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export INTEL_EMBEDDING_SHARD_INDEX="${HOSTNAME##*-}"
+              exec intelligence embedding
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: REDIS_URL
+            # Must equal `replicas` above. Kept explicit rather than derived:
+            # a silent mismatch would leave part of the keyspace unswept, and
+            # an explicit value makes the intended partition reviewable.
+            - name: INTEL_EMBEDDING_SHARD_TOTAL
+              value: "1"
+            - name: INTELLIGENCE_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

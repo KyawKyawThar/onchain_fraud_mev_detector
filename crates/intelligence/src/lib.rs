@@ -114,6 +114,24 @@
 //! chain, so a bridge deposit's chain-A funding cluster and its fill's
 //! chain-B funding cluster converge on one entity. `entity_hint` itself is
 //! never turned into a label — see [`cross_chain_attribution`]'s module docs.
+//!
+//! Sprint 19 t1 adds [`embedding`], [`embedding_store`] and [`embedding_job`]:
+//! the §20.3 per-address **behavior vector** — activity cadence,
+//! counterparty-type distribution, value-flow shape and incident history —
+//! computed from the ClickHouse adjacency store, versioned exactly the way a
+//! risk-score model is. The split is this crate's standard one:
+//! [`embedding`] is the pure, frozen-schema kernel (no store dependency, like
+//! [`risk`]), [`embedding_store`] is the append-only ClickHouse table
+//! (latest-per-`(chain, address, version)`, like [`production_store`]), and
+//! [`embedding_job`] is the shell — a `RiskScoreUpdated`-style invalidation
+//! consumer *and* a scheduled sweep, because neither trigger alone is
+//! sufficient: cadence drifts with time passing (which no event announces),
+//! while a fresh sanctions hit must not wait out a sweep interval. Two
+//! deliberate boundaries are documented at their modules: the embedding does
+//! **not** fan out to a labeled address's neighbors (that is the one unbounded
+//! path in the design, left to the sweep), and it reports no *monetary*
+//! magnitude at all, because `address_adjacency` records relations rather than
+//! amounts — encoded as an explicit "unknown", never imputed as zero.
 
 pub mod adjacency;
 pub mod association;
@@ -123,6 +141,11 @@ pub mod ch_migrate;
 pub mod cluster;
 pub mod config;
 pub mod cross_chain_attribution;
+pub mod embedding;
+pub mod embedding_consumer;
+pub mod embedding_job;
+pub mod embedding_store;
+pub mod embedding_sweep;
 pub mod graph;
 pub mod grpc;
 pub mod leaderboard;

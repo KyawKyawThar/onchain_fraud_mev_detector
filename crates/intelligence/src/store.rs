@@ -293,6 +293,40 @@ pub trait EntityStore: Send + Sync {
         address: &AccountAddress,
     ) -> Result<Option<EntityId>, StoreError>;
 
+    /// Which entity each of `addresses` belongs to — the batched form of
+    /// [`entity_for_address`](Self::entity_for_address), for a caller holding
+    /// a whole page. Absent from the map means unclustered.
+    ///
+    /// The default loops (correct, N round trips) so a double stays right for
+    /// free; the Postgres impl overrides it with one `= ANY($1)`.
+    async fn entities_for_addresses(
+        &self,
+        addresses: &[AccountAddress],
+    ) -> Result<std::collections::HashMap<AccountAddress, EntityId>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        for address in addresses {
+            if let Some(entity_id) = self.entity_for_address(address).await? {
+                out.insert(*address, entity_id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Several entities with their membership at once — the batched form of
+    /// [`entity`](Self::entity). A missing/unknown id is simply absent.
+    async fn entities(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<std::collections::HashMap<EntityId, EntityRecord>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        for entity_id in entity_ids {
+            if let Some(record) = self.entity(*entity_id).await? {
+                out.insert(*entity_id, record);
+            }
+        }
+        Ok(out)
+    }
+
     /// Merge `absorbed` into `surviving` in one transaction: move membership,
     /// tombstone the absorbed entity (status + `absorbed_into`), bump **both**
     /// versions (§8.2: version increments on merge), and append an
@@ -377,6 +411,26 @@ pub trait AttributionStore: Send + Sync {
         entity_id: EntityId,
     ) -> Result<Vec<AttributionRecord>, StoreError>;
 
+    /// Attributions for several entities at once — the batched form of
+    /// [`attributions_for_entity`](Self::attributions_for_entity). An entity
+    /// with none is absent from the map.
+    ///
+    /// The default loops so a double stays right for free; the Postgres impl
+    /// overrides it with one `= ANY($1)`.
+    async fn attributions_for_entities(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<std::collections::HashMap<EntityId, Vec<AttributionRecord>>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        for entity_id in entity_ids {
+            let found = self.attributions_for_entity(*entity_id).await?;
+            if !found.is_empty() {
+                out.insert(*entity_id, found);
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove every attribution link `incident_id` carries — the reversal of
     /// [`record_attribution`](Self::record_attribution) for every entity this
     /// incident was linked to (§15, `IncidentRetracted`). Returns the entity
@@ -402,6 +456,27 @@ pub trait SanctionsStore: Send + Sync {
         &self,
         address: &AccountAddress,
     ) -> Result<Vec<SanctionEntry>, StoreError>;
+
+    /// Designations for several addresses at once — the batched form of
+    /// [`sanction_matches`](Self::sanction_matches). An unsanctioned address
+    /// is absent from the map (the common case, so seeding empties would be
+    /// mostly waste).
+    ///
+    /// The default loops so a double stays right for free; the Postgres impl
+    /// overrides it with one `= ANY($1)`.
+    async fn sanction_matches_many(
+        &self,
+        addresses: &[AccountAddress],
+    ) -> Result<std::collections::HashMap<AccountAddress, Vec<SanctionEntry>>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        for address in addresses {
+            let found = self.sanction_matches(address).await?;
+            if !found.is_empty() {
+                out.insert(*address, found);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// The four Postgres-backed seams a pass needs, bundled so a consumer's
@@ -509,7 +584,10 @@ impl TryFrom<LabelRow> for LabelRecord {
     }
 }
 
-/// An `attributions` row as stored.
+/// An `attributions` row as stored. `FromRow` is for the runtime-checked
+/// batched read ([`AttributionStore::attributions_for_entities`]), which maps
+/// by column name; the compile-time `query_as!` sites don't use the derive.
+#[derive(sqlx::FromRow)]
 struct AttributionRow {
     incident_id: Uuid,
     entity_id: Uuid,
@@ -565,7 +643,10 @@ impl TryFrom<MergeRow> for MergeLogEntry {
     }
 }
 
-/// A `sanctions` row as stored.
+/// A `sanctions` row as stored. `FromRow` is for the runtime-checked batched
+/// read ([`SanctionsStore::sanction_matches_many`]), which maps by column
+/// name; the compile-time `query_as!` sites don't use the derive.
+#[derive(sqlx::FromRow)]
 struct SanctionRow {
     address: String,
     list_name: String,
@@ -1006,6 +1087,90 @@ impl EntityStore for PgIntelligenceStore {
         Ok(row.map(|row| EntityId(row.entity_id)))
     }
 
+    /// One `= ANY($1)` instead of one query per address. Runtime-checked
+    /// (not `query!`) for the same reason `labels_for_many` is: a batched read
+    /// added without regenerating the offline `.sqlx` cache.
+    async fn entities_for_addresses(
+        &self,
+        addresses: &[AccountAddress],
+    ) -> Result<std::collections::HashMap<AccountAddress, EntityId>, StoreError> {
+        use std::collections::HashMap;
+
+        if addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<String> = addresses.iter().map(address_key).collect();
+        let rows: Vec<(String, Uuid)> = sqlx::query_as(
+            "SELECT address, entity_id FROM entity_addresses WHERE address = ANY($1)",
+        )
+        .bind(&keys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(address, entity_id)| Ok((parse_address_key(&address)?, EntityId(entity_id))))
+            .collect()
+    }
+
+    /// Two batched queries (the entities, then all their members) joined in
+    /// memory — instead of two queries *per entity*.
+    async fn entities(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<std::collections::HashMap<EntityId, EntityRecord>, StoreError> {
+        use std::collections::HashMap;
+
+        if entity_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<Uuid> = entity_ids.iter().map(|id| id.0).collect();
+
+        let rows: Vec<(Uuid, i64, String, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT entity_id, version, status, absorbed_into, created_at
+             FROM entities WHERE entity_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Same ordering as single `entity` so membership order is identical
+        // whichever path a caller took — otherwise a batched read and a single
+        // read of the same entity could produce different vectors.
+        let members: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT entity_id, address FROM entity_addresses
+             WHERE entity_id = ANY($1) ORDER BY entity_id, linked_at, address",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_entity: HashMap<Uuid, Vec<AccountAddress>> = HashMap::new();
+        for (entity_id, address) in members {
+            by_entity
+                .entry(entity_id)
+                .or_default()
+                .push(parse_address_key(&address)?);
+        }
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for (entity_id, version, status, absorbed_into, created_at) in rows {
+            let version = u64::try_from(version)
+                .map_err(|_| StoreError::malformed(format!("entity version {version}")))?;
+            out.insert(
+                EntityId(entity_id),
+                EntityRecord {
+                    entity_id: EntityId(entity_id),
+                    version,
+                    status: parse_enum::<EntityStatus>(&status, "entity status")?,
+                    absorbed_into: absorbed_into.map(EntityId),
+                    addresses: by_entity.remove(&entity_id).unwrap_or_default(),
+                    created_at,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     async fn absorb(
         &self,
         surviving: EntityId,
@@ -1380,6 +1545,37 @@ impl AttributionStore for PgIntelligenceStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// One `= ANY($1)`, grouped in memory — the batched read the embedding
+    /// sweep uses for a whole page of addresses' entities at once.
+    async fn attributions_for_entities(
+        &self,
+        entity_ids: &[EntityId],
+    ) -> Result<std::collections::HashMap<EntityId, Vec<AttributionRecord>>, StoreError> {
+        use std::collections::HashMap;
+
+        if entity_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<Uuid> = entity_ids.iter().map(|id| id.0).collect();
+        // Same ORDER BY as the single read, so a batched and a single fetch of
+        // the same entity yield identical vectors.
+        let rows = sqlx::query_as::<_, AttributionRow>(
+            "SELECT incident_id, entity_id, confidence, evidence, attributed_at
+             FROM attributions WHERE entity_id = ANY($1)
+             ORDER BY entity_id, attributed_at, incident_id",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<EntityId, Vec<AttributionRecord>> = HashMap::new();
+        for row in rows {
+            let record: AttributionRecord = row.try_into()?;
+            out.entry(record.entity_id).or_default().push(record);
+        }
+        Ok(out)
+    }
+
     async fn retract_attributions_for_incident(
         &self,
         incident_id: IncidentId,
@@ -1458,6 +1654,37 @@ impl SanctionsStore for PgIntelligenceStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// One `= ANY($1)`, grouped in memory. Most addresses in any page are
+    /// unsanctioned, so this usually returns far fewer rows than it was asked
+    /// about — which is exactly why looping it per address was waste.
+    async fn sanction_matches_many(
+        &self,
+        addresses: &[AccountAddress],
+    ) -> Result<std::collections::HashMap<AccountAddress, Vec<SanctionEntry>>, StoreError> {
+        use std::collections::HashMap;
+
+        if addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<String> = addresses.iter().map(address_key).collect();
+        // Same ORDER BY as the single read, so a batched and a single fetch of
+        // the same address yield identical vectors.
+        let rows = sqlx::query_as::<_, SanctionRow>(
+            "SELECT address, list_name, entry, listed_at
+             FROM sanctions WHERE address = ANY($1) ORDER BY address, list_name",
+        )
+        .bind(&keys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<AccountAddress, Vec<SanctionEntry>> = HashMap::new();
+        for row in rows {
+            let record: SanctionEntry = row.try_into()?;
+            out.entry(record.address).or_default().push(record);
+        }
+        Ok(out)
     }
 }
 

@@ -40,8 +40,8 @@ use events::cross_chain::{
 };
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
-    AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
-    LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
+    AddressEmbeddingUpdated, AttributionUpdated, BehaviorFactor, EntityCreated, EntityMerged,
+    EntitySplit, LabelAdded, LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
@@ -104,6 +104,30 @@ fn stable_fixed_point(f: f64) -> Option<f64> {
     }
     let r = round_trip(f);
     (round_trip(r) == r).then_some(r)
+}
+
+/// `Some(f)` when `f` is a stable JSON codec fixed point at `f32` width — the
+/// [`stable_fixed_point`] argument, one precision down. `AddressEmbeddingUpdated`
+/// carries `f32`s (an embedding is stored as `Array(Float32)`), and
+/// `serde_json`'s shortest-repr printer has the same non-injectivity there.
+fn stable_fixed_point_f32(f: f32) -> Option<f32> {
+    if !f.is_finite() {
+        return None;
+    }
+    let round_trip = |f: f32| -> f32 {
+        let s = serde_json::to_string(&f).expect("a finite f32 serializes");
+        serde_json::from_str(&s).expect("serde_json's own f32 output parses")
+    };
+    let r = round_trip(f);
+    (round_trip(r) == r).then_some(r)
+}
+
+/// A finite `f32` that survives the JSON codec exactly — see [`finite_f64`].
+fn finite_f32() -> impl Strategy<Value = f32> {
+    any::<f32>().prop_filter_map(
+        "finite and a JSON round-trip fixed point",
+        stable_fixed_point_f32,
+    )
 }
 
 /// A non-negative `UsdAmount`, restricted to codec-stable floats for the same
@@ -500,7 +524,47 @@ fn intelligence_event() -> impl Strategy<Value = DomainEvent> {
                 entry,
             })
         }),
+        (
+            address(),
+            prop::option::of(entity_id()),
+            any::<String>(),
+            any::<String>(),
+            prop::collection::vec(finite_f32(), 0..8),
+            prop::collection::vec(behavior_factor(), 0..4),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    address,
+                    entity_id,
+                    embedding_version,
+                    schema_hash,
+                    vector,
+                    top_factors,
+                    observations_truncated,
+                )| {
+                    DomainEvent::AddressEmbeddingUpdated(AddressEmbeddingUpdated {
+                        address,
+                        entity_id,
+                        embedding_version,
+                        schema_hash,
+                        vector,
+                        top_factors,
+                        observations_truncated,
+                    })
+                },
+            ),
     ]
+}
+
+fn behavior_factor() -> impl Strategy<Value = BehaviorFactor> {
+    (any::<String>(), finite_f32(), finite_f32()).prop_map(|(feature, value, share)| {
+        BehaviorFactor {
+            feature,
+            value,
+            share,
+        }
+    })
 }
 
 fn rule_engine_event() -> impl Strategy<Value = DomainEvent> {

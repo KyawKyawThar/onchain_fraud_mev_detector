@@ -129,3 +129,58 @@ pub struct SanctionHit {
     pub list: String,
     pub entry: String,
 }
+
+/// One behavioral feature's contribution to an address's embedding (§20.3) —
+/// the explainability view over [`AddressEmbeddingUpdated::vector`], the same
+/// "an aggregate is only as auditable as its parts" stance as [`RiskFactor`].
+///
+/// `feature` is the intelligence crate's frozen schema name (its `snake_case`
+/// wire string), carried as a plain `String` here for the same reason
+/// [`LabelAdded::kind`] is: the closed enum lives in the service that owns the
+/// vocabulary, not in the shared schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BehaviorFactor {
+    pub feature: String,
+    /// The feature's scaled value in the vector.
+    pub value: f32,
+    /// This feature's share (0–1) of the vector's total squared magnitude —
+    /// "how much of this address's behavior is this feature".
+    pub share: f32,
+}
+
+/// An address's behavior vector was recomputed (§20.3). The intelligence
+/// service's embedding job publishes one per address it recomputes, whether
+/// off its schedule or off an invalidating input change — the embedding
+/// analogue of [`RiskScoreUpdated`], and versioned the same way
+/// (`embedding_version` + `schema_hash` are part of the output, so a reweight
+/// is a new value under a new key, never a silent change under an old one).
+///
+/// The full `vector` rides along rather than only a "recomputed" notification:
+/// a consumer that only needs to react (the §20.3 clustering signal) then
+/// needs no second read, and one that wants history has it in the event store.
+/// Its length is fixed by the named schema version, so the payload is bounded
+/// by construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AddressEmbeddingUpdated {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub address: AccountAddress,
+    /// The address's resolved entity at compute time, if any.
+    pub entity_id: Option<EntityId>,
+    /// The schema/model version that produced `vector` (e.g. `behavior-v1`).
+    pub embedding_version: String,
+    /// Hex SHA-256 of the frozen feature schema behind `embedding_version` —
+    /// so an accidental edit under an unchanged version name is detectable
+    /// downstream, not just in the producing build.
+    pub schema_hash: String,
+    /// The scaled feature values, in schema order.
+    pub vector: Vec<f32>,
+    /// The largest-magnitude features behind `vector`, bounded — the
+    /// explainable view (§8.3), not a second copy of the vector.
+    pub top_factors: Vec<BehaviorFactor>,
+    /// The address's observation history hit the read cap: `vector` describes
+    /// its most *recent* activity window rather than all of it (§8.2's
+    /// hub-node rule). A fidelity flag, marked rather than assumed (§20.1).
+    pub observations_truncated: bool,
+}

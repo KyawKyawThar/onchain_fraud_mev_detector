@@ -36,8 +36,9 @@ use events::cross_chain::{
 };
 use events::detection::{DetectorTriggered, PreliminaryAlertCreated};
 use events::intelligence::{
-    AttributionRetracted, AttributionUpdated, EntityCreated, EntityMerged, EntitySplit, LabelAdded,
-    LabelRevoked, LabelUpdated, RiskFactor, RiskScoreUpdated, SanctionHit,
+    AddressEmbeddingUpdated, AttributionRetracted, AttributionUpdated, BehaviorFactor,
+    EntityCreated, EntityMerged, EntitySplit, LabelAdded, LabelRevoked, LabelUpdated, RiskFactor,
+    RiskScoreUpdated, SanctionHit,
 };
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{
@@ -260,6 +261,21 @@ fn sample_events() -> Vec<DomainEvent> {
             address: addr(),
             list: "OFAC".into(),
             entry: "SDN-123".into(),
+        }),
+        DomainEvent::AddressEmbeddingUpdated(AddressEmbeddingUpdated {
+            address: addr(),
+            entity_id: Some(entity_id()),
+            embedding_version: "behavior-v1".into(),
+            schema_hash: "a1b2c3".into(),
+            // Exactly-representable f32s — a golden must not depend on the
+            // shortest-repr float printer's rounding.
+            vector: vec![0.5, 0.25, 0.0],
+            top_factors: vec![BehaviorFactor {
+                feature: "edge_count_log".into(),
+                value: 0.5,
+                share: 0.75,
+            }],
+            observations_truncated: false,
         }),
         // Rule engine (§9)
         DomainEvent::RuleCreated(RuleCreated {
@@ -499,6 +515,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "SanctionHit",
         r#"{"type":"SanctionHit","payload":{"address":"0x3333333333333333333333333333333333333333","list":"OFAC","entry":"SDN-123"}}"#,
+    ),
+    (
+        "AddressEmbeddingUpdated",
+        r#"{"type":"AddressEmbeddingUpdated","payload":{"address":"0x3333333333333333333333333333333333333333","entity_id":"00000000-0000-0000-0000-0000000000e1","embedding_version":"behavior-v1","schema_hash":"a1b2c3","vector":[0.5,0.25,0.0],"top_factors":[{"feature":"edge_count_log","value":0.5,"share":0.75}],"observations_truncated":false}}"#,
     ),
     (
         "RuleCreated",

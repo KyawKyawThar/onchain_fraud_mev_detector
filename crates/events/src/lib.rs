@@ -219,6 +219,7 @@ pub enum DomainEvent {
     AttributionRetracted(intelligence::AttributionRetracted),
     RiskScoreUpdated(intelligence::RiskScoreUpdated),
     SanctionHit(intelligence::SanctionHit),
+    AddressEmbeddingUpdated(intelligence::AddressEmbeddingUpdated),
 
     // Rule engine (§9)
     RuleCreated(rule_engine::RuleCreated),
@@ -307,7 +308,8 @@ impl DomainEvent {
             | AttributionUpdated(_)
             | AttributionRetracted(_)
             | RiskScoreUpdated(_)
-            | SanctionHit(_) => EventFamily::Intelligence,
+            | SanctionHit(_)
+            | AddressEmbeddingUpdated(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
             UsageRecorded(_) | ScreeningDecisionRecorded(_) | ModelDriftDetected(_) => {
                 EventFamily::System
@@ -356,6 +358,7 @@ impl DomainEvent {
             | EntitySplit(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
+            | AddressEmbeddingUpdated(_)
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
@@ -451,6 +454,7 @@ impl DomainEvent {
             | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
+            | AddressEmbeddingUpdated(_)
             | RuleCreated(_)
             | RuleTriggered(_)
             | RuleAlertCreated(_)
@@ -486,6 +490,7 @@ impl DomainEvent {
             EntityCreated(e) => vec![e.seed_address],
             RiskScoreUpdated(e) => vec![e.address],
             SanctionHit(e) => vec![e.address],
+            AddressEmbeddingUpdated(e) => vec![e.address],
             ScreeningDecisionRecorded(e) => vec![e.address],
             IncidentCreated(e) => e.victim_address.into_iter().collect(),
             WalletExposureReportReady(e) => vec![e.address],

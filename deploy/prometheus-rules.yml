@@ -220,3 +220,44 @@ groups:
         annotations:
           summary: "{{ $labels.model }} drift observations are being dropped ({{ $labels.reason }})"
           description: "The monitor is failing open — by design, it must never block the fast path — but it is losing data. `contended`: the accumulator lock was held, which today's one-block-at-a-time scheduler should make impossible, so this means the concurrency model changed. `poisoned`: something panicked inside the accumulator; the partial window was discarded and it recovered, but the panic is a bug. `undrained`: readings were evicted before the scheduler drained them, so `ModelDriftDetected` events are being lost."
+
+      - alert: EmbeddingSweepFallingBehind
+        expr: sum(rate(intelligence_embedding_sweep_budget_exhausted_total[1h])) > 0
+        for: 2h
+        labels:
+          severity: informational
+        annotations:
+          summary: "The behavior-embedding sweep is not finishing its windows"
+          description: "The §20.3 sweep hit its per-tick address budget (INTEL_EMBEDDING_SWEEP_BUDGET) and stopped early. It resumes from its cursor on the next tick, so nothing is skipped — but sustained exhaustion means behavior vectors are getting older than one sweep interval. Check intelligence_embedding_sweep_lap_seconds for the actual staleness. Fixes, in order of preference: add shards (raise replicas AND INTEL_EMBEDDING_SHARD_TOTAL together), raise the budget, shorten the interval. A burst after a backfill is expected and self-clears."
+
+      - alert: EmbeddingSweepLapTooSlow
+        expr: |
+          histogram_quantile(0.9, sum(rate(intelligence_embedding_sweep_lap_seconds_bucket[6h])) by (le)) > 21600
+        for: 6h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Behavior vectors are going stale faster than the sweep refreshes them"
+          description: "The p90 time to walk one sweep window has exceeded 6h. This is the *staleness SLI*: it is the age bound that similarity search (§20.3, Sprint 19 t2) and the clustering signal (t3) inherit — a stale vector makes 'behaves like this actor' an answer about last week. Unlike the budget alert this fires even when every tick completes, which is the case where the job looks healthy and is simply too slow. Threshold is a placeholder with no production graph to calibrate against."
+
+      - alert: EmbeddingChangeDetectionNotPaying
+        expr: |
+          sum(rate(intelligence_embeddings_skipped_total[6h]))
+            / sum(rate(intelligence_embeddings_computed_total[6h])) < 0.5
+        for: 6h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Most behavior-vector recomputations are producing changed vectors"
+          description: "Change detection exists so an unchanged recomputation is neither stored nor published; a healthy steady state skips most of what it computes, because most addresses are dormant on any given hour. A sustained low skip ratio means either the graph really is that busy, or something is making vectors move that shouldn't — the clock is supposed to enter a vector at day resolution precisely so a dormant address is stable within a day. Check intelligence_embeddings_written_total by `reason`: a flood of `refresh` means INTEL_EMBEDDING_REFRESH_INTERVAL_SECS is too short, a flood of `schema_changed` means a version rollout is in flight, a flood of `changed` means the day-quantization assumption is broken."
+
+      - alert: EmbeddingsMostlyTruncated
+        expr: |
+          sum(rate(intelligence_embeddings_truncated_total[1h]))
+            / sum(rate(intelligence_embeddings_computed_total[1h])) > 0.25
+        for: 2h
+        labels:
+          severity: informational
+        annotations:
+          summary: "Over a quarter of behavior vectors are computed over a truncated history"
+          description: "INTEL_EMBEDDING_HISTORY_CAP is biting on more of the graph than it was sized for: those vectors describe a recent activity window rather than an address's whole life (the §8.2 hub rule at edge granularity), and they carry `is_hub = 1` to say so. That is correct behavior, not a fault — but at this share the cadence features are measuring the cap more than the addresses, so raise the cap or accept the narrower window deliberately. Threshold is a placeholder with no production graph to calibrate against."

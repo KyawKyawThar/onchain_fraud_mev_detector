@@ -41,6 +41,32 @@ pub struct Config {
     /// `grpc` run mode. `max_hops` here is the per-request default; the
     /// operator-tunable knobs are `degree_cap` and `max_nodes`.
     pub graph_limits: crate::graph::GraphLimits,
+    /// §20.3 behavior-embedding settings — read by the `embedding` run mode
+    /// and the `embed` inspection command.
+    pub embedding: EmbeddingConfig,
+}
+
+/// Settings for the §20.3 behavior-embedding job (Sprint 19 t1).
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    /// The one chain whose adjacency graph this instance embeds
+    /// (`INTEL_EMBEDDING_CHAIN_ID`, default 1 = Ethereum). Observations are
+    /// chain-scoped even though labels and entities are not, so a two-chain
+    /// deployment runs two instances rather than one that guesses.
+    pub chain: events::primitives::Chain,
+    /// Consumer-group id for the invalidation consumer — its own group, like
+    /// `score`/`reorg`/`block-production`, so it is independently deployable
+    /// and its lag is separately visible.
+    pub group_id: String,
+    /// The schema versions to compute, newest-first in the roster. Empty means
+    /// "the default (newest) version"; naming two is how a v2 rollout runs
+    /// both side by side (`INTEL_EMBEDDING_VERSIONS`, comma-separated). An
+    /// unknown version is a boot error, never a silent fallback.
+    pub versions: Vec<String>,
+    /// Bounds for the compute core.
+    pub limits: crate::embedding_job::EmbeddingLimits,
+    /// Bounds for the schedule, including this replica's keyspace shard.
+    pub sweep: crate::embedding_sweep::SweepLimits,
 }
 
 /// Settings for the `block-production` consumer (§10, Sprint 11 t1).
@@ -140,6 +166,9 @@ impl Config {
             Err(_) => None,
         };
 
+        let defaults = crate::embedding_job::EmbeddingLimits::default();
+        let sweep_defaults = crate::embedding_sweep::SweepLimits::default();
+
         Ok(Self {
             postgres_url: SecretString::from(env("DATABASE_URL")?),
             redis: RedisConfig {
@@ -181,6 +210,56 @@ impl Config {
                     "INTELLIGENCE_PRODUCTION_KAFKA_GROUP",
                     "intelligence-block-production",
                 ),
+            },
+            embedding: EmbeddingConfig {
+                chain: events::primitives::Chain(env_parse("INTEL_EMBEDDING_CHAIN_ID", 1u64)?),
+                group_id: env_or(
+                    "INTELLIGENCE_EMBEDDING_KAFKA_GROUP",
+                    "intelligence-embedding",
+                ),
+                versions: std::env::var("INTEL_EMBEDDING_VERSIONS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                limits: crate::embedding_job::EmbeddingLimits {
+                    history_cap: env_parse("INTEL_EMBEDDING_HISTORY_CAP", defaults.history_cap)?,
+                    batch_size: env_parse("INTEL_EMBEDDING_BATCH_SIZE", defaults.batch_size)?,
+                    page_concurrency: env_parse(
+                        "INTEL_EMBEDDING_PAGE_CONCURRENCY",
+                        defaults.page_concurrency,
+                    )?,
+                    refresh_interval: Duration::from_secs(env_parse(
+                        "INTEL_EMBEDDING_REFRESH_INTERVAL_SECS",
+                        defaults.refresh_interval.as_secs(),
+                    )?),
+                },
+                sweep: crate::embedding_sweep::SweepLimits {
+                    interval: Duration::from_secs(env_parse(
+                        "INTEL_EMBEDDING_SWEEP_INTERVAL_SECS",
+                        sweep_defaults.interval.as_secs(),
+                    )?),
+                    lookback: Duration::from_secs(env_parse(
+                        "INTEL_EMBEDDING_SWEEP_LOOKBACK_SECS",
+                        sweep_defaults.lookback.as_secs(),
+                    )?),
+                    page_size: env_parse(
+                        "INTEL_EMBEDDING_SWEEP_PAGE_SIZE",
+                        sweep_defaults.page_size,
+                    )?,
+                    budget: env_parse("INTEL_EMBEDDING_SWEEP_BUDGET", sweep_defaults.budget)?,
+                    // Parsed, not validated: an index at or past the total
+                    // would select nothing at all, so a mistyped shard is a
+                    // refused boot rather than a replica that silently embeds
+                    // no addresses.
+                    shard: crate::adjacency::Shard::new(
+                        env_parse("INTEL_EMBEDDING_SHARD_INDEX", 0u32)?,
+                        env_parse("INTEL_EMBEDDING_SHARD_TOTAL", 1u32)?,
+                    )
+                    .context("INTEL_EMBEDDING_SHARD_INDEX/INTEL_EMBEDDING_SHARD_TOTAL")?,
+                },
             },
             graph_limits: crate::graph::GraphLimits {
                 degree_cap: env_parse(

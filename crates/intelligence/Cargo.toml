@@ -76,6 +76,12 @@ prost = { workspace = true }
 # changed claim lands as a new coexisting row, never an overwrite.
 csv = { workspace = true }
 sha2 = { workspace = true }
+
+# The §20.3 behavior embedding pins its one transcendental (`log10`/`log`) to
+# the pure-Rust `libm` rather than the host C library, which differs in the
+# last ulp across platforms — a replayed vector must be the same *bits*, not
+# approximately the same vector (§18). Same rationale as `ml-features`.
+libm = { workspace = true }
 uuid = { workspace = true }
 
 # Import counters for seed batches (§19), through the `metrics` facade — a

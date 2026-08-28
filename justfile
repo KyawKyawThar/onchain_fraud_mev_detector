@@ -291,6 +291,34 @@ intel-reorg:
 intel-block-production:
     cargo run -p intelligence -- block-production
 
+# ── Behavior embeddings (§20.3, Sprint 19 t1) ─────────────────────
+# Long-running job: the per-address behavior vector (activity cadence,
+# counterparty-type distribution, value-flow shape, incident history) computed
+# from the ClickHouse adjacency graph. Two triggers in one process — a
+# scheduled sweep over recently-active addresses, and a `RiskScoreUpdated`-style
+# invalidation consumer on label/entity/sanctions/attribution changes — because
+# neither alone is enough (cadence drifts with time passing; a sanctions hit
+# must not wait out a sweep interval). Appends to `address_embeddings` (apply
+# the table first: `just intel-ch-migrate-up`) and publishes
+# `AddressEmbeddingUpdated`. Its own Kafka consumer group
+# (INTELLIGENCE_EMBEDDING_KAFKA_GROUP) — deploy/scale independently.
+intel-embedding:
+    cargo run -p intelligence -- embedding
+
+# Print one address's behavior vector and the features that dominate it —
+# read-only inspection, nothing stored and nothing published. The embedding
+# analogue of `just intel-risk`.
+intel-embed address:
+    cargo run -p intelligence -- embed {{address}}
+
+# Recompute the §20.3 population baseline (per-feature median + scaled MAD) a
+# similarity search standardizes against — without it a raw distance is
+# dominated by the log-magnitude family and "behaviorally similar" degrades
+# into "similar transaction count". A periodic operator/cron action: the
+# population moves on a much slower clock than individual vectors do.
+intel-embedding-baseline:
+    cargo run -p intelligence -- embedding-baseline
+
 # Regenerate offline query cache (.sqlx) so CI builds without a DB
 sqlx-prepare:
     cargo sqlx prepare --workspace -- --all-targets

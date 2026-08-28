@@ -963,6 +963,92 @@ ClickHouse adjacency store on a schedule, versioned like risk-score models.
   improve attribution → richer incident history sharpens the embeddings —
   the §8.5 loop, now with a learned component.
 
+The vector itself is delivered as `intelligence::embedding` (the pure kernel
+and its version registry), `embedding_store` (ClickHouse), `embedding_job` (the
+compute core), `embedding_sweep` (the schedule) and `embedding_consumer` (the
+invalidation stream), with `AddressEmbeddingUpdated` as its event. What the
+sketch above leaves open turned out to be almost everything that matters.
+
+*The schema is frozen, doubly versioned, and the freeze is survivable.* The
+feature enum **is** the schema — declaration order is vector order, and one
+exhaustive `match` computes it — so a reordered or unclassified feature is a
+compile error rather than a silently incomparable vector. Alongside
+`embedding_version` every vector carries a hash of that schema, because a
+version string cannot catch an edit made *under* it, and comparing across such
+an edit computes distances between two different feature spaces while looking
+entirely well-formed. Crucially the versions live in a **registry**, not a
+constant: the job computes every enabled version per address, so shipping a v2
+is shadow → backfill → cut the read over → retire v1. A frozen schema without
+that seam is just a schema you cannot change.
+
+*The clock enters a vector at day resolution.* Three features are functions of
+"now" rather than of the observations alone — recency, the trailing-window
+share, and the incident decay. Evaluated at the instant, every one of them moves
+on every recomputation, so a **dormant** address — precisely what a schedule
+exists to notice — would produce a different vector every hour forever and
+nothing could ever be skipped. Quantizing to the UTC day is also the better
+statistic: sub-day precision in "days since last seen" is spurious, and ranking
+on it would be ranking on when the sweep happened to run.
+
+*Not every recomputation is worth writing down.* A vector is stored and
+published when it is new, when its content moved, when its schema changed, or
+when the stored one has passed a refresh floor — otherwise it is skipped and
+counted. Without this an hourly sweep republishes the whole address space
+forever, into a bus and an event store that keep everything. The refresh floor
+is what keeps `computed_at` readable as "last verified" rather than "last
+changed", which is otherwise indistinguishable from "the job stopped running".
+
+*Everything is page-shaped.* The naive form — "for each address, load its
+inputs" — is seven sequential round trips per address, which at a sweep page of
+500 is 3,500 queries to embed 500 addresses. The batched loader issues a fixed
+number of queries per page regardless of its size, which is why the adjacency
+seam grew `edge_history_many` and the store seams grew their `*_many` siblings.
+The single-address path is a thin wrapper over the batched one, so the two
+cannot drift about what the kernel is fed.
+
+*The sweep is hash-sharded, and the shard key was declared before it was
+needed.* Cursor-paging over an ordered keyspace makes a hash shard nearly free:
+each replica owns the addresses that hash into its index, reads only those rows,
+and keeps its own cursor — no coordination, no rebalancing protocol. One pod
+cannot embed mainnet, and retrofitting a shard key onto a keyspace already being
+walked is a flag day, so an unsharded deployment is simply shard 0 of 1. It
+deploys as a StatefulSet because the pod ordinal *is* the shard index.
+
+*Storage diverges from its neighbours on purpose.* `block_production` is
+append-only because a record legitimately evolves — incidents fold in,
+retractions subtract, reorgs revert. A recomputed behavior vector instead fully
+supersedes its predecessor and nothing reads the history, so this table is a
+`ReplacingMergeTree`: consistency with a neighbouring table is not a reason when
+the write semantics differ.
+
+*Comparison is standardized, and that is not the kernel's job.* The feature
+families have deliberately different natural ranges, so a raw distance is
+dominated by the log-magnitude family and "behaviorally similar" degrades into
+"similar transaction count". A population **baseline** — median and scaled MAD
+per feature, robust because on-chain distributions are heavy-tailed — is
+computed periodically from the stored vectors and applied at *comparison* time.
+Stored vectors stay in interpretable units, a re-derived baseline changes
+rankings without rewriting history, and a baseline whose schema hash does not
+match is a refused comparison rather than a plausible-looking distance in the
+wrong units.
+
+Two properties the sketch does not mention and a reader should not assume.
+"Value-flow shape" is shape, not magnitude: `address_adjacency` records
+relations and no amounts, so the missing magnitude is an explicit
+`value_magnitude_known = 0` — the same "encode, never impute" rule §20.1 applies
+to unpriced tokens. And a vector is **not reorg-safe**: the incident-history
+family rolls back (the consumer reads `AttributionRetracted`, §15), but the
+adjacency graph has no reversal, so the cadence and flow families describe every
+observation ever appended, canonical or not.
+
+Finally, one fan-out is deliberately refused. Labelling an address also changes
+the counterparty-type distribution of everyone who ever transacted with it, and
+a `LabelAdded` on a router would invalidate millions of addresses off a single
+event — the same collapse the §8.2 hub cap exists to prevent. That drift is left
+to the sweep, and its staleness bound is one sweep interval. This is the
+concrete reason the job is scheduled *as well as* event-driven rather than
+either alone.
+
 ### 20.4 LLM investigation copilot (copilot-service)
 
 A separate service consuming `IncidentCreated` and reading the audit stream

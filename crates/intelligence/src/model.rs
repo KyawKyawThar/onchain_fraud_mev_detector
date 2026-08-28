@@ -383,6 +383,45 @@ pub struct AdjacencyEdge {
     pub observed_at: DateTime<Utc>,
 }
 
+/// One adjacency observation as seen *from one address's point of view* — the
+/// per-address read the §20.3 behavior embedding is computed from, where an
+/// [`AdjacencyEdge`]'s `src`/`dst` have already been resolved into "me" and
+/// "the counterparty" plus the direction that resolution discarded.
+///
+/// Deliberately not an [`AdjacencyEdge`]: the embedding needs *direction
+/// relative to the subject* (funding out is a different behavior from funding
+/// in), which a caller would otherwise re-derive at every use site by
+/// re-comparing `src` against the address it just queried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressEdge {
+    /// The other end of the relation.
+    pub counterparty: AccountAddress,
+    pub kind: EdgeKind,
+    /// `true` when the subject address is the edge's `src` (it funded/deployed/
+    /// paid the counterparty), `false` when it is the `dst`.
+    pub outbound: bool,
+    pub block_number: u64,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// An address's observation history, **bounded** — the edge-level analogue of
+/// [`Neighborhood`]'s degree cap (§8.2). A router or CEX hot wallet has
+/// millions of observations; reading them all to embed one address is the
+/// query this cap exists to refuse.
+///
+/// `truncated` says the cap was hit, which changes what the history *means*:
+/// the edges are the most recent window of the address's activity, not all of
+/// it. That distinction is carried, never silently dropped — a consumer that
+/// treats a truncated history as complete would read a hub's lifetime cadence
+/// off its last few hours (§20.1's "mark the weak join, don't assume it").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeHistory {
+    /// Most recent first (the truncation order), so a truncated history is
+    /// still a well-defined recency window rather than an arbitrary sample.
+    pub edges: Vec<AddressEdge>,
+    pub truncated: bool,
+}
+
 /// A degree-capped neighborhood read (§8.2 — critical). `capped` says the walk
 /// hit the hub-node cap: the address connects to *more* neighbors than
 /// returned, so a graph walk must treat it as an infrastructure endpoint and
