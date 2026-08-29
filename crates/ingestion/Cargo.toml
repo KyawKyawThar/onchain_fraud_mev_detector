@@ -13,6 +13,8 @@ name = "ingestion"
 path = "src/main.rs"
 
 [dependencies]
+# The per-endpoint circuit breaker (§5), now shared — see `source::circuit`.
+resilience = { workspace = true }
 events = { workspace = true }
 telemetry = { workspace = true }
 # The shared publish seam (§20): `EventSink`/`KafkaEventSink`/`publish_resilient`,

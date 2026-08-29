@@ -1211,16 +1211,58 @@ A separate service consuming `IncidentCreated` and reading the audit stream
 Mechanics:
 
 - **`llm` seam crate:** an `LlmClient` trait over the Claude Messages API
-  (thin `reqwest` client — there is no official Rust SDK), with retry/backoff
-  under the shared permanent-vs-transient error classification and an
-  in-memory double for tests. Default model `claude-opus-5`; model id is
-  config, never hardcoded at call sites.
+  (thin `reqwest` client — there is no official Rust SDK), with an in-memory
+  double for tests. Default model `claude-opus-5`; model id is config, never
+  hardcoded at call sites.
+
+  Everything that makes a rate-limited third party survivable is a **decorator
+  over the seam**, assembled in one composition root (`llm::LlmStack`) because
+  the order is load-bearing and every wrong order still compiles:
+  `Cached → Metered → Retrying → Breaker → Admitted → Anthropic`. A cache hit
+  therefore costs no permit, no breaker signal and no bill; metering is per
+  *logical* call, so three attempts are one invoice line; the breaker is
+  consulted on every attempt; and an admission permit covers the HTTP call
+  only, not the backoff sleep.
+
+  Two failure classifications, deliberately distinct: `Transience` answers
+  "should the queue above re-run this later?" and `retry_now` answers "would
+  trying again in 200ms help?". A shed call, an open circuit, and a
+  `retry-after` longer than this process will hold a worker are all *transient
+  but not retriable here* — **there are two clocks**, and an in-process loop
+  exists to ride out a blip, not to wait out a quota.
+
+  The breaker and the jittered backoff are `resilience`, shared with §5's RPC
+  endpoint pool rather than copied — the `db::redis` argument applied to
+  concurrency state machines.
+
+- **The copilot must not call the model from inside a consumer callback.**
+  `run_consumer` awaits its handler inline before committing, so a multi-minute
+  completion becomes the poll interval: the member is evicted, the partition
+  rebalances, the record is redelivered, and the same expensive call starts
+  again elsewhere. The copilot therefore takes the shape §7 already uses for
+  the slow path — a thin consumer that records a draft job and commits in
+  milliseconds, and a worker pool that drains it. The drafts table doubles as
+  the cross-pod response cache, keyed by request digest.
+
+- **Prompt injection is expected input, not an edge case.** Everything the
+  copilot reasons over is attacker-influenced (token and ENS names, contract
+  metadata, decoded calldata). Instructions live only in the versioned system
+  artifact; chain-derived text is fenced as untrusted in a *user* turn and
+  cannot close its own fence. Those reduce how often the architectural defence
+  is needed; they do not replace it — the load-bearing control remains that
+  output is a proposal, a drafted rule must survive the §9 parse boundary, a
+  rule's owner comes from the JWT and never from the model, and activation is a
+  human step.
 - **Prompts are versioned artifacts** — checked in, hashed, and stamped into
   every draft event alongside the model id. A prompt change is a diff review,
   and every historical draft is attributable to the exact prompt that
   produced it.
 - **Cost is metered:** token usage flows through `UsageRecorded` like every
-  other billable quantity, with per-customer budget alarms.
+  other billable quantity — in **four SKUs** (fresh input, output, cache write,
+  cache read), because they are four different prices and a single "tokens"
+  number cannot be turned into a bill. Per-customer spend is alarmed, never
+  gated. A separate, platform-wide spend ceiling exists as a runaway-loop
+  safety valve; it is not a per-customer quota.
 
 ### 20.5 Model governance
 

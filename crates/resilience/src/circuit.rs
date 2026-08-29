@@ -1,5 +1,9 @@
-//! A per-endpoint circuit breaker (§5 — the RPC pool is "health-checked,
-//! circuit-broken").
+//! A circuit breaker for one flaky dependency.
+//!
+//! Written for §5's per-endpoint RPC pool ("health-checked, circuit-broken")
+//! and promoted into this shared crate when the §20.4 LLM seam needed the
+//! same machine for a rate-limited third party. Nothing here knows about
+//! either: the unit it guards is whatever the caller decides.
 //!
 //! The classic three-state breaker: while **closed**, calls flow and
 //! consecutive failures are counted; once they cross `failure_threshold` the

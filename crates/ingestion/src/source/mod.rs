@@ -17,7 +17,15 @@
 //! `impl`, not a rewrite. Adapter #1 reuses the pipeline wholesale rather than
 //! re-implementing the reorg walk (see [`exex`]).
 
-pub mod circuit;
+/// The per-endpoint circuit breaker (§5).
+///
+/// The state machine itself moved to the shared `resilience` crate when the
+/// §20.4 LLM seam became its second consumer — it never contained anything
+/// ingestion-specific. Re-exported under the original path so the pool's call
+/// sites (and `tests/failover.rs`) are unchanged.
+pub mod circuit {
+    pub use resilience::circuit::{BreakerConfig, CircuitBreaker, CircuitState};
+}
 pub mod endpoint;
 pub mod exex;
 pub mod head_stream;

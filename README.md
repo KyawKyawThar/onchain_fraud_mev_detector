@@ -173,9 +173,10 @@ Full design: [ARCHITECTURE.md §20](./ARCHITECTURE.md#20-aiml-layer) · build-ou
 
 What is **built** here is classical ML — a gradient-boosted classifier and an
 isolation forest, served as ONNX through an in-process inference seam. The
-LLM copilot (§20.4) is **designed, not built**; it is marked as such below.
-Being explicit about the line, because "AI" is doing a lot of work in most
-repos and none of it is doing any here.
+LLM copilot (§20.4) is **not built**: its model-access seam (`llm`) is
+shipped, the service that would use it is not, and nothing in the platform
+calls a language model today. Being explicit about the line, because "AI" is
+doing a lot of work in most repos and none of it is doing any here.
 
 | §20 component | Crate | Status |
 |---|---|---|
@@ -185,6 +186,7 @@ repos and none of it is doing any here.
 | Isolation-forest anomaly detector | `anomaly-detector` | Shipped, Shadow-staged |
 | Rollout gate · drift · governance | `backtest`, `detection` | Shipped |
 | Behavioral embeddings + similarity search | `intelligence` | Shipped |
+| LLM client seam (Claude Messages API, metered) | `llm` | Shipped, unused |
 | LLM investigation copilot (SAR drafts, NL rules) | — | **Designed only** |
 
 The platform's event-sourced core makes it an unusually good substrate for
@@ -310,7 +312,13 @@ for EVM simulation.
 Prometheus, Grafana dashboards. Key SLOs: end-to-end alert latency, simulation
 confirmation rate, false-positive rate.
 
----
+<!--
+Business model — commented out. The tier/price tables below are a
+commercial plan, not a description of what the code does: nothing in this
+repository enforces a tier, a quota, or a per-call price. Usage is metered
+onto the event stream (§13) and never gated at request time. Kept in source
+so the intent isn't lost; hidden so a reader can't mistake it for a shipped
+feature.
 
 ## Business model
 
@@ -338,6 +346,7 @@ Target customers: compliance teams at crypto exchanges (regulatory obligation
 to file SARs, plus inline withdrawal screening), DeFi protocol risk officers
 (attack attribution and blocking), and quantitative researchers (MEV landscape
 data).
+-->
 
 ---
 
@@ -392,6 +401,7 @@ binary/container.
 │   ├── ml-features/             frozen, versioned feature schema (§20.1)
 │   ├── dataset/                 training-set export with provenance + manifests (§20.1)
 │   ├── inference/               ONNX runtime seam (`ort`) behind InferenceEngine (§20.2)
+│   ├── llm/                     Claude Messages API seam: LlmClient + token metering (§20.4)
 │   ├── backtest/                replay ground truth → precision/recall; the CI gate
 │   ├── db/ · ch-migrate/        shared Postgres pool + ClickHouse migration runner
 │   ├── telemetry/               tracing + metrics boot, W3C trace propagation
@@ -479,7 +489,7 @@ already wired, and the numbers move under review rather than silently.
 
 ## Contact
 
-Built by **Nicholas** — senior backend engineer, distributed systems,
+Built by **Kyaw Kyaw Thar** — senior backend engineer, distributed systems,
 Go + Rust.
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/kyawkyaw-thar-210602185/)
