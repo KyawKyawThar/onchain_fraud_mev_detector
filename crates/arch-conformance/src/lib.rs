@@ -245,6 +245,42 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── The copilot reads other services over their APIs (§20.4/§14) ──
+        // The copilot's whole safety argument is that a draft must cross a
+        // validating boundary before anything acts on it. That argument only
+        // holds while the boundaries are *other services'*:
+        //
+        // * it must go through the `llm` seam, never a hand-rolled HTTP call
+        //   to a provider — that is where metering, retry, admission and the
+        //   response cache live, and a second path around them is an
+        //   unreconcilable billing SKU (§13);
+        // * it reads the incident's audit stream over event-store's HTTP read
+        //   API, so no `clickhouse` and no `event-store` edge: a service that
+        //   could query another's store is the cross-service join §14 forbids,
+        //   and it would couple a draft to a schema it does not own.
+        //
+        // `rule-engine` is deliberately *absent* from this list: t4 compiles a
+        // drafted rule through that crate's existing parse boundary, which is
+        // the hallucination-safety mechanism, not a shortcut around one.
+        if krate == "copilot" {
+            if !has("llm") {
+                out.push(format!(
+                    "{krate}: must reach the model through the `llm` seam \
+                     (it has no llm dependency) — transport, retry, admission, \
+                     metering and the response cache live there (§20.4)"
+                ));
+            }
+            for forbidden in ["clickhouse", "event-store", "intelligence", "detection"] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — the copilot reads \
+                         other services over their APIs (§14: no cross-service joins, \
+                         no shared tables); its own store is `copilot_drafts` alone"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -430,6 +466,19 @@ mod tests {
                     "reqwest",
                 ],
             ),
+            (
+                "copilot",
+                &[
+                    "events",
+                    "llm",
+                    "event-bus",
+                    "rdkafka",
+                    "sqlx",
+                    "db",
+                    "reqwest",
+                    "telemetry",
+                ],
+            ),
             ("resilience", &[]),
             ("ingestion", &["event-bus", "rdkafka", "resilience"]),
         ]);
@@ -502,6 +551,24 @@ mod tests {
                 "llm",
                 &["event-bus", "rule-engine"],
                 "compiling a drafted rule",
+            ),
+            (
+                "copilot",
+                &["events", "event-bus", "rdkafka", "sqlx", "db", "reqwest"],
+                "no llm dependency",
+            ),
+            (
+                "copilot",
+                &[
+                    "llm",
+                    "event-bus",
+                    "rdkafka",
+                    "sqlx",
+                    "db",
+                    "clickhouse",
+                    "ch-migrate",
+                ],
+                "no cross-service joins",
             ),
         ];
         for (krate, deps, expected) in cases {

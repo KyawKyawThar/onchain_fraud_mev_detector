@@ -198,6 +198,7 @@ jobs:
           - bin: notification
           - bin: usage
           - bin: predictive
+          - bin: copilot
     env:
       REGISTRY: ghcr.io
       # Lowercased below — GHCR requires lowercase image names.

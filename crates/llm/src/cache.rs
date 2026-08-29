@@ -101,18 +101,24 @@ impl std::fmt::Display for CacheKey {
 
 /// The cache seam.
 ///
-/// Synchronous on purpose: an in-process map needs no `await`, and a
-/// store-backed implementation can block on its own runtime handle or keep a
-/// write-behind buffer. Making this async would force every implementation to
-/// be async for the benefit of the one that isn't yet written.
+/// **Async, for the implementation that isn't in this crate.** The in-process
+/// map below needs no `await` and pays one boxed future per call for the
+/// privilege; the cross-pod cache the copilot supplies is a database round
+/// trip, and a synchronous trait would force it to block a runtime worker on
+/// that I/O — `block_in_place` + `Handle::block_on`, a spawned replacement
+/// thread per call, and a hard requirement on the multi-threaded scheduler.
+/// Sizing a seam for the cheap implementation and taxing the expensive one is
+/// exactly backwards when the expensive one is the one that runs in
+/// production.
+#[async_trait::async_trait]
 pub trait CompletionCache: Send + Sync + std::fmt::Debug {
     /// A previously stored completion for this exact request, if any.
-    fn get(&self, key: &CacheKey) -> Option<Completion>;
+    async fn get(&self, key: &CacheKey) -> Option<Completion>;
 
     /// Store a completion. Best-effort: an implementation that cannot store
     /// (full, store down) must return normally — a cache is never allowed to
     /// fail a call that already succeeded and was already paid for.
-    fn put(&self, key: CacheKey, completion: &Completion);
+    async fn put(&self, key: CacheKey, completion: &Completion);
 }
 
 /// A cache that never hits — the default when caching is switched off, so the
@@ -120,12 +126,13 @@ pub trait CompletionCache: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct NoCache;
 
+#[async_trait::async_trait]
 impl CompletionCache for NoCache {
-    fn get(&self, _key: &CacheKey) -> Option<Completion> {
+    async fn get(&self, _key: &CacheKey) -> Option<Completion> {
         None
     }
 
-    fn put(&self, _key: CacheKey, _completion: &Completion) {}
+    async fn put(&self, _key: CacheKey, _completion: &Completion) {}
 }
 
 /// Process-local cache over the workspace's bounded FIFO map.
@@ -172,14 +179,18 @@ impl InMemoryCache {
     }
 }
 
+#[async_trait::async_trait]
 impl CompletionCache for InMemoryCache {
-    fn get(&self, key: &CacheKey) -> Option<Completion> {
+    /// No `await` inside, and none wanted: the lock is never held across a
+    /// suspension point, so this stays a plain map lookup wearing an async
+    /// signature.
+    async fn get(&self, key: &CacheKey) -> Option<Completion> {
         let entries = self.lock();
         let entry = entries.get(key)?;
         (entry.stored_at.elapsed() < self.ttl).then(|| entry.completion.clone())
     }
 
-    fn put(&self, key: CacheKey, completion: &Completion) {
+    async fn put(&self, key: CacheKey, completion: &Completion) {
         self.lock().put(
             key,
             Entry {
@@ -226,7 +237,7 @@ impl<C: LlmClient> LlmClient for CachingClient<C> {
 
     async fn complete(&self, request: &CompletionRequest) -> Result<Completion, LlmError> {
         let key = CacheKey::new(self.inner.model(), request);
-        if let Some(hit) = self.cache.get(&key) {
+        if let Some(hit) = self.cache.get(&key).await {
             record_cache(request.purpose, "hit");
             tracing::debug!(
                 purpose = request.purpose,
@@ -242,7 +253,7 @@ impl<C: LlmClient> LlmClient for CachingClient<C> {
         // included (see the module docs); never store a failure, which is the
         // one case where trying again might genuinely differ.
         if let Ok(completion) = &outcome {
-            self.cache.put(key, completion);
+            self.cache.put(key, completion).await;
         }
         outcome
     }
@@ -265,22 +276,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_stored_completion_comes_back_for_the_same_request() {
+    #[tokio::test]
+    async fn a_stored_completion_comes_back_for_the_same_request() {
         let cache = InMemoryCache::new(8, Duration::from_secs(60));
         let request = CompletionRequest::new("narrative", "incident 7");
         let key = CacheKey::new("claude-opus-5", &request);
 
-        assert!(cache.get(&key).is_none());
-        cache.put(key, &completion("a draft"));
-        assert_eq!(cache.get(&key).unwrap().text, "a draft");
+        assert!(cache.get(&key).await.is_none());
+        cache.put(key, &completion("a draft")).await;
+        assert_eq!(cache.get(&key).await.unwrap().text, "a draft");
     }
 
     /// The tenant-isolation property. Identical questions, different
     /// customers: a shared entry here would serve one customer's incident
     /// analysis to another.
-    #[test]
-    fn two_customers_asking_the_same_question_do_not_share_an_entry() {
+    #[tokio::test]
+    async fn two_customers_asking_the_same_question_do_not_share_an_entry() {
         let cache = InMemoryCache::new(8, Duration::from_secs(60));
         let a = CompletionRequest::new("narrative", "incident 7").for_customer(CustomerId::new());
         let b = CompletionRequest::new("narrative", "incident 7").for_customer(CustomerId::new());
@@ -289,8 +300,8 @@ mod tests {
         let key_b = CacheKey::new("claude-opus-5", &b);
         assert_ne!(key_a, key_b);
 
-        cache.put(key_a, &completion("customer A's draft"));
-        assert!(cache.get(&key_b).is_none(), "cross-tenant hit");
+        cache.put(key_a, &completion("customer A's draft")).await;
+        assert!(cache.get(&key_b).await.is_none(), "cross-tenant hit");
     }
 
     /// An untracked edit to a live prompt must not be served from cache under
@@ -319,19 +330,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_expired_entry_is_a_miss() {
+    #[tokio::test]
+    async fn an_expired_entry_is_a_miss() {
         let cache = InMemoryCache::new(8, Duration::from_millis(1));
         let request = CompletionRequest::new("narrative", "incident 7");
         let key = CacheKey::new("m", &request);
-        cache.put(key, &completion("stale"));
+        cache.put(key, &completion("stale")).await;
         std::thread::sleep(Duration::from_millis(5));
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&key).await.is_none());
     }
 
     /// A backfill must not be able to grow this without bound.
-    #[test]
-    fn capacity_is_bounded_and_evicts_the_oldest() {
+    #[tokio::test]
+    async fn capacity_is_bounded_and_evicts_the_oldest() {
         let cache = InMemoryCache::new(2, Duration::from_secs(60));
         let keys: Vec<CacheKey> = (0..3)
             .map(|i| {
@@ -342,18 +353,18 @@ mod tests {
             })
             .collect();
         for key in &keys {
-            cache.put(*key, &completion("draft"));
+            cache.put(*key, &completion("draft")).await;
         }
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(&keys[0]).is_none(), "oldest evicted");
-        assert!(cache.get(&keys[2]).is_some());
+        assert!(cache.get(&keys[0]).await.is_none(), "oldest evicted");
+        assert!(cache.get(&keys[2]).await.is_some());
     }
 
-    #[test]
-    fn the_null_cache_never_hits() {
+    #[tokio::test]
+    async fn the_null_cache_never_hits() {
         let request = CompletionRequest::new("narrative", "x");
         let key = CacheKey::new("m", &request);
-        NoCache.put(key, &completion("ignored"));
-        assert!(NoCache.get(&key).is_none());
+        NoCache.put(key, &completion("ignored")).await;
+        assert!(NoCache.get(&key).await.is_none());
     }
 }

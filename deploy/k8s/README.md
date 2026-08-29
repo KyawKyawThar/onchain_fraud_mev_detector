@@ -58,6 +58,7 @@ lesson).
 | ingestion-eth / -base | 1 per chain, `Recreate` | the RPC failover pool is *in-process*; two pollers double-publish heads |
 | detection-eth / -base | 1 per chain, `Recreate` | chain is the Kafka partition key → one partition per chain; scale **up** (CPU/rayon), out by adding chains |
 | predictive | 1, `Recreate` | owns the mempool filter + in-process dedup ring |
+| copilot | 1, rolling with `maxSurge: 0` | interchangeable (leased `SKIP LOCKED` queue), but `replicas × COPILOT_WORKER_CONCURRENCY` hits an **org-wide** provider limit — a spend decision, never an HPA's |
 | event-store | 1 → partitions | consumer group; event-id-keyed inserts make overlap safe |
 | simulation-dispatcher | 1 | thin Kafka→RabbitMQ bridge |
 | **simulation-worker** | **HPA 2–8 (prod 4–16) on CPU** | revm is the bottleneck; competing consumers scale linearly (§20 "scale aggressively") |
@@ -111,11 +112,11 @@ real values**:
 
 | Secret | Keys | Consumers |
 |---|---|---|
-| `postgres-credentials` | `POSTGRES_DB/USER/PASSWORD` (image), `DATABASE_URL` (apps) | postgres, projection, intelligence×3, rule-engine, api-server, notification |
+| `postgres-credentials` | `POSTGRES_DB/USER/PASSWORD` (image), `DATABASE_URL` (apps) | postgres, projection, intelligence×3, rule-engine, api-server, notification, copilot |
 | `redis-credentials` | `REDIS_PASSWORD` (image), `REDIS_URL` (apps) | redis, intelligence×3, rule-engine, api-server (§19 screening rate limiter) |
 | `clickhouse-credentials` | `CLICKHOUSE_DB/USER/PASSWORD` | clickhouse, event-store, projection, intelligence×3, usage, grafana (§19 billing-usage datasource) |
 | `rabbitmq-credentials` | `RABBITMQ_DEFAULT_USER/PASS/VHOST` (image), `RABBITMQ_URL` (apps — vhost `/` percent-encoded `%2f`!) | rabbitmq, dispatcher, worker |
-| `app-secrets` | `JWT_SECRET`, `EVENT_STORE_WRITE_TOKEN`, `SMTP_USERNAME/PASSWORD` | api-server, event-store, notification |
+| `app-secrets` | `JWT_SECRET`, `EVENT_STORE_WRITE_TOKEN`, `SMTP_USERNAME/PASSWORD`, `ANTHROPIC_API_KEY` | api-server, event-store, notification, copilot |
 | `rpc-endpoints` | `ETH_RPC_URLS`, `BASE_RPC_URLS`, `MEMPOOL_RPC_URL`, `INTEL_ETH_RPC_URL` | ingestion×2, predictive, intelligence-block-production |
 | `grafana-admin` | `GF_SECURITY_ADMIN_USER/PASSWORD` (§19) | grafana |
 

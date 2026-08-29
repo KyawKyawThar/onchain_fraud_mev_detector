@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts\n                SET request_digest = $1, model_digest = $2, prompt_id = $3,\n                    prompt_digest = $4, grounded_event_ids = $5, updated_at = $6\n              WHERE draft_id = $7",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "43a55e19fa6577f48bb8c1f1797012c95c87f1c17f9fcde305be477ac025abce"
+}

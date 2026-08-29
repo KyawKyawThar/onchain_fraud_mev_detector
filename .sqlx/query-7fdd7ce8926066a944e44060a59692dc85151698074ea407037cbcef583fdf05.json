@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts\n                SET status = $1, reviewed_by = $2, reviewed_at = $3, review_note = $4,\n                    updated_at = $3\n              WHERE draft_id = $5 AND status = $6\n            RETURNING draft_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "draft_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7fdd7ce8926066a944e44060a59692dc85151698074ea407037cbcef583fdf05"
+}

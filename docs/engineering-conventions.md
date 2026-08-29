@@ -86,6 +86,25 @@ Each pairs with a `Recording*` / canned double in its `#[cfg(test)]` module.
 **Anti-pattern.** Reaching for `rdkafka`/`lapin`/`reqwest` types directly in service
 logic. If a test needs a broker to run, the seam is missing.
 
+**Corollary — size a seam for its most expensive implementation.** A trait's
+signature is a tax the *other* implementations pay. `llm::CompletionCache` was
+first written synchronous because the in-process map needs no `await`; the
+copilot's cross-pod cache then had to bridge with `block_in_place` +
+`Handle::block_on`, blocking a runtime worker on a database round trip and
+constraining the whole binary to the multi-threaded scheduler. Making it async
+costs the map one boxed future per call and deletes that. The question to ask
+of a new seam is not "what does the first implementation need?" but "what will
+the one that runs in production need?"
+
+**Corollary — give each collaborator the narrowest trait that does its job.** A
+nine-method store trait means the double implements nine methods to test one,
+and the type system stops saying which component may do what.
+`copilot::store` splits into `DraftQueue` (the consumer: one method),
+`DraftWorkQueue` (the pool), `DraftCache` (the `llm` adapter) and `DraftReview`
+(the human surface), with a blanket supertrait for the one type that owns the
+table. The consumer *cannot* call a model or approve a draft, which is the §7
+slow-path constraint expressed as a type rather than a comment.
+
 **Enforcement.** The dependency-direction half of this rule is *mechanical*, not
 review-vigilance: [`crates/arch-conformance`](../crates/arch-conformance/) runs the
 seam rules (detector crates → `detector-api` never `detection`; `rdkafka` never
@@ -94,7 +113,10 @@ alongside `db`; `redis` alongside `db` too (§8/§9 — `db::redis` is the share
 connect + transient/permanent classification, the Redis analog of the sqlx rule);
 `clickhouse` alongside `ch-migrate`; `ml-features`/`dataset`/`inference` never
 touch `intelligence`, so attribution-blindness holds upstream and downstream of
-the model as well as inside it; `events`/`detector-api` stay at
+the model as well as inside it; `llm` stays a seam and `copilot` reaches both the
+model and other services only through theirs (§20.4 — the copilot's safety
+argument is that a draft crosses a *validating boundary* it does not own);
+`events`/`detector-api` stay at
 the bottom of the graph) against `cargo metadata` on every `cargo test` — a
 violation fails the same gate locally and in CI. Changing a rule is an architecture
 decision: edit the rule in the same PR, with the reasoning in the commit.
@@ -318,10 +340,21 @@ fix for a production failure mode:
   scaling shape honestly (see the README table there): HPA only if replicas are
   truly interchangeable; `Recreate` + 1 if there's a single-writer anywhere in
   the loop; reorg-rewindable if it holds cross-block state (§15).
+- [ ] **Nothing slow inside the handler.** `run_consumer` awaits the handler
+  *before* committing, so the handler's worst case is the poll interval: a
+  call that can take minutes (a model, a third-party API, a long simulation)
+  blows `max.poll.interval.ms`, gets the member evicted, rebalances the
+  partition, and redelivers the record into a *second* run of the same
+  expensive work — with the first still in flight. Raising the poll interval
+  only trades that for a fleet that takes minutes to notice a dead pod. The
+  fix is structural: the handler records a durable work item and commits, and
+  a pool drains it on its own clock (§7's slow path; §20.4's copilot).
 
 **Reference.** [`usage`](../crates/usage/) is the smallest complete example;
 [`detection`'s scheduler](../crates/detection/src/scheduler.rs) shows the
-foreign-record commit-ordering pattern.
+foreign-record commit-ordering pattern; [`copilot`](../crates/copilot/) shows
+the slow-path split — a thin consumer over a leased Postgres queue, where the
+work item's row doubles as the durable cache of the expensive answer.
 
 ---
 

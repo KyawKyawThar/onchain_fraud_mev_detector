@@ -1,0 +1,84 @@
+[package]
+name = "copilot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The §20.4 LLM investigation copilot (Sprint 20 t2) — the service half of the
+# `llm` seam. It is deliberately NOT a plain consumer: `run_consumer` awaits
+# its handler before committing, so a multi-minute completion inside the
+# handler *is* the poll interval (eviction -> rebalance -> redelivery into the
+# same billed call). The shape here is §7's slow path instead: a thin consumer
+# records a draft job and commits in milliseconds, and a worker pool drains
+# the queue out of band.
+
+[dependencies]
+events = { workspace = true }
+llm = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+# Derive-driven wire/storage string mappings for `DraftKind`/`DraftStatus`
+# (the `kind`/`status` columns) — same discipline as
+# `notification::model::ChannelKind`, so a new variant can't drift between the
+# Rust enum and what a row stores.
+strum = { workspace = true }
+
+# Postgres system of record (§14: this service owns `copilot_drafts` alone —
+# the queue, the draft, its approval state and the cross-pod completion
+# cache). The shared `db` crate supplies the pool + fault classification.
+db = { workspace = true }
+sqlx = { workspace = true }
+
+# The consume seam: `run_consumer`/`Handled`/DLQ/lag and the `EventSink` the
+# LLM stack meters `UsageRecorded` through — never raw rdkafka in the logic;
+# rdkafka itself only to build the `StreamConsumer` the seam drives.
+event-bus = { workspace = true }
+rdkafka = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Reading the incident's audit stream out of event-store over its internal
+# HTTP read API (§4). A *client*, not a link edge: §14 forbids reaching into
+# another service's store, which is why this crate has no ClickHouse
+# dependency and no `event-store` dependency.
+reqwest = { workspace = true }
+
+# Service binary plumbing (src/main.rs): tracing/metrics/health boot, env
+# config, and the API key kept out of `Debug`/logs.
+telemetry = { workspace = true }
+secrecy = { workspace = true }
+# §19 counters/histograms through the `metrics` facade — a no-op until the
+# binary's exporter installs the recorder.
+metrics = { workspace = true }
+
+[features]
+# Exposes `copilot::test_util` (the in-memory `DraftStore` double) to this
+# crate's own tests.
+test-util = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Self-dependency with `test-util` on, so `tests/` sees the in-memory double.
+copilot = { path = ".", features = ["test-util"] }
+llm = { workspace = true, features = ["test-util"] }
+event-bus = { workspace = true, features = ["test-util"] }
+# Live-store integration tests (`#[ignore]`): real Postgres via a throwaway
+# container, run by `just test-integration` — proves `PgDraftStore` honours
+# the same enqueue/claim/cache contract the in-memory double does.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres"] }
+# Scoped in-memory recorder for the draft-metrics test (same pattern as
+# notification/detection/simulation).
+metrics-util = { workspace = true }
+
+[lints]
+workspace = true

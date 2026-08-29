@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT body, model, stop_reason, token_usage\n               FROM copilot_drafts\n              WHERE request_digest = $1\n                AND model_digest = $2\n                AND status = ANY($3::TEXT[])\n                AND body IS NOT NULL\n                AND model IS NOT NULL\n                AND stop_reason IS NOT NULL\n              ORDER BY completed_at DESC NULLS LAST\n              LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "stop_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "stop_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "token_usage",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "token_usage"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "67d0a0033db9f0f0215bcd2df815cdd5da35cab504a223c1179145bc0cebf330"
+}

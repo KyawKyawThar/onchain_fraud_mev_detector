@@ -46,6 +46,10 @@ data:
 
   # ── Internal read APIs the api-service fronts (§11) ───────────
   EVENT_STORE_URL: http://event-store:8081
+  # The copilot reads an incident's audit stream over the same internal read
+  # API (§14: no cross-service joins) — its own var so the two consumers can
+  # be pointed at different replicas if the read load ever justifies it.
+  COPILOT_EVENT_STORE_URL: http://event-store:8081
   SIMULATION_URL: http://simulation-projection:8082
   INTELLIGENCE_GRPC_ADDR: http://intelligence-grpc:50051
 
