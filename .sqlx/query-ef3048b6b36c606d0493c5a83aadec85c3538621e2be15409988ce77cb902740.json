@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO copilot_drafts\n                 (draft_id, kind, subject_id, customer_id, chain, status, attempts,\n                  created_at, updated_at)\n             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7)\n             ON CONFLICT (kind, subject_id) DO NOTHING\n             RETURNING draft_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "draft_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ef3048b6b36c606d0493c5a83aadec85c3538621e2be15409988ce77cb902740"
+}

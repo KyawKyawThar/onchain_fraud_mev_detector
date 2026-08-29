@@ -173,10 +173,12 @@ Full design: [ARCHITECTURE.md §20](./ARCHITECTURE.md#20-aiml-layer) · build-ou
 
 What is **built** here is classical ML — a gradient-boosted classifier and an
 isolation forest, served as ONNX through an in-process inference seam. The
-LLM copilot (§20.4) is **not built**: its model-access seam (`llm`) is
-shipped, the service that would use it is not, and nothing in the platform
-calls a language model today. Being explicit about the line, because "AI" is
-doing a lot of work in most repos and none of it is doing any here.
+LLM copilot (§20.4) is **partly built**: its model-access seam (`llm`) and
+the `copilot` service that drafts incident narratives through it are shipped;
+natural-language rule creation, the per-claim grounding contract and the
+`IncidentNarrativeDrafted` emission are not. Being explicit about the line,
+because "AI" is doing a lot of work in most repos and less than it claims in
+almost all of them.
 
 | §20 component | Crate | Status |
 |---|---|---|
@@ -186,8 +188,10 @@ doing a lot of work in most repos and none of it is doing any here.
 | Isolation-forest anomaly detector | `anomaly-detector` | Shipped, Shadow-staged |
 | Rollout gate · drift · governance | `backtest`, `detection` | Shipped |
 | Behavioral embeddings + similarity search | `intelligence` | Shipped |
-| LLM client seam (Claude Messages API, metered) | `llm` | Shipped, unused |
-| LLM investigation copilot (SAR drafts, NL rules) | — | **Designed only** |
+| LLM client seam (Claude Messages API, metered) | `llm` | Shipped |
+| Copilot service (queue, worker pool, drafts, approval) | `copilot` | Shipped |
+| SAR narratives: per-claim grounding + draft events | `copilot` | **Not built** |
+| Natural-language rule creation | — | **Designed only** |
 
 The platform's event-sourced core makes it an unusually good substrate for
 ML, and the layer is built to exploit exactly that, under the same governance
@@ -223,16 +227,29 @@ graph-evidence cluster earns. A label the system itself derived can never
 anchor a further match — one hop from something known, or nothing — so the
 graph's correctness story stays intact while its recall widens.
 
-**The LLM copilot is designed to be hallucination-safe by construction —
-and is not built yet.** No copilot crate exists; this paragraph describes
-§20.4's design, not shipped behavior. The intended construction: SAR narrative
-drafts grounded in the audit trail, every factual claim carrying the event ids
-it derives from, so reviewers verify against the store rather than the model.
-Natural-language rule creation ("alert when a wallet within 2 hops of a
-sanctioned address moves > $10K") would emit the rule engine's existing wire
-form and must compile through the existing parse boundary — so a hallucinated
-rule fails compilation and can never run. LLM output stays a proposal, never a
-fact: nothing it produces would enter the event store as evidence.
+**The LLM copilot drafts, and a human decides.** The `copilot` service
+consumes `IncidentCreated`, reads the incident's audit stream from the event
+store, and drafts a SAR narrative from it — into a Postgres row that stays
+`ready` until a person approves it. Nothing auto-delivers, nothing enters the
+event store as evidence, and nothing touches the entity graph: LLM output is a
+proposal, never a fact.
+
+The interesting part is the shape rather than the prompt. The model is never
+called from inside the Kafka handler — a multi-minute completion there becomes
+the poll interval, and the rebalance it triggers redelivers the record into a
+second run of the same billed call. So the consumer records a job and commits
+in milliseconds, a small worker pool leases jobs off a Postgres queue, and
+that same row doubles as a cross-pod response cache keyed by request digest.
+Which makes a rolling update cost nothing, instead of producing a second,
+differently-worded version of a document a compliance reviewer already read.
+
+Still design, not shipped: the per-claim `grounded_event_ids` contract (every
+factual claim carrying the event ids it derives from, so reviewers verify
+against the store rather than the model) and natural-language rule creation
+("alert when a wallet within 2 hops of a sanctioned address moves > $10K"),
+which will emit the rule engine's existing wire form and must compile through
+its existing parse boundary — so a hallucinated rule fails compilation and can
+never run.
 
 ---
 

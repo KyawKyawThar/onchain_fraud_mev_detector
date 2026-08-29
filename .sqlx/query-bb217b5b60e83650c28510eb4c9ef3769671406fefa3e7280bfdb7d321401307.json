@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts\n                        SET status = $1, model = $2, stop_reason = $3, body = $4,\n                            token_usage = $5, last_error = $6, lease_expires_at = NULL,\n                            completed_at = $7, updated_at = $7\n                      WHERE draft_id = $8",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bb217b5b60e83650c28510eb4c9ef3769671406fefa3e7280bfdb7d321401307"
+}

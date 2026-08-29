@@ -1215,6 +1215,13 @@ Mechanics:
   double for tests. Default model `claude-opus-5`; model id is config, never
   hardcoded at call sites.
 
+  Its `CompletionCache` seam is **async**, sized for the implementation that
+  isn't in the crate: the in-process map pays one boxed future per call, while
+  the copilot's cross-pod cache is a database round trip that a synchronous
+  trait would force to block a runtime worker. Sizing a seam for the cheap
+  implementation and taxing the expensive one is backwards when the expensive
+  one is the one that runs in production.
+
   Everything that makes a rate-limited third party survivable is a **decorator
   over the seam**, assembled in one composition root (`llm::LlmStack`) because
   the order is load-bearing and every wrong order still compiles:
@@ -1243,6 +1250,48 @@ Mechanics:
   the slow path — a thin consumer that records a draft job and commits in
   milliseconds, and a worker pool that drains it. The drafts table doubles as
   the cross-pod response cache, keyed by request digest.
+
+  The queue is a **Postgres table**, not the RabbitMQ §7 uses for simulation
+  jobs, and the difference is what each thing *is*: a simulation job is a
+  command consumed once, while a draft is an artifact with a lifecycle
+  (queued → leased → answered → approved) that has to stay auditable long
+  after the work item is gone. Splitting the two across a broker and a store
+  would need a distributed transaction to keep them agreed; one row needs
+  none. Claims are `FOR UPDATE SKIP LOCKED` with a lease, so every pod runs
+  the same query without colliding and a pod killed mid-call leaves work that
+  expires back onto the queue rather than work that vanished behind a
+  committed offset.
+
+  Two invariants the lease carries. It must **outlast the worst-case call**
+  (the seam's per-request timeout times its attempt budget) or a second pod
+  reclaims a job that is still running and both pay — checked at boot, because
+  its failure mode is a doubled bill and two documents, never an error. And a
+  worker **never retries**: a transient fault releases the job to the queue's
+  clock, a permanent one fails the draft. That is the same two-clocks split
+  the seam draws between `Transience` and `retry_now`, applied one level up.
+
+  A refusal or a `max_tokens` truncation is a *successful, billed* call whose
+  answer is unusable, so it lands in its own terminal state rather than being
+  retried — re-running a decline buys a second identical decline at full
+  price — and it is **cached**, which is what stops a redelivery loop paying
+  for it repeatedly.
+
+  **A pod only claims the draft kinds it can serve.** The queue is
+  kind-agnostic — narratives and rule drafts share it — but a replica carries
+  only the generators it was built with, and a claim is a *durable lease*: a
+  draft leased by a pod with no generator for it is a draft nobody else may
+  touch until that lease expires. The generator roster is linked at boot
+  (duplicate or empty is a refused rollout) and its key set *is* the claim
+  filter, so leasing unservable work is impossible rather than merely
+  unlikely.
+
+  **The lease is sized from the real worst case**, which is not
+  `attempts × timeout`: the seam sleeps *between* attempts, outside the
+  per-request timeout, so the budget is the grounding read plus
+  `attempts × timeout` plus `(attempts − 1) ×` the longest inter-attempt
+  sleep. Checked at boot, because a lease that expires mid-call produces no
+  error at all — a second pod reclaims a running job, both call the provider,
+  and the only symptom is the bill.
 
 - **Prompt injection is expected input, not an edge case.** Everything the
   copilot reasons over is attacker-influenced (token and ENS names, contract

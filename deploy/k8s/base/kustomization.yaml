@@ -33,6 +33,7 @@ resources:
   - services/notification.yaml
   - services/usage.yaml
   - services/predictive.yaml
+  - services/copilot.yaml
 
 # Dashboards/datasources feed both the compose Grafana and this in-cluster one
 # from the same source files (deploy/grafana/...) — one place to edit, no

@@ -73,3 +73,5 @@ images:
     newTag: dev
   - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/predictive
     newTag: dev
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/copilot
+    newTag: dev

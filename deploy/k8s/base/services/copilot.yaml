@@ -1,0 +1,103 @@
+# ── copilot (§20.4) — LLM investigation copilot: SAR-draft narratives ──
+# §20 "small pool (LLM calls are I/O-bound, never hot-path)". Two halves in
+# one pod: a thin IncidentCreated consumer that records draft jobs, and a
+# worker pool that drains them.
+#
+# Scaling shape: overlap-safe, so this rolls normally. Replicas are
+# interchangeable — the queue is `copilot_drafts` and claims are
+# `FOR UPDATE SKIP LOCKED` with a lease, so two pods never run the same draft,
+# and a pod killed mid-call leaves a lease that expires rather than losing the
+# work. Deliberately NOT autoscaled: what reaches the provider is
+# `replicas x COPILOT_WORKER_CONCURRENCY` against a rate limit that is
+# org-wide, so adding pods is a spend decision an operator makes, not one an
+# HPA should make from CPU (which is near zero — every worker is waiting on
+# I/O).
+#
+# `maxSurge: 0` on the rolling update for the same reason: a surge pod is
+# extra concurrency against that org-wide limit during every deploy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot
+  labels:
+    app.kubernetes.io/name: copilot
+spec:
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: copilot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: copilot
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: copilot
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # A draft in flight has already been paid for. The grace period covers
+      # the pool's drain window: SIGTERM stops claiming, in-flight calls
+      # finish and are written, and only then does the pod exit. Cutting it
+      # short would leave the answer unrecorded and the lease to expire —
+      # whoever reclaims it re-runs a call the platform already bought.
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: copilot
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/copilot:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config # COPILOT_EVENT_STORE_URL rides here
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            # The one required LLM value. A wrong key is a refused rollout:
+            # the binary verifies the credential and model at boot
+            # (`GET /v1/models/{id}`, no tokens), so readiness never flips on
+            # a pod that would fail on the first incident of the day.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: COPILOT_METRICS_ADDR
+              value: 0.0.0.0:9100
+          ports:
+            - name: health
+              containerPort: 8086
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

@@ -44,6 +44,8 @@ images:
     newTag: latest
   - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/predictive
     newTag: latest
+  - name: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/copilot
+    newTag: latest
 
 patches:
   # Production floor/ceiling bumps on the two HPA-scaled hot paths (§20:
