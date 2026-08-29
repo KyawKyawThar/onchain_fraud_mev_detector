@@ -61,6 +61,16 @@ pub enum UsageEventType {
     EntityQueried,
     WalletMevExposureQueried,
     TimingRecommendationQueried,
+    /// LLM tokens (§20.4). Four variants and not one, because the provider
+    /// prices them at four different rates — fresh input, generated output,
+    /// input written into the prompt cache, and input served from it. A single
+    /// "tokens" SKU could not be turned into a bill, and a metering fact that
+    /// can't be priced isn't metering. Emitted by `llm::MeteredClient`, the one
+    /// decorator every LLM call goes through.
+    LlmInputTokens,
+    LlmOutputTokens,
+    LlmCacheWriteTokens,
+    LlmCacheReadTokens,
 }
 
 impl UsageEventType {

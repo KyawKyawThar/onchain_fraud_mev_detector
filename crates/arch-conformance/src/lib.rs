@@ -179,6 +179,72 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── The shared resilience primitives stay primitive (§5, §20.4) ──
+        // `resilience` holds the circuit breaker and the retry/backoff policy
+        // that guard *every* call to something outside this system — an RPC
+        // endpoint, a model provider, and whatever comes next. It is a leaf,
+        // like `events`: pure state machines with the clock passed in, no I/O,
+        // no runtime. The moment it grows a workspace edge it stops being
+        // linkable from anywhere, and the copy-paste it was promoted to
+        // prevent comes straight back.
+        if krate == "resilience" {
+            let ws_deps: Vec<&str> = deps
+                .iter()
+                .map(String::as_str)
+                .filter(|d| members.contains(d))
+                .collect();
+            if !ws_deps.is_empty() {
+                out.push(format!(
+                    "resilience: must have no workspace dependencies (found {ws_deps:?}) — \
+                     the shared breaker/backoff primitives are a leaf so anything can \
+                     link them without inheriting a runtime"
+                ));
+            }
+        }
+
+        // ── The LLM seam stays a seam (§20.4) ────────────────────────────
+        // `llm` owns transport, retry policy and token accounting, and
+        // nothing else. Two directions matter:
+        //
+        // * it meters through `event-bus` (`UsageFact` over `EventSink`) — an
+        //   LLM-shaped second metering path would be a billing SKU nobody can
+        //   reconcile (§13), which is the same reason no producer hand-rolls
+        //   rdkafka;
+        // * it must not reach a store or a domain service. A seam that could
+        //   read the graph, the rule store, or `intelligence` would make "LLM
+        //   output is a proposal, never a fact" a convention instead of a
+        //   structural property: the copilot's safety argument rests on a
+        //   draft having to pass a validating boundary (the rule parser, a
+        //   human approval) that lives *above* this crate.
+        if krate == "llm" {
+            if !has("event-bus") {
+                out.push(format!(
+                    "{krate}: must meter token usage through the event-bus seam \
+                     (it has no event-bus dependency) — `UsageRecorded` has one \
+                     producer path (§13), not an LLM-specific one"
+                ));
+            }
+            for forbidden in [
+                "intelligence",
+                "rule-engine",
+                "simulation",
+                "sqlx",
+                "redis",
+                "clickhouse",
+                "rdkafka",
+                "lapin",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — the LLM seam owns \
+                         transport, retry and token accounting only (§20.4); reading \
+                         the audit stream, compiling a drafted rule and storing an \
+                         approval are the copilot service's job, above this seam"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -353,6 +419,19 @@ mod tests {
                 "rule-engine",
                 &["event-bus", "rdkafka", "sqlx", "db", "redis"],
             ),
+            (
+                "llm",
+                &[
+                    "events",
+                    "event-bus",
+                    "telemetry",
+                    "resilience",
+                    "bounded-map",
+                    "reqwest",
+                ],
+            ),
+            ("resilience", &[]),
+            ("ingestion", &["event-bus", "rdkafka", "resilience"]),
         ]);
         assert_eq!(violations(&g), Vec::<String>::new());
     }
@@ -413,6 +492,17 @@ mod tests {
                 "model serving is a pure function of a FeatureVector",
             ),
             ("inference", &["ort"], "no ml-features dependency"),
+            ("llm", &["events", "reqwest"], "no event-bus dependency"),
+            (
+                "llm",
+                &["event-bus", "intelligence"],
+                "owns transport, retry and token accounting only",
+            ),
+            (
+                "llm",
+                &["event-bus", "rule-engine"],
+                "compiling a drafted rule",
+            ),
         ];
         for (krate, deps, expected) in cases {
             let g = graph(&[(*krate, *deps)]);
@@ -431,6 +521,7 @@ mod tests {
             ("detector-api", &["events", "event-bus"]),
             ("telemetry", &[]),
             ("event-bus", &["events"]),
+            ("resilience", &["events"]),
         ]);
         let found = violations(&g);
         assert!(
@@ -443,6 +534,12 @@ mod tests {
             found
                 .iter()
                 .any(|v| v.contains("may depend on `events` only")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("resilience: must have no workspace dependencies")),
             "{found:?}"
         );
     }

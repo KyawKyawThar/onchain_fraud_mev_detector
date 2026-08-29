@@ -28,6 +28,13 @@ db        = { path = "crates/db" }
 # near-identical hand-rolled copies across intelligence/simulation/rule-engine/
 # notification (see crates/bounded-map/Cargo.toml) into one implementation.
 bounded-map = { path = "crates/bounded-map" }
+# Shared resilience primitives (§5, §20.4): the `CircuitBreaker` promoted out
+# of `ingestion::source::circuit` when the LLM seam became its second consumer,
+# plus the bounded/jittered/`retry-after`-capped `Backoff` policy. Pure state
+# machines with the clock passed in — no I/O, no runtime, so anything can link
+# it. The `db::redis` argument applied to concurrency logic: a hand-rolled copy
+# of a breaker or a backoff is a production incident nobody reviews.
+resilience = { path = "crates/resilience" }
 # Shared ClickHouse migration runner (§4/§14): one `Migrator` implementation
 # (apply/revert/status + the `migrate` CLI arm, with fail-fast set validation)
 # that event-store, simulation and intelligence each bind to their OWN
@@ -131,6 +138,15 @@ inference = { path = "crates/inference" }
 # binary, not a library other crates link: it is listed here only so the
 # workspace's crate inventory stays in one place.
 dataset = { path = "crates/dataset" }
+# LLM seam (§20.4, Sprint 20 t1) — the `LlmClient` trait the investigation
+# copilot programs against, its thin `reqwest` client over the Claude Messages
+# API (there is no official Anthropic Rust SDK), the metering decorator that
+# turns token usage into `UsageRecorded` facts (§13), and an in-memory double.
+# A *seam*, not a service: it owns transport, retry policy and token
+# accounting, and knows nothing about narratives, rule drafts or approvals —
+# which is what keeps §20.4's safety argument ("LLM output is a proposal, never
+# a fact") testable with no network in the test binary.
+llm = { path = "crates/llm" }
 
 # Errors.
 anyhow = "1"

@@ -1,0 +1,92 @@
+[package]
+name = "llm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The LLM seam (§20.4, Sprint 20 t1). `LlmClient` is to the copilot what
+# `InferenceEngine` is to an ML detector: one object-safe trait, one production
+# implementation (`AnthropicClient`, a thin `reqwest` client over the Claude
+# Messages API — there is no official Rust SDK), one in-memory double, and one
+# decorator that is the single place a call is measured and metered.
+#
+# Deliberately a *seam* crate, not a service: it owns the transport, the retry
+# policy and the token accounting, and knows nothing about narratives, rule
+# drafts, incidents or approvals — those are t2–t4's copilot service. That is
+# what keeps the grounding/parse-boundary logic (§20.4's whole safety argument)
+# unit-testable with no network anywhere near the test binary.
+
+[features]
+default = []
+# The shared in-memory `LlmClient` double, for the dev-dependencies of the
+# crates that consume the seam (the copilot service, and any test that wants a
+# scripted completion). Off by default so no test code ships in a binary.
+test-util = []
+
+[dependencies]
+# `CustomerId` (who a completion is metered to), `Chain` (the envelope's chain
+# stamp) and the closed `UsageEventType` vocabulary the token SKUs come from.
+events = { workspace = true }
+# Token usage is a `UsageRecorded` fact like every other billable quantity
+# (§13), so it ships through the one producer seam — `EventSink` +
+# `UsageFact::record`, never a second producer (see `MeteredClient`). This is
+# also where the shared `Transience` classification lives, which is what
+# `LlmError` implements so retry/skip decisions here can't drift from the rest
+# of the workspace.
+event-bus = { workspace = true }
+# `telemetry::env` — the shared fail-fast-at-boot config read.
+telemetry = { workspace = true }
+# The shared `CircuitBreaker` and the jittered/`retry-after`-capped `Backoff`
+# policy the retry and breaker decorators are built on. Shared rather than
+# hand-rolled: the same state machines guard §5's RPC endpoint pool, and a
+# divergent second copy of either is a production incident nobody reviews.
+resilience = { workspace = true }
+# The response cache is keyed by request digest, which a backfill can mint
+# millions of — so it is a bounded FIFO map, not a `HashMap` with a memory leak
+# in it. The crate that exists for exactly that discipline (§4/§19).
+bounded-map = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Per-call metrics recorded at the one call site `MeteredClient` owns, through
+# the facade that is a no-op until a binary installs the exporter (§8, §19).
+metrics = { workspace = true }
+serde = { workspace = true }
+# SHA-256 over the versioned prompt artifact and over a rendered request — the
+# same "artifact identity is a content hash" move as `detection::ConfigHash`,
+# `ml_features::FeatureSchema::content_hash` and
+# `inference::ModelDescriptor::content_hash`. A prompt digest is an audit
+# identifier stamped into every draft event (§20.4), and a request digest is a
+# cache key across tenants, so both are places collision-resistance matters.
+sha2 = { workspace = true }
+# Hex rendering of those digests at the edges — the same helper the three
+# hashes above use, so all of them render identically in logs and events.
+alloy-primitives = { workspace = true }
+# The Messages API wire form. `serde_json::Value` is also how a caller hands
+# in a structured-output JSON schema (t4's rule wire form) without this crate
+# taking a dependency on the rule model.
+serde_json = { workspace = true }
+# The HTTP client. Same `rustls` build every other outbound caller in the
+# workspace uses (no system OpenSSL — the self-contained-image stance).
+reqwest = { workspace = true }
+# The API key never reaches a `Debug` line or a log; `expose_secret()` is
+# required at the one place it becomes a header value.
+secrecy = { workspace = true }
+tokio = { workspace = true }
+# Cancellation: a retry backoff must not outlive a SIGTERM.
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+# Assert on the `UsageRecorded` facts the metering decorator publishes.
+event-bus = { workspace = true, features = ["test-util"] }
+# In-memory recorder so the metering tests assert on the series a scrape would
+# see — including that a *failed* call still counts, which is the
+# under-reporting conventions §14 exists to prevent.
+metrics-util = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

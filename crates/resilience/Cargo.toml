@@ -1,0 +1,29 @@
+[package]
+name = "resilience"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The shared "calling something that can be slow, rate-limited or down"
+# primitives: `CircuitBreaker` (promoted out of `ingestion::source::circuit`
+# when the LLM seam became its second consumer) and `Backoff` (the bounded,
+# *jittered*, retry-after-capped policy the workspace's four hand-rolled retry
+# loops approximate).
+#
+# The `db::redis` precedent, one layer up: connection setup and error
+# classification were consolidated because `intelligence::cache` and
+# `rule_engine::state_store` had already drifted into byte-identical
+# hand-rolled copies. A breaker and a backoff policy are the same kind of
+# thing — small, subtle concurrency state machines where a divergent copy is a
+# production incident nobody reviews, not a compile error.
+#
+# Deliberately dependency-free beyond `std`: every rule here is a pure
+# function of (state, time), with the clock passed *in* so the state machines
+# are deterministic and testable without sleeping. Nothing in this crate does
+# I/O, so anything in the workspace can link it without inheriting a runtime.
+
+[dependencies]
+
+[lints]
+workspace = true
