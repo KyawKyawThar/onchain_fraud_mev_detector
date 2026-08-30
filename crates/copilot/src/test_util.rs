@@ -21,14 +21,17 @@ use llm::{Completion, CompletionRequest, ContentDigest, PromptDescriptor, StopRe
 use uuid::Uuid;
 
 use crate::audit::{AuditError, AuditSource, AuditStream};
+use crate::grounding::GroundingPolicy;
 use crate::model::{
-    ClaimedJob, Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftStatus, Provenance, Review,
-    Reviewed,
+    ClaimedJob, Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus,
+    Provenance, Review, Reviewed,
 };
 use crate::store::{
-    status_for, DraftCache, DraftOutcome, DraftQueue, DraftReview, DraftWorkQueue, Enqueued,
-    StoreError,
+    batch_failure, DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftOutbox,
+    DraftOutcome, DraftQueue, DraftReview, DraftWorkQueue, Enqueued, Landing, LandingRule,
+    PendingAnnouncement, StoreError, MAX_LIST_LIMIT,
 };
+use llm::batch::{BatchId, BatchItemOutcome};
 
 /// A stand-in `EventEnvelope` for prompt/consumer tests — deliberately an
 /// event the copilot does *not* act on, so a test that asserts "nothing was
@@ -104,6 +107,7 @@ pub fn claimed(kind: DraftKind) -> ClaimedJob {
             subject_id: Uuid::from_u128(9),
             customer_id: None,
             chain: Chain::ETHEREUM,
+            source: DraftSource::Live,
         },
         attempts: 1,
         lease_expires_at: Utc::now(),
@@ -162,13 +166,68 @@ struct Row {
     model_digest: Option<ContentDigest>,
 }
 
+impl Row {
+    /// Apply a landing to this row — the double's mirror of the store's one
+    /// `SET` clause for an answered draft, including the citation check.
+    ///
+    /// Returns the announcement to file, when the landing produced one: the
+    /// Postgres store writes it into `copilot_outbox` in the same transaction,
+    /// so the double records it in the same call or the two backends would not
+    /// be answering the same contract.
+    fn apply(
+        &mut self,
+        landing: Landing,
+        completion: &Completion,
+        at: DateTime<Utc>,
+    ) -> Option<EventEnvelope> {
+        self.draft.status = landing.status;
+        self.draft.answer = Some(answer_from(completion, at));
+        self.draft.grounding = landing.grounding;
+        self.draft.grounded_event_ids = landing.grounded_event_ids;
+        self.draft.last_error = landing.last_error;
+        self.draft.updated_at = at;
+        self.lease_expires_at = None;
+
+        if self.draft.status != DraftStatus::Ready {
+            return None;
+        }
+        self.draft
+            .drafted_facts()
+            .and_then(crate::announce::drafted_envelope)
+    }
+}
+
 /// In-memory [`DraftStore`], with the real claim/lease and cache semantics.
+/// One filed announcement (`copilot_outbox`).
+#[derive(Debug, Clone)]
+struct OutboxRow {
+    id: i64,
+    envelope: EventEnvelope,
+    published: bool,
+}
+
+/// A Batch API job, as the double tracks it (`copilot_batches`).
+#[derive(Debug, Clone, Default)]
+struct BatchRow {
+    items: usize,
+    results_fetched: bool,
+    closed: Option<&'static str>,
+}
+
 #[derive(Debug, Default)]
 pub struct InMemoryDraftStore {
     rows: Mutex<HashMap<Uuid, Row>>,
     /// When set, every call fails with the given transience — how a test
     /// drives the consumer's retry-or-park decision.
     fail: Mutex<Option<bool>>,
+    /// The same landing rule the Postgres store composes, for the same reason:
+    /// every path that lands an answer must apply exactly one.
+    rule: Mutex<LandingRule>,
+    /// `copilot_outbox` — announcements filed by a landing, in order, with
+    /// the `published_at` stamp the flusher sets.
+    outbox: Mutex<Vec<OutboxRow>>,
+    /// `copilot_batches` — the Batch API jobs this store knows about.
+    batches: Mutex<HashMap<String, BatchRow>>,
 }
 
 impl InMemoryDraftStore {
@@ -176,6 +235,59 @@ impl InMemoryDraftStore {
     pub fn failing_transiently(self) -> Self {
         *self.fail.lock().unwrap() = Some(true);
         self
+    }
+
+    /// Override the grounding policy (mirrors
+    /// [`crate::store::PgDraftStore::with_grounding`]).
+    pub fn with_grounding(self, policy: GroundingPolicy) -> Self {
+        *self.rule.lock().unwrap() = LandingRule::new(policy);
+        self
+    }
+
+    fn rule(&self) -> LandingRule {
+        *self.rule.lock().unwrap()
+    }
+
+    /// How many drafts a submitted batch carried, as `attach_batch` recorded
+    /// it — the double's `copilot_batches.items`, for asserting a submit was
+    /// registered with the size it claimed.
+    pub fn batch_items(&self, batch_id: &str) -> Option<usize> {
+        self.batches
+            .lock()
+            .unwrap()
+            .get(batch_id)
+            .map(|batch| batch.items)
+    }
+
+    /// Announcements filed by a landing, oldest first — the double's
+    /// `copilot_outbox`, for asserting that a ready narrative announced itself
+    /// exactly once.
+    pub fn announcements(&self) -> Vec<EventEnvelope> {
+        self.outbox
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.envelope.clone())
+            .collect()
+    }
+
+    /// File an announcement, deduplicated by draft id exactly as the outbox's
+    /// `ON CONFLICT (draft_id) DO NOTHING` does.
+    fn file_announcement(&self, envelope: Option<EventEnvelope>, draft_id: DraftId) {
+        let Some(envelope) = envelope else { return };
+        let mut outbox = self.outbox.lock().unwrap();
+        let already = outbox.iter().any(|row| match &row.envelope.payload {
+            events::DomainEvent::IncidentNarrativeDrafted(event) => event.draft_id == draft_id.0,
+            _ => false,
+        });
+        if !already {
+            let id = outbox.len() as i64 + 1;
+            outbox.push(OutboxRow {
+                id,
+                envelope,
+                published: false,
+            });
+        }
     }
 
     /// Every draft, oldest first.
@@ -232,12 +344,15 @@ impl DraftQueue for InMemoryDraftStore {
                     subject_id: job.subject_id,
                     customer_id: job.customer_id,
                     chain: job.chain,
+                    source: job.source,
                     status: DraftStatus::Queued,
                     attempts: 0,
                     provenance: None,
                     answer: None,
                     review: None,
                     grounded_event_ids: Vec::new(),
+                    grounding: None,
+                    batch_id: None,
                     last_error: None,
                     created_at: at,
                     updated_at: at,
@@ -271,7 +386,7 @@ impl DraftWorkQueue for InMemoryDraftStore {
 
         for row in rows
             .values_mut()
-            .filter(|row| kinds.contains(&row.draft.kind))
+            .filter(|row| kinds.contains(&row.draft.kind) && row.draft.source == DraftSource::Live)
         {
             let expired = row.lease_expires_at.is_none_or(|expires| expires < at);
             // Both runnable statuses, not just `in_flight`: a transiently
@@ -290,6 +405,7 @@ impl DraftWorkQueue for InMemoryDraftStore {
             .values_mut()
             .filter(|row| {
                 kinds.contains(&row.draft.kind)
+                    && row.draft.source == DraftSource::Live
                     && row.draft.attempts < max_attempts
                     && (row.draft.status == DraftStatus::Queued
                         || (row.draft.status == DraftStatus::InFlight
@@ -313,6 +429,7 @@ impl DraftWorkQueue for InMemoryDraftStore {
                         subject_id: row.draft.subject_id,
                         customer_id: row.draft.customer_id,
                         chain: row.draft.chain,
+                        source: row.draft.source,
                     },
                     attempts: row.draft.attempts,
                     lease_expires_at: at + lease,
@@ -320,7 +437,10 @@ impl DraftWorkQueue for InMemoryDraftStore {
             })
             .collect())
     }
+}
 
+#[async_trait]
+impl DraftAttempt for InMemoryDraftStore {
     async fn begin_attempt(
         &self,
         draft_id: DraftId,
@@ -350,29 +470,29 @@ impl DraftWorkQueue for InMemoryDraftStore {
         at: DateTime<Utc>,
     ) -> Result<DraftStatus, StoreError> {
         self.guard()?;
-        self.with_row(draft_id, |row| {
-            let status = match &outcome {
-                DraftOutcome::Completed(completion) => {
-                    let status = status_for(&completion.stop_reason);
-                    row.draft.answer = Some(answer_from(completion, at));
-                    row.draft.last_error = (!completion.stop_reason.is_complete())
-                        .then(|| format!("unusable answer: {}", completion.stop_reason.as_str()));
-                    status
-                }
-                DraftOutcome::Failed { reason, permanent } => {
-                    row.draft.last_error = Some(reason.clone());
-                    if *permanent {
-                        DraftStatus::Failed
-                    } else {
-                        DraftStatus::Queued
-                    }
-                }
-            };
-            row.draft.status = status;
-            row.draft.updated_at = at;
-            row.lease_expires_at = None;
-            status
-        })
+        let rule = self.rule();
+        let (status, announcement) = self.with_row(draft_id, |row| match outcome {
+            DraftOutcome::Completed(completion) => {
+                let landing =
+                    rule.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
+                let status = landing.status;
+                (status, row.apply(landing, &completion, at))
+            }
+            DraftOutcome::Failed { reason, permanent } => {
+                let status = if permanent {
+                    DraftStatus::Failed
+                } else {
+                    DraftStatus::Queued
+                };
+                row.draft.last_error = Some(reason);
+                row.draft.status = status;
+                row.draft.updated_at = at;
+                row.lease_expires_at = None;
+                (status, None)
+            }
+        })?;
+        self.file_announcement(announcement, draft_id);
+        Ok(status)
     }
 
     async fn release(&self, draft_id: DraftId, at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -421,17 +541,22 @@ impl DraftCache for InMemoryDraftStore {
         self.guard()?;
         let mut rows = self.rows.lock().unwrap();
         let mut landed = 0u64;
+        let rule = self.rule();
+        let mut announcements: Vec<(DraftId, Option<EventEnvelope>)> = Vec::new();
         for row in rows.values_mut() {
             if row.request_digest == Some(key.request_digest())
                 && row.model_digest == Some(key.model_digest())
                 && row.draft.status == DraftStatus::InFlight
             {
-                row.draft.status = status_for(&completion.stop_reason);
-                row.draft.answer = Some(answer_from(completion, at));
-                row.draft.updated_at = at;
-                row.lease_expires_at = None;
+                let landing = rule.apply(row.draft.kind, &row.draft.grounded_event_ids, completion);
+                let draft_id = row.draft.draft_id;
+                announcements.push((draft_id, row.apply(landing, completion, at)));
                 landed += 1;
             }
+        }
+        drop(rows);
+        for (draft_id, envelope) in announcements {
+            self.file_announcement(envelope, draft_id);
         }
         Ok(landed)
     }
@@ -477,5 +602,261 @@ impl DraftReview for InMemoryDraftStore {
             .unwrap()
             .get(&draft_id.0)
             .map(|row| row.draft.clone()))
+    }
+
+    async fn list(&self, filter: &DraftFilter) -> Result<Vec<Draft>, StoreError> {
+        self.guard()?;
+        let mut drafts: Vec<Draft> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|row| row.draft.clone())
+            .filter(|draft| filter.status.is_none_or(|status| status == draft.status))
+            .filter(|draft| filter.kind.is_none_or(|kind| kind == draft.kind))
+            .filter(|draft| filter.source.is_none_or(|source| source == draft.source))
+            .filter(|draft| {
+                filter
+                    .subject_id
+                    .is_none_or(|subject| subject == draft.subject_id)
+            })
+            .collect();
+        // Newest first, exactly as the store's `ORDER BY created_at DESC`.
+        drafts.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.draft_id.0.cmp(&a.draft_id.0))
+        });
+        drafts.truncate(filter.limit.clamp(1, MAX_LIST_LIMIT) as usize);
+        Ok(drafts)
+    }
+}
+
+#[async_trait]
+impl DraftBatchQueue for InMemoryDraftStore {
+    async fn claim_for_batch(
+        &self,
+        limit: usize,
+        lease: std::time::Duration,
+        max_attempts: i32,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<ClaimedJob>, StoreError> {
+        self.guard()?;
+        let lease = chrono::Duration::from_std(lease)
+            .map_err(|err| StoreError::malformed(format!("lease: {err}")))?;
+        let mut rows = self.rows.lock().unwrap();
+        let mut claimable: Vec<&mut Row> = rows
+            .values_mut()
+            .filter(|row| {
+                row.draft.source == DraftSource::Backfill
+                    && row.draft.attempts < max_attempts
+                    && (row.draft.status == DraftStatus::Queued
+                        || (row.draft.status == DraftStatus::InFlight
+                            && row.lease_expires_at.is_some_and(|expires| expires < at)))
+            })
+            .collect();
+        claimable.sort_by_key(|row| (row.draft.created_at, row.draft.draft_id.0));
+
+        Ok(claimable
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                row.draft.status = DraftStatus::InFlight;
+                row.draft.attempts += 1;
+                row.draft.updated_at = at;
+                row.lease_expires_at = Some(at + lease);
+                ClaimedJob {
+                    job: DraftJob {
+                        draft_id: row.draft.draft_id,
+                        kind: row.draft.kind,
+                        subject_id: row.draft.subject_id,
+                        customer_id: row.draft.customer_id,
+                        chain: row.draft.chain,
+                        source: row.draft.source,
+                    },
+                    attempts: row.draft.attempts,
+                    lease_expires_at: at + lease,
+                }
+            })
+            .collect())
+    }
+
+    async fn attach_batch(
+        &self,
+        draft_ids: &[DraftId],
+        batch_id: &BatchId,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.guard()?;
+        self.batches
+            .lock()
+            .unwrap()
+            .entry(batch_id.0.clone())
+            .or_insert_with(|| BatchRow {
+                items: draft_ids.len(),
+                ..BatchRow::default()
+            });
+        for draft_id in draft_ids {
+            self.with_row(*draft_id, |row| {
+                row.draft.batch_id = Some(batch_id.0.clone());
+                row.draft.updated_at = at;
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn open_batches(&self) -> Result<Vec<BatchId>, StoreError> {
+        self.guard()?;
+        let batches = self.batches.lock().unwrap();
+        let mut ids: Vec<String> = batches
+            .iter()
+            .filter(|(_, batch)| batch.closed.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids.into_iter().map(BatchId).collect())
+    }
+
+    async fn claim_results_fetch(
+        &self,
+        batch_id: &BatchId,
+        _at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.guard()?;
+        let mut batches = self.batches.lock().unwrap();
+        let batch = batches.entry(batch_id.0.clone()).or_default();
+        if batch.results_fetched {
+            return Ok(false);
+        }
+        batch.results_fetched = true;
+        Ok(true)
+    }
+
+    async fn close_batch(
+        &self,
+        batch_id: &BatchId,
+        reason: &'static str,
+        _at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.guard()?;
+        let mut batches = self.batches.lock().unwrap();
+        let batch = batches.entry(batch_id.0.clone()).or_default();
+        if batch.closed.is_none() {
+            batch.closed = Some(reason);
+        }
+        Ok(())
+    }
+
+    async fn release_batch_stragglers(
+        &self,
+        batch_id: &BatchId,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        self.guard()?;
+        let mut rows = self.rows.lock().unwrap();
+        let mut released = 0u64;
+        for row in rows.values_mut() {
+            if row.draft.batch_id.as_deref() == Some(batch_id.0.as_str())
+                && row.draft.status == DraftStatus::InFlight
+            {
+                row.draft.status = DraftStatus::Queued;
+                row.draft.batch_id = None;
+                row.draft.last_error = Some(reason.to_owned());
+                row.draft.updated_at = at;
+                row.lease_expires_at = None;
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    async fn land_batch_outcome(
+        &self,
+        draft_id: DraftId,
+        batch_id: &BatchId,
+        outcome: BatchItemOutcome,
+        at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.guard()?;
+        let rule = self.rule();
+        let mut announcement = None;
+        let landed = self.with_row(draft_id, |row| {
+            if row.draft.batch_id.as_deref() != Some(batch_id.0.as_str())
+                || row.draft.status != DraftStatus::InFlight
+            {
+                return false;
+            }
+            match outcome {
+                BatchItemOutcome::Answered(completion) => {
+                    let landing =
+                        rule.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
+                    announcement = row.apply(landing, &completion, at);
+                }
+                other => {
+                    row.draft.last_error = Some(batch_failure(&other));
+                    if other.is_retryable() {
+                        row.draft.status = DraftStatus::Queued;
+                        row.draft.batch_id = None;
+                    } else {
+                        row.draft.status = DraftStatus::Failed;
+                    }
+                    row.lease_expires_at = None;
+                    row.draft.updated_at = at;
+                }
+            }
+            true
+        })?;
+        self.file_announcement(announcement, draft_id);
+        Ok(landed)
+    }
+}
+
+#[async_trait]
+impl DraftOutbox for InMemoryDraftStore {
+    async fn pending_announcements(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingAnnouncement>, StoreError> {
+        self.guard()?;
+        self.outbox
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| !row.published)
+            .take(limit.max(1) as usize)
+            .map(|row| {
+                Ok(PendingAnnouncement {
+                    id: row.id,
+                    envelope: serde_json::to_value(&row.envelope)
+                        .map_err(|err| StoreError::malformed(format!("envelope: {err}")))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn mark_announced(&self, id: i64, _at: DateTime<Utc>) -> Result<(), StoreError> {
+        self.guard()?;
+        if let Some(row) = self
+            .outbox
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row.id == id)
+        {
+            row.published = true;
+        }
+        Ok(())
+    }
+
+    async fn pending_announcement_count(&self) -> Result<i64, StoreError> {
+        self.guard()?;
+        Ok(self
+            .outbox
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| !row.published)
+            .count() as i64)
     }
 }

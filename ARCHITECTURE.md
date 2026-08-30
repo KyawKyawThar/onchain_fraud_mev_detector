@@ -1199,6 +1199,35 @@ A separate service consuming `IncidentCreated` and reading the audit stream
   before leaving the platform. Backfill over historical incidents runs
   through the Batch API at half cost — narrative generation is never
   latency-critical.
+
+  **The citation contract is enforced, not requested.** A narrative has no
+  compiler, and "a human reads it" is a boundary that degrades with queue
+  depth, so the drafted text is parsed back: its inline `[uuid, …]` citations
+  are checked against the audit window the model was actually shown, the
+  draft's `grounded_event_ids` is narrowed from that window to what the text
+  cites, and a draft citing an event it was never shown — a fabricated
+  reference, which looks verifiable until someone tries to look it up — lands
+  `blocked` rather than in a reviewer's queue. That is the narrative's
+  analogue of the rule parse boundary below: the same statement a refusal
+  makes, for the same reason. The threshold on *how much* must be cited is
+  deliberately below 100%, because the prompt itself requires uncitable
+  sentences (saying plainly what the record does not establish).
+
+  The event carries a **reference** to the draft plus the provenance triple
+  (`model_id`, `prompt_version`, prompt digest) and the grounded ids — never
+  the prose: an unapproved, machine-written document has no business being
+  replicated into an immutable audit log as if it were evidence. It is written
+  into `copilot_outbox` **in the same transaction as the landing** and drained
+  onto Kafka by a flusher — the same transactional-outbox shape `rule_outbox`
+  uses (§20), because a narrative reaching `ready` and the audit trail hearing
+  about it are one fact, not two.
+
+  Approval is a store-side flip over the copilot's own review API, and nothing
+  auto-delivers. **The reviewer's identity comes from a verified JWT**, not a
+  request field: an approval signed with a name the caller chose is not an
+  audit record. Bearer verification is shared (`crates/auth`) so the platform
+  has one issuer and one claim set; each service then interprets `sub` for
+  itself (a billing customer for the metered API, a person for the copilot).
 - **Natural-language rule creation.** "Alert me when any wallet within 2 hops
   of a sanctioned address moves more than $10K into our pools" → the model
   emits the rule engine's wire form under a structured-output schema → the

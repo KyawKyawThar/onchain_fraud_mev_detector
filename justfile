@@ -429,6 +429,32 @@ run-notification:
 notification-ping:
     cargo run -p notification -- ping
 
+# Run the LLM investigation copilot (§20.4, Sprint 20). Consumes
+# IncidentCreated, drafts a SAR narrative from the incident's audit stream,
+# checks every claim's citations against the events the model was shown, and
+# holds the draft at `ready` until a human approves it over the review API
+# (COPILOT_HTTP_ADDR + COPILOT_REVIEW_TOKEN; Swagger at /swagger-ui).
+# Needs Postgres + Kafka up, `just migrate-up` applied, event-store running,
+# and ANTHROPIC_API_KEY set — boot verifies the credential and the model.
+run-copilot:
+    cargo run -p copilot
+
+# Probe the copilot's Postgres schema AND its model credential (costs no
+# tokens) — the two things a misconfigured deployment gets wrong quietly.
+copilot-ping:
+    cargo run -p copilot -- ping
+
+# §20.4 historical narrative backfill, through the Batch API at HALF price.
+# A job, not a service: bounded window, safe to re-run (idempotent per
+# incident) and safe to interrupt (an outstanding batch is resumed from its
+# stored id, never submitted — or paid for — twice). Omit the window to draft
+# the whole archive.
+#   just copilot-backfill 2026-01-01T00:00:00Z 2026-02-01T00:00:00Z
+copilot-backfill from="" to="":
+    cargo run -p copilot -- backfill \
+        {{ if from == "" { "" } else { "--from " + from } }} \
+        {{ if to == "" { "" } else { "--to " + to } }}
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon
@@ -584,7 +610,7 @@ backtest-accept-snapshot:
 # docker matrix). Each entry is `bin[:features[:runtime]]`; detection carries
 # its feature flags inline and builds on the `onnx` runtime flavour, which adds
 # the pinned ONNX Runtime the ML detector loads (§20.2, deploy/Dockerfile).
-k8s_bins := "server ingestion detection:detection/detectors,detection/anomaly:onnx event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive"
+k8s_bins := "server ingestion detection:detection/detectors,detection/anomaly:onnx event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive copilot"
 k8s_image := "ghcr.io/kyawkyawthar/onchain_fraud_mev_detector"
 
 # Build every service image locally (:dev) and load it into the kind cluster —

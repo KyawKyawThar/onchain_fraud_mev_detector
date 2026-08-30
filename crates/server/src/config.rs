@@ -7,6 +7,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+/// Re-exported: JWT verification is shared (`crates/auth`), so this service
+/// configures it but does not define it.
+pub use auth::JwtConfig;
 use secrecy::SecretString;
 
 /// Broadcast channel capacity for `WS /v1/stream` when `WS_ALERT_CHANNEL_CAPACITY`
@@ -102,24 +105,6 @@ pub struct KafkaConfig {
     /// Consumer-group id — restarts resume from committed offsets. Distinct
     /// from event-store's group so the two consumers advance independently.
     pub group_id: String,
-}
-
-/// JWT bearer verification settings (§11). No issuance here — see `src/auth.rs`.
-#[derive(Clone)]
-pub struct JwtConfig {
-    /// HMAC signing secret. Secret — `Debug` redacts it.
-    pub secret: SecretString,
-    /// Expected `iss` claim; a token from anywhere else is rejected.
-    pub issuer: String,
-}
-
-impl std::fmt::Debug for JwtConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JwtConfig")
-            .field("secret", &"[redacted]")
-            .field("issuer", &self.issuer)
-            .finish()
-    }
 }
 
 impl Config {

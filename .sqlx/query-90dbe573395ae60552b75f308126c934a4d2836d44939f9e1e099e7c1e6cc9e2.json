@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts\n                SET status = $1, updated_at = $2, lease_expires_at = NULL,\n                    last_error = COALESCE(last_error, 'attempts exhausted')\n              WHERE status = ANY($3::TEXT[])\n                AND kind = ANY($5::TEXT[])\n                AND source = $6\n                AND attempts >= $4\n                AND (lease_expires_at IS NULL OR lease_expires_at < $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "TextArray",
+        "Int4",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "90dbe573395ae60552b75f308126c934a4d2836d44939f9e1e099e7c1e6cc9e2"
+}

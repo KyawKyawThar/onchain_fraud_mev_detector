@@ -94,6 +94,52 @@ pub const BREAKER_STATE: &str = "llm_breaker_state";
 /// rate — the number the provider's rate limit is spent against — wrong.
 pub const CACHE_TOTAL: &str = "llm_cache_total";
 
+/// Counter: requests handed to the Batch API, labeled `{purpose}` (§20.4's
+/// half-price backfill). Distinct from [`CALLS_TOTAL`] because a batched
+/// request is a different price *and* a different latency class — folding the
+/// two would make both the spend view and the latency view meaningless.
+pub const BATCH_SUBMITTED_TOTAL: &str = "llm_batch_submitted_total";
+
+/// Counter: batch items that came back, labeled `{purpose, outcome}` where
+/// outcome is `answered`/`errored`/`canceled`/`expired`. The gap between this
+/// and [`BATCH_SUBMITTED_TOTAL`] is the backlog still running server-side.
+pub const BATCH_ITEMS_TOTAL: &str = "llm_batch_items_total";
+
+/// Counter: batch tokens, labeled `{model, purpose, kind}` — the same four
+/// kinds as [`TOKENS_TOTAL`], kept in their own family because they bill at
+/// half rate. A dashboard that summed them together would be wrong by up to
+/// 2x, in a direction that depends on the traffic mix.
+pub const BATCH_TOKENS_TOTAL: &str = "llm_batch_tokens_total";
+
+/// Requests accepted into a batch. Single call site:
+/// [`crate::batch::MeteredBatchClient`].
+pub fn record_batch_submitted(purpose: &'static str, items: u64) {
+    metrics::counter!(BATCH_SUBMITTED_TOTAL, "purpose" => purpose).increment(items);
+}
+
+/// One batch item's outcome. Single call site:
+/// [`crate::batch::MeteredBatchClient`].
+pub fn record_batch_item(purpose: &'static str, outcome: &'static str) {
+    metrics::counter!(BATCH_ITEMS_TOTAL, "purpose" => purpose, "outcome" => outcome).increment(1);
+}
+
+/// One answered batch item's tokens. Single call site:
+/// [`crate::batch::MeteredBatchClient`].
+pub fn record_batch_tokens(model: &str, purpose: &'static str, usage: &TokenUsage) {
+    for (kind, tokens) in token_kinds(usage) {
+        if tokens == 0 {
+            continue;
+        }
+        metrics::counter!(
+            BATCH_TOKENS_TOTAL,
+            "model" => model.to_owned(),
+            "purpose" => purpose,
+            "kind" => kind,
+        )
+        .increment(tokens);
+    }
+}
+
 /// One retry attempt. Single call site: [`crate::RetryingClient`].
 pub fn record_retry(purpose: &'static str, reason: &'static str) {
     metrics::counter!(RETRIES_TOTAL, "purpose" => purpose, "reason" => reason).increment(1);

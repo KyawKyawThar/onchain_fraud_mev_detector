@@ -33,6 +33,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # Shared HTTP handler-error type (§11) — see crates/api-error.
 api-error = { workspace = true }
+# Shared JWT verification (§11) — this service adds only the customer-UUID rule.
+auth = { workspace = true }
 
 # HTTP server. axum + tower-http mirror event-store's own stack; utoipa/-swagger-ui/
 # -axum give this public surface the same OpenAPI/Swagger docs event-store's append

@@ -202,6 +202,30 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── Auth is verified in one place (§11) ─────────────────────────
+        // `auth` holds the JWT verification every service that authenticates a
+        // caller shares — signature, expiry, issuer, claims. A leaf like
+        // `resilience`, for the same reason: it must be linkable from a
+        // service without dragging a runtime in, and a second copy of "is this
+        // token real" is a second answer to a question that must have one.
+        //
+        // It also must never gain issuance. A library that can both mint and
+        // verify invites a service to trust a token it minted for itself,
+        // which is not authentication.
+        if krate == "auth" {
+            let ws_deps: Vec<&str> = deps
+                .iter()
+                .map(String::as_str)
+                .filter(|d| members.contains(d))
+                .collect();
+            if !ws_deps.is_empty() {
+                out.push(format!(
+                    "auth: must have no workspace dependencies (found {ws_deps:?}) — \
+                     shared bearer verification is a leaf so any service can link it"
+                ));
+            }
+        }
+
         // ── The LLM seam stays a seam (§20.4) ────────────────────────────
         // `llm` owns transport, retry policy and token accounting, and
         // nothing else. Two directions matter:

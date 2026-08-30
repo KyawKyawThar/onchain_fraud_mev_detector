@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(request.purpose, "incident_narrative");
         assert_eq!(
             request.prompt.map(|p| p.version()),
-            Some("v1"),
+            Some("v2"),
             "the artifact, not an inline string, carries the instructions"
         );
         let system = request

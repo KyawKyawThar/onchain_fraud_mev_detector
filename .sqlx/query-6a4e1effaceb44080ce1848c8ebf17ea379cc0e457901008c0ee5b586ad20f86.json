@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO copilot_outbox (draft_id, envelope, created_at)\n             VALUES ($1, $2, $3)\n             ON CONFLICT (draft_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6a4e1effaceb44080ce1848c8ebf17ea379cc0e457901008c0ee5b586ad20f86"
+}

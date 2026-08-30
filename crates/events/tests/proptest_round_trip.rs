@@ -864,7 +864,55 @@ fn cross_chain_event() -> impl Strategy<Value = DomainEvent> {
     ]
 }
 
-/// Every `DomainEvent` variant, uniformly across the eight families.
+/// AI copilot (§20.4): `IncidentNarrativeDrafted`.
+fn copilot_event() -> impl Strategy<Value = DomainEvent> {
+    (
+        incident_id(),
+        uuid(),
+        any::<String>(),
+        any::<String>(),
+        any::<String>(),
+        any::<u32>(),
+        prop::collection::vec(uuid(), 0..4),
+        prop_oneof![
+            Just(events::copilot::NarrativeSource::Live),
+            Just(events::copilot::NarrativeSource::Backfill),
+        ],
+        timestamp(),
+    )
+        .prop_map(
+            |(
+                incident_id,
+                draft_id,
+                narrative_ref,
+                model_id,
+                prompt_id,
+                claims,
+                grounded_event_ids,
+                source,
+                drafted_at,
+            )| {
+                DomainEvent::IncidentNarrativeDrafted(events::copilot::IncidentNarrativeDrafted {
+                    incident_id,
+                    draft_id,
+                    narrative_ref,
+                    model_id,
+                    prompt_id,
+                    prompt_version: "v2".into(),
+                    prompt_digest: "3f9c".into(),
+                    // Cited claims can never exceed the claims made: the
+                    // generator asserts the invariant the parser produces.
+                    cited_claims: claims,
+                    claims,
+                    grounded_event_ids,
+                    source,
+                    drafted_at,
+                })
+            },
+        )
+}
+
+/// Every `DomainEvent` variant, uniformly across the nine families.
 fn domain_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
         chain_event(),
@@ -874,6 +922,7 @@ fn domain_event() -> impl Strategy<Value = DomainEvent> {
         rule_engine_event(),
         system_event(),
         predictive_event(),
+        copilot_event(),
         cross_chain_event(),
     ]
 }

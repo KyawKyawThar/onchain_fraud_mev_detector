@@ -6,9 +6,21 @@
 //! (`strum`), the same reason `notification::model::ChannelKind` is.
 
 use chrono::{DateTime, Utc};
+use events::copilot::NarrativeSource;
 use events::primitives::{Chain, CustomerId, IncidentId};
 use llm::{StopReason, TokenUsage};
 use uuid::Uuid;
+
+use crate::grounding::GroundingSummary;
+
+/// Which path a draft is produced by — the synchronous worker pool, or the
+/// half-price Batch API backfill (§20.4).
+///
+/// This is [`events::copilot::NarrativeSource`] and not a second enum beside
+/// it: the column, the claim filter and the emitted event all mean the same
+/// thing by it, and a copy would eventually disagree with the wire form about
+/// what `"backfill"` is.
+pub type DraftSource = NarrativeSource;
 
 /// A draft's identity. Minted once at enqueue and stable across every retry —
 /// a redelivered `IncidentCreated` resolves to the *existing* id (see
@@ -126,6 +138,67 @@ impl DraftStatus {
         self.into()
     }
 
+    /// Whether `self -> next` is a transition the lifecycle allows.
+    ///
+    /// The state machine written down once, instead of implied by a `WHERE
+    /// status = …` clause in each of the store's writes. Those clauses stay —
+    /// they are what makes each write atomic — but this is the table they must
+    /// agree with, and [`Self::transitions`] is the test that they do.
+    ///
+    /// Reading it as a graph: work is claimed (`queued -> in_flight`) and
+    /// either comes back with an answer (`ready`/`blocked`), fails
+    /// (`failed`), or is handed back (`in_flight -> queued`, a release or a
+    /// transient fault). Only `ready` is reviewable, and a review is
+    /// terminal — there is no path out of `approved`/`rejected`, because a
+    /// regulatory document that could be un-approved is not an audit trail.
+    pub fn can_transition(self, next: DraftStatus) -> bool {
+        use DraftStatus::*;
+        match (self, next) {
+            // The claim, and the two ways a claim comes back without an
+            // answer: released (no attempt consumed) or transiently failed.
+            (Queued, InFlight) | (InFlight, Queued) => true,
+            // An answer landed — usable, or billed-but-unusable.
+            (InFlight, Ready | Blocked) => true,
+            // A permanent fault, or the attempt ceiling retiring a draft that
+            // is still runnable.
+            (Queued | InFlight, Failed) => true,
+            // The §20.4 boundary: a human decides, once.
+            (Ready, Approved | Rejected) => true,
+            // An operator requeues a terminal draft (a new prompt version, a
+            // provider outage that has since cleared). Deliberately allowed
+            // from `failed` and `blocked` — and deliberately *not* from a
+            // reviewed one.
+            (Failed | Blocked, Queued) => true,
+            _ => false,
+        }
+    }
+
+    /// Every legal transition, for tests and for documentation that cannot go
+    /// stale.
+    pub fn transitions() -> Vec<(DraftStatus, DraftStatus)> {
+        use strum::IntoEnumIterator;
+        DraftStatus::iter()
+            .flat_map(|from| DraftStatus::iter().map(move |to| (from, to)))
+            .filter(|(from, to)| from.can_transition(*to))
+            .collect()
+    }
+
+    /// Whether a human may still decide on this draft (§20.4).
+    pub fn is_reviewable(self) -> bool {
+        matches!(self, DraftStatus::Ready)
+    }
+
+    /// Whether the lifecycle is over unless an operator intervenes.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            DraftStatus::Failed
+                | DraftStatus::Blocked
+                | DraftStatus::Approved
+                | DraftStatus::Rejected
+        )
+    }
+
     /// Whether a worker may still pick this draft up. Only these two states
     /// are scanned by the claim query — everything else is terminal or
     /// already reviewed.
@@ -164,6 +237,12 @@ pub struct DraftJob {
     /// no customer in scope — which is every incident-stream draft today.
     pub customer_id: Option<CustomerId>,
     pub chain: Chain,
+    /// Which path must drain this job. Load-bearing, not descriptive: the
+    /// synchronous pool claims only `live` rows and the backfill only
+    /// `backfill` ones, so a historical draft cannot be picked up by a worker
+    /// and paid for at full price (§20.4 — backfill is half price precisely
+    /// because nobody is waiting for it).
+    pub source: DraftSource,
 }
 
 impl DraftJob {
@@ -175,6 +254,16 @@ impl DraftJob {
             subject_id: incident_id.0,
             customer_id: None,
             chain,
+            source: DraftSource::Live,
+        }
+    }
+
+    /// The same job, for an incident being backfilled from the archive —
+    /// drained through the Batch API instead of the worker pool.
+    pub fn backfilled_narrative(incident_id: IncidentId, chain: Chain) -> Self {
+        Self {
+            source: DraftSource::Backfill,
+            ..Self::narrative(incident_id, chain)
         }
     }
 }
@@ -260,6 +349,7 @@ pub struct Draft {
     pub subject_id: Uuid,
     pub customer_id: Option<CustomerId>,
     pub chain: Chain,
+    pub source: DraftSource,
     pub status: DraftStatus,
     pub attempts: i32,
     /// The prompt half of §20.4's provenance triple; the model half lives on
@@ -271,9 +361,23 @@ pub struct Draft {
     pub answer: Option<DraftAnswer>,
     /// `None` until a human decides. Nothing in this service ever sets it.
     pub review: Option<Reviewed>,
-    /// The event ids the model was grounded in (§20.4). t3 narrows this from
-    /// "the window it was shown" to "the ids the narrative cites".
+    /// The event ids this draft stands on (§20.4).
+    ///
+    /// Two meanings, in sequence, and the transition is the point: the worker
+    /// writes the *window* it showed the model before the call (so the draft
+    /// records what it was allowed to see), and the landing narrows it to the
+    /// ids the narrative actually **cites** ([`crate::grounding`]). Keeping
+    /// the window first is what makes the narrowing checkable — a citation
+    /// outside it is a fabrication, not a wider view.
     pub grounded_event_ids: Vec<Uuid>,
+    /// What the citation check found. `None` until a call has landed, and for
+    /// kinds that make no citable claims.
+    pub grounding: Option<GroundingSummary>,
+    /// The Batch API job this draft rode, if it was backfilled. Durable state,
+    /// not a log line: a backfill process that dies mid-run recovers its
+    /// outstanding batches from this column rather than submitting (and
+    /// paying for) them a second time.
+    pub batch_id: Option<String>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -294,6 +398,42 @@ impl Draft {
     /// question anything downstream of the copilot is allowed to act on.
     pub fn is_approved(&self) -> bool {
         matches!(self.status, DraftStatus::Approved)
+    }
+
+    /// The incident this narrative is about, for a draft that is one.
+    pub fn incident_id(&self) -> Option<IncidentId> {
+        (self.kind == DraftKind::IncidentNarrative).then_some(IncidentId(self.subject_id))
+    }
+
+    /// The facts an `IncidentNarrativeDrafted` is built from, once this draft
+    /// has an answer and an attributable prompt.
+    ///
+    /// The store's landing path builds the same announcement from raw columns
+    /// inside its transaction; this is the read-side equivalent, so the two
+    /// can be tested against each other rather than trusted to agree.
+    pub fn drafted_facts(&self) -> Option<crate::announce::DraftedFacts<'_>> {
+        Some(crate::announce::DraftedFacts {
+            draft_id: self.draft_id,
+            kind: self.kind,
+            subject_id: self.subject_id,
+            chain: self.chain,
+            source: self.source,
+            provenance: self.provenance.as_ref()?,
+            model: self.answer.as_ref()?.model.as_str(),
+            completed_at: self.answer.as_ref()?.completed_at,
+            grounding: self.grounding.as_ref(),
+            grounded_event_ids: &self.grounded_event_ids,
+        })
+    }
+
+    /// Where a reviewer reads and approves this draft — the `narrative_ref`
+    /// carried on `IncidentNarrativeDrafted`.
+    ///
+    /// A reference and not the prose: an unapproved machine-written document
+    /// has no business being replicated into an immutable audit log (see
+    /// [`events::copilot`]).
+    pub fn narrative_ref(&self) -> String {
+        format!("copilot://drafts/{}", self.draft_id)
     }
 }
 
@@ -346,6 +486,51 @@ mod tests {
             );
         }
         assert_eq!(listed.len(), DraftKind::iter().count());
+    }
+
+    /// The transitions the store's `WHERE status = …` clauses are allowed to
+    /// perform. If a write starts doing something this table forbids, one of
+    /// the two is wrong — and this is where the argument happens.
+    #[test]
+    fn the_lifecycle_graph_is_the_one_the_store_writes() {
+        use DraftStatus::*;
+        for (from, to) in [
+            (Queued, InFlight),
+            (InFlight, Ready),
+            (InFlight, Blocked),
+            (InFlight, Failed),
+            (InFlight, Queued),
+            (Queued, Failed),
+            (Ready, Approved),
+            (Ready, Rejected),
+            (Failed, Queued),
+            (Blocked, Queued),
+        ] {
+            assert!(from.can_transition(to), "{from:?} -> {to:?} must be legal");
+        }
+
+        // A review is final: nothing may walk an approved narrative back into
+        // the queue, or re-decide one that was rejected.
+        for from in [Approved, Rejected] {
+            for to in DraftStatus::iter() {
+                assert!(
+                    !from.can_transition(to),
+                    "{from:?} -> {to:?} must not be legal: a decided draft is decided"
+                );
+            }
+        }
+        // …and nothing skips the claim.
+        assert!(!Queued.can_transition(Ready));
+        assert!(!Queued.can_transition(Approved));
+        // A landed draft is not reviewable until it is `ready`.
+        assert!(Ready.is_reviewable());
+        for status in [Queued, InFlight, Blocked, Failed, Approved, Rejected] {
+            assert!(
+                !status.is_reviewable(),
+                "{status:?} has no answer to approve"
+            );
+        }
+        assert!(!DraftStatus::transitions().is_empty());
     }
 
     #[test]

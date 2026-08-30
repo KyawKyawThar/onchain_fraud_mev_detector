@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT batch_id FROM copilot_batches\n              WHERE closed_at IS NULL\n              ORDER BY submitted_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_batches",
+            "name": "batch_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5eb285739517cf38479532da49c064a2fd1adcba4c059c40817243fc94425534"
+}

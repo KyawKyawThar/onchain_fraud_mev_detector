@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO copilot_batches (batch_id, items, submitted_at)\n             VALUES ($1, $2, $3)\n             ON CONFLICT (batch_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39189b985cf24376d39d2d444371a220a539f0c911b7446b9925b5155a2109be"
+}

@@ -19,6 +19,8 @@
 //! what lets the same struct be the wire format *and* the stored record.
 
 pub mod chain;
+/// AI copilot events (§20.4) — what the model drafted, from what.
+pub mod copilot;
 pub mod cross_chain;
 pub mod detection;
 pub mod intelligence;
@@ -237,6 +239,9 @@ pub enum DomainEvent {
     LiquidationRiskPredicted(predictive::LiquidationRiskPredicted),
     LiquidationCascadeWarned(predictive::LiquidationCascadeWarned),
 
+    // AI copilot (§20.4)
+    IncidentNarrativeDrafted(copilot::IncidentNarrativeDrafted),
+
     // Cross-chain (§24)
     BridgeMevDetected(cross_chain::BridgeMevDetected),
     CrossChainMevDetected(cross_chain::CrossChainMevDetected),
@@ -260,6 +265,12 @@ pub enum EventFamily {
     RuleEngine,
     System,
     Predictive,
+    /// §20.4 — the LLM copilot's audit records. Its own family and not
+    /// `System`: these are the only events on the backbone a *model* had a
+    /// hand in, and the one question every reader of them starts with is
+    /// exactly that. A consumer routing on family should never have to
+    /// re-derive "was this machine-drafted?" from an event type list.
+    Copilot,
     CrossChain,
 }
 
@@ -319,6 +330,7 @@ impl DomainEvent {
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
+            IncidentNarrativeDrafted(_) => EventFamily::Copilot,
             BridgeMevDetected(_) | CrossChainMevDetected(_) | CrossChainFindingRetracted(_) => {
                 EventFamily::CrossChain
             }
@@ -343,6 +355,11 @@ impl DomainEvent {
             IncidentFinalized(e) => Some(e.incident_id),
             AttributionUpdated(e) => Some(e.incident_id),
             AttributionRetracted(e) => Some(e.incident_id),
+            // The drafting record joins the incident's own audit trail: "a
+            // narrative was drafted from these events, by this model" is part
+            // of that incident's history, and a reviewer pulling the trail
+            // must see it beside the events it cites.
+            IncidentNarrativeDrafted(e) => Some(e.incident_id),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -439,6 +456,11 @@ impl DomainEvent {
             BridgeMevDetected(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
             CrossChainMevDetected(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
             CrossChainFindingRetracted(e) => Some(PartitionKey::CrossChainFinding(e.finding_id)),
+            // Keyed by the incident, like the rest of that incident's
+            // lifecycle: a re-draft (an operator requeued the draft) must land
+            // on the same partition as the first, so a reader sees the two in
+            // the order they were produced rather than in broker order.
+            IncidentNarrativeDrafted(e) => Some(PartitionKey::Incident(e.incident_id)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -524,6 +546,10 @@ impl DomainEvent {
             | RuleAlertCreated(_)
             | UsageRecorded(_)
             | CrossChainFindingRetracted(_)
+            // §20.4 rule 3: the platform names behaviour, not actors — the
+            // narrative prompt forbids attributing activity to a named party,
+            // and the drafting record carries no address for the same reason.
+            | IncidentNarrativeDrafted(_)
             // Attribution-blind by construction: §20.1 features are structural
             // and statistical, never "which address did something" (there is a
             // property test in `ml-features` for exactly this), so a drift

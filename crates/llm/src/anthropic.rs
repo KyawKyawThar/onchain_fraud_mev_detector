@@ -27,8 +27,13 @@
 //!
 //! **The Batch API** — §20.4's historical backfill runs at half cost through
 //! batches, but that is a different endpoint with a different lifecycle
-//! (submit → poll → fetch results), which belongs with the backfill job that
-//! needs it (t3) rather than in the synchronous seam every caller holds.
+//! (submit → poll → fetch results) and therefore a different seam:
+//! [`crate::batch`]. It shares this module's *wire form* — [`messages_body`],
+//! [`into_completion`] and [`classify_status`] are `pub(crate)` for exactly
+//! that — because a batched request and a synchronous one must be the same
+//! request, or a backfill silently drafts under different rules than the live
+//! path. It shares nothing else: the lifecycle, the polling and the half-price
+//! metering are the batch client's own.
 
 use std::time::Duration;
 
@@ -43,7 +48,7 @@ use crate::config::{LlmConfig, ANTHROPIC_VERSION, SERVER_SIDE_FALLBACK_BETA};
 // ── Wire form (private: a detail of this backend, not of the seam) ─────────
 
 #[derive(Serialize)]
-struct MessagesRequest<'a> {
+pub(crate) struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     messages: &'a [Message],
@@ -60,7 +65,7 @@ struct MessagesRequest<'a> {
 }
 
 #[derive(Serialize)]
-struct SystemBlock<'a> {
+pub(crate) struct SystemBlock<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     text: &'a str,
@@ -69,13 +74,13 @@ struct SystemBlock<'a> {
 }
 
 #[derive(Serialize)]
-struct CacheControl {
+pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     kind: &'static str,
 }
 
 #[derive(Serialize)]
-struct ThinkingBlock {
+pub(crate) struct ThinkingBlock {
     #[serde(rename = "type")]
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +88,7 @@ struct ThinkingBlock {
 }
 
 #[derive(Serialize)]
-struct OutputConfig<'a> {
+pub(crate) struct OutputConfig<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,14 +96,14 @@ struct OutputConfig<'a> {
 }
 
 #[derive(Serialize)]
-struct OutputFormat<'a> {
+pub(crate) struct OutputFormat<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     schema: &'a serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct MessagesResponse {
+pub(crate) struct MessagesResponse {
     #[serde(default)]
     model: String,
     #[serde(default)]
@@ -118,7 +123,7 @@ struct MessagesResponse {
 /// takes.
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum ContentBlock {
+pub(crate) enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(other)]
@@ -126,13 +131,13 @@ enum ContentBlock {
 }
 
 #[derive(Deserialize)]
-struct StopDetails {
+pub(crate) struct StopDetails {
     #[serde(default)]
     category: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
-struct WireUsage {
+pub(crate) struct WireUsage {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
@@ -145,12 +150,12 @@ struct WireUsage {
 
 /// The API's error body (`{"type":"error","error":{"type":..,"message":..}}`).
 #[derive(Deserialize)]
-struct ErrorEnvelope {
+pub(crate) struct ErrorEnvelope {
     error: ErrorBody,
 }
 
 #[derive(Deserialize)]
-struct ErrorBody {
+pub(crate) struct ErrorBody {
     #[serde(default)]
     message: String,
 }
@@ -234,7 +239,28 @@ impl AnthropicClient {
         &self.config
     }
 
+    /// This backend's body for one request: the configured model, and refusal
+    /// fallbacks when the deployment asked for them.
     fn build_body<'a>(&'a self, request: &'a CompletionRequest) -> MessagesRequest<'a> {
+        messages_body(&self.config, request, self.config.fallbacks)
+    }
+}
+
+/// The Messages API body shared by the synchronous backend and the Batch API
+/// ([`crate::batch`]).
+///
+/// `fallbacks` is a parameter and not read from the config, because of one
+/// wire rule that is invisible until it 400s: **the `fallbacks` parameter is
+/// rejected by the Batches API.** The synchronous path wants it on by default
+/// (an incident narrative is exactly the shape that draws a false-positive
+/// decline); a batched request carrying it is refused outright. One function,
+/// two callers, one explicit flag — rather than two bodies that drift.
+pub(crate) fn messages_body<'a>(
+    config: &'a LlmConfig,
+    request: &'a CompletionRequest,
+    fallbacks: bool,
+) -> MessagesRequest<'a> {
+    {
         let thinking = match request.thinking {
             Thinking::Adaptive => Some(ThinkingBlock {
                 kind: "adaptive",
@@ -252,7 +278,7 @@ impl AnthropicClient {
 
         let effort = request
             .effort
-            .or(self.config.effort)
+            .or(config.effort)
             .map(|effort| effort.as_wire_str());
         let format = request.json_schema.as_ref().map(|schema| OutputFormat {
             kind: "json_schema",
@@ -264,8 +290,8 @@ impl AnthropicClient {
             (effort.is_some() || format.is_some()).then_some(OutputConfig { effort, format });
 
         MessagesRequest {
-            model: &self.config.model,
-            max_tokens: request.max_tokens.unwrap_or(self.config.max_tokens),
+            model: &config.model,
+            max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
             messages: &request.messages,
             system: request.system.as_ref().map(|system| {
                 [SystemBlock {
@@ -276,10 +302,12 @@ impl AnthropicClient {
             }),
             thinking,
             output_config,
-            fallbacks: self.config.fallbacks.then_some("default"),
+            fallbacks: fallbacks.then_some("default"),
         }
     }
+}
 
+impl AnthropicClient {
     /// One HTTP attempt.
     async fn post_completion(&self, request: &CompletionRequest) -> Result<Completion, LlmError> {
         let mut post = self
@@ -339,7 +367,7 @@ impl LlmClient for AnthropicClient {
 /// The split that matters is 429/5xx (theirs, retriable) vs. 4xx (ours,
 /// never). 408 and 409 sit on the transient side with the 5xx family: both are
 /// timing, not a malformed request.
-fn classify_status(status: u16, body: &str, retry_after: Option<Duration>) -> LlmError {
+pub(crate) fn classify_status(status: u16, body: &str, retry_after: Option<Duration>) -> LlmError {
     let reason = error_message(body);
     match status {
         401 | 403 => LlmError::Auth { reason },
@@ -353,7 +381,7 @@ fn classify_status(status: u16, body: &str, retry_after: Option<Duration>) -> Ll
 /// The API's `error.message` when the body is the documented error envelope,
 /// otherwise the raw body — truncated, because an HTML error page from a proxy
 /// is not worth 40KB of log line.
-fn error_message(body: &str) -> String {
+pub(crate) fn error_message(body: &str) -> String {
     match serde_json::from_str::<ErrorEnvelope>(body) {
         Ok(envelope) if !envelope.error.message.is_empty() => envelope.error.message,
         _ => body.chars().take(500).collect(),
@@ -363,7 +391,7 @@ fn error_message(body: &str) -> String {
 /// `retry-after`, in the delta-seconds form the API uses. An HTTP-date form
 /// (also legal per RFC 9110) parses to `None` and simply falls back to our own
 /// backoff — a wrong wait is worse than a default one.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -374,7 +402,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn into_completion(response: MessagesResponse) -> Completion {
+pub(crate) fn into_completion(response: MessagesResponse) -> Completion {
     // Text blocks only: thinking and fallback-boundary blocks are not the
     // answer, and nothing downstream should be able to quote them as one.
     let text = response

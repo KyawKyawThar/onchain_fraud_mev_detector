@@ -105,17 +105,16 @@ impl<C: LlmClient> MeteredClient<C> {
     }
 
     async fn meter(&self, request: &CompletionRequest, usage: &TokenUsage) {
-        for (event_type, quantity) in usage_facts(usage) {
-            if quantity == 0 {
-                continue;
-            }
-            let mut fact = UsageFact::new(event_type, quantity);
-            if let Some(customer_id) = request.customer_id {
-                fact = fact.for_customer(customer_id);
-            }
-            fact.record(&*self.sink, self.chain, self.backoff, &self.shutdown)
-                .await;
-        }
+        publish_usage(
+            &*self.sink,
+            self.chain,
+            self.backoff,
+            &self.shutdown,
+            request.customer_id,
+            usage,
+            Billing::Standard,
+        )
+        .await;
     }
 }
 
@@ -172,25 +171,77 @@ impl<C: LlmClient> LlmClient for MeteredClient<C> {
     }
 }
 
+/// Which price list a call's tokens are billed against.
+///
+/// The Batch API charges half of the synchronous rate, so the two cannot share
+/// a SKU: a `llm_input_tokens` quantity that silently mixes both is only
+/// priceable if the reader also knows the split, which is the very thing the
+/// fold threw away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Billing {
+    /// A synchronous `POST /v1/messages` call.
+    Standard,
+    /// A request that rode the Batch API ([`crate::batch`]) at half price.
+    Batch,
+}
+
 /// One call's usage as billable §13 facts — the same four kinds, in the same
 /// order, as [`crate::metrics::token_kinds`].
 ///
 /// Four SKUs and not one, because they are four different rates: a bill cannot
 /// be reconstructed from a single "tokens" number, and a metering event that
-/// can't be priced is not metering.
-fn usage_facts(usage: &TokenUsage) -> [(UsageEventType, u64); 4] {
-    [
-        (UsageEventType::LlmInputTokens, usage.input_tokens),
-        (UsageEventType::LlmOutputTokens, usage.output_tokens),
-        (
+/// can't be priced is not metering. `billing` picks which of the two price
+/// lists those four SKUs name.
+pub(crate) fn usage_facts(usage: &TokenUsage, billing: Billing) -> [(UsageEventType, u64); 4] {
+    let (input, output, cache_write, cache_read) = match billing {
+        Billing::Standard => (
+            UsageEventType::LlmInputTokens,
+            UsageEventType::LlmOutputTokens,
             UsageEventType::LlmCacheWriteTokens,
-            usage.cache_creation_input_tokens,
-        ),
-        (
             UsageEventType::LlmCacheReadTokens,
-            usage.cache_read_input_tokens,
         ),
+        Billing::Batch => (
+            UsageEventType::LlmBatchInputTokens,
+            UsageEventType::LlmBatchOutputTokens,
+            UsageEventType::LlmBatchCacheWriteTokens,
+            UsageEventType::LlmBatchCacheReadTokens,
+        ),
+    };
+    [
+        (input, usage.input_tokens),
+        (output, usage.output_tokens),
+        (cache_write, usage.cache_creation_input_tokens),
+        (cache_read, usage.cache_read_input_tokens),
     ]
+}
+
+/// Publish one call's usage as `UsageRecorded` facts.
+///
+/// The single metering write in this crate, shared by [`MeteredClient`] and
+/// [`crate::batch::MeteredBatchClient`] — a second copy for the batch path is
+/// how the two would come to disagree about what a zero-token kind, or a
+/// customer-less platform call, means (§13).
+pub(crate) async fn publish_usage(
+    sink: &dyn EventSink,
+    chain: Chain,
+    backoff: Duration,
+    shutdown: &CancellationToken,
+    customer_id: Option<events::primitives::CustomerId>,
+    usage: &TokenUsage,
+    billing: Billing,
+) {
+    for (event_type, quantity) in usage_facts(usage, billing) {
+        // A zero-token kind is not a fact: an envelope saying "0 cache writes"
+        // costs a partition write and tells a bill nothing.
+        if quantity == 0 {
+            continue;
+        }
+        let mut fact = UsageFact::new(event_type, quantity);
+        if let Some(customer_id) = customer_id {
+            fact = fact.for_customer(customer_id);
+        }
+        fact.record(sink, chain, backoff, shutdown).await;
+    }
 }
 
 #[cfg(test)]
@@ -402,15 +453,29 @@ mod tests {
             cache_read_input_tokens: 4,
         };
         let kinds = crate::metrics::token_kinds(&usage);
-        let facts = usage_facts(&usage);
-        for (i, (event_type, quantity)) in facts.iter().enumerate() {
-            assert_eq!(*quantity, kinds[i].1);
-            assert!(
-                event_type.as_wire_str().contains(kinds[i].0),
-                "{} should describe the {} kind",
-                event_type.as_wire_str(),
-                kinds[i].0
-            );
+        for billing in [Billing::Standard, Billing::Batch] {
+            let facts = usage_facts(&usage, billing);
+            for (i, (event_type, quantity)) in facts.iter().enumerate() {
+                assert_eq!(*quantity, kinds[i].1);
+                assert!(
+                    event_type.as_wire_str().contains(kinds[i].0),
+                    "{} should describe the {} kind",
+                    event_type.as_wire_str(),
+                    kinds[i].0
+                );
+            }
         }
+
+        // …and the two price lists must not share a single SKU: a batched
+        // token costs half a synchronous one.
+        let standard: Vec<&str> = usage_facts(&usage, Billing::Standard)
+            .iter()
+            .map(|(event_type, _)| event_type.as_wire_str())
+            .collect();
+        let batch: Vec<&str> = usage_facts(&usage, Billing::Batch)
+            .iter()
+            .map(|(event_type, _)| event_type.as_wire_str())
+            .collect();
+        assert!(batch.iter().all(|sku| !standard.contains(sku)), "{batch:?}");
     }
 }
