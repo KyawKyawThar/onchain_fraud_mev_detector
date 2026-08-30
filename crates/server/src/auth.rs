@@ -1,97 +1,75 @@
-//! JWT bearer verification (§11) — the public API service's end-user auth
-//! gate. Every `/v1` route requires a valid `Authorization: Bearer <jwt>`;
-//! `/healthz` is the only open route (see `http.rs`).
+//! The API service's JWT gate (§11) — the shared verifier, plus the one rule
+//! that is this service's alone.
 //!
-//! No issuance/login endpoint: no user/tenant store exists yet, so a token is
-//! assumed to have been minted elsewhere against the same `JWT_SECRET`/
-//! `JWT_ISSUER`. This module only validates — signature (HS256), expiry, and
-//! issuer.
+//! Signature, expiry and issuer checking live in the workspace's [`auth`]
+//! crate, because a second service (the §20.4 copilot's review API) has to
+//! answer "who is this" the *same* way. What stays here is the part that is
+//! only true of this service: `sub` must be a billing customer's UUID (§13),
+//! because every call it serves is metered against one — so a token whose
+//! `sub` is not a customer is rejected outright, an unmeterable call on a
+//! metered product being an invalid credential rather than a free one.
+//!
+//! No issuance endpoint: tokens are minted elsewhere against the same
+//! `JWT_SECRET`/`JWT_ISSUER`. This module only validates.
 
+use auth::{AuthError, JwtConfig};
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use events::primitives::CustomerId;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use secrecy::ExposeSecret;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::JwtConfig;
+/// Re-exported so existing call sites (and tests) keep naming one type.
+pub use auth::Claims;
 
-/// The claims this service expects. `sub` is the billing customer's UUID
-/// ([`CustomerId`], §13) — every authenticated call is metered against it
-/// (see `usage.rs`), so a token whose `sub` isn't a UUID is rejected outright:
-/// an unmeterable call on a metered product is an invalid credential, not a
-/// free one. `exp`/`iss` are enforced by [`jsonwebtoken::decode`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
-    pub iss: String,
-}
-
-/// Middleware: require a valid bearer JWT or reject with 401. Mirrors the
-/// shape of event-store's `require_write_token`, just JWT instead of a static
-/// shared secret. On success, inserts the token's [`CustomerId`] as a request
-/// extension so downstream layers (usage metering, `usage.rs`) know who
-/// called without re-parsing the token.
+/// Middleware: require a valid bearer JWT whose `sub` is a customer UUID, or
+/// reject with 401. On success, inserts the [`CustomerId`] as a request
+/// extension so downstream layers (usage metering, `usage.rs`) know who called
+/// without re-parsing the token.
 pub async fn require_jwt(State(jwt): State<JwtConfig>, mut req: Request, next: Next) -> Response {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-
-    let Some(token) = presented else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let Some(token) = auth::bearer(req.headers()) else {
+        return AuthError::Missing.into_response();
+    };
+    let claims = match auth::verify(token, &jwt) {
+        Ok(claims) => claims,
+        Err(err) => return err.into_response(),
     };
 
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.set_issuer(&[&jwt.issuer]);
-
-    let key = DecodingKey::from_secret(jwt.secret.expose_secret().as_bytes());
-    match decode::<Claims>(token, &key, &validation) {
-        Ok(data) => {
-            let Ok(customer) = Uuid::parse_str(&data.claims.sub) else {
-                tracing::warn!(
-                    sub = %data.claims.sub,
-                    "bearer token rejected: sub is not a customer UUID (unmeterable, §13)"
-                );
-                return StatusCode::UNAUTHORIZED.into_response();
-            };
-            // The nil UUID is reserved: `crates/usage`'s ClickHouse store uses it
-            // as the sentinel for system-wide usage that has no customer at all
-            // (`UsageRecorded.customer_id: None` — see `events::system::
-            // UsageRecorded` and `usage::store::NIL_CUSTOMER`). A real customer
-            // minted with this id would be indistinguishable from that system
-            // bucket in every usage query, so it's rejected here — the one place
-            // every `CustomerId` in the system originates from.
-            if customer.is_nil() {
-                tracing::warn!(
-                    "bearer token rejected: sub is the nil UUID (reserved for system usage, §13)"
-                );
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
-            req.extensions_mut().insert(CustomerId(customer));
-            next.run(req).await
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "bearer token rejected");
-            StatusCode::UNAUTHORIZED.into_response()
-        }
+    let Ok(customer) = Uuid::parse_str(&claims.sub) else {
+        tracing::warn!(
+            sub = %claims.sub,
+            "bearer token rejected: sub is not a customer UUID (unmeterable, §13)"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // The nil UUID is reserved: `crates/usage`'s ClickHouse store uses it as
+    // the sentinel for system-wide usage that has no customer at all
+    // (`UsageRecorded.customer_id: None`). A real customer minted with this id
+    // would be indistinguishable from that system bucket in every usage query,
+    // so it is rejected here — the one place every `CustomerId` originates.
+    if customer.is_nil() {
+        tracing::warn!(
+            "bearer token rejected: sub is the nil UUID (reserved for system usage, §13)"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
     }
+    req.extensions_mut().insert(CustomerId(customer));
+    req.extensions_mut().insert(claims);
+    next.run(req).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::http::header;
     use axum::http::Request as HttpRequest;
     use axum::middleware;
     use axum::routing::get;
     use axum::Router;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use secrecy::ExposeSecret;
     use secrecy::SecretString;
     use tower::ServiceExt;
 

@@ -36,6 +36,14 @@ pub enum ApiError {
     #[error("{0}")]
     NotFound(String),
 
+    /// 409 — the request is well-formed and addresses something real, but the
+    /// resource is not in a state that admits it (approving a draft that has
+    /// no usable answer, §20.4). Distinct from a 400 (the request is fine) and
+    /// from a 404 (the thing exists): the caller's *timing or expectation* is
+    /// wrong, and the detail says which state it is actually in.
+    #[error("{0}")]
+    Conflict(String),
+
     /// 413 — the request body exceeds a service-defined limit.
     #[error("{0}")]
     PayloadTooLarge(String),
@@ -75,6 +83,12 @@ impl ApiError {
         Self::NotFound(message.to_string())
     }
 
+    /// 409 — the addressed resource exists but is in the wrong state for this
+    /// request. The detail should name the state it is actually in.
+    pub fn conflict(message: impl std::fmt::Display) -> Self {
+        Self::Conflict(message.to_string())
+    }
+
     /// 413 — the request exceeds a size/count limit `message` describes.
     pub fn payload_too_large(message: impl std::fmt::Display) -> Self {
         Self::PayloadTooLarge(message.to_string())
@@ -103,6 +117,7 @@ impl ApiError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -135,6 +150,7 @@ mod tests {
     fn each_constructor_maps_to_its_documented_status() {
         assert_eq!(ApiError::bad_request("x").status(), StatusCode::BAD_REQUEST);
         assert_eq!(ApiError::not_found("x").status(), StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::conflict("x").status(), StatusCode::CONFLICT);
         assert_eq!(
             ApiError::payload_too_large("x").status(),
             StatusCode::PAYLOAD_TOO_LARGE

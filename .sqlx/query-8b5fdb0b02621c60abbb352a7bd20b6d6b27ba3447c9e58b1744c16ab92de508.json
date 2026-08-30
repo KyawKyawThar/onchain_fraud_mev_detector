@@ -1,0 +1,114 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT draft_id, kind, subject_id, chain, source, prompt_id, prompt_digest,\n                  grounded_event_ids\n             FROM copilot_drafts\n            WHERE draft_id = $1\n              AND ($2::TEXT IS NULL OR (batch_id = $2 AND status = $3))\n            FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "draft_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "chain",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "chain"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "prompt_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "prompt_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "prompt_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "prompt_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "grounded_event_ids",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "grounded_event_ids"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "8b5fdb0b02621c60abbb352a7bd20b6d6b27ba3447c9e58b1744c16ab92de508"
+}

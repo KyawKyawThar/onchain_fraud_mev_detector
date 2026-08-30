@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_batches\n                SET closed_at = $1, closed_reason = $2\n              WHERE batch_id = $3 AND closed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a70a811632e100e38a6411282b557983853f22276eb878fb1f87e89304d20f2"
+}

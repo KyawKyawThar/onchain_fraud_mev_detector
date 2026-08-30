@@ -18,6 +18,8 @@ use llm::LlmConfig;
 use secrecy::SecretString;
 use telemetry::env::{parse_or as env_parse, required as env};
 
+use crate::backfill::BackfillConfig;
+use crate::grounding::{GroundingPolicy, DEFAULT_MIN_CITED_RATIO};
 use crate::worker::{CallBudget, PoolConfig};
 
 /// Backstop poll interval when `COPILOT_POLL_INTERVAL_SECS` is unset. The
@@ -39,6 +41,15 @@ const DEFAULT_MAX_ATTEMPTS: i32 = 3;
 /// org-wide, so the default is deliberately timid.
 const DEFAULT_CONCURRENCY: usize = 2;
 
+/// Default lease for a draft handed to the Batch API. Longer than the API's
+/// own 24-hour deadline, because the lease has to cover the job *and* the poll
+/// that lands its results.
+const DEFAULT_BATCH_LEASE_SECS: u64 = 25 * 60 * 60;
+
+/// Default gap between batch status polls. Minutes, not seconds: a batch takes
+/// an hour or more, and polling it faster spends rate limit on nothing.
+const DEFAULT_BATCH_POLL_SECS: u64 = 60;
+
 /// All runtime configuration for the §20.4 copilot service.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -58,8 +69,27 @@ pub struct Config {
     /// incident arrives — so this is a deployment label, not a routing key.
     pub chain: Chain,
     pub pool: PoolConfig,
+    /// How strictly a landed narrative is held to its citations (§20.4).
+    pub grounding: GroundingPolicy,
+    /// The Batch API backfill's pacing (the `backfill` subcommand).
+    pub backfill: BackfillConfig,
     /// Address the Prometheus `/metrics` endpoint binds to (§19).
     pub metrics_addr: SocketAddr,
+    /// The draft review API, when a deployment serves one. `None` (the
+    /// default) serves nothing — the API is opt-in the way `HEALTH_ADDR` is,
+    /// so a dev run does not silently expose an approval endpoint.
+    pub http: Option<HttpConfig>,
+}
+
+/// The review API's listener and its verdict gate.
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
+    pub addr: SocketAddr,
+    /// How a reviewer's JWT is verified (§11, the shared `auth` crate). The
+    /// token's `sub` becomes the reviewer recorded on the draft, so this is
+    /// what makes "who approved this narrative" an authenticated fact rather
+    /// than a request field. Required whenever the API is served.
+    pub jwt: auth::JwtConfig,
 }
 
 /// How to reach Kafka.
@@ -102,10 +132,41 @@ impl Config {
                 )?
                 .max(1),
             },
+            grounding: GroundingPolicy {
+                min_cited_ratio: env_parse("COPILOT_MIN_CITED_RATIO", DEFAULT_MIN_CITED_RATIO)?,
+                // Not configurable, deliberately: a citation that does not
+                // resolve is a fabricated reference, and there is no
+                // deployment for which accepting one is the right answer.
+                reject_unknown: true,
+                enforced: env_parse("COPILOT_REQUIRE_GROUNDING", true)?,
+            },
+            backfill: BackfillConfig {
+                batch_size: env_parse("COPILOT_BATCH_SIZE", crate::backfill::DEFAULT_BATCH_SIZE)?
+                    .max(1),
+                lease: Duration::from_secs(env_parse(
+                    "COPILOT_BATCH_LEASE_SECS",
+                    DEFAULT_BATCH_LEASE_SECS,
+                )?),
+                poll_interval: Duration::from_secs(
+                    env_parse("COPILOT_BATCH_POLL_SECS", DEFAULT_BATCH_POLL_SECS)?.max(1),
+                ),
+                max_attempts: env_parse("COPILOT_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)?.max(1),
+                max_audit_events: env_parse(
+                    "COPILOT_MAX_AUDIT_EVENTS",
+                    crate::audit::DEFAULT_MAX_EVENTS,
+                )?
+                .max(1),
+                page_size: env_parse(
+                    "COPILOT_BACKFILL_PAGE_SIZE",
+                    crate::backfill::DEFAULT_PAGE_SIZE,
+                )?
+                .max(1),
+            },
             metrics_addr: env_parse(
                 "COPILOT_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9113)),
             )?,
+            http: http_from_env()?,
             llm,
         };
         config.validate()?;
@@ -138,6 +199,11 @@ impl Config {
         }
     }
 
+    /// The review API's state, if this deployment serves one.
+    pub fn http(&self) -> Option<&HttpConfig> {
+        self.http.as_ref()
+    }
+
     /// The one cross-cutting check: a lease must outlast the worst-case job.
     /// A shorter lease lets a second pod reclaim a job that is still running,
     /// and both pay for the same narrative — a failure that shows up as a
@@ -159,8 +225,54 @@ impl Config {
             budget.attempts.saturating_sub(1),
             budget.gap.as_secs(),
         );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.grounding.min_cited_ratio),
+            "COPILOT_MIN_CITED_RATIO ({}) must be a share between 0 and 1",
+            self.grounding.min_cited_ratio,
+        );
+        // The Batch API's own deadline is 24 hours. A lease that expires
+        // before it lets a second run claim a draft the provider is still
+        // working on, and the platform pays for both.
+        anyhow::ensure!(
+            self.backfill.lease >= Duration::from_secs(24 * 60 * 60),
+            "COPILOT_BATCH_LEASE_SECS ({}s) is shorter than the Batch API's own 24h deadline — \
+             a backfill draft whose lease expires while the batch is still running would be \
+             claimed and submitted a second time, paying twice for one narrative",
+            self.backfill.lease.as_secs(),
+        );
         Ok(())
     }
+}
+
+/// The review API's config, or `None` when `COPILOT_HTTP_ADDR` is unset.
+///
+/// The token is required the moment the address is set — fail at boot rather
+/// than serve an ungated approval endpoint.
+fn http_from_env() -> Result<Option<HttpConfig>> {
+    let Some(addr) = std::env::var("COPILOT_HTTP_ADDR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("env var COPILOT_HTTP_ADDR ({addr})"))?;
+    let secret = env("JWT_SECRET").context(
+        "COPILOT_HTTP_ADDR is set, so JWT_SECRET/JWT_ISSUER are required — the approve/reject \
+         routes are what let a machine-written SAR narrative leave the platform (§20.4), and \
+         the token's subject is the reviewer recorded against that decision. They are not \
+         served unauthenticated",
+    )?;
+    let issuer =
+        env("JWT_ISSUER").context("COPILOT_HTTP_ADDR is set, so JWT_ISSUER is required")?;
+    Ok(Some(HttpConfig {
+        addr,
+        jwt: auth::JwtConfig {
+            secret: SecretString::from(secret),
+            issuer,
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -187,7 +299,10 @@ mod tests {
                 lease,
                 ..PoolConfig::default()
             },
+            grounding: GroundingPolicy::default(),
+            backfill: BackfillConfig::default(),
             metrics_addr: SocketAddr::from(([0, 0, 0, 0], 9113)),
+            http: None,
         }
     }
 
@@ -212,6 +327,38 @@ mod tests {
         )
         .validate()
         .expect("the shipped defaults are self-consistent");
+    }
+
+    /// The batch lease has to outlast the provider's own deadline, or a
+    /// running job is claimed and submitted twice.
+    #[test]
+    fn a_batch_lease_shorter_than_the_api_deadline_is_refused_at_boot() {
+        let mut config = config(
+            Duration::from_secs(DEFAULT_LEASE_SECS),
+            Duration::from_secs(300),
+            3,
+        );
+        config.backfill.lease = Duration::from_secs(60 * 60);
+        let err = config.validate().expect_err("must refuse");
+        assert!(
+            err.to_string().contains("COPILOT_BATCH_LEASE_SECS"),
+            "{err}"
+        );
+
+        config.backfill.lease = Duration::from_secs(DEFAULT_BATCH_LEASE_SECS);
+        config.validate().expect("the shipped default covers it");
+    }
+
+    #[test]
+    fn a_nonsensical_grounding_threshold_is_refused_at_boot() {
+        let mut config = config(
+            Duration::from_secs(DEFAULT_LEASE_SECS),
+            Duration::from_secs(300),
+            3,
+        );
+        config.grounding.min_cited_ratio = 1.5;
+        let err = config.validate().expect_err("must refuse");
+        assert!(err.to_string().contains("COPILOT_MIN_CITED_RATIO"), "{err}");
     }
 
     #[test]

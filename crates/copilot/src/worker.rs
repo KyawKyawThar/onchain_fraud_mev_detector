@@ -515,7 +515,12 @@ mod tests {
             incident,
             vec![envelope(0), envelope(1)],
         ));
-        let client = Arc::new(StubClient::answering("a narrative").with_model("claude-opus-5"));
+        // The narrative has to cite the events it was shown, or the §20.4
+        // citation check blocks it — which is the point of that check and is
+        // asserted on its own below.
+        let cited = envelope(0).event_id;
+        let narrative = format!("The attacker's transaction preceded the victim's swap [{cited}].");
+        let client = Arc::new(StubClient::answering(narrative.clone()).with_model("claude-opus-5"));
         let job = queued(&store, incident).await;
 
         pool(store.clone(), audit, client)
@@ -523,8 +528,8 @@ mod tests {
             .await;
 
         let draft = store.get(job.job.draft_id).await.unwrap().unwrap();
-        assert_eq!(draft.status, DraftStatus::Ready);
-        assert_eq!(draft.body(), Some("a narrative"));
+        assert_eq!(draft.status, DraftStatus::Ready, "{:?}", draft.last_error);
+        assert_eq!(draft.body(), Some(narrative.as_str()));
         assert_eq!(
             draft.model(),
             Some("claude-opus-5"),
@@ -532,12 +537,13 @@ mod tests {
         );
         assert_eq!(
             draft.provenance.as_ref().map(|p| p.prompt_id.as_str()),
-            Some("incident_narrative@v1")
+            Some("incident_narrative@v2")
         );
         assert_eq!(
-            draft.grounded_event_ids.len(),
-            2,
-            "the window the model was shown is recorded for t3 to narrow"
+            draft.grounded_event_ids,
+            vec![cited],
+            "the window the model was shown (2 events) narrows to the one the \
+             narrative actually cites"
         );
     }
 
@@ -739,7 +745,10 @@ mod tests {
             .unwrap();
         let audit = Arc::new(VecAuditSource::new(incident, vec![envelope(0)]));
         let client: Arc<dyn LlmClient> = Arc::new(StubClient::sequence(vec![Completion {
-            text: "drained".into(),
+            text: format!(
+                "The block was drained by the attacker [{}].",
+                envelope(0).event_id
+            ),
             stop_reason: StopReason::EndTurn,
             model: "claude-opus-5".into(),
             usage: TokenUsage::default(),

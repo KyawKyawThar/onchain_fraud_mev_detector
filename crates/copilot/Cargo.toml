@@ -52,6 +52,20 @@ tokio-util = { workspace = true }
 # dependency and no `event-store` dependency.
 reqwest = { workspace = true }
 
+# The draft review API (§20.4, src/http.rs): a reviewer reads a narrative and
+# approves it — the boundary a draft must cross before it leaves the platform.
+# Swagger-documented for the same reason event-store's append API is: it has to
+# be exercisable by hand. `api-error` is the shared 4xx/5xx policy.
+api-error = { workspace = true }
+# The reviewer's identity comes from a verified JWT, not a request field —
+# shared with the API service so there is one issuer and one claim set (§11).
+auth = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
 # Service binary plumbing (src/main.rs): tracing/metrics/health boot, env
 # config, and the API key kept out of `Debug`/logs.
 telemetry = { workspace = true }
@@ -79,6 +93,11 @@ testcontainers-modules = { workspace = true, features = ["postgres"] }
 # Scoped in-memory recorder for the draft-metrics test (same pattern as
 # notification/detection/simulation).
 metrics-util = { workspace = true }
+# `ServiceExt::oneshot` — drives the review API's routes in-process, with no
+# listener and no port; `jsonwebtoken` mints the reviewer tokens those tests
+# present (verification itself is `auth`'s).
+tower = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [lints]
 workspace = true

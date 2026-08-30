@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_batches\n                SET results_fetched_at = $1\n              WHERE batch_id = $2 AND results_fetched_at IS NULL\n            RETURNING batch_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_batches",
+            "name": "batch_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "56f67df77b87525c68230b8e865d16a12c354710cb633e121db23702c9e7eafc"
+}

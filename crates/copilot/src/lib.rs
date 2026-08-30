@@ -40,23 +40,47 @@
 //! version of a document a reviewer may already have read. With it, a
 //! completion someone paid for is filed exactly where its audit record lives.
 //!
-//! # Scope (Sprint 20 t2)
+//! # The citation boundary (Sprint 20 t3)
 //!
-//! This task builds the pipeline: consumer, queue, worker pool, store,
-//! approval state, and a v1 narrative prompt to exercise it end to end.
-//! Deliberately not here: the per-claim `grounded_event_ids` contract, the
-//! `IncidentNarrativeDrafted` emission and the Batch API backfill (t3);
-//! natural-language rule drafting and its parse boundary (t4) — for which
-//! `DraftKind::RuleDraft` and the kind-agnostic queue already exist; the
-//! grounding audit and budget alarms (t5).
+//! A narrative is only useful if a reviewer can check it against the record
+//! rather than against the model, so every landed draft goes through
+//! [`grounding`]: the citations are parsed out of the text, checked against
+//! the window the model was shown, and the draft's `grounded_event_ids` is
+//! narrowed from that window to what the narrative actually cites. A draft
+//! that cites an event it was never shown is `blocked`, not `ready` — the
+//! same statement a refusal makes, for the same reason.
+//!
+//! Every path that lands an answer applies that one rule through one write
+//! ([`store`]'s `write_landing`): the worker's, the cross-pod cache's, and the
+//! backfill's batch results. That write also files the
+//! `IncidentNarrativeDrafted` announcement ([`announce`]) into
+//! `copilot_outbox` **in the same transaction**, so the audit record is
+//! exactly as durable as the draft it describes; [`outbox`] publishes it. The
+//! draft then stays provisional until a human approves it over [`http`].
+//!
+//! # Scope
+//!
+//! Built: the pipeline (consumer, queue, worker pool, store, approval state),
+//! the citation boundary, the drafting event, the review API, and the
+//! half-price [`backfill`] over the Batch API.
+//!
+//! Deliberately not here: natural-language rule drafting and its parse
+//! boundary (t4) — for which `DraftKind::RuleDraft` and the kind-agnostic
+//! queue already exist; the grounding audit test and per-customer budget
+//! alarms (t5).
 
+pub mod announce;
 pub mod audit;
+pub mod backfill;
 pub mod cache;
 pub mod config;
 pub mod consumer;
 pub mod draft;
+pub mod grounding;
+pub mod http;
 pub mod metrics;
 pub mod model;
+pub mod outbox;
 pub mod prompts;
 pub mod store;
 pub mod worker;
@@ -64,10 +88,16 @@ pub mod worker;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+pub use backfill::{BackfillConfig, BackfillReport, BackfillRunner};
 pub use config::Config;
 pub use consumer::CopilotConsumer;
+pub use grounding::{GroundingPolicy, GroundingSummary};
 pub use model::{
-    Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftStatus, Provenance, Review, Reviewed,
+    Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus, Provenance, Review,
+    Reviewed,
 };
-pub use store::{DraftCache, DraftQueue, DraftReview, DraftStore, DraftWorkQueue, PgDraftStore};
+pub use store::{
+    DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftQueue, DraftReview, DraftStore,
+    DraftWorkQueue, Landing, LandingRule, PgDraftStore,
+};
 pub use worker::{DraftWorkerPool, GeneratorRegistry, PoolConfig};

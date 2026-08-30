@@ -154,6 +154,11 @@ mod digest;
 mod metered;
 mod retry;
 
+/// The Message Batches seam (§20.4's half-price historical backfill) — its own
+/// trait beside [`LlmClient`], because submit → poll → fetch is not the shape
+/// of an `await`.
+pub mod batch;
+
 /// The bulkhead seam ([`CallAdmission`]) and its in-process implementation.
 /// A module rather than bare re-exports because a service crate implements the
 /// trait against its own store.
@@ -179,6 +184,11 @@ pub mod metrics;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+pub use batch::{
+    AnthropicBatchClient, BatchClient, BatchCounts, BatchId, BatchItem, BatchItemOutcome,
+    BatchOutcome, BatchState, BatchStatus, BatchSubmission, MeteredBatchClient,
+};
+
 pub use admission::{
     AdmissionConfig, AdmittedClient, CallAdmission, LocalAdmission, UnlimitedAdmission,
 };
@@ -193,7 +203,7 @@ pub use config::{
     LlmConfig, ANTHROPIC_VERSION, DEFAULT_BASE_URL, DEFAULT_MODEL, SERVER_SIDE_FALLBACK_BETA,
 };
 pub use digest::{ContentDigest, DigestBuilder};
-pub use metered::MeteredClient;
+pub use metered::{Billing, MeteredClient};
 pub use prompt::{grounded_message, PromptDescriptor, PromptRegistry, Untrusted};
 pub use retry::RetryingClient;
 pub use stack::LlmStack;

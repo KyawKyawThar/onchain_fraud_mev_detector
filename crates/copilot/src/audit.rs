@@ -24,8 +24,9 @@
 //! a narrative degrades and admits it.
 
 use async_trait::async_trait;
-use events::primitives::IncidentId;
-use events::EventEnvelope;
+use chrono::{DateTime, Utc};
+use events::primitives::{Chain, IncidentId};
+use events::{DomainEvent, EventEnvelope};
 use serde::Deserialize;
 
 /// Default events per page. The store clamps to its own ceiling.
@@ -261,6 +262,139 @@ impl AuditSource for VecAuditSource {
             incident_id: Some(incident_id),
             events: all.into_iter().take(max_events).collect(),
             truncated,
+        })
+    }
+}
+
+/// One page of historical incidents, for the §20.4 backfill.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IncidentPage {
+    /// `(incident, the chain its `IncidentCreated` was stamped with)` — the
+    /// chain travels with the incident because a draft row records it and the
+    /// platform is multi-chain (§17); defaulting it to the deployment's chain
+    /// would mislabel every backfilled L2 incident.
+    pub incidents: Vec<(IncidentId, Chain)>,
+    pub next_cursor: Option<String>,
+}
+
+/// Lists historical incidents over a time window — the backfill's input.
+///
+/// A seam for the same reason [`AuditSource`] is one: the backfill's whole
+/// submit/poll/land lifecycle has to be exercisable without an event store,
+/// and "which incidents exist" is the only other thing it reads.
+#[async_trait]
+pub trait IncidentSource: Send + Sync + std::fmt::Debug {
+    /// One page of incidents created in `[from, to)`, oldest first.
+    async fn incidents(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        cursor: Option<&str>,
+        limit: u64,
+    ) -> Result<IncidentPage, AuditError>;
+}
+
+#[async_trait]
+impl IncidentSource for HttpAuditSource {
+    /// `GET /v1/replay?event_type=IncidentCreated` — event-store's existing
+    /// deterministic window read (§4/§18).
+    ///
+    /// Deliberately not a new endpoint: "every incident in a window" is
+    /// exactly what replay already answers, and adding a copilot-shaped query
+    /// to another service's API would be this crate reaching across the §14
+    /// boundary in a politer costume.
+    async fn incidents(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        cursor: Option<&str>,
+        limit: u64,
+    ) -> Result<IncidentPage, AuditError> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("event_type", "IncidentCreated".to_owned()),
+            ("limit", limit.max(1).to_string()),
+        ];
+        if let Some(from) = from {
+            params.push(("from", from.to_rfc3339()));
+        }
+        if let Some(to) = to {
+            params.push(("to", to.to_rfc3339()));
+        }
+        if let Some(cursor) = cursor {
+            params.push(("cursor", cursor.to_owned()));
+        }
+
+        let response = self
+            .client
+            .get(format!("{}/v1/replay", self.base_url))
+            .query(&params)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AuditError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let page: EventPage = response.json().await?;
+        Ok(IncidentPage {
+            incidents: page
+                .events
+                .into_iter()
+                .filter_map(|envelope| match envelope.payload {
+                    // Read the id off the payload rather than trusting the
+                    // filter: a store that ever widens what `event_type`
+                    // matches must not silently enqueue drafts for events that
+                    // are not incidents.
+                    DomainEvent::IncidentCreated(incident) => {
+                        Some((incident.incident_id, envelope.chain))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+}
+
+/// In-memory [`IncidentSource`]: one page of incidents, no event store.
+#[derive(Debug, Clone, Default)]
+pub struct VecIncidentSource {
+    incidents: Vec<(IncidentId, Chain)>,
+}
+
+impl VecIncidentSource {
+    pub fn new(incidents: Vec<(IncidentId, Chain)>) -> Self {
+        Self { incidents }
+    }
+}
+
+#[async_trait]
+impl IncidentSource for VecIncidentSource {
+    async fn incidents(
+        &self,
+        _from: Option<DateTime<Utc>>,
+        _to: Option<DateTime<Utc>>,
+        cursor: Option<&str>,
+        limit: u64,
+    ) -> Result<IncidentPage, AuditError> {
+        // The cursor is the offset, so a paginating caller is exercised as
+        // faithfully as the real store paginates it.
+        let offset: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
+        let limit = limit.max(1) as usize;
+        let page: Vec<(IncidentId, Chain)> = self
+            .incidents
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .copied()
+            .collect();
+        let next = offset + page.len();
+        Ok(IncidentPage {
+            incidents: page,
+            next_cursor: (next < self.incidents.len()).then(|| next.to_string()),
         })
     }
 }

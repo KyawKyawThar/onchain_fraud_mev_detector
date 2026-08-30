@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts\n                SET batch_id = $1, updated_at = $2\n              WHERE draft_id = ANY($3::UUID[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "97208d688ad8da1ae7737f4697191008acdfa631d492f236ed272f7774de1659"
+}

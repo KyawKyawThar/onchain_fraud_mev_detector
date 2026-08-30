@@ -116,7 +116,7 @@ real values**:
 | `redis-credentials` | `REDIS_PASSWORD` (image), `REDIS_URL` (apps) | redis, intelligence×3, rule-engine, api-server (§19 screening rate limiter) |
 | `clickhouse-credentials` | `CLICKHOUSE_DB/USER/PASSWORD` | clickhouse, event-store, projection, intelligence×3, usage, grafana (§19 billing-usage datasource) |
 | `rabbitmq-credentials` | `RABBITMQ_DEFAULT_USER/PASS/VHOST` (image), `RABBITMQ_URL` (apps — vhost `/` percent-encoded `%2f`!) | rabbitmq, dispatcher, worker |
-| `app-secrets` | `JWT_SECRET`, `EVENT_STORE_WRITE_TOKEN`, `SMTP_USERNAME/PASSWORD`, `ANTHROPIC_API_KEY` | api-server, event-store, notification, copilot |
+| `app-secrets` | `JWT_SECRET`, `EVENT_STORE_WRITE_TOKEN`, `SMTP_USERNAME/PASSWORD`, `ANTHROPIC_API_KEY` | api-server, event-store, notification, copilot (JWT_SECRET gates its review API) |
 | `rpc-endpoints` | `ETH_RPC_URLS`, `BASE_RPC_URLS`, `MEMPOOL_RPC_URL`, `INTEL_ETH_RPC_URL` | ingestion×2, predictive, intelligence-block-production |
 | `grafana-admin` | `GF_SECURITY_ADMIN_USER/PASSWORD` (§19) | grafana |
 

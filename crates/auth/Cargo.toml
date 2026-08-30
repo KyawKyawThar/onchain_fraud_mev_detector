@@ -1,0 +1,29 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# JWT bearer verification, shared (§11). Promoted out of the API service the
+# same way `resilience` was promoted out of `ingestion`: a second service (the
+# §20.4 copilot's review API) needed to answer "who is calling" with something
+# better than a name typed into a request body, and the answer must be the
+# *same* answer — one issuer, one signature check, one set of claims.
+#
+# Verify-only by design: nothing here mints a token. A workspace-dep-free leaf
+# apart from axum, so any service can link it without inheriting a runtime.
+
+[dependencies]
+axum = { workspace = true }
+jsonwebtoken = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

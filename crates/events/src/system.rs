@@ -71,6 +71,16 @@ pub enum UsageEventType {
     LlmOutputTokens,
     LlmCacheWriteTokens,
     LlmCacheReadTokens,
+    /// The same four kinds again, for tokens spent through the **Batch API**
+    /// (§20.4's historical narrative backfill). Eight SKUs and not four,
+    /// because a batched token costs *half* a synchronous one: folding the two
+    /// together would leave a quantity that is only priceable if you also know
+    /// which path produced it — which is exactly the information the fold
+    /// destroyed. Same argument as the four-way split, one level down.
+    LlmBatchInputTokens,
+    LlmBatchOutputTokens,
+    LlmBatchCacheWriteTokens,
+    LlmBatchCacheReadTokens,
 }
 
 impl UsageEventType {
@@ -155,6 +165,21 @@ pub struct ScreeningDecisionRecorded {
 #[cfg(test)]
 mod tests {
     use super::UsageEventType;
+
+    #[test]
+    fn the_batch_skus_are_distinct_from_the_synchronous_ones() {
+        // A batched token is billed at half rate, so the two must never
+        // collapse onto one wire value — a reconciliation that cannot tell
+        // them apart is off by 2x on whichever share it guessed wrong.
+        assert_eq!(
+            UsageEventType::LlmBatchInputTokens.as_wire_str(),
+            "llm_batch_input_tokens"
+        );
+        assert_ne!(
+            UsageEventType::LlmInputTokens.as_wire_str(),
+            UsageEventType::LlmBatchInputTokens.as_wire_str()
+        );
+    }
 
     #[test]
     fn wire_str_is_snake_case() {

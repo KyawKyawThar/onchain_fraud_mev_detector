@@ -112,9 +112,24 @@ impl CompletionCache for PgCompletionCache {
 mod tests {
     use super::*;
     use crate::model::{DraftJob, DraftKind, DraftStatus};
-    use crate::store::{DraftQueue, DraftReview, DraftWorkQueue};
+    use crate::store::{DraftAttempt, DraftQueue, DraftReview, DraftWorkQueue};
     use crate::test_util::{completion, request, InMemoryDraftStore};
     use events::primitives::{Chain, IncidentId};
+
+    /// The audit window every attempt below declares — a cached answer is
+    /// landed through the same citation check as any other, so it has to cite
+    /// something the model was shown.
+    fn window() -> Vec<uuid::Uuid> {
+        vec![uuid::Uuid::from_u128(1)]
+    }
+
+    /// A narrative that cites its window — what a landing accepts as `ready`.
+    fn grounded() -> llm::Completion {
+        completion(&format!(
+            "The attacker's transaction preceded the victim's swap [{}].",
+            window()[0]
+        ))
+    }
 
     /// Enqueue one narrative, claim it, and declare the request it is about
     /// to make — the state a completion needs to land on.
@@ -133,7 +148,7 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         store
-            .begin_attempt(enqueued.draft_id(), key, None, &[], Utc::now())
+            .begin_attempt(enqueued.draft_id(), key, None, &window(), Utc::now())
             .await
             .unwrap();
         enqueued.draft_id()
@@ -149,20 +164,23 @@ mod tests {
         let draft_id = in_flight(&store, &key).await;
 
         assert!(cache.get(&key).await.is_none(), "nothing paid for yet");
-        cache.put(key, &completion("a narrative")).await;
+        cache.put(key, &grounded()).await;
 
         // The write landed on the draft — the cache entry and the audit
-        // record are the same row.
+        // record are the same row — and it went through the *same* citation
+        // check the worker's own write does, so a cached answer can never be
+        // `ready` on one path and `blocked` on the other.
         let draft = store.get(draft_id).await.unwrap().unwrap();
-        assert_eq!(draft.status, DraftStatus::Ready);
-        assert_eq!(draft.body(), Some("a narrative"));
+        assert_eq!(draft.status, DraftStatus::Ready, "{:?}", draft.last_error);
+        assert_eq!(draft.body(), Some(grounded().text.as_str()));
         assert_eq!(draft.kind, DraftKind::IncidentNarrative);
+        assert_eq!(draft.grounded_event_ids, window());
 
         let hit = cache
             .get(&CacheKey::new("claude-opus-5", &request))
             .await
             .expect("a redelivery on any pod reads the first answer");
-        assert_eq!(hit.text, "a narrative");
+        assert_eq!(hit.text, grounded().text);
     }
 
     #[tokio::test]
@@ -172,7 +190,7 @@ mod tests {
         let request = request();
         let key = CacheKey::new("claude-opus-5", &request);
         in_flight(&store, &key).await;
-        cache.put(key, &completion("a narrative")).await;
+        cache.put(key, &grounded()).await;
 
         assert!(
             cache

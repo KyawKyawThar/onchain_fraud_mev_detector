@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
+use events::copilot::{IncidentNarrativeDrafted, NarrativeSource};
 use events::cross_chain::{
     BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef, CrossChainMevDetected,
 };
@@ -364,6 +365,21 @@ fn sample_events() -> Vec<DomainEvent> {
             }],
             timestamp: ts(),
         }),
+        // AI copilot (§20.4)
+        DomainEvent::IncidentNarrativeDrafted(IncidentNarrativeDrafted {
+            incident_id: incident_id(),
+            draft_id: uuid::Uuid::from_u128(0xD1),
+            narrative_ref: "copilot://drafts/00000000-0000-0000-0000-0000000000d1".into(),
+            model_id: "claude-opus-5".into(),
+            prompt_id: "incident_narrative".into(),
+            prompt_version: "v2".into(),
+            prompt_digest: "3f9c".into(),
+            grounded_event_ids: vec![uuid::Uuid::from_u128(0xE7)],
+            claims: 6,
+            cited_claims: 5,
+            source: NarrativeSource::Backfill,
+            drafted_at: ts(),
+        }),
         // Predictive (§16)
         DomainEvent::PredictedAlert(PredictedAlert {
             prediction_id: prediction_id(),
@@ -572,6 +588,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "ModelDriftDetected",
         r#"{"type":"ModelDriftDetected","payload":{"model_id":"anomaly-iforest","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"feature_version":1,"granularity":"block","baseline_hash":"9f2c","samples":512,"window_closed_by":"full","threshold":3.0,"max_magnitude":4.5,"drifted":[{"feature":"tx_count_log","magnitude":4.5,"shift":4.5,"spread":1.0}],"observed_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "IncidentNarrativeDrafted",
+        r#"{"type":"IncidentNarrativeDrafted","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","draft_id":"00000000-0000-0000-0000-0000000000d1","narrative_ref":"copilot://drafts/00000000-0000-0000-0000-0000000000d1","model_id":"claude-opus-5","prompt_id":"incident_narrative","prompt_version":"v2","prompt_digest":"3f9c","grounded_event_ids":["00000000-0000-0000-0000-0000000000e7"],"claims":6,"cited_claims":5,"source":"backfill","drafted_at":"2023-11-14T22:13:20Z"}}"#,
     ),
     (
         "PredictedAlert",

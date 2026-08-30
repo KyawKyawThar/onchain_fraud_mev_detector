@@ -15,6 +15,22 @@
 #
 # `maxSurge: 0` on the rolling update for the same reason: a surge pod is
 # extra concurrency against that org-wide limit during every deploy.
+# The draft review API (§20.4): where a human approves a narrative. In-cluster
+# only — no Ingress — because a verdict is a privileged action and the public,
+# JWT-gated path is a future proxy in the API service, not this port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: copilot
+  labels:
+    app.kubernetes.io/name: copilot
+spec:
+  selector:
+    app.kubernetes.io/name: copilot
+  ports:
+    - name: http
+      port: 9467
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,11 +92,29 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: ANTHROPIC_API_KEY
+            # Verdicts are JWT-gated, verified with the same secret and issuer
+            # as the API service (§11): the token's `sub` is the reviewer
+            # recorded against the approval. Required whenever
+            # COPILOT_HTTP_ADDR is set — boot fails without it, because an
+            # unauthenticated approval endpoint would let anything on the
+            # cluster network release a machine-written SAR narrative under any
+            # name it liked.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: JWT_SECRET
             - name: COPILOT_METRICS_ADDR
               value: 0.0.0.0:9100
+            - name: COPILOT_HTTP_ADDR
+              value: 0.0.0.0:9467
+            - name: JWT_ISSUER
+              value: mevwatch
           ports:
             - name: health
               containerPort: 8086
+            - name: http
+              containerPort: 9467
             - name: metrics
               containerPort: 9100
           startupProbe:
