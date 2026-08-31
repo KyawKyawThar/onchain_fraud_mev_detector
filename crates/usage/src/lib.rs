@@ -18,7 +18,19 @@
 //!   envelope→row projection.
 //! - [`kafka`] — the at-least-once consume loop over the shared `event-bus`
 //!   seam; commit only after a successful insert.
+//! - [`budget`] — per-customer token budget **alarms** (§20.4, Sprint 20 t5):
+//!   the read side of the same stream, telling a human when one customer's LLM
+//!   spend has gone somewhere nobody expected.
+//!
+//! # It still gates nothing
+//!
+//! [`budget`] does not change that. It raises alarms and writes log lines; it
+//! never refuses a call, and there is no per-customer quota anywhere in this
+//! platform — the only enforced ceiling is `llm::admission`'s platform-wide
+//! runaway-loop valve. An alarm is a sentence addressed to an operator, and
+//! this crate is still a sink that "consumes and stores".
 
+pub mod budget;
 pub mod config;
 pub mod kafka;
 pub mod migrate;

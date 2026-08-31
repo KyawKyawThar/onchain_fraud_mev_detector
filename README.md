@@ -172,13 +172,15 @@ backed only by heuristic labels.
 Full design: [ARCHITECTURE.md §20](./ARCHITECTURE.md#20-aiml-layer) · build-out: Sprints 18–20.
 
 What is **built** here is classical ML — a gradient-boosted classifier and an
-isolation forest, served as ONNX through an in-process inference seam. The
-LLM copilot (§20.4) is **partly built**: its model-access seam (`llm`) and
-the `copilot` service that drafts incident narratives through it are shipped;
-natural-language rule creation, the per-claim grounding contract and the
-`IncidentNarrativeDrafted` emission are not. Being explicit about the line,
-because "AI" is doing a lot of work in most repos and less than it claims in
-almost all of them.
+isolation forest, served as ONNX through an in-process inference seam — plus
+the §20.4 LLM copilot: the model-access seam (`llm`), the `copilot` service
+that drafts incident narratives and rules through it, the per-claim citation
+contract, and the after-the-fact audit that re-resolves those citations
+against the event store. What no model here can do is act: a narrative waits
+for a human, a drafted rule must compile through the rule engine's existing
+parser, and neither ever enters the event store as evidence. Being explicit
+about the line, because "AI" is doing a lot of work in most repos and less
+than it claims in almost all of them.
 
 | §20 component | Crate | Status |
 |---|---|---|
@@ -190,8 +192,9 @@ almost all of them.
 | Behavioral embeddings + similarity search | `intelligence` | Shipped |
 | LLM client seam (Claude Messages API, metered) | `llm` | Shipped |
 | Copilot service (queue, worker pool, drafts, approval) | `copilot` | Shipped |
-| SAR narratives: per-claim grounding + draft events | `copilot` | **Not built** |
-| Natural-language rule creation | — | **Designed only** |
+| SAR narratives: per-claim grounding + draft events | `copilot` | Shipped |
+| Natural-language rule creation (compiles through §9's parser) | `copilot` | Shipped |
+| Grounding audit + token budget alarms + prompt gate | `copilot`, `usage` | Shipped |
 
 The platform's event-sourced core makes it an unusually good substrate for
 ML, and the layer is built to exploit exactly that, under the same governance

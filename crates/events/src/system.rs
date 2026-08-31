@@ -45,7 +45,7 @@ pub struct UsageRecorded {
 /// (the API service emits [`UsageEventType::ApiCallMade`] today, and
 /// [`UsageEventType::ScreeningCall`] once `POST /v1/address/{addr}/screen`
 /// lands, §11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::EnumIter)]
 #[strum(serialize_all = "snake_case")]
 pub enum UsageEventType {
     EventProcessed,

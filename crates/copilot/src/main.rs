@@ -44,6 +44,7 @@ use copilot::capability::DraftCapability;
 use copilot::config::{Config, HttpConfig};
 use copilot::consumer::{build_consumer, CopilotConsumer};
 use copilot::draft::NarrativeDrafter;
+use copilot::grounding_audit::{AuditConfig, GroundingAuditor, Outcome};
 use copilot::rule_draft::RuleDrafter;
 use copilot::store::PgDraftStore;
 use copilot::worker::{DraftWorkerPool, GeneratorRegistry};
@@ -55,7 +56,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const USAGE: &str = "expected `run` (also the no-arg default), `backfill [--from RFC3339] \
-                     [--to RFC3339]`, or `ping`";
+                     [--to RFC3339]`, `audit [--limit N] [--json]`, `prompts`, or `ping`";
 
 /// How often the outbox flusher drains pending announcements.
 const OUTBOX_INTERVAL: Duration = Duration::from_secs(5);
@@ -70,15 +71,43 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Hold the guard for the lifetime of `main` so spans flush on exit (§19).
-    let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("copilot"))?;
-    let cfg = Config::from_env()?;
+    // The scope is load-bearing: the telemetry guard flushes spans when it
+    // drops, and `audit` reports its result as an **exit code**. Calling
+    // `process::exit` while the guard was still alive would skip that flush,
+    // so the code is carried out of the scope and the process exits after it.
+    let exit_code = {
+        let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("copilot"))?;
+        dispatch().await?
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
 
+/// Run the requested subcommand, returning the process exit code.
+///
+/// `Ok(0)` for everything except the audit sweep, whose whole purpose is to be
+/// runnable by something that reads exit codes (a CronJob, a pipeline).
+async fn dispatch() -> Result<i32> {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("run") | None => run(&cfg).await,
-        Some("backfill") => backfill(&cfg, args.collect()).await,
-        Some("ping") => ping(&cfg).await,
+    let command = args.next();
+
+    // Before the config: printing which instructions this binary carries must
+    // work in a checkout, in CI and on a pod, and none of those three has the
+    // same environment. `just prompt-manifest` redirects this into the
+    // checked-in manifest (engineering conventions §16).
+    if command.as_deref() == Some("prompts") {
+        print!("{}", copilot::prompts::manifest());
+        return Ok(0);
+    }
+
+    let cfg = Config::from_env()?;
+    match command.as_deref() {
+        Some("run") | None => run(&cfg).await.map(|()| 0),
+        Some("backfill") => backfill(&cfg, args.collect()).await.map(|()| 0),
+        Some("audit") => audit(&cfg, args.collect()).await,
+        Some("ping") => ping(&cfg).await.map(|()| 0),
         Some(other) => bail!("unknown argument {other:?}; {USAGE}"),
     }
 }
@@ -158,6 +187,107 @@ async fn backfill(cfg: &Config, args: Vec<String>) -> Result<()> {
     // service's flusher publishes them on its next tick, on exactly the same
     // path a live draft's announcement takes.
     Ok(())
+}
+
+/// `copilot audit [--limit N] [--since RFC3339] [--max-findings N]` — the
+/// §20.4 governance sweep (Sprint 20 t5).
+///
+/// Re-resolves every landed narrative's citations against event-store, and
+/// **exits non-zero when a stored draft makes a claim that does not hold**.
+/// The exit code is the deliverable: this is meant to run in a CronJob, in a
+/// pipeline, or by hand before an audit, and all three read exit codes rather
+/// than scraping a process that has already gone.
+///
+///   0 — clean: everything examined resolves.
+///   1 — findings: a draft cites what the store does not have, or a row
+///       disagrees with its own text, or a `ready` draft never went through the
+///       citation boundary at all.
+///   2 — inconclusive: drafts were examined and none could be verified (an
+///       unreachable event-store, or an archive whose retention has overtaken
+///       its narratives). Deliberately not 0: an audit that proved nothing must
+///       not exit like one that proved everything.
+async fn audit(cfg: &Config, args: Vec<String>) -> Result<i32> {
+    let options = parse_audit_options(&args)?;
+
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received; the audit will report what it has");
+            shutdown.cancel();
+        }
+    });
+
+    let pool = db::connect(cfg.database_url.expose_secret()).await?;
+    // No `.with_grounding` here, deliberately: that policy configures the
+    // *landing* write path, and this sweep only reads. Passing it would read
+    // as though the audit re-applies the cited-ratio threshold, which it does
+    // not — it checks whether citations resolve, which is a different question
+    // and is not configurable.
+    let store = Arc::new(PgDraftStore::new(pool));
+    store.ping().await.context("copilot schema not reachable")?;
+
+    let http = reqwest::Client::builder()
+        .timeout(cfg.event_store_timeout)
+        .build()
+        .context("building the event-store HTTP client")?;
+    let events = Arc::new(HttpAuditSource::new(http, cfg.event_store_url.clone()));
+
+    let config = AuditConfig {
+        max_audit_events: cfg.pool.max_audit_events,
+        concurrency: cfg.audit_concurrency,
+        ..options
+    };
+    let report = GroundingAuditor::new(store, events, config)
+        .run(&shutdown)
+        .await
+        .context("the grounding audit could not read the draft store")?;
+
+    println!("{report}");
+    // An exit code rather than an `Err`: these are *results*, not failures of
+    // the command, and rendering a finding as an anyhow chain would bury the
+    // report under a backtrace-shaped error message.
+    Ok(match report.outcome() {
+        Outcome::Clean => 0,
+        Outcome::Findings => 1,
+        Outcome::Inconclusive => 2,
+    })
+}
+
+/// `--limit`, `--since`, `--max-findings` for the audit sweep.
+fn parse_audit_options(args: &[String]) -> Result<AuditConfig> {
+    let mut config = AuditConfig::default();
+    let mut index = 0usize;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let raw = || -> Result<&String> {
+            args.get(index + 1)
+                .with_context(|| format!("{flag} needs a value"))
+        };
+        match flag {
+            "--limit" => {
+                config.max_drafts = raw()?
+                    .parse()
+                    .with_context(|| format!("--limit {:?} is not a count", raw()))?
+            }
+            "--max-findings" => {
+                config.max_findings = raw()?
+                    .parse()
+                    .with_context(|| format!("--max-findings {:?} is not a count", raw()))?
+            }
+            "--since" => {
+                config.since = Some(
+                    DateTime::parse_from_rfc3339(raw()?)
+                        .with_context(|| format!("--since {:?} is not RFC 3339", raw()))?
+                        .with_timezone(&Utc),
+                )
+            }
+            other => bail!("unknown audit argument {other:?}; {USAGE}"),
+        }
+        index += 2;
+    }
+    Ok(config)
 }
 
 /// The half-open window a backfill run covers. Both ends optional: no window

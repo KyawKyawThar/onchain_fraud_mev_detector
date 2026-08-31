@@ -98,8 +98,23 @@
 //! the ordinary `POST /v1/rules`, which validates it a second time under an
 //! owner it takes from the token rather than from the draft.
 //!
-//! Deliberately not here: the grounding audit test and per-customer budget
-//! alarms (t5).
+//! # The governance sweep (Sprint 20 t5)
+//!
+//! The citation boundary above runs at landing time, against the window the
+//! worker was holding. [`grounding_audit`] runs the *same pure check* again —
+//! months later, against event-store itself — and answers the question a
+//! regulator actually asks: does every claim in this document still resolve in
+//! the record? It is a job (`copilot audit`), not a monitor, and it reports
+//! through an exit code because a short-lived process is not reliably scraped.
+//!
+//! Per-customer token budget alarms are the cost half of the same task, and
+//! they live in the `usage` service rather than here: spend is a question about
+//! the `UsageRecorded` stream every metering path already publishes to (§13),
+//! and answering it in this crate would be a second, copilot-shaped view of a
+//! number the platform already has one view of. It is an **alarm and not a
+//! quota** — see `llm::admission`'s spend ceiling for the platform-wide valve,
+//! and this product's "meter, never gate" stance for why nothing here refuses a
+//! call on a customer's behalf.
 
 pub mod announce;
 pub mod audit;
@@ -110,6 +125,7 @@ pub mod config;
 pub mod consumer;
 pub mod draft;
 pub mod grounding;
+pub mod grounding_audit;
 pub mod http;
 pub mod metrics;
 pub mod model;
@@ -127,6 +143,7 @@ pub use capability::{CheckRegistry, DraftCapability, Grounding, Landing, Registr
 pub use config::Config;
 pub use consumer::CopilotConsumer;
 pub use grounding::{GroundingPolicy, GroundingSummary};
+pub use grounding_audit::{AuditConfig, AuditReport, GroundingAuditor, Outcome};
 pub use model::{
     Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus, Provenance, Review,
     Reviewed,

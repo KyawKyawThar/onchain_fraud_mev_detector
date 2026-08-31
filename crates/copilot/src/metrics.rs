@@ -168,3 +168,35 @@ pub const REVIEWS_TOTAL: &str = "copilot_reviews_total";
 pub fn record_review(verdict: &'static str) {
     metrics::counter!(REVIEWS_TOTAL, "verdict" => verdict).increment(1);
 }
+
+/// Counter (labeled by `verdict`): drafts examined by the §20.4 grounding
+/// audit — `grounded`, `unresolved`, `drifted`, `unchecked` or `unverifiable`
+/// (see [`crate::grounding_audit`]).
+///
+/// **Alert on any of the three failure verdicts.** They mean a stored,
+/// reviewable — possibly already *approved* — narrative makes a claim that
+/// does not hold against the store it is supposed to derive from.
+/// `unverifiable` is a different signal: it tracks event-store retention
+/// overtaking the drafts that cite it, which is an archive-policy question
+/// rather than a hallucination.
+///
+/// The audit runs as a job (`copilot audit`), so its **exit code is the
+/// primary result** and these counters are the secondary one: a short-lived
+/// process is not reliably scraped. They exist so a long-lived deployment that
+/// schedules the sweep in-process (or pushes on completion) has the series.
+pub const GROUNDING_AUDIT_DRAFTS_TOTAL: &str = "copilot_grounding_audit_drafts_total";
+
+/// Counter: cited event ids the audit could not resolve in the store.
+///
+/// Separate from the draft counter because the two answer different questions:
+/// one narrative citing forty missing events is one bad document, and forty
+/// narratives each missing one is a retention window that has moved.
+pub const GROUNDING_AUDIT_UNRESOLVED_IDS_TOTAL: &str =
+    "copilot_grounding_audit_unresolved_ids_total";
+
+pub fn record_grounding_audit(verdict: &'static str, unresolved_ids: usize) {
+    metrics::counter!(GROUNDING_AUDIT_DRAFTS_TOTAL, "verdict" => verdict).increment(1);
+    if unresolved_ids > 0 {
+        metrics::counter!(GROUNDING_AUDIT_UNRESOLVED_IDS_TOTAL).increment(unresolved_ids as u64);
+    }
+}

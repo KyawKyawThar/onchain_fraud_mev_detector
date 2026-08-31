@@ -17,12 +17,17 @@
 //!     migrations explicitly and exit (the boot path always runs `up` too).
 //!   - `ping` — probe ClickHouse, so a misconfigured deployment fails fast
 //!     and visibly.
+//!   - `budget` — print the current per-customer token spend against the
+//!     configured budget and exit (§20.4 t5). The alarm's metrics deliberately
+//!     carry no customer label, so this is where an operator reading
+//!     `usage_token_budget_customers{level="alarm"} > 0` finds out *who*.
 
 use anyhow::{bail, Context, Result};
 use tokio_util::sync::CancellationToken;
 use usage::{config, migrate, store};
 
-const USAGE: &str = "expected `run` (also the no-arg default), `migrate up|down|info`, or `ping`";
+const USAGE: &str =
+    "expected `run` (also the no-arg default), `migrate up|down|info`, `budget`, or `ping`";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,6 +51,7 @@ async fn main() -> Result<()> {
             println!("ok: clickhouse reachable");
             Ok(())
         }
+        Some("budget") => budget_report(cfg, client).await,
         Some(other) => bail!("unknown argument {other:?}; {USAGE}"),
     }
 }
@@ -94,11 +100,51 @@ async fn serve(cfg: config::Config, client: clickhouse::Client) -> Result<()> {
     .await
     .context("provisioning the usage DLQ topic")?;
 
+    // Per-customer token budget alarms (§20.4 t5), beside the sink rather
+    // than in a service of their own: the question is "what does the stream
+    // this process already owns add up to", and a second deployment to ask it
+    // would be a second view of one number. It reads only, alarms only, and
+    // fails open — a ClickHouse blip must never take the sink down with it.
+    let monitor = std::sync::Arc::new(usage::budget::BudgetMonitor::new(
+        std::sync::Arc::new(store.clone()),
+        cfg.budget,
+    ));
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { monitor.run(shutdown).await }
+    });
+
     let consumer = usage::kafka::build_consumer(&cfg.kafka)?;
     health.set_ready(true);
     let result = usage::kafka::run(consumer, store, cfg.batch, Some(&dlq), shutdown).await;
     tracing::info!("usage service shut down");
     result.context("Kafka consumer exited with error")
+}
+
+/// `usage budget` — one evaluation, printed, then exit.
+///
+/// Runs the *same* [`BudgetMonitor::evaluate_now`](usage::budget::BudgetMonitor::evaluate_now)
+/// the loop runs: an operator checking an alarm must not be checking a second
+/// implementation of it. Exits 0 whatever it finds — this is a report, not a
+/// gate, and the platform meters spend without ever refusing on it.
+async fn budget_report(cfg: config::Config, client: clickhouse::Client) -> Result<()> {
+    if !cfg.budget.is_enabled() {
+        println!(
+            "token budget alarms are off — set USAGE_TOKEN_BUDGET (tokens per customer per \
+             USAGE_BUDGET_WINDOW_DAYS) to arm them"
+        );
+        return Ok(());
+    }
+    let monitor = usage::budget::BudgetMonitor::new(
+        std::sync::Arc::new(store::UsageStore::new(client)),
+        cfg.budget,
+    );
+    let report = monitor
+        .evaluate_now(chrono::Utc::now())
+        .await
+        .context("reading token spend from ClickHouse")?;
+    println!("{}", report.render(&cfg.budget));
+    Ok(())
 }
 
 /// Resolve when the process receives Ctrl+C or (on Unix) SIGTERM — the signals

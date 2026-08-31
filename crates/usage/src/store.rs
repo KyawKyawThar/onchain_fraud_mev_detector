@@ -67,6 +67,16 @@ pub struct UsageStore {
     client: Client,
 }
 
+/// Hand-written because `clickhouse::Client` is not `Debug` — and every
+/// object-safe seam in this workspace requires it, so a failing assertion can
+/// name the implementation it was holding. Nothing about the connection is
+/// printed: the client carries the ClickHouse password.
+impl std::fmt::Debug for UsageStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageStore").finish_non_exhaustive()
+    }
+}
+
 impl UsageStore {
     /// Wrap a ClickHouse client (see [`build_client`]) as the usage store.
     pub fn new(client: Client) -> Self {

@@ -20,6 +20,7 @@ use telemetry::env::{parse_or as env_parse, required as env};
 
 use crate::backfill::BackfillConfig;
 use crate::grounding::{GroundingPolicy, DEFAULT_MIN_CITED_RATIO};
+use crate::grounding_audit::{DEFAULT_CONCURRENCY as DEFAULT_AUDIT_CONCURRENCY, MAX_CONCURRENCY};
 use crate::worker::{CallBudget, PoolConfig};
 
 /// Backstop poll interval when `COPILOT_POLL_INTERVAL_SECS` is unset. The
@@ -73,6 +74,14 @@ pub struct Config {
     pub grounding: GroundingPolicy,
     /// The Batch API backfill's pacing (the `backfill` subcommand).
     pub backfill: BackfillConfig,
+    /// Audit-stream reads the `audit` sweep keeps in flight (§20.4 t5).
+    ///
+    /// Deployment shape, so it is resolved here and not from a CLI flag: the
+    /// CronJob that actually runs the sweep passes `args: ["audit"]` and
+    /// configures everything else through the environment. The sweep's *scope*
+    /// (`--since`, `--limit`) stays on the command line, because that is a
+    /// property of one run rather than of the deployment.
+    pub audit_concurrency: usize,
     /// Address the Prometheus `/metrics` endpoint binds to (§19).
     pub metrics_addr: SocketAddr,
     /// The draft review API, when a deployment serves one. `None` (the
@@ -162,6 +171,7 @@ impl Config {
                 )?
                 .max(1),
             },
+            audit_concurrency: env_parse("COPILOT_AUDIT_CONCURRENCY", DEFAULT_AUDIT_CONCURRENCY)?,
             metrics_addr: env_parse(
                 "COPILOT_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9113)),
@@ -229,6 +239,13 @@ impl Config {
             (0.0..=1.0).contains(&self.grounding.min_cited_ratio),
             "COPILOT_MIN_CITED_RATIO ({}) must be a share between 0 and 1",
             self.grounding.min_cited_ratio,
+        );
+        anyhow::ensure!(
+            (1..=MAX_CONCURRENCY).contains(&self.audit_concurrency),
+            "COPILOT_AUDIT_CONCURRENCY ({}) must be between 1 and {MAX_CONCURRENCY} — it is a \
+             bulkhead on event-store's read path, not a throughput dial, and 0 would leave the \
+             audit hanging on a stream that never yields",
+            self.audit_concurrency,
         );
         // The Batch API's own deadline is 24 hours. A lease that expires
         // before it lets a second run claim a draft the provider is still
@@ -301,6 +318,7 @@ mod tests {
             },
             grounding: GroundingPolicy::default(),
             backfill: BackfillConfig::default(),
+            audit_concurrency: DEFAULT_AUDIT_CONCURRENCY,
             metrics_addr: SocketAddr::from(([0, 0, 0, 0], 9113)),
             http: None,
         }
@@ -347,6 +365,27 @@ mod tests {
 
         config.backfill.lease = Duration::from_secs(DEFAULT_BATCH_LEASE_SECS);
         config.validate().expect("the shipped default covers it");
+    }
+
+    /// The bulkhead is a bounded range, both ends: `0` is a sweep that hangs,
+    /// and a fat-fingered large value is event-store falling over.
+    #[test]
+    fn an_out_of_range_audit_concurrency_is_refused_at_boot() {
+        let mut config = config(
+            Duration::from_secs(DEFAULT_LEASE_SECS),
+            Duration::from_secs(300),
+            3,
+        );
+        for bad in [0, MAX_CONCURRENCY + 1] {
+            config.audit_concurrency = bad;
+            let err = config.validate().expect_err("must refuse {bad}");
+            assert!(
+                err.to_string().contains("COPILOT_AUDIT_CONCURRENCY"),
+                "{err}"
+            );
+        }
+        config.audit_concurrency = DEFAULT_AUDIT_CONCURRENCY;
+        config.validate().expect("the shipped default is in range");
     }
 
     #[test]

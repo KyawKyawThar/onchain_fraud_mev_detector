@@ -1,0 +1,11 @@
+# Prompt manifest (engineering conventions §16) — one line per artifact this
+# service ships, `purpose@version  sha256-of-the-bytes`, sorted.
+#
+# Generated, and checked in on purpose: a digest changes when a prompt's bytes
+# change, so a prompt edit cannot reach main without a hunk in *this* file for a
+# reviewer to see — including an edit made underneath a version that did not
+# move, and including a retired artifact that a historical draft is still
+# attributed to. Regenerate with `just prompt-manifest`; never hand-edit.
+incident_narrative@v1  62fe9cc32f268cdb8bc67fa98b3d3a25a77859cb93604a742c7b5ff30b0b5ffa
+incident_narrative@v2  3e500f34e74f9b1f1f96a2f62bce02d59b1ac5542411c265b4d6c63cde820a22
+rule_draft@v1  b6f94282f3866bdce11a581197925d120485fa9f54a2fe4f5b12e3337bf168cd

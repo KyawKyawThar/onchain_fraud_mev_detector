@@ -309,3 +309,56 @@ groups:
         annotations:
           summary: "Candidate links were stored without their event reaching the bus"
           description: "The boot-time recovery sweep found proposals whose `EntityLinkProposed` was never published and announced them itself. The ordinary crash — commit, then die before publishing — is covered by redelivery and shows up as `intelligence_link_candidates_total{outcome=\"re_announce\"}` instead; reaching *this* counter means redelivery could not have fixed it (a consumer group reset forward, a topic compacted past the event, offsets moved by hand). Not data loss — the row is durable and the sweep published it — but it means something moved the consumer's position, and that is worth understanding before it happens to a topic with no such backstop."
+
+  # ── §20.4 LLM copilot: grounding governance and token cost ──────
+  # These alerts watch a machine that writes suspicious-activity reports. The
+  # failure they exist for is not an outage: it is a plausible, well-formatted,
+  # confidently-cited document that nothing in the record supports.
+  - name: mevwatch-copilot-governance
+    rules:
+      - alert: CopilotFabricatedCitations
+        expr: sum(rate(copilot_grounding_rejected_total{reason="fabricated"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The copilot cited event ids it was never shown"
+          description: "copilot_grounding_rejected_total{reason=\"fabricated\"} is non-zero: a narrative cited event ids that were not in the audit window the model was given. The drafts themselves are safe — they land `blocked`, never `ready` — so this pages for the *cause*, not the consequence: a prompt change that stopped demanding full ids, a model swap, or an audit-window read that is returning less than the prompt claims. Check the most recent change to crates/copilot/prompts/ (engineering conventions §16) before assuming the model."
+
+      - alert: CopilotGroundingAuditFindings
+        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict=~"unresolved|drifted|unchecked"}[1d])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The grounding audit found stored narratives that no longer check out"
+          description: "`copilot audit` re-resolved landed narratives against event-store and found at least one that does not hold: `unresolved` = it cites events the store does not have, `drifted` = the row's grounded_event_ids disagrees with the prose a reviewer reads, `unchecked` = a ready/approved draft the citation boundary never ran on. Any of the three means a document that reads as verifiable is not. Run `just copilot-audit` for the draft ids — the sweep names them, the metric deliberately cannot. NOTE: these series exist only where the sweep runs somewhere Prometheus scrapes; the copilot-audit CronJob is short-lived, so in Kubernetes the primary signal is the Job itself failing (kube_job_status_failed{job_name=~\"copilot-audit.*\"}) — this rule is the backstop for a scraped or in-process run."
+
+      - alert: CopilotGroundingAuditUnverifiable
+        expr: |
+          sum(increase(copilot_grounding_audit_drafts_total{verdict="unverifiable"}[1d]))
+            / clamp_min(sum(increase(copilot_grounding_audit_drafts_total[1d])), 1e-9) > 0.25
+        for: 1h
+        labels:
+          severity: informational
+        annotations:
+          summary: "A quarter of audited narratives can no longer be verified"
+          description: "The audit could not read a subject's stream for a large share of the drafts it examined — event-store retention has overtaken the narratives that cite it, or the store was unreachable during the sweep. This is an archive-policy signal, not a hallucination one: the drafts are not wrong, they are simply no longer checkable. If retention is the cause, that is a decision to make deliberately — a SAR narrative whose evidence has expired is a document nobody can defend."
+
+      - alert: CopilotTokenBudgetAlarm
+        expr: max(usage_token_budget_customers{level="alarm"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A customer's LLM token spend is over the configured budget"
+          description: "At least one spender has passed USAGE_TOKEN_BUDGET over the configured window. Nothing has been refused — this platform meters and never gates — so this is a 'look at it' signal, not an incident: a stuck retry loop, a backfill pointed at the wrong window, or genuine heavy use. Run `just usage-budget` to see *who*; the series carries no customer label on purpose (an unbounded id set has no business in a time series, §19). `usage_token_budget_max_ratio` says how far over the worst one is."
+
+      - alert: CopilotTokenBudgetMonitorStale
+        expr: time() - max(usage_budget_last_success_timestamp_seconds) > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The token budget monitor has stopped evaluating"
+          description: "No successful budget evaluation for over an hour. The monitor fails open by design (§15) — a ClickHouse blip must not take the metering sink down with it — which is exactly why this alert exists: a monitor that has quietly stopped looks identical to a monitor with nothing to report. Check usage_budget_evaluations_total{outcome=\"failed\"} and the usage service's logs. Until it recovers, CopilotTokenBudgetAlarm is reporting a stale number."

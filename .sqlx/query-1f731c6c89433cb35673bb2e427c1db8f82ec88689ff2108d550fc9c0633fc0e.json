@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,\n                      attempts, model, prompt_id, prompt_digest, stop_reason, body, token_usage,\n                      grounded_event_ids, grounding, batch_id, last_error, reviewed_by,\n                      reviewed_at, review_note, created_at, updated_at, completed_at\n                 FROM copilot_drafts\n                WHERE ($1::TEXT IS NULL OR status = $1)\n                  AND ($2::TEXT IS NULL OR kind = $2)\n                  AND ($3::TEXT IS NULL OR source = $3)\n                  AND ($4::UUID IS NULL OR subject_id = $4)\n                ORDER BY created_at DESC\n                LIMIT $5",
+  "query": "SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,\n                      attempts, model, prompt_id, prompt_digest, stop_reason, body, token_usage,\n                      grounded_event_ids, grounding, batch_id, last_error, reviewed_by,\n                      reviewed_at, review_note, created_at, updated_at, completed_at\n                 FROM copilot_drafts\n                WHERE ($1::TEXT IS NULL OR status = $1)\n                  AND ($2::TEXT IS NULL OR kind = $2)\n                  AND ($3::TEXT IS NULL OR source = $3)\n                  AND ($4::UUID IS NULL OR subject_id = $4)\n                  AND ($5::TIMESTAMPTZ IS NULL\n                       OR (created_at, draft_id) < ($5, $6::UUID))\n                ORDER BY created_at DESC, draft_id DESC\n                LIMIT $7",
   "describe": {
     "columns": [
       {
@@ -285,6 +285,8 @@
         "Text",
         "Text",
         "Uuid",
+        "Timestamptz",
+        "Uuid",
         "Int8"
       ]
     },
@@ -316,5 +318,5 @@
       true
     ]
   },
-  "hash": "790987544e15fdc8651d4a73a5d79732132ed7c78058452a7fb35b0268c1a063"
+  "hash": "1f731c6c89433cb35673bb2e427c1db8f82ec88689ff2108d550fc9c0633fc0e"
 }

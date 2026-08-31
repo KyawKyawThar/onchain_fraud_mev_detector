@@ -339,6 +339,10 @@ impl ListParams {
             kind: parse_opt::<DraftKind>("kind", self.kind)?,
             source: parse_opt::<DraftSource>("source", self.source)?,
             subject_id: self.subject_id,
+            // The review queue is a queue: a reviewer reads the newest page and
+            // narrows it, so no cursor is exposed here. Paging the *whole*
+            // table is the audit sweep's job, and it holds the store directly.
+            before: None,
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIST_LIMIT),
         })
     }

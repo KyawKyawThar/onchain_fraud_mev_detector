@@ -309,7 +309,36 @@ pub struct DraftFilter {
     /// One subject — the natural "show me this incident's draft" lookup, since
     /// callers know incident ids and not draft ids.
     pub subject_id: Option<Uuid>,
+    /// Resume point: only drafts strictly *older* than this position in the
+    /// `(created_at DESC, draft_id DESC)` order. `None` starts at the newest.
+    ///
+    /// A keyset cursor rather than an offset, because the caller that needs it
+    /// ([`crate::grounding_audit`]) walks the whole table while the service
+    /// keeps writing to it: an `OFFSET` re-reads or skips rows whenever the
+    /// prefix shifts, and an audit that silently skips drafts is worse than no
+    /// audit. It is a full position and not just a timestamp because two drafts
+    /// can share `created_at` — a batch enqueue writes many in one
+    /// transaction — and a timestamp-only cursor either loops on them forever
+    /// or steps over them.
+    pub before: Option<DraftCursor>,
     pub limit: i64,
+}
+
+/// A position in the `list` ordering: the last draft a page returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftCursor {
+    pub created_at: DateTime<Utc>,
+    pub draft_id: DraftId,
+}
+
+impl DraftCursor {
+    /// Resume immediately after this draft.
+    pub fn after(draft: &Draft) -> Self {
+        Self {
+            created_at: draft.created_at,
+            draft_id: draft.draft_id,
+        }
+    }
 }
 
 impl DraftFilter {
@@ -1082,7 +1111,9 @@ impl DraftReview for PgDraftStore {
     async fn list(&self, filter: &DraftFilter) -> Result<Vec<Draft>, StoreError> {
         // Optional filters as `$n IS NULL OR column = $n`: one prepared
         // statement for every combination, which is what keeps this a
-        // compile-time-checked query rather than a string builder.
+        // compile-time-checked query rather than a string builder. The cursor
+        // is a *row* comparison, so it matches the `ORDER BY` exactly — two
+        // separate `<`/`<=` predicates on the two columns would not.
         let rows = sqlx::query_as!(
             DraftRow,
             r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,
@@ -1094,12 +1125,16 @@ impl DraftReview for PgDraftStore {
                   AND ($2::TEXT IS NULL OR kind = $2)
                   AND ($3::TEXT IS NULL OR source = $3)
                   AND ($4::UUID IS NULL OR subject_id = $4)
-                ORDER BY created_at DESC
-                LIMIT $5"#,
+                  AND ($5::TIMESTAMPTZ IS NULL
+                       OR (created_at, draft_id) < ($5, $6::UUID))
+                ORDER BY created_at DESC, draft_id DESC
+                LIMIT $7"#,
             filter.status.map(DraftStatus::as_wire_str),
             filter.kind.map(DraftKind::as_wire_str),
             filter.source.map(DraftSource::as_wire_str),
             filter.subject_id,
+            filter.before.map(|cursor| cursor.created_at),
+            filter.before.map(|cursor| cursor.draft_id.0),
             filter.limit.clamp(1, MAX_LIST_LIMIT),
         )
         .fetch_all(&self.pool)
