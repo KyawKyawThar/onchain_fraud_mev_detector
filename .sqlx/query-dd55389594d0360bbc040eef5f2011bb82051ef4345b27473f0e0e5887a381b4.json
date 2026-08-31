@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT draft_id, kind, subject_id, customer_id, chain, source, status, attempts,\n                      model, prompt_id, prompt_digest, stop_reason, body, token_usage,\n                      grounded_event_ids, grounding, batch_id, last_error, reviewed_by,\n                      reviewed_at, review_note, created_at, updated_at, completed_at\n                 FROM copilot_drafts\n                WHERE ($1::TEXT IS NULL OR status = $1)\n                  AND ($2::TEXT IS NULL OR kind = $2)\n                  AND ($3::TEXT IS NULL OR source = $3)\n                  AND ($4::UUID IS NULL OR subject_id = $4)\n                ORDER BY created_at DESC\n                LIMIT $5",
+  "query": "SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,\n                      attempts, model, prompt_id, prompt_digest, stop_reason, body, token_usage,\n                      grounded_event_ids, grounding, batch_id, last_error, reviewed_by,\n                      reviewed_at, review_note, created_at, updated_at, completed_at\n                 FROM copilot_drafts\n                WHERE draft_id = $1",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "source_text",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "source_text"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "attempts",
         "type_info": "Int4",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "model",
         "type_info": "Text",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "prompt_id",
         "type_info": "Text",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "prompt_digest",
         "type_info": "Text",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "stop_reason",
         "type_info": "Text",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "body",
         "type_info": "Text",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "token_usage",
         "type_info": "Jsonb",
         "origin": {
@@ -158,7 +169,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "grounded_event_ids",
         "type_info": "Jsonb",
         "origin": {
@@ -169,7 +180,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "grounding",
         "type_info": "Jsonb",
         "origin": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "batch_id",
         "type_info": "Text",
         "origin": {
@@ -191,7 +202,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "last_error",
         "type_info": "Text",
         "origin": {
@@ -202,7 +213,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "reviewed_by",
         "type_info": "Text",
         "origin": {
@@ -213,7 +224,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "reviewed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -224,7 +235,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "review_note",
         "type_info": "Text",
         "origin": {
@@ -235,7 +246,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -246,7 +257,7 @@
         }
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -257,7 +268,7 @@
         }
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "completed_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -270,11 +281,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Text",
-        "Uuid",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -284,6 +291,7 @@
       true,
       false,
       false,
+      true,
       false,
       false,
       true,
@@ -304,5 +312,5 @@
       true
     ]
   },
-  "hash": "8447b3ae998810d3f7bfa0d4e7433b59cc1d6bdba6f7465a8eb6824c35328c31"
+  "hash": "dd55389594d0360bbc040eef5f2011bb82051ef4345b27473f0e0e5887a381b4"
 }

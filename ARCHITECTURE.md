@@ -98,7 +98,7 @@ UsageRecorded         { customer_id, event_type, quantity, timestamp }
 ### AI events (copilot-service — §20)
 ```
 IncidentNarrativeDrafted { incident_id, narrative_ref, model_id, prompt_version, grounded_event_ids }
-RuleDraftProposed        { draft_id, owner, source_text_hash, definition, model_id, prompt_version }
+RuleDraftProposed        { draft_id, owner, source_text_hash, draft_ref, definition, model_id, prompt_id, prompt_version, prompt_digest, proposed_at }
 ```
 
 > **Schema evolution.** Events ride a versioned envelope with an upcasting
@@ -1236,6 +1236,36 @@ A separate service consuming `IncidentCreated` and reading the audit stream
   it can never run. The customer reviews the compiled rule (echoed back in
   plain language) before activating it. `RuleDraftProposed` is the audit
   record; activation flows through the normal `POST /v1/rules` path.
+
+  **The safety argument is that there is only one parser.** The copilot
+  re-implements none of §9's vocabulary: a drafted rule goes through
+  `RuleDefinition` → `Rule::validate` → `CompiledRuleSet::compile`, the same
+  path a hand-written rule takes, and the compiler — not merely the validator —
+  is the gate, because "well formed" and "evaluable" are different questions
+  and only the second is safe to hand somebody. A draft that fails lands
+  `blocked` with the parser's own message, inside the same one landing rule the
+  narrative's citation check runs in, so the cross-pod cache cannot promote a
+  draft the worker would have blocked.
+
+  **The model has no owner field to hallucinate into.** The structured-output
+  schema is generated from `RuleDefinition` — a rule *minus* `id` and `owner`,
+  the two fields no request body may choose — and that same type is what the
+  API service's `POST /v1/rules` builds from, so a drafted definition is
+  byte-for-byte a create body. The owner comes from the verified JWT twice: at
+  `POST /v1/rules/draft`, and again at activation.
+
+  The draft's subject id is **derived from `(owner, request)`**, so asking the
+  same question twice resolves to the draft that already exists rather than
+  buying a second, differently-worded answer to it; the hash is salted by owner
+  because a key shared across customers would be a cross-tenant draft, not a
+  cache hit. The event carries the **definition** where the narrative event
+  carries only a reference — a definition is a closed structure that already
+  passed the compiler and cannot act on anything until a customer activates it,
+  which is precisely what an auditor will later want to diff against what *was*
+  activated — and it carries only the **hash** of the customer's sentence,
+  never the sentence. The plain-language echo is rendered from the compiled
+  definition, never from what the model said about its own output: a
+  model-written summary would be wrong in exactly the case that matters.
 
 Mechanics:
 

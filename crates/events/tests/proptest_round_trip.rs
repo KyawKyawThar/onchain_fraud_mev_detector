@@ -912,6 +912,46 @@ fn copilot_event() -> impl Strategy<Value = DomainEvent> {
         )
 }
 
+/// AI copilot (§20.4): `RuleDraftProposed`.
+///
+/// The `definition` is generated as a *shaped* JSON document rather than an
+/// arbitrary `Value`: the field is untyped on the wire only because the event
+/// crate must stay a leaf, and a round-trip over shapes the rule engine can
+/// never emit would be testing `serde_json`, not this schema.
+fn rule_draft_event() -> impl Strategy<Value = DomainEvent> {
+    (
+        uuid(),
+        customer_id(),
+        any::<String>(),
+        any::<String>(),
+        any::<u8>(),
+        any::<String>(),
+        timestamp(),
+    )
+        .prop_map(
+            |(draft_id, owner, source_text_hash, name, threshold, model_id, proposed_at)| {
+                DomainEvent::RuleDraftProposed(events::copilot::RuleDraftProposed {
+                    draft_id,
+                    owner,
+                    source_text_hash,
+                    draft_ref: format!("copilot://drafts/{draft_id}"),
+                    definition: serde_json::json!({
+                        "name": name,
+                        "enabled": true,
+                        "conditions": [{"risk_score": {"gt": threshold}}],
+                        "logic": "all",
+                        "actions": [{"slack_alert": {"channel": "#alerts"}}],
+                    }),
+                    model_id,
+                    prompt_id: "rule_draft".into(),
+                    prompt_version: "v1".into(),
+                    prompt_digest: "7c41".into(),
+                    proposed_at,
+                })
+            },
+        )
+}
+
 /// Every `DomainEvent` variant, uniformly across the nine families.
 fn domain_event() -> impl Strategy<Value = DomainEvent> {
     prop_oneof![
@@ -923,6 +963,7 @@ fn domain_event() -> impl Strategy<Value = DomainEvent> {
         system_event(),
         predictive_event(),
         copilot_event(),
+        rule_draft_event(),
         cross_chain_event(),
     ]
 }

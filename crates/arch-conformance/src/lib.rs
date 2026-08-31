@@ -283,9 +283,14 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
         //   could query another's store is the cross-service join §14 forbids,
         //   and it would couple a draft to a schema it does not own.
         //
-        // `rule-engine` is deliberately *absent* from this list: t4 compiles a
-        // drafted rule through that crate's existing parse boundary, which is
-        // the hallucination-safety mechanism, not a shortcut around one.
+        // `rule-engine` is deliberately *absent* from this list, and since t4
+        // the copilot actually depends on it: a drafted rule is compiled
+        // through that crate's existing parse boundary
+        // (`copilot::rule_draft::compile_check`). That is the
+        // hallucination-safety mechanism itself, not a shortcut around one —
+        // and it is the reverse of the `llm` rule above, which forbids the
+        // same edge precisely because a validating boundary must live *above*
+        // the seam that produces what it validates.
         if krate == "copilot" {
             if !has("llm") {
                 out.push(format!(
@@ -495,6 +500,10 @@ mod tests {
                 &[
                     "events",
                     "llm",
+                    // The §20.4 t4 parse boundary — allowed, and the reason
+                    // the `copilot` rule's forbidden list deliberately omits
+                    // it (see the rule's own comment).
+                    "rule-engine",
                     "event-bus",
                     "rdkafka",
                     "sqlx",

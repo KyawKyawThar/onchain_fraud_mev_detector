@@ -4,8 +4,10 @@
 //!
 //! Subcommands, mirroring the other service binaries:
 //!   - `run` (default; also the no-arg run) — the consumer and the pool, plus
-//!     the announcement sweep and (when `COPILOT_HTTP_ADDR` is set) the draft
-//!     review API where a human approves a narrative.
+//!     the outbox flusher and (when `COPILOT_HTTP_ADDR` is set) the HTTP
+//!     surface: the review API where a human approves a narrative, and
+//!     `POST /v1/rules/draft` where a customer asks for a rule in plain
+//!     English (§20.4 t4).
 //!   - `backfill [--from RFC3339] [--to RFC3339]` — §20.4's historical
 //!     backfill through the Batch API at half price. A job, not a service:
 //!     bounded window, safe to re-run, safe to interrupt.
@@ -38,9 +40,11 @@ use chrono::{DateTime, Utc};
 use copilot::audit::{AuditSource, HttpAuditSource, IncidentSource};
 use copilot::backfill::BackfillRunner;
 use copilot::cache::PgCompletionCache;
+use copilot::capability::DraftCapability;
 use copilot::config::{Config, HttpConfig};
 use copilot::consumer::{build_consumer, CopilotConsumer};
-use copilot::draft::{DraftGenerator, NarrativeDrafter};
+use copilot::draft::NarrativeDrafter;
+use copilot::rule_draft::RuleDrafter;
 use copilot::store::PgDraftStore;
 use copilot::worker::{DraftWorkerPool, GeneratorRegistry};
 use event_bus::{EventSink, KafkaEventSink};
@@ -290,7 +294,13 @@ async fn run(cfg: &Config) -> Result<()> {
     // claimable at all.
     let generators = Arc::new(
         GeneratorRegistry::link(vec![
-            Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftGenerator>
+            Arc::new(NarrativeDrafter::new().with_grounding(cfg.grounding))
+                as Arc<dyn DraftCapability>,
+            // §20.4 t4. Registering it here is what makes `rule_draft` rows
+            // claimable at all — the roster's kinds *are* the claim filter, so
+            // a pod that does not link this one leaves them for a pod that
+            // does rather than leasing work it cannot finish.
+            Arc::new(RuleDrafter::new()),
         ])
         .context("linking the draft generators")?,
     );
@@ -318,7 +328,16 @@ async fn run(cfg: &Config) -> Result<()> {
     // Opt-in: unset `COPILOT_HTTP_ADDR` serves nothing, so a dev run does not
     // quietly expose an endpoint that can approve a SAR narrative.
     let http_task = match cfg.http() {
-        Some(http) => Some(serve_reviews(http, store.clone(), shutdown.clone()).await?),
+        Some(http) => Some(
+            serve_reviews(
+                http,
+                store.clone(),
+                Arc::clone(&wake),
+                cfg.chain,
+                shutdown.clone(),
+            )
+            .await?,
+        ),
         None => {
             tracing::info!("COPILOT_HTTP_ADDR unset — the draft review API is not served");
             None
@@ -363,6 +382,8 @@ async fn run(cfg: &Config) -> Result<()> {
 async fn serve_reviews(
     http: &HttpConfig,
     store: Arc<PgDraftStore>,
+    wake: Arc<Notify>,
+    chain: events::primitives::Chain,
     shutdown: CancellationToken,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let listener = tokio::net::TcpListener::bind(http.addr)
@@ -372,8 +393,14 @@ async fn serve_reviews(
         addr = %http.addr,
         "draft review API listening (Swagger UI at /swagger-ui)"
     );
+    // The same store, handed out as two narrow views: a reviewer's read/verdict
+    // surface and the enqueue the drafting route needs. Neither can claim a
+    // job, call the model, or land an answer.
     let router = copilot::http::router(copilot::http::AppState {
-        store,
+        store: store.clone(),
+        queue: store,
+        wake,
+        chain,
         jwt: http.jwt.clone(),
     });
     Ok(tokio::spawn(async move {

@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
-use events::copilot::{IncidentNarrativeDrafted, NarrativeSource};
+use events::copilot::{IncidentNarrativeDrafted, NarrativeSource, RuleDraftProposed};
 use events::cross_chain::{
     BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef, CrossChainMevDetected,
 };
@@ -380,6 +380,24 @@ fn sample_events() -> Vec<DomainEvent> {
             source: NarrativeSource::Backfill,
             drafted_at: ts(),
         }),
+        DomainEvent::RuleDraftProposed(RuleDraftProposed {
+            draft_id: uuid::Uuid::from_u128(0xD2),
+            owner: customer_id(),
+            source_text_hash: "9a1f".into(),
+            draft_ref: "copilot://drafts/00000000-0000-0000-0000-0000000000d2".into(),
+            definition: json!({
+                "name": "Sanctioned proximity inflow",
+                "enabled": true,
+                "conditions": [{"risk_score": {"gt": 80}}],
+                "logic": "all",
+                "actions": [{"slack_alert": {"channel": "#compliance"}}],
+            }),
+            model_id: "claude-opus-5".into(),
+            prompt_id: "rule_draft".into(),
+            prompt_version: "v1".into(),
+            prompt_digest: "7c41".into(),
+            proposed_at: ts(),
+        }),
         // Predictive (§16)
         DomainEvent::PredictedAlert(PredictedAlert {
             prediction_id: prediction_id(),
@@ -592,6 +610,10 @@ const GOLDENS: &[(&str, &str)] = &[
     (
         "IncidentNarrativeDrafted",
         r#"{"type":"IncidentNarrativeDrafted","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","draft_id":"00000000-0000-0000-0000-0000000000d1","narrative_ref":"copilot://drafts/00000000-0000-0000-0000-0000000000d1","model_id":"claude-opus-5","prompt_id":"incident_narrative","prompt_version":"v2","prompt_digest":"3f9c","grounded_event_ids":["00000000-0000-0000-0000-0000000000e7"],"claims":6,"cited_claims":5,"source":"backfill","drafted_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "RuleDraftProposed",
+        r##"{"type":"RuleDraftProposed","payload":{"draft_id":"00000000-0000-0000-0000-0000000000d2","owner":"00000000-0000-0000-0000-0000000000c0","source_text_hash":"9a1f","draft_ref":"copilot://drafts/00000000-0000-0000-0000-0000000000d2","definition":{"actions":[{"slack_alert":{"channel":"#compliance"}}],"conditions":[{"risk_score":{"gt":80}}],"enabled":true,"logic":"all","name":"Sanctioned proximity inflow"},"model_id":"claude-opus-5","prompt_id":"rule_draft","prompt_version":"v1","prompt_digest":"7c41","proposed_at":"2023-11-14T22:13:20Z"}}"##,
     ),
     (
         "PredictedAlert",

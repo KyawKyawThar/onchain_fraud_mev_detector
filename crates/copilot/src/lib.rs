@@ -51,7 +51,8 @@
 //! same statement a refusal makes, for the same reason.
 //!
 //! Every path that lands an answer applies that one rule through one write
-//! ([`store`]'s `write_landing`): the worker's, the cross-pod cache's, and the
+//! ([`store`]'s `write_landing`), which asks the kind's own capability
+//! ([`capability::CheckRegistry`]): the worker's, the cross-pod cache's, and the
 //! backfill's batch results. That write also files the
 //! `IncidentNarrativeDrafted` announcement ([`announce`]) into
 //! `copilot_outbox` **in the same transaction**, so the audit record is
@@ -64,15 +65,47 @@
 //! the citation boundary, the drafting event, the review API, and the
 //! half-price [`backfill`] over the Batch API.
 //!
-//! Deliberately not here: natural-language rule drafting and its parse
-//! boundary (t4) — for which `DraftKind::RuleDraft` and the kind-agnostic
-//! queue already exist; the grounding audit test and per-customer budget
+//! # A draft kind is one object ([`capability`])
+//!
+//! Everything a kind knows about itself — what to fetch, what to ask, whether
+//! the answer is usable, what the audit trail records — lives on one
+//! [`DraftCapability`](capability::DraftCapability). That is not tidiness: a
+//! kind whose *answer-check* was forgotten would land `ready` with no boundary
+//! applied, which is the one thing §20.4 exists to prevent, and a `match` arm
+//! in another module cannot be made to fail the build. Two registries are built
+//! from those objects, and they are deliberately different sets:
+//! [`CheckRegistry`](capability::CheckRegistry) is **exhaustive** and held by
+//! the store (every pod must be able to land every kind), while
+//! [`GeneratorRegistry`](worker::GeneratorRegistry) is the subset this pod may
+//! *run* and is the claim filter.
+//!
+//! # The rule parse boundary (Sprint 20 t4)
+//!
+//! Natural-language rule creation reuses every one of the above and adds one
+//! idea: [`rule_draft`]. A customer's sentence arrives at
+//! `POST /v1/rules/draft` with the owner taken from the verified token, is
+//! enqueued as `DraftKind::RuleDraft` under a subject id **derived from the
+//! request** (so asking twice costs once), and is drafted under a
+//! structured-output schema generated from the rule engine's own wire form.
+//!
+//! The answer then goes through §9's *existing* parser and compiler
+//! ([`rule_draft::compile_check`]) inside the same `store::land` the narrative
+//! path uses. A hallucinated condition is a parse error, not a rule: the draft
+//! lands `blocked` carrying the compiler's own message, exactly as an
+//! ungrounded narrative does. A draft that compiles lands `ready` with a
+//! plain-language echo rendered from the *compiled* definition, announces
+//! `RuleDraftProposed`, and is activated — if the customer wants it — through
+//! the ordinary `POST /v1/rules`, which validates it a second time under an
+//! owner it takes from the token rather than from the draft.
+//!
+//! Deliberately not here: the grounding audit test and per-customer budget
 //! alarms (t5).
 
 pub mod announce;
 pub mod audit;
 pub mod backfill;
 pub mod cache;
+pub mod capability;
 pub mod config;
 pub mod consumer;
 pub mod draft;
@@ -82,6 +115,7 @@ pub mod metrics;
 pub mod model;
 pub mod outbox;
 pub mod prompts;
+pub mod rule_draft;
 pub mod store;
 pub mod worker;
 
@@ -89,6 +123,7 @@ pub mod worker;
 pub mod test_util;
 
 pub use backfill::{BackfillConfig, BackfillReport, BackfillRunner};
+pub use capability::{CheckRegistry, DraftCapability, Grounding, Landing, RegistryError};
 pub use config::Config;
 pub use consumer::CopilotConsumer;
 pub use grounding::{GroundingPolicy, GroundingSummary};
@@ -96,8 +131,9 @@ pub use model::{
     Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus, Provenance, Review,
     Reviewed,
 };
+pub use rule_draft::{compile_check, describe, CompiledDraft, RuleDraftError, RuleDrafter};
 pub use store::{
     DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftQueue, DraftReview, DraftStore,
-    DraftWorkQueue, Landing, LandingRule, PgDraftStore,
+    DraftWorkQueue, PgDraftStore,
 };
 pub use worker::{DraftWorkerPool, GeneratorRegistry, PoolConfig};

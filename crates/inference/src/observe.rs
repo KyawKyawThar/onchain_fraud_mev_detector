@@ -18,15 +18,28 @@
 //! Composing it is the binary's job, once at boot, next to where the model is
 //! loaded:
 //!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use inference::{InferenceEngine, ObservedEngine};
-//! # fn build() -> Result<(), Box<dyn std::error::Error>> {
-//! # let config = unimplemented!();
+//! ```text
 //! let engine: Arc<dyn InferenceEngine> =
 //!     Arc::new(ObservedEngine::new(inference::onnx::OrtEngine::load(config)?));
-//! # Ok(())
-//! # }
+//! ```
+//!
+//! That line is `text` and not a compiled example on purpose: `onnx::OrtEngine`
+//! lives behind the `onnx` feature, which is **off by default** so the seam
+//! costs nothing to link (see the crate docs). A doctest naming it does not
+//! compile on the feature set anything in this workspace actually builds — so
+//! the compiled example below wraps the double instead, which is the same
+//! composition and is checked on every `cargo test`:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use inference::test_util::{block_descriptor, StubEngine};
+//! use inference::{InferenceEngine, ObservedEngine, Score};
+//!
+//! let engine: Arc<dyn InferenceEngine> = Arc::new(ObservedEngine::new(
+//!     StubEngine::constant(block_descriptor("anomaly-gbdt"), Score::new(0.9)?),
+//! ));
+//! assert_eq!(engine.descriptor().model_id(), "anomaly-gbdt");
+//! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # Double counting

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE copilot_drafts AS d\n                  SET status = $1,\n                      attempts = d.attempts + 1,\n                      lease_expires_at = $2,\n                      updated_at = $3\n                 FROM (\n                     SELECT draft_id\n                       FROM copilot_drafts\n                      WHERE (status = $4 OR (status = $1 AND lease_expires_at < $3))\n                        AND source = $7\n                        AND attempts < $5\n                      ORDER BY created_at\n                      FOR UPDATE SKIP LOCKED\n                      LIMIT $6\n                 ) AS claimable\n                WHERE d.draft_id = claimable.draft_id\n            RETURNING d.draft_id, d.kind, d.subject_id, d.customer_id, d.chain, d.source,\n                      d.attempts, d.lease_expires_at AS \"lease_expires_at!\"",
+  "query": "SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text,\n                      prompt_id, prompt_digest, grounded_event_ids\n                 FROM copilot_drafts\n                WHERE request_digest = $1\n                  AND model_digest = $2\n                  AND status = $3\n                FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -71,23 +71,45 @@
       },
       {
         "ordinal": 6,
-        "name": "attempts",
-        "type_info": "Int4",
+        "name": "source_text",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "copilot_drafts",
-            "name": "attempts"
+            "name": "source_text"
           }
         }
       },
       {
         "ordinal": 7,
-        "name": "lease_expires_at!",
-        "type_info": "Timestamptz",
+        "name": "prompt_id",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "copilot_drafts",
-            "name": "lease_expires_at"
+            "name": "prompt_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "prompt_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "prompt_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "grounded_event_ids",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "grounded_event_ids"
           }
         }
       }
@@ -95,11 +117,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Timestamptz",
-        "Timestamptz",
         "Text",
-        "Int4",
-        "Int8",
         "Text"
       ]
     },
@@ -110,9 +128,11 @@
       true,
       false,
       false,
-      false,
-      true
+      true,
+      true,
+      true,
+      false
     ]
   },
-  "hash": "8f59ae5fb01e4cc5c571fd6d61535da53b7458b5892c7945df3322e29f20ee17"
+  "hash": "53a9491385eb59983b5b8793f4dbc0a5fb1c7eb8052aee85dbcd05dd8276ad20"
 }

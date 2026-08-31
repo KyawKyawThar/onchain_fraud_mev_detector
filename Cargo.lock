@@ -2198,6 +2198,7 @@ dependencies = [
  "metrics-util",
  "rdkafka",
  "reqwest 0.13.4",
+ "rule-engine",
  "secrecy",
  "serde",
  "serde_json",
@@ -3931,6 +3932,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "detector-api",
+ "inference",
  "metrics",
  "metrics-util",
  "ml-features",

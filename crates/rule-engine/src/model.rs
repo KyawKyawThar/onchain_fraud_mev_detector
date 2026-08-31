@@ -50,25 +50,26 @@ impl Rule {
     /// the `POST /v1/rules` boundary (t4) to reject bad definitions with a
     /// specific reason instead of a 500 later.
     pub fn validate(&self) -> Result<(), InvalidRule> {
-        if self.name.trim().is_empty() {
-            return Err(InvalidRule::EmptyName);
+        validate_parts(
+            &self.name,
+            &self.conditions,
+            self.temporal.as_ref(),
+            &self.actions,
+        )
+    }
+
+    /// This rule's authored half, without its identity — the shape a
+    /// `POST /v1/rules` body carries and the shape §20.4's natural-language
+    /// drafter emits.
+    pub fn definition(&self) -> RuleDefinition {
+        RuleDefinition {
+            name: self.name.clone(),
+            enabled: self.enabled,
+            conditions: self.conditions.clone(),
+            logic: self.logic,
+            temporal: self.temporal.clone(),
+            actions: self.actions.clone(),
         }
-        if self.conditions.is_empty() {
-            return Err(InvalidRule::NoConditions);
-        }
-        if self.actions.is_empty() {
-            return Err(InvalidRule::NoActions);
-        }
-        for condition in &self.conditions {
-            condition.validate()?;
-        }
-        if let Some(temporal) = &self.temporal {
-            temporal.validate()?;
-        }
-        for action in &self.actions {
-            action.validate()?;
-        }
-        Ok(())
     }
 
     /// Visit every condition in the rule — top-level *and* inside the temporal
@@ -85,6 +86,95 @@ impl Rule {
             None => {}
         }
     }
+}
+
+/// A rule **without its identity**: everything a customer authors, and
+/// nothing the platform owns.
+///
+/// The two fields it drops are exactly the two nobody outside the platform may
+/// choose. `owner` always comes from the bearer token — a body that could name
+/// another customer would defeat the whole §9 isolation contract — and `id` is
+/// server-minted. Splitting them out makes that a property of the type rather
+/// than a rule each surface has to remember, which matters now that there are
+/// two surfaces: `POST /v1/rules` (§9) and §20.4's natural-language drafter,
+/// whose structured-output schema is generated from *this* struct so a model
+/// cannot emit an `owner` field at all.
+///
+/// The serde form is the wire form is the stored JSONB form — flattening this
+/// into a [`Rule`] adds `id` and `owner` and changes nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleDefinition {
+    pub name: String,
+    /// Defaults to `true` — an authored rule evaluates as soon as it exists.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    pub conditions: Vec<Condition>,
+    pub logic: LogicOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalConstraint>,
+    pub actions: Vec<Action>,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+impl RuleDefinition {
+    /// The same shape invariants [`Rule::validate`] checks — none of which
+    /// involve `id` or `owner`, which is what makes this split safe.
+    pub fn validate(&self) -> Result<(), InvalidRule> {
+        validate_parts(
+            &self.name,
+            &self.conditions,
+            self.temporal.as_ref(),
+            &self.actions,
+        )
+    }
+
+    /// Stamp the platform's half onto the customer's half.
+    pub fn into_rule(self, id: RuleId, owner: CustomerId) -> Rule {
+        Rule {
+            id,
+            owner,
+            name: self.name,
+            enabled: self.enabled,
+            conditions: self.conditions,
+            logic: self.logic,
+            temporal: self.temporal,
+            actions: self.actions,
+        }
+    }
+}
+
+/// The §9 shape invariants, over the fields that carry them. One body, two
+/// callers ([`Rule::validate`] and [`RuleDefinition::validate`]) — a second
+/// copy would be a second answer to "is this rule well formed", and the whole
+/// hallucination-safety argument for §20.4 rests on there being exactly one.
+fn validate_parts(
+    name: &str,
+    conditions: &[Condition],
+    temporal: Option<&TemporalConstraint>,
+    actions: &[Action],
+) -> Result<(), InvalidRule> {
+    if name.trim().is_empty() {
+        return Err(InvalidRule::EmptyName);
+    }
+    if conditions.is_empty() {
+        return Err(InvalidRule::NoConditions);
+    }
+    if actions.is_empty() {
+        return Err(InvalidRule::NoActions);
+    }
+    for condition in conditions {
+        condition.validate()?;
+    }
+    if let Some(temporal) = temporal {
+        temporal.validate()?;
+    }
+    for action in actions {
+        action.validate()?;
+    }
+    Ok(())
 }
 
 /// How a rule's conditions combine (§9).

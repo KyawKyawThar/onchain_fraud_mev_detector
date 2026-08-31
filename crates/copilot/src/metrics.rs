@@ -108,6 +108,25 @@ pub fn record_grounding(
     }
 }
 
+/// Counter (labeled by `reason`): rule drafts refused by §9's parse boundary —
+/// `malformed` (not a rule document), `invalid` (§9 rejected it) or
+/// `uncompilable` (the compiler did).
+///
+/// This is the rule-shaped twin of [`GROUNDING_REJECTED_TOTAL`], and it is a
+/// *health* signal rather than an incident one: every count here is the safety
+/// mechanism working — a hallucinated rule that could never run. Alert on the
+/// rate relative to `copilot_drafts_finished_total{kind="rule_draft"}`, because
+/// a rising share means the prompt or the schema has drifted from §9's
+/// vocabulary and customers are paying for drafts they cannot activate.
+pub const RULE_DRAFTS_REJECTED_TOTAL: &str = "copilot_rule_drafts_rejected_total";
+
+/// Record one rule draft's landing. `None` means it compiled.
+pub fn record_rule_draft(rejected: Option<&'static str>) {
+    if let Some(reason) = rejected {
+        metrics::counter!(RULE_DRAFTS_REJECTED_TOTAL, "reason" => reason).increment(1);
+    }
+}
+
 /// Counter (labeled by `outcome`): drafts landed by the Batch API backfill —
 /// the same `answered`/`errored`/`canceled`/`expired` vocabulary the seam
 /// reports, plus `orphaned` for a result whose draft had moved on.
