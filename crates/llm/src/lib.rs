@@ -204,7 +204,7 @@ pub use config::{
 };
 pub use digest::{ContentDigest, DigestBuilder};
 pub use metered::{Billing, MeteredClient};
-pub use prompt::{grounded_message, PromptDescriptor, PromptRegistry, Untrusted};
+pub use prompt::{grounded_message, manifest, PromptDescriptor, PromptRegistry, Untrusted};
 pub use retry::RetryingClient;
 pub use stack::LlmStack;
 

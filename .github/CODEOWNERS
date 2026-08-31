@@ -1,0 +1,21 @@
+# Code owners — who must approve a change to the files below.
+#
+# GitHub enforces this only where branch protection requires code-owner review;
+# without that it is an automatic reviewer request. Either way the point is the
+# same: these paths must not be changed by one person alone.
+
+# ── Prompt artifacts (engineering conventions §16) ───────────────
+# A prompt edit changes what a machine-written suspicious-activity report says
+# about people's money, with no type error, no failing test and no deploy
+# artifact that looks different. The MANIFEST is what turns such an edit into a
+# reviewable hunk; both it and the artifacts it pins are owned here.
+/crates/*/prompts/            @KyawKyawThar
+/crates/llm/src/prompt.rs     @KyawKyawThar
+
+# ── The §20.4 safety boundaries themselves ───────────────────────
+# The citation check, its after-the-fact audit, and the per-kind boundary
+# registry are the mechanisms the "an LLM output is a proposal, never a fact"
+# argument rests on. Weakening one is a governance decision, not a refactor.
+/crates/copilot/src/grounding.rs        @KyawKyawThar
+/crates/copilot/src/grounding_audit.rs  @KyawKyawThar
+/crates/copilot/src/capability.rs       @KyawKyawThar

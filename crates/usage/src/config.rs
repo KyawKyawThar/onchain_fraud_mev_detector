@@ -12,6 +12,8 @@ use event_bus::batch::BatchConfig;
 use secrecy::SecretString;
 use telemetry::env::{parse_or, required};
 
+use crate::budget::{BudgetPolicy, DEFAULT_MAX_REPORTED, DEFAULT_WARN_RATIO, DEFAULT_WINDOW_DAYS};
+
 /// Default rows-per-flush ceiling. Sized for ClickHouse's parts economics
 /// (one insert = one part; the official guidance is few, large inserts) while
 /// keeping a bounded memory footprint per consumer.
@@ -31,6 +33,9 @@ const SHUTDOWN_FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// out of.
 const DEFAULT_DLQ_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
+/// Default gap between token-budget evaluations, in seconds.
+const DEFAULT_BUDGET_INTERVAL_SECS: u64 = crate::budget::DEFAULT_INTERVAL.as_secs();
+
 /// All runtime configuration for the usage service.
 ///
 /// Secret-bearing fields are [`SecretString`], so `Debug` redacts them and an
@@ -41,6 +46,11 @@ pub struct Config {
     pub kafka: KafkaConfig,
     /// How the sink sizes and paces its ClickHouse flushes.
     pub batch: BatchConfig,
+    /// Per-customer token budget alarms (§20.4). Off unless
+    /// `USAGE_TOKEN_BUDGET` is set — a budget nobody chose is a number that
+    /// alarms on nothing or on everything, and both teach an operator to
+    /// ignore it.
+    pub budget: BudgetPolicy,
     /// Address the Prometheus `/metrics` exporter binds to (§19).
     pub metrics_addr: SocketAddr,
 }
@@ -82,7 +92,7 @@ impl Config {
     /// Resolve config from the process environment, erroring on anything missing
     /// or malformed (fail fast at boot rather than at first record).
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let config = Self {
             clickhouse: ClickhouseConfig {
                 url: required("CLICKHOUSE_HTTP_URL")?,
                 user: required("CLICKHOUSE_USER")?,
@@ -104,7 +114,29 @@ impl Config {
                 retry_backoff: RETRY_BACKOFF,
                 shutdown_flush_grace: SHUTDOWN_FLUSH_GRACE,
             },
+            budget: BudgetPolicy {
+                tokens: parse_or("USAGE_TOKEN_BUDGET", 0u64)?,
+                warn_ratio: parse_or("USAGE_TOKEN_BUDGET_WARN_RATIO", DEFAULT_WARN_RATIO)?,
+                window: Duration::from_secs(
+                    parse_or("USAGE_BUDGET_WINDOW_DAYS", u64::from(DEFAULT_WINDOW_DAYS))?
+                        * 24
+                        * 60
+                        * 60,
+                ),
+                interval: Duration::from_secs(parse_or(
+                    "USAGE_BUDGET_INTERVAL_SECS",
+                    DEFAULT_BUDGET_INTERVAL_SECS,
+                )?),
+                max_reported: parse_or("USAGE_BUDGET_MAX_REPORTED", DEFAULT_MAX_REPORTED)?,
+            },
             metrics_addr: parse_or("USAGE_METRICS_ADDR", "0.0.0.0:9109".parse()?)?,
-        })
+        };
+        // Only when it is switched on: an unset budget is the default, and
+        // validating the untouched knobs around a disabled alarm would refuse
+        // boots for a feature the deployment is not using.
+        if config.budget.is_enabled() {
+            config.budget.validate()?;
+        }
+        Ok(config)
     }
 }

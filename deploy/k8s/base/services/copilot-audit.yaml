@@ -1,0 +1,113 @@
+# ── copilot grounding audit (§20.4, Sprint 20 t5) ─────────────────
+# A weekly CronJob that re-resolves every landed narrative's citations against
+# event-store and **fails the Job** when a stored draft makes a claim the
+# record does not support.
+#
+# Why a CronJob and not a loop inside the copilot Deployment:
+#
+#  * It is a *sweep*, not a monitor. It reads every landed narrative and one
+#    audit stream per narrative — bounded, occasional and expensive, which is
+#    the shape of a job, not of something that shares a process with a worker
+#    pool holding leases.
+#  * Its result is an exit code. A short-lived process is not reliably scraped,
+#    so a failing Job (kube_job_status_failed) is the durable signal; the
+#    counters it also emits are the secondary one.
+#  * It must be runnable *on demand*, before an audit or after a prompt change:
+#    `kubectl create job --from=cronjob/copilot-audit audit-now`, which is the
+#    same command line `just copilot-audit` runs locally.
+#
+# It shares the copilot's config and credentials but needs no model access: the
+# audit calls nothing and costs nothing. ANTHROPIC_API_KEY is still required
+# because `Config::from_env` resolves the whole config at boot (§9) — the
+# alternative would be a second, partial config path used only here, which is
+# how a job ends up running against different settings than the service it
+# audits.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: copilot-audit
+  labels:
+    app.kubernetes.io/name: copilot-audit
+    app.kubernetes.io/part-of: mevwatch
+    app.kubernetes.io/component: copilot
+spec:
+  # Sunday 03:00. The sweep is read-only and off every hot path, so the time
+  # matters only in that its findings should be waiting on Monday morning.
+  schedule: "0 3 * * 0"
+  # A sweep that overran its week must not be joined by a second one competing
+  # for the same event-store reads.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Failed runs are kept longer: the pod log *is* the report, naming the draft
+  # ids the metrics deliberately cannot.
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      # No retries. A finding is a *result*, not a flake — re-running the sweep
+      # produces the identical finding, and a backoff would turn one honest
+      # failure into six identical ones in the Job history.
+      backoffLimit: 0
+      # A sweep that has run for six hours is not going to finish; kill it
+      # rather than let it hold the schedule's Forbid lock into next week.
+      activeDeadlineSeconds: 21600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: copilot-audit
+            app.kubernetes.io/part-of: mevwatch
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: copilot-audit
+              image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/copilot:latest
+              args: ["audit"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              envFrom:
+                - configMapRef:
+                    name: app-config # COPILOT_EVENT_STORE_URL rides here
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-credentials
+                      key: DATABASE_URL
+                # Not used by the audit — it calls no model — but the config is
+                # resolved once, whole, at boot (§9). See the header.
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: app-secrets
+                      key: ANTHROPIC_API_KEY
+                # The bulkhead on event-store's read path. Set explicitly
+                # rather than left to the binary's default so the number is
+                # visible in `kubectl describe cronjob` — this sweep runs
+                # against a service that is serving live traffic, and "how hard
+                # does the weekly audit hit event-store" should be answerable
+                # without reading the source.
+                - name: COPILOT_AUDIT_CONCURRENCY
+                  value: "4"
+                # The audit serves no HTTP and needs no reviewer identity, so
+                # COPILOT_HTTP_ADDR is deliberately absent here: setting it
+                # would make JWT_SECRET/JWT_ISSUER required for a process that
+                # exposes nothing. COPILOT_METRICS_ADDR is absent for a related
+                # reason — nothing scrapes a pod that lives for two minutes, so
+                # the exit code and the pod log are the result. In Kubernetes
+                # the alertable signal is this Job failing
+                # (`kube_job_status_failed{job_name=~"copilot-audit.*"}`), not
+                # the `copilot_grounding_audit_*` counters.
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

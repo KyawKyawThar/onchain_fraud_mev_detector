@@ -47,3 +47,7 @@ metrics.workspace = true
 # Real ClickHouse/Kafka in throwaway containers for the `#[ignore]` tests.
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
+# `UsageEventType::iter()` — the budget-alarm test that every token SKU is
+# counted. A new SKU that TOKEN_SKUS forgets is a budget that quietly stops
+# counting part of the bill, and only an exhaustive iteration catches it.
+strum.workspace = true

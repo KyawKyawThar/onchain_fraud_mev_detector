@@ -455,6 +455,30 @@ copilot-backfill from="" to="":
         {{ if from == "" { "" } else { "--from " + from } }} \
         {{ if to == "" { "" } else { "--to " + to } }}
 
+# §20.4 governance sweep (Sprint 20 t5): re-resolve every landed narrative's
+# citations against event-store and report what no longer holds. Exits 1 on a
+# finding (a citation the store does not have, a row that disagrees with its
+# own text, or a `ready` draft the citation boundary never ran on) and 2 when
+# nothing could be verified at all — so it is usable as a CronJob or a
+# pre-audit gate, not just as something to read.
+#   just copilot-audit --since 2026-01-01T00:00:00Z
+copilot-audit *args:
+    cargo run -p copilot -- audit {{args}}
+
+# Regenerate the checked-in prompt manifest (engineering conventions §16).
+# A prompt edit changes a digest here, so the change cannot merge without a
+# hunk a reviewer sees. Run this after touching anything under
+# crates/copilot/prompts/, and put the diff in the PR.
+prompt-manifest:
+    cargo run -q -p copilot -- prompts > crates/copilot/prompts/MANIFEST
+
+# Print the current per-customer token spend against the configured budget
+# (§20.4 t5). The alarm's metrics deliberately carry no customer label, so
+# this is where an operator finds out *who* is over budget. Needs
+# USAGE_TOKEN_BUDGET set and ClickHouse up.
+usage-budget:
+    cargo run -p usage -- budget
+
 # Start bacon (TUI, jobs defined in bacon.toml)
 bacon:
     bacon

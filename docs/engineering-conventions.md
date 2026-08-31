@@ -33,6 +33,7 @@ A change is "done" when:
 - [ ] **The gates pass locally** — `just check` green (local == CI).
 - [ ] **New Kafka consumer?** — every line of the §12 conformance list, no exceptions.
 - [ ] **Doc comments state constraints** the code can't express (§13) — never narration of the next line.
+- [ ] **Changed a prompt?** — the artifact is versioned, the manifest is regenerated, and the diff is reviewed (§16).
 
 ---
 
@@ -455,6 +456,76 @@ reason}` counting `contended` / `poisoned` / `undrained`.
 **Anti-pattern.** `let Ok(guard) = mutex.lock() else { return; }` — correct
 about not panicking, silent about having given up, and permanent once the lock
 is poisoned.
+
+---
+
+## 16. A prompt is code, and a prompt change is a reviewed diff
+
+**Rule.** Every instruction sent to a model is a **versioned, content-hashed
+artifact checked into the repository** — never a string literal at a call site,
+never a value in a console or a database row. Concretely:
+
+1. The text lives in `crates/<service>/prompts/<purpose>.<version>.md` and reaches
+   the code through `include_str!`, so the deployed binary physically contains the
+   instructions it claims to run.
+2. It is wrapped in a `llm::PromptDescriptor` (purpose, version, SHA-256 of the
+   bytes) and linked at boot through a `PromptRegistry` — link-or-fail, one live
+   version per purpose.
+3. Every artifact in the tree, **including retired ones**, has a line in the
+   service's checked-in `prompts/MANIFEST`, and a unit test fails when the file and
+   the artifacts disagree. Regenerate with `just prompt-manifest`.
+4. A change to what the model is *told to do* moves the version and retires the old
+   artifact in place (kept, never deleted). A typo fix may stay on the version; the
+   manifest still moves, because the manifest is over bytes.
+5. `.github/CODEOWNERS` covers `prompts/**`, so the diff needs a second pair of
+   eyes wherever branch protection requires code-owner review.
+
+**Why here.** The output of these prompts is a **suspicious-activity report a human
+files with a regulator**, and a rule proposal that will run against customer alerts.
+Three specific failures follow from treating the text as configuration:
+
+* **Unattributable history.** "Which instructions produced this narrative?" must be
+  answerable for a document written eleven months ago. A version string alone cannot
+  answer it — an edit made underneath an unmoved version is invisible — which is why
+  the digest is stamped beside the id on every draft, exactly as a detector stamps
+  `(id, version, config_hash)` and `inference` hashes weights instead of trusting a
+  filename. It is also why a retired artifact stays in the tree: a provenance stamp
+  pointing at bytes nobody kept proves nothing.
+* **Unreviewed behaviour change.** A prompt edit changes what the system says about
+  people's money, with no type error, no failing test, and no deploy artifact that
+  looks different. The manifest is what turns it into a hunk somebody has to
+  approve. This is not hypothetical: `incident_narrative@v1`'s own example wrote
+  event ids elided (`[3f2a...-...]`), teaching the model to produce citations that
+  the grounding check can never resolve — the artifact was training the failure the
+  checker exists to catch, and it took a reader of the *text* to see it.
+* **Silent drift in a retired artifact.** A retired prompt is linked to no purpose,
+  so no cache key, no boot check and no request digest covers it. Without a manifest
+  line, it is the one file in the tree that can be edited with nothing noticing —
+  and it is the file that historical drafts are attributed to.
+
+Two smaller rules follow from the same reasoning. **Load-bearing instructions are
+pinned by assertions**, not by hoping a reviewer notices they went missing: a test
+asserts that the narrative artifact still demands full event ids and still states
+the injection boundary. And **the prompt's own examples are held to the format the
+parser reads** — an artifact that demonstrates an unparseable citation is a bug in
+the same way a wrong constant is.
+
+**Reference.**
+- [`llm::prompt`](../crates/llm/src/prompt.rs) — `PromptDescriptor`, `PromptRegistry`, `manifest`.
+- [`copilot::prompts`](../crates/copilot/src/prompts.rs) — the linked + retired roster, and the three tests that are the gate: the manifest match, the "every `.md` in the tree is described" sweep, and the instruction assertions.
+- [`crates/copilot/prompts/MANIFEST`](../crates/copilot/prompts/MANIFEST) — the reviewed file itself.
+
+**Anti-pattern.** `let system = format!("You are a compliance analyst. {extra}");` at
+a call site — unversioned, unhashed, unreviewable, and one interpolation away from
+putting attacker-controlled chain data into the instruction channel (which is what
+`Untrusted` and the user-turn fence exist to prevent).
+
+**Corollary — governance is checked, not asserted.** The same posture applies to the
+*output*: `copilot audit` re-resolves every landed narrative's citations against
+event-store and exits non-zero when a stored draft makes a claim the record does not
+support ([`copilot::grounding_audit`](../crates/copilot/src/grounding_audit.rs)). A
+governance property nobody re-checks after the fact is a governance property that
+holds until the first time it doesn't.
 
 ---
 

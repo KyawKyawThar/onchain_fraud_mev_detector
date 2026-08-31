@@ -631,6 +631,13 @@ impl DraftReview for InMemoryDraftStore {
                     .subject_id
                     .is_none_or(|subject| subject == draft.subject_id)
             })
+            // The keyset cursor, as the row comparison the SQL does: strictly
+            // older in `(created_at, draft_id)` order.
+            .filter(|draft| {
+                filter.before.is_none_or(|cursor| {
+                    (draft.created_at, draft.draft_id.0) < (cursor.created_at, cursor.draft_id.0)
+                })
+            })
             .collect();
         // Newest first, exactly as the store's `ORDER BY created_at DESC`.
         drafts.sort_by(|a, b| {

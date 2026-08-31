@@ -45,6 +45,12 @@ rdkafka = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+# Bounded fan-out for the §20.4 grounding audit (src/grounding_audit.rs): one
+# event-store read per landed narrative, `COPILOT_AUDIT_CONCURRENCY` at a time.
+# Serially the sweep outlives its own CronJob deadline; unbounded it is a load
+# test on a service that is serving live traffic. Same seam
+# `simulation::exposure_report` uses for the same reason.
+futures-util = { workspace = true }
 
 # §20.4's hallucination-safety mechanism for natural-language rule creation
 # (src/rule_draft.rs): a drafted rule is parsed and compiled through §9's
