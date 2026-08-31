@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE copilot_drafts AS d\n                  SET status = $1,\n                      attempts = d.attempts + 1,\n                      lease_expires_at = $2,\n                      updated_at = $3\n                 FROM (\n                     SELECT draft_id\n                       FROM copilot_drafts\n                      WHERE (status = $4 OR (status = $1 AND lease_expires_at < $3))\n                        AND kind = ANY($7::TEXT[])\n                        AND source = $8\n                        AND attempts < $5\n                      ORDER BY created_at\n                      FOR UPDATE SKIP LOCKED\n                      LIMIT $6\n                 ) AS claimable\n                WHERE d.draft_id = claimable.draft_id\n            RETURNING d.draft_id, d.kind, d.subject_id, d.customer_id, d.chain, d.source,\n                      d.source_text, d.attempts,\n                      d.lease_expires_at AS \"lease_expires_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "draft_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "customer_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "chain",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "chain"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "source_text",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "source_text"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "lease_expires_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "copilot_drafts",
+            "name": "lease_expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Text",
+        "Int4",
+        "Int8",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "30df6dddfaad3e682ff27d4ddfbee6d55a69a02f9d42636644f872d4fc02fd52"
+}

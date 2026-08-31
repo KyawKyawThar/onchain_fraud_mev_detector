@@ -1,5 +1,5 @@
-//! The draft review API (§20.4) — where a human reads a narrative and
-//! approves it, and the only way a draft ever becomes usable.
+//! The copilot's HTTP surface (§20.4) — where a human reads a draft and
+//! decides on it, and where a customer asks for a rule in plain English.
 //!
 //! # Nothing auto-delivers
 //!
@@ -25,6 +25,26 @@
 //! SSO subject); this service does not require it to be a customer UUID the
 //! way the metered API does, because an incident narrative has no customer.
 //!
+//! # `POST /v1/rules/draft` — asking, not activating (t4)
+//!
+//! The one write that is not a verdict. A customer posts a sentence; the
+//! service records a `rule_draft` job **owned by the token's subject** and
+//! returns a draft id. It does not call the model (that is the worker pool's
+//! job, minutes later — see the crate docs on why an LLM call never rides a
+//! request that something is waiting on), and it emphatically does not create
+//! a rule.
+//!
+//! Three properties hold by construction rather than by care:
+//!
+//! * the owner is the verified `sub` parsed as a customer UUID, so a body
+//!   cannot name another customer and the model has no field to put one in;
+//! * the subject id is derived from `(owner, request)`, so a double-clicked
+//!   button resolves to the draft that already exists instead of buying a
+//!   second, differently-worded answer to the same question;
+//! * activation is somewhere else entirely — the rule engine's own
+//!   `POST /v1/rules`, which re-validates the definition under an owner it
+//!   takes from the token. Nothing this service serves can make a rule run.
+//!
 //! # Swagger, because a compliance reviewer is not a `curl` user
 //!
 //! The spec is generated from the handlers, so it cannot drift from the routes
@@ -36,6 +56,8 @@ use std::sync::Arc;
 use api_error::ApiError;
 use auth::{Claims, JwtConfig};
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,8 +69,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::grounding::GroundingSummary;
 use crate::metrics;
-use crate::model::{Draft, DraftId, DraftKind, DraftSource, DraftStatus, Review};
-use crate::store::{DraftFilter, DraftReview, StoreError, MAX_LIST_LIMIT};
+use crate::model::{Draft, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus, Review};
+use crate::rule_draft::MAX_REQUEST_BYTES;
+use crate::store::{DraftFilter, DraftQueue, DraftReview, Enqueued, StoreError, MAX_LIST_LIMIT};
 
 /// Default page size for the review queue.
 const DEFAULT_LIMIT: i64 = 50;
@@ -64,7 +87,16 @@ const DEFAULT_LIMIT: i64 = 50;
                        audit trail, and the human approval that is the only way one leaves the \
                        platform (§20.4)",
     ),
-    components(schemas(DraftSummary, DraftDetail, GroundingView, ReviewRequest, ReviewResponse)),
+    components(schemas(
+        DraftSummary,
+        DraftDetail,
+        GroundingView,
+        RuleView,
+        ReviewRequest,
+        ReviewResponse,
+        DraftRuleRequest,
+        DraftRuleResponse,
+    )),
     tags((name = "copilot", description = "Incident narrative drafts and their review (§20.4)")),
 )]
 pub struct ApiDoc;
@@ -73,6 +105,19 @@ pub struct ApiDoc;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn DraftReview>,
+    /// The enqueue half, for `POST /v1/rules/draft`. Narrow on purpose: this
+    /// handler records a job and nothing else — it cannot claim, call a model,
+    /// or approve anything (`crate::store`'s four views).
+    pub queue: Arc<dyn DraftQueue>,
+    /// Nudges the worker pool that there is new work, so a customer waits the
+    /// length of a draft rather than the length of a draft plus a poll
+    /// interval. A latency hint only: polling is what actually drains the
+    /// queue, because other pods enqueue too.
+    pub wake: Arc<tokio::sync::Notify>,
+    /// The chain stamped on this deployment's events (`COPILOT_CHAIN`). The
+    /// copilot is not per-chain; a rule draft is not a chain fact either, and
+    /// every envelope needs one.
+    pub chain: events::primitives::Chain,
     /// How a reviewer's token is verified (§11, shared with the API service).
     pub jwt: JwtConfig,
 }
@@ -88,8 +133,11 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     let (reviews, review_api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(approve))
         .routes(routes!(reject))
-        // Only the verdict routes: a reviewer needs a token to *decide*, not to
-        // read the queue.
+        .routes(routes!(draft_rule))
+        // Only the writes: a reviewer needs a token to *decide* and a customer
+        // needs one to *ask*, but neither needs one to read the queue. The
+        // drafting route is here for a second reason as well — its owner is
+        // the verified subject, so it cannot be served without a token at all.
         .layer(axum::middleware::from_fn_with_state(
             state.jwt.clone(),
             auth::require_jwt,
@@ -175,9 +223,31 @@ struct DraftDetail {
     #[schema(value_type = Vec<String>)]
     grounded: Vec<uuid::Uuid>,
     grounding: Option<GroundingView>,
+    /// The compiled rule, for a rule draft (§20.4 t4). Present only when the
+    /// draft crossed §9's parse boundary — a `blocked` rule draft has the
+    /// compiler's complaint in `last_error` and nothing here, which is the
+    /// whole distinction.
+    rule: Option<RuleView>,
     /// The Batch API job that produced it, for a backfilled draft.
     batch_id: Option<String>,
     review_note: Option<String>,
+}
+
+/// A drafted rule, as its customer reviews it before activating it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct RuleView {
+    /// The definition in §9's wire form — **post this verbatim to the rule
+    /// engine's `POST /v1/rules` to activate it**. There is no "activate"
+    /// button here on purpose: making a rule run is the rule engine's write,
+    /// under an owner it takes from the customer's own token, and a copilot
+    /// endpoint that could do it would be this service creating rules.
+    #[schema(value_type = Object)]
+    definition: serde_json::Value,
+    /// The same rule in plain language, rendered from the **compiled**
+    /// definition rather than from anything the model said about its own
+    /// output. That is what makes it a check: a model-written summary would be
+    /// wrong in exactly the case that matters.
+    explanation: String,
 }
 
 /// The citation check's findings.
@@ -235,6 +305,12 @@ impl From<&Draft> for DraftDetail {
             prompt_digest: draft.provenance.as_ref().map(|p| p.prompt_digest.clone()),
             grounded: draft.grounded_event_ids.clone(),
             grounding: draft.grounding.as_ref().map(GroundingView::from),
+            rule: draft.compiled_rule().and_then(|compiled| {
+                Some(RuleView {
+                    explanation: compiled.explain(),
+                    definition: serde_json::to_value(compiled.definition()).ok()?,
+                })
+            }),
             batch_id: draft.batch_id.clone(),
             review_note: draft.review.as_ref().and_then(|review| review.note.clone()),
         }
@@ -446,6 +522,140 @@ async fn decide(
     }))
 }
 
+/// `POST /v1/rules/draft` body: the customer's own sentence, and nothing else.
+///
+/// Note what is absent, twice over: an `owner` (the token's `sub` is the only
+/// answer this service accepts) and any part of the rule itself. A body that
+/// could carry half a definition would be a second, unvalidated way into the
+/// rule store.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+struct DraftRuleRequest {
+    /// What to alert on, in plain English — e.g. "alert me when any wallet
+    /// within 2 hops of a sanctioned address moves more than $10K into our
+    /// pools".
+    request: String,
+}
+
+/// Where the customer picks the draft up.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct DraftRuleResponse {
+    #[schema(value_type = String, format = Uuid)]
+    draft_id: uuid::Uuid,
+    /// `queued` on a fresh ask, `already_queued` when this customer has
+    /// already asked this exact question — the same idempotent-retry
+    /// vocabulary `POST /v1/rules` uses, and for the same reason: a
+    /// double-clicked button must not buy a second billed answer.
+    status: &'static str,
+    /// Poll here (`GET /v1/drafts/{draft_id}`) for the compiled rule and its
+    /// plain-language echo.
+    draft_ref: String,
+}
+
+/// `POST /v1/rules/draft` — ask for a rule in plain English (§20.4).
+///
+/// Returns `202`: the model is called by the worker pool out of band, because
+/// a completion takes minutes and no request path in this system waits on one.
+/// Poll `GET /v1/drafts/{draft_id}` until it is `ready` (the compiled rule and
+/// its echo are on the response) or `blocked` (the compiler's own error is in
+/// `last_error`, and the draft can never run).
+///
+/// **This never creates a rule.** Activation is the rule engine's
+/// `POST /v1/rules`, with the definition from the draft.
+#[utoipa::path(
+    post,
+    path = "/v1/rules/draft",
+    tag = "copilot",
+    request_body = DraftRuleRequest,
+    security(("bearer_token" = [])),
+    responses(
+        (status = 202, description = "Draft queued (or already queued)", body = DraftRuleResponse),
+        (status = 400, description = "Empty request, or a `sub` that is not a customer UUID"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 413, description = "The request text exceeds the ceiling"),
+        (status = 500, description = "Store failure"),
+    ),
+)]
+async fn draft_rule(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<DraftRuleRequest>,
+) -> Result<Response, ApiError> {
+    let owner = customer_from(&claims)?;
+    let request = body.request.trim();
+    if request.is_empty() {
+        return Err(ApiError::bad_request(
+            "`request` must describe what to alert on",
+        ));
+    }
+    if request.len() > MAX_REQUEST_BYTES {
+        // Refused rather than truncated: this string *is* the prompt, and a
+        // silently shortened one drafts a rule for a question nobody asked.
+        return Err(ApiError::payload_too_large(format!(
+            "`request` is {} bytes; the ceiling is {MAX_REQUEST_BYTES}",
+            request.len()
+        )));
+    }
+
+    let job = DraftJob::rule_draft(owner, state.chain, request);
+    let enqueued = state
+        .queue
+        .enqueue(&job, Utc::now())
+        .await
+        .map_err(map_store_error)?;
+
+    let (draft_id, status) = match enqueued {
+        Enqueued::Queued(id) => {
+            // Only a *new* job is worth waking the pool for; a duplicate is
+            // already in flight or already answered.
+            state.wake.notify_one();
+            (id, "queued")
+        }
+        Enqueued::AlreadyQueued(id) => (id, "already_queued"),
+    };
+    metrics::record_enqueued(
+        DraftKind::RuleDraft.as_wire_str(),
+        if enqueued.is_new() {
+            "queued"
+        } else {
+            "duplicate"
+        },
+    );
+    tracing::info!(%draft_id, %owner, status, "rule draft requested");
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DraftRuleResponse {
+            draft_id: draft_id.0,
+            status,
+            draft_ref: crate::announce::narrative_ref(draft_id),
+        }),
+    )
+        .into_response())
+}
+
+/// The customer behind a verified token.
+///
+/// The API service's rule (`server::auth`), applied here to the one route that
+/// needs it and deliberately not to the rest: a rule has a billing owner, an
+/// incident narrative has a reviewer who is a person. Duplicated rather than
+/// shared because `auth` is pinned as a workspace-dependency-free leaf by
+/// arch-conformance, so it cannot know what a `CustomerId` is — and promoting
+/// this there would give the verifier a domain type and, eventually, a reason
+/// to grow issuance.
+fn customer_from(claims: &Claims) -> Result<events::primitives::CustomerId, ApiError> {
+    let sub = claims.sub.trim();
+    let customer = uuid::Uuid::parse_str(sub)
+        .map_err(|_| ApiError::bad_request("the token's `sub` is not a customer UUID"))?;
+    if customer.is_nil() {
+        // Reserved for platform-internal usage with no customer in scope
+        // (§13); a rule owned by it would be unattributable and unmeterable.
+        return Err(ApiError::bad_request(
+            "the token's `sub` is the nil UUID, which is reserved for system usage",
+        ));
+    }
+    Ok(events::primitives::CustomerId(customer))
+}
+
 /// Map a store failure onto the shared API error vocabulary.
 ///
 /// The three that matter are distinguishable on purpose: "no such draft" and
@@ -469,8 +679,7 @@ mod tests {
     use crate::store::{DraftAttempt, DraftOutcome, DraftQueue, DraftWorkQueue};
     use crate::test_util::{completion, InMemoryDraftStore};
     use axum::body::Body;
-    use axum::http::{Request as HttpRequest, StatusCode};
-    use axum::response::Response;
+    use axum::http::Request as HttpRequest;
     use events::primitives::{Chain, IncidentId};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use llm::cache::CacheKey;
@@ -541,7 +750,278 @@ mod tests {
     }
 
     fn app(store: Arc<InMemoryDraftStore>) -> Router {
-        router(AppState { store, jwt: jwt() })
+        router(AppState {
+            store: store.clone(),
+            queue: store,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            chain: Chain::ETHEREUM,
+            jwt: jwt(),
+        })
+    }
+
+    /// A `sub` the drafting route accepts: a customer UUID (§13).
+    const CUSTOMER: &str = "00000000-0000-0000-0000-0000000000c0";
+    const RULE_REQUEST: &str = "Alert me when any wallet within 2 hops of a sanctioned \
+                                address moves more than $10K into our pools";
+
+    fn customer_token() -> String {
+        token_for(CUSTOMER, SECRET)
+    }
+
+    /// A rule draft that landed `ready`, as the worker would leave it.
+    async fn ready_rule_draft(store: &Arc<InMemoryDraftStore>, body: &str) -> DraftId {
+        let job = DraftJob::rule_draft(
+            events::primitives::CustomerId(uuid::Uuid::parse_str(CUSTOMER).unwrap()),
+            Chain::ETHEREUM,
+            RULE_REQUEST,
+        );
+        store.enqueue(&job, Utc::now()).await.unwrap();
+        let claimed = store
+            .claim_batch(
+                DraftKind::ALL,
+                1,
+                std::time::Duration::from_secs(60),
+                3,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let draft_id = claimed[0].job.draft_id;
+        store
+            .begin_attempt(
+                draft_id,
+                &CacheKey::new("claude-opus-5", &crate::test_util::request()),
+                Some(crate::prompts::rule_draft()),
+                &[],
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .finish(
+                draft_id,
+                DraftOutcome::Completed(Box::new(completion(body))),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        draft_id
+    }
+
+    const GOOD_RULE: &str = r##"{"name":"Sanctioned proximity inflow",
+        "conditions":[{"hop_distance":{"from":"0x1111111111111111111111111111111111111111",
+        "max_hops":2}}],"logic":"all","actions":[{"slack_alert":{"channel":"#compliance"}}]}"##;
+
+    /// The whole t4 round trip through the API: ask in English, and read back
+    /// a compiled rule plus the plain-language echo of what will actually run.
+    #[tokio::test]
+    async fn a_customer_asks_in_english_and_reads_back_a_compiled_rule() {
+        let store = Arc::new(InMemoryDraftStore::default());
+        let app = app(store.clone());
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/v1/rules/draft",
+                Some(&customer_token()),
+                &serde_json::json!({ "request": RULE_REQUEST }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "queued");
+        let draft_id = body["draft_id"].as_str().unwrap().to_owned();
+
+        // The row exists, is owned by the token's subject, and carries the
+        // customer's own words — the worker's whole input.
+        let draft = store
+            .get(DraftId(uuid::Uuid::parse_str(&draft_id).unwrap()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.kind, DraftKind::RuleDraft);
+        assert_eq!(draft.status, DraftStatus::Queued);
+        assert_eq!(draft.customer_id.unwrap().0.to_string(), CUSTOMER);
+        assert_eq!(draft.source_text.as_deref(), Some(RULE_REQUEST));
+
+        // …and nothing has been drafted or activated yet: this route records
+        // work, it does not call a model and it does not create a rule.
+        assert!(draft.answer.is_none());
+
+        // The worker lands it. Now the read surface carries the compiled rule.
+        let landed = ready_rule_draft(&store, GOOD_RULE).await;
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/v1/drafts/{landed}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail = body_json(response).await;
+        assert_eq!(detail["status"], "ready");
+        assert_eq!(
+            detail["rule"]["definition"]["name"],
+            "Sanctioned proximity inflow"
+        );
+        let echo = detail["rule"]["explanation"].as_str().unwrap();
+        assert!(echo.contains("within 2 transfer hop(s)"), "{echo}");
+        assert_eq!(detail["prompt_id"], "rule_draft@v1");
+    }
+
+    /// §20.4's headline claim, at the API: a hallucinated condition comes back
+    /// as the compiler's error on a draft that can never run — and the
+    /// response carries no rule to activate.
+    #[tokio::test]
+    async fn a_hallucinated_rule_is_blocked_with_the_compilers_error() {
+        let store = Arc::new(InMemoryDraftStore::default());
+        let draft_id = ready_rule_draft(
+            &store,
+            r#"{"name":"Wash trading","conditions":[{"unusual_volume":{"gt":"1000"}}],
+                "logic":"all","actions":[{"tag_address":{"label":"x"}}]}"#,
+        )
+        .await;
+
+        let response = app(store.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/v1/drafts/{draft_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let detail = body_json(response).await;
+        assert_eq!(detail["status"], "blocked");
+        assert!(detail["rule"].is_null(), "there is nothing to activate");
+        assert!(
+            detail["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("unusual_volume"),
+            "the customer sees the parser's own complaint: {detail}"
+        );
+        assert!(
+            !store
+                .get(draft_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_reviewable(),
+            "a draft that does not compile never reaches a review queue"
+        );
+    }
+
+    /// Asking twice is asking once. The subject id is derived from
+    /// `(owner, request)`, so a double-clicked button cannot buy a second
+    /// billed answer to the same question.
+    #[tokio::test]
+    async fn the_same_request_twice_resolves_to_the_same_draft() {
+        let store = Arc::new(InMemoryDraftStore::default());
+        let app = app(store.clone());
+        let body = serde_json::json!({ "request": RULE_REQUEST }).to_string();
+
+        let first = body_json(
+            app.clone()
+                .oneshot(post("/v1/rules/draft", Some(&customer_token()), &body))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // Same ask, differently wrapped.
+        let second_body =
+            serde_json::json!({ "request": format!("  {RULE_REQUEST}\n") }).to_string();
+        let second = body_json(
+            app.oneshot(post(
+                "/v1/rules/draft",
+                Some(&customer_token()),
+                &second_body,
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        assert_eq!(first["draft_id"], second["draft_id"]);
+        assert_eq!(second["status"], "already_queued");
+        assert_eq!(store.drafts().len(), 1);
+    }
+
+    /// The owner is the token, never the body. Two independent guards: an
+    /// unauthenticated call is a 401, and a token whose `sub` is not a
+    /// customer cannot own a rule at all.
+    #[tokio::test]
+    async fn a_rule_draft_needs_a_customer_token_and_takes_its_owner_from_it() {
+        let store = Arc::new(InMemoryDraftStore::default());
+        let app = app(store.clone());
+        let body = serde_json::json!({
+            "request": RULE_REQUEST,
+            // A body field that looks like an owner. There is no such field,
+            // so it is parsed away — and asserted away below.
+            "owner": "00000000-0000-0000-0000-0000000000ff",
+        })
+        .to_string();
+
+        for token in [None, Some("garbage")] {
+            let response = app
+                .clone()
+                .oneshot(post("/v1/rules/draft", token, &body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        // Correctly signed, but the subject is a person rather than a customer.
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/v1/rules/draft",
+                Some(&token_for(REVIEWER, SECRET)),
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(store.drafts().is_empty());
+
+        let response = app
+            .oneshot(post("/v1/rules/draft", Some(&customer_token()), &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            store.drafts()[0].customer_id.unwrap().0.to_string(),
+            CUSTOMER,
+            "the owner is the verified subject, not the body's suggestion"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_oversized_request_is_refused() {
+        let store = Arc::new(InMemoryDraftStore::default());
+        let app = app(store.clone());
+
+        for (body, expected) in [
+            (
+                serde_json::json!({ "request": "   " }).to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "request": "x".repeat(MAX_REQUEST_BYTES + 1) }).to_string(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/v1/rules/draft", Some(&customer_token()), &body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(store.drafts().is_empty());
     }
 
     fn post(path: &str, token: Option<&str>, body: &str) -> HttpRequest<Body> {

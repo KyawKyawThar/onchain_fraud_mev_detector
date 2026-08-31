@@ -46,8 +46,9 @@ use llm::{LlmClient, LlmError};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::AuditSource;
-use crate::draft::{DraftError, DraftGenerator};
+use crate::audit::{AuditSource, AuditStream};
+use crate::capability::{index, DraftCapability, Grounding, RegistryError};
+use crate::draft::DraftError;
 use crate::metrics;
 use crate::model::{ClaimedJob, DraftKind, DraftStatus};
 use crate::store::{DraftOutcome, DraftWorkQueue, StoreError};
@@ -95,46 +96,27 @@ impl Default for PoolConfig {
 /// no way to finish.
 #[derive(Debug, Default)]
 pub struct GeneratorRegistry {
-    by_kind: BTreeMap<DraftKind, Arc<dyn DraftGenerator>>,
-}
-
-/// Why a roster could not be linked.
-#[derive(Debug, thiserror::Error)]
-pub enum RegistryError {
-    #[error("two generators registered for draft kind {kind}: {first} and {second}")]
-    Duplicate {
-        kind: &'static str,
-        first: String,
-        second: String,
-    },
-    #[error("no draft generators linked — this pod could never claim any work")]
-    Empty,
+    by_kind: BTreeMap<DraftKind, Arc<dyn DraftCapability>>,
 }
 
 impl GeneratorRegistry {
-    /// Link a roster. An empty one is refused: a pod with no generators is a
-    /// pod that polls forever and drains nothing, which reads as a healthy
-    /// deployment and a growing backlog.
-    pub fn link(generators: Vec<Arc<dyn DraftGenerator>>) -> Result<Self, RegistryError> {
-        let mut by_kind: BTreeMap<DraftKind, Arc<dyn DraftGenerator>> = BTreeMap::new();
-        for generator in generators {
-            if let Some(existing) = by_kind.get(&generator.kind()) {
-                return Err(RegistryError::Duplicate {
-                    kind: generator.kind().as_wire_str(),
-                    first: format!("{existing:?}"),
-                    second: format!("{generator:?}"),
-                });
-            }
-            by_kind.insert(generator.kind(), generator);
-        }
-        if by_kind.is_empty() {
-            return Err(RegistryError::Empty);
-        }
-        Ok(Self { by_kind })
+    /// Link the roster this pod serves. A **subset** of the kinds, unlike
+    /// `CheckRegistry`, which must cover all of them: what a pod may *run* and
+    /// what it must be able to *land* are different questions, and collapsing
+    /// them would either let a pod claim work it cannot finish or stop it
+    /// landing an answer it already paid for.
+    ///
+    /// An empty roster is refused: a pod with no generators polls forever and
+    /// drains nothing, which reads as a healthy deployment and a growing
+    /// backlog.
+    pub fn link(capabilities: Vec<Arc<dyn DraftCapability>>) -> Result<Self, RegistryError> {
+        Ok(Self {
+            by_kind: index(capabilities)?,
+        })
     }
 
-    /// The generator for `kind`, if this pod serves it.
-    pub fn get(&self, kind: DraftKind) -> Option<&Arc<dyn DraftGenerator>> {
+    /// The capability for `kind`, if this pod serves it.
+    pub fn get(&self, kind: DraftKind) -> Option<&Arc<dyn DraftCapability>> {
         self.by_kind.get(&kind)
     }
 
@@ -344,12 +326,21 @@ impl DraftWorkerPool {
     async fn draft(
         &self,
         job: &ClaimedJob,
-        generator: &dyn DraftGenerator,
+        generator: &dyn DraftCapability,
     ) -> Result<DraftOutcome, WorkerError> {
-        let audit = self
-            .audit
-            .audit_stream(IncidentId(job.job.subject_id), self.config.max_audit_events)
-            .await?;
+        // Fetch what *this* generator declared it needs, not what the first
+        // one happened to. A rule draft's whole input is the customer's
+        // sentence, already on the row: reading an "incident" stream for it
+        // would be an HTTP round trip for an id that is not an incident,
+        // answered empty, and then a permanently failed job.
+        let audit = match generator.grounding() {
+            Grounding::IncidentAuditStream => {
+                self.audit
+                    .audit_stream(IncidentId(job.job.subject_id), self.config.max_audit_events)
+                    .await?
+            }
+            Grounding::SourceText => AuditStream::default(),
+        };
         let grounded = audit.event_ids();
 
         let request = generator.build_request(job, &audit)?;
@@ -469,7 +460,7 @@ mod tests {
     fn narrative_only() -> Arc<GeneratorRegistry> {
         Arc::new(
             GeneratorRegistry::link(vec![
-                Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftGenerator>
+                Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftCapability>
             ])
             .expect("one generator links"),
         )
@@ -726,8 +717,8 @@ mod tests {
             Err(RegistryError::Empty)
         ));
         let twice = vec![
-            Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftGenerator>,
-            Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftGenerator>,
+            Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftCapability>,
+            Arc::new(NarrativeDrafter::new()) as Arc<dyn DraftCapability>,
         ];
         assert!(matches!(
             GeneratorRegistry::link(twice),

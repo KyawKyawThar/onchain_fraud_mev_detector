@@ -241,6 +241,7 @@ pub enum DomainEvent {
 
     // AI copilot (§20.4)
     IncidentNarrativeDrafted(copilot::IncidentNarrativeDrafted),
+    RuleDraftProposed(copilot::RuleDraftProposed),
 
     // Cross-chain (§24)
     BridgeMevDetected(cross_chain::BridgeMevDetected),
@@ -330,7 +331,7 @@ impl DomainEvent {
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
-            IncidentNarrativeDrafted(_) => EventFamily::Copilot,
+            IncidentNarrativeDrafted(_) | RuleDraftProposed(_) => EventFamily::Copilot,
             BridgeMevDetected(_) | CrossChainMevDetected(_) | CrossChainFindingRetracted(_) => {
                 EventFamily::CrossChain
             }
@@ -391,6 +392,8 @@ impl DomainEvent {
             | BridgeMevDetected(_)
             | CrossChainMevDetected(_)
             | CrossChainFindingRetracted(_)
+            // A proposed rule is about a customer's alerting, not an incident.
+            | RuleDraftProposed(_)
             // A drift reading is about a model, not an incident. (If a future
             // change wants "which incidents were produced under drifted
             // weights?", that is a join on the detector triple, not a field.)
@@ -461,6 +464,10 @@ impl DomainEvent {
             // on the same partition as the first, so a reader sees the two in
             // the order they were produced rather than in broker order.
             IncidentNarrativeDrafted(e) => Some(PartitionKey::Incident(e.incident_id)),
+            // Keyed by owner: a customer's rule drafts are one ordered
+            // stream, the same way `RuleCreated` and every other
+            // customer-scoped record on the backbone is.
+            RuleDraftProposed(e) => Some(PartitionKey::Customer(e.owner)),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -550,6 +557,10 @@ impl DomainEvent {
             // narrative prompt forbids attributing activity to a named party,
             // and the drafting record carries no address for the same reason.
             | IncidentNarrativeDrafted(_)
+            // A drafted rule names condition *shapes*, not the addresses a
+            // customer happens to have typed into one: this is a record
+            // that a rule was proposed, not an observation about anybody.
+            | RuleDraftProposed(_)
             // Attribution-blind by construction: §20.1 features are structural
             // and statistical, never "which address did something" (there is a
             // property test in `ml-features` for exactly this), so a drift

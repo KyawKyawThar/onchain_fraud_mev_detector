@@ -1,11 +1,11 @@
 //! Turning a claimed job into the one thing the LLM seam accepts: a
 //! [`CompletionRequest`].
 //!
-//! [`DraftGenerator`] is the seam between "what the platform knows about this
-//! subject" and "what the model is asked". It exists so the worker pool — the
+//! The narrative half of [`DraftCapability`](crate::capability) — the seam
+//! between "what the platform knows about this subject" and "what the model is
+//! asked, and whether the answer is usable". It exists so the worker pool — the
 //! part that leases, calls, stores and un-leases — has no opinion on prompts,
-//! and so Sprint 20 t3 can replace the narrative renderer's grounding rules
-//! without touching the queue.
+//! and so a prompt or a grounding rule can change without touching the queue.
 //!
 //! # What is in the prompt, and where it may come from
 //!
@@ -18,9 +18,13 @@
 //! that a human approves (§20.4).
 
 use events::EventEnvelope;
-use llm::{grounded_message, CompletionRequest, Untrusted};
+use llm::{grounded_message, Completion, CompletionRequest, Untrusted};
+use uuid::Uuid;
 
+use crate::announce::DraftedFacts;
 use crate::audit::AuditStream;
+use crate::capability::{DraftCapability, Grounding, Landing};
+use crate::grounding::GroundingPolicy;
 use crate::model::{ClaimedJob, DraftKind};
 
 /// Per-event byte ceiling inside the fence. An audit stream is many small
@@ -58,26 +62,6 @@ impl event_bus::Transience for DraftError {
     }
 }
 
-/// Builds the model request for one claimed job.
-///
-/// Object-safe and synchronous: a generator is a pure function of the job and
-/// the material already fetched for it. Anything that needs I/O to build a
-/// prompt is fetching grounding, which belongs in an [`crate::audit`]-style
-/// source the worker calls first — keeping this pure is what lets a prompt
-/// change be tested without a network.
-pub trait DraftGenerator: Send + Sync + std::fmt::Debug {
-    /// Which kind this generator serves.
-    fn kind(&self) -> DraftKind;
-
-    /// Render the request. `audit` is the grounding the worker fetched for
-    /// this job.
-    fn build_request(
-        &self,
-        job: &ClaimedJob,
-        audit: &AuditStream,
-    ) -> Result<CompletionRequest, DraftError>;
-}
-
 /// The §20.4 incident-narrative / SAR drafter.
 ///
 /// **Scope note (Sprint 20 t2).** This renders the audit stream and records
@@ -88,17 +72,31 @@ pub trait DraftGenerator: Send + Sync + std::fmt::Debug {
 pub struct NarrativeDrafter {
     /// Per-event ceiling inside the fence (see [`DEFAULT_EVENT_LIMIT`]).
     event_limit: usize,
+    /// How strictly this deployment holds a narrative to its citations.
+    ///
+    /// Carried by the capability rather than passed into `check`, because it is
+    /// the *only* kind with a tunable boundary: threading a policy every other
+    /// kind ignores through the shared signature would make one kind's
+    /// configuration everyone's problem.
+    grounding: GroundingPolicy,
 }
 
 impl NarrativeDrafter {
     pub fn new() -> Self {
         Self {
             event_limit: DEFAULT_EVENT_LIMIT,
+            grounding: GroundingPolicy::default(),
         }
     }
 
     pub fn with_event_limit(mut self, limit: usize) -> Self {
         self.event_limit = limit.max(1);
+        self
+    }
+
+    /// The deployment's citation policy (`COPILOT_MIN_CITED_RATIO` and friends).
+    pub fn with_grounding(mut self, policy: GroundingPolicy) -> Self {
+        self.grounding = policy;
         self
     }
 
@@ -126,9 +124,13 @@ impl NarrativeDrafter {
     }
 }
 
-impl DraftGenerator for NarrativeDrafter {
+impl DraftCapability for NarrativeDrafter {
     fn kind(&self) -> DraftKind {
         DraftKind::IncidentNarrative
+    }
+
+    fn grounding(&self) -> Grounding {
+        Grounding::IncidentAuditStream
     }
 
     fn build_request(
@@ -180,6 +182,31 @@ impl DraftGenerator for NarrativeDrafter {
             Some(customer) => request.for_customer(customer),
             None => request,
         })
+    }
+
+    /// The citation contract *is* this kind's landing check (§20.4).
+    ///
+    /// A narrative has no compiler, and "a human reads it" is a boundary that
+    /// degrades with queue depth — so the drafted text is parsed back, its
+    /// citations checked against the window, and `grounded_event_ids` narrowed
+    /// from the window to what the text actually stands on. A draft citing an
+    /// event it was never shown lands `blocked`, exactly as a refusal does.
+    fn check(&self, window: &[Uuid], completion: &Completion) -> Landing {
+        let summary = crate::grounding::evaluate(&completion.text, window);
+        let cited = summary.cited_event_ids.clone();
+        match crate::grounding::verdict(&summary, &self.grounding) {
+            Ok(()) => Landing::ready(cited).with_grounding(summary),
+            Err(failure) => Landing::blocked(
+                failure.reason(),
+                format!("ungrounded draft: {failure}"),
+                cited,
+            )
+            .with_grounding(summary),
+        }
+    }
+
+    fn announce(&self, facts: DraftedFacts<'_>) -> Option<EventEnvelope> {
+        crate::announce::narrative_envelope(facts)
     }
 }
 

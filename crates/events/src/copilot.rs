@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::primitives::IncidentId;
+use crate::primitives::{CustomerId, IncidentId};
 
 /// A SAR-draft narrative was produced for an incident and is waiting for a
 /// human (§20.4).
@@ -78,6 +78,67 @@ pub struct IncidentNarrativeDrafted {
     /// reconciliation that cannot tell them apart is guesswork.
     pub source: NarrativeSource,
     pub drafted_at: DateTime<Utc>,
+}
+
+/// A natural-language rule request was turned into a rule definition that
+/// **compiles**, and is waiting for its customer (§20.4).
+///
+/// # Why this one carries the definition, when the narrative does not
+///
+/// [`IncidentNarrativeDrafted`] deliberately carries a reference and no prose,
+/// because unreviewed prose entering an immutable log is indistinguishable to
+/// a later reader from the evidence it was derived from. A rule definition is
+/// the opposite kind of artifact: it is a *closed, machine-checked structure*
+/// that already passed the rule engine's own parse boundary (§9) before this
+/// event could be written, and it cannot do anything — a definition in an
+/// event is not a rule in the rule store, and only `POST /v1/rules` puts one
+/// there. So the audit record can afford to say exactly what was proposed,
+/// which is the thing a reviewer will later want to diff against what was
+/// activated.
+///
+/// # What it does *not* carry
+///
+/// The customer's own sentence. Only its hash: the request is free text a
+/// person typed about their own business, it is not a platform fact, and the
+/// hash is enough to answer "was this the same ask?" without replicating it
+/// onto every broker and archive. The text stays in the copilot's store beside
+/// the draft.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RuleDraftProposed {
+    /// The copilot draft this record is about — the join key between this
+    /// event, the row the customer reads, and any re-draft of the same ask.
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+    pub draft_id: Uuid,
+    /// Whose rule it would be. Taken from the verified bearer token at
+    /// `POST /v1/rules/draft` and never from the model's output — a drafted
+    /// rule that could name its own owner would be a cross-tenant write
+    /// dressed up as a suggestion.
+    pub owner: CustomerId,
+    /// SHA-256 (hex) of the request the customer typed, salted by owner — the
+    /// same derivation the draft's subject id uses, so "did this customer
+    /// already ask this?" has one answer.
+    pub source_text_hash: String,
+    /// Where a customer reads and reviews the draft
+    /// (`copilot://drafts/{draft_id}`).
+    pub draft_ref: String,
+    /// The proposed rule, in §9's wire form — byte-for-byte a `POST /v1/rules`
+    /// body minus `id`/`owner`. Typed as raw JSON because the event schema is
+    /// the platform's leaf crate and must not depend on the rule engine; the
+    /// rule engine's `RuleDefinition` is what produced it and what parses it
+    /// back.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub definition: serde_json::Value,
+    /// The model that *actually* answered, read from the response.
+    pub model_id: String,
+    /// The prompt artifact's id (`rule_draft`) …
+    pub prompt_id: String,
+    /// … its version (`v1`) …
+    pub prompt_version: String,
+    /// … and the hash of the bytes that ran (see
+    /// [`IncidentNarrativeDrafted::prompt_digest`]).
+    pub prompt_digest: String,
+    pub proposed_at: DateTime<Utc>,
 }
 
 /// Which path produced a narrative.

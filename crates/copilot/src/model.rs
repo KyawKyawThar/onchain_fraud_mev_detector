@@ -243,6 +243,17 @@ pub struct DraftJob {
     /// and paid for at full price (§20.4 — backfill is half price precisely
     /// because nobody is waiting for it).
     pub source: DraftSource,
+    /// What the customer asked for, in their own words — the *whole* input to
+    /// a rule draft (§20.4 t4).
+    ///
+    /// `None` for a narrative, and the asymmetry is deliberate rather than an
+    /// oversight. A narrative's subject is an incident the platform recorded,
+    /// so the job names it and the worker reads the current stream; carrying a
+    /// rendered copy would be a snapshot of a stream that has since grown. A
+    /// rule request is the opposite: it is the input itself, immutable, and
+    /// stored nowhere else in the system. Re-drafting it after a rebalance
+    /// means reading it back from this row.
+    pub source_text: Option<String>,
 }
 
 impl DraftJob {
@@ -255,6 +266,30 @@ impl DraftJob {
             customer_id: None,
             chain,
             source: DraftSource::Live,
+            source_text: None,
+        }
+    }
+
+    /// The rule-draft job one `POST /v1/rules/draft` implies (§20.4 t4).
+    ///
+    /// The subject is **derived from the request**
+    /// ([`crate::rule_draft::subject_for`]), not minted: the enqueue is keyed
+    /// on `(kind, subject_id)`, so a customer who submits the same sentence
+    /// twice — a double-clicked button, a retried request — resolves to the
+    /// draft that already exists instead of paying for a second, differently
+    /// worded answer to the same question.
+    pub fn rule_draft(owner: CustomerId, chain: Chain, request: impl Into<String>) -> Self {
+        let request = request.into();
+        Self {
+            draft_id: DraftId::new(),
+            kind: DraftKind::RuleDraft,
+            subject_id: crate::rule_draft::subject_for(owner, &request),
+            // Always billed to the customer who asked (§13) — unlike a
+            // narrative, a rule draft has one by construction.
+            customer_id: Some(owner),
+            chain,
+            source: DraftSource::Live,
+            source_text: Some(request),
         }
     }
 
@@ -350,6 +385,9 @@ pub struct Draft {
     pub customer_id: Option<CustomerId>,
     pub chain: Chain,
     pub source: DraftSource,
+    /// The customer's own request, for a kind whose subject is one
+    /// ([`DraftJob::source_text`]). `None` for a narrative.
+    pub source_text: Option<String>,
     pub status: DraftStatus,
     pub attempts: i32,
     /// The prompt half of §20.4's provenance triple; the model half lives on
@@ -405,6 +443,27 @@ impl Draft {
         (self.kind == DraftKind::IncidentNarrative).then_some(IncidentId(self.subject_id))
     }
 
+    /// The compiled rule this draft proposes, for a rule draft that landed a
+    /// usable answer (§20.4 t4).
+    ///
+    /// Re-parsed from the body rather than stored a second time: the body *is*
+    /// the definition, and a parsed copy beside it is one more thing that can
+    /// disagree with what the customer reads. The parse cannot fail on a
+    /// `ready` draft — clearing [`crate::rule_draft::compile_check`] is what
+    /// made it `ready` — so a failure here is a corrupt row and reads as
+    /// `None`.
+    ///
+    /// Returns [`CompiledDraft`](crate::rule_draft::CompiledDraft), not a bare
+    /// definition: a caller receiving this cannot confuse it with something
+    /// that merely deserialized, and activating it still requires supplying the
+    /// id and owner the model was never allowed to choose.
+    pub fn compiled_rule(&self) -> Option<crate::rule_draft::CompiledDraft> {
+        if self.kind != DraftKind::RuleDraft {
+            return None;
+        }
+        crate::rule_draft::compile_check(self.body()?).ok()
+    }
+
     /// The facts an `IncidentNarrativeDrafted` is built from, once this draft
     /// has an answer and an attributable prompt.
     ///
@@ -416,10 +475,13 @@ impl Draft {
             draft_id: self.draft_id,
             kind: self.kind,
             subject_id: self.subject_id,
+            owner: self.customer_id,
             chain: self.chain,
             source: self.source,
+            source_text: self.source_text.as_deref(),
             provenance: self.provenance.as_ref()?,
             model: self.answer.as_ref()?.model.as_str(),
+            body: self.answer.as_ref()?.body.as_str(),
             completed_at: self.answer.as_ref()?.completed_at,
             grounding: self.grounding.as_ref(),
             grounded_event_ids: &self.grounded_event_ids,
@@ -427,7 +489,8 @@ impl Draft {
     }
 
     /// Where a reviewer reads and approves this draft — the `narrative_ref`
-    /// carried on `IncidentNarrativeDrafted`.
+    /// on `IncidentNarrativeDrafted`, and the `draft_ref` on
+    /// `RuleDraftProposed`.
     ///
     /// A reference and not the prose: an unapproved machine-written document
     /// has no business being replicated into an immutable audit log (see

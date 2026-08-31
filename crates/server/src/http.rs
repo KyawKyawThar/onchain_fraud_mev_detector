@@ -33,7 +33,7 @@ use events::system::{ScreeningDecisionRecorded, UsageEventType};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::model::address_key;
 use intelligence::pb::ScreeningFactsReply;
-use rule_engine::model::{Action, Condition, LogicOp, Rule, TemporalConstraint};
+use rule_engine::model::{Action, Condition, LogicOp, Rule, RuleDefinition, TemporalConstraint};
 use rule_engine::store::{CreateRuleOutcome, RuleStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -1764,16 +1764,21 @@ async fn create_rule(
     Extension(customer): Extension<CustomerId>,
     Json(body): Json<CreateRuleRequest>,
 ) -> Result<Response, ApiError> {
-    let rule = Rule {
-        id: body.id.unwrap_or_else(RuleId::new),
-        owner: customer,
+    // The customer's half and the platform's half, assembled through the
+    // shared `RuleDefinition` (§9) rather than by hand. That type is also what
+    // §20.4's natural-language drafter emits and what its structured-output
+    // schema is generated from, so "a drafted rule is exactly a `POST
+    // /v1/rules` body" is a fact about the types rather than a claim in a doc
+    // comment — and `owner`/`id` stay the two fields no body can name.
+    let rule = RuleDefinition {
         name: body.name,
         enabled: body.enabled,
         conditions: body.conditions,
         logic: body.logic,
         temporal: body.temporal,
         actions: body.actions,
-    };
+    }
+    .into_rule(body.id.unwrap_or_else(RuleId::new), customer);
 
     // Reject a bad definition here, with the §9 customer-language reason —
     // the store re-validates (defense in depth), but a 422 beats its 500.

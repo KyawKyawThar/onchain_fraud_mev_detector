@@ -1,0 +1,30 @@
+-- Sprint 20 t4 — natural-language rule creation (§20.4).
+--
+-- One column. The rest of the feature reuses `copilot_drafts` exactly as it
+-- stands: `DraftKind::RuleDraft` and the kind-agnostic queue, claim, lease,
+-- cache and review paths were built for this in t2.
+--
+-- `source_text` is the customer's own request ("alert me when any wallet
+-- within 2 hops of a sanctioned address moves more than $10K into our
+-- pools"), and it is stored rather than derived because it is the *whole*
+-- input to the draft and lives nowhere else in the system:
+--
+--   * a narrative's subject is an incident the platform recorded, so a worker
+--     re-reads the current audit stream and the job carries only the id;
+--   * a rule request is a sentence a person typed at an API. If a pod dies
+--     mid-call and another reclaims the lease, this column is the only place
+--     the second pod can read what was asked.
+--
+-- NULL for every narrative — the queue is kind-agnostic and a narrative has no
+-- request text. Enforcing "rule drafts have one" as a CHECK was considered and
+-- rejected: the enqueue is the boundary that guarantees it
+-- (`DraftJob::rule_draft`), and a constraint here would also have to be
+-- weakened for any future kind, which is how a check constraint becomes a
+-- comment.
+--
+-- The request's *hash* — not this text — is what travels on
+-- `RuleDraftProposed`, and it is derived (owner + normalised text) rather than
+-- stored, so there is one derivation and it cannot drift from the subject id
+-- it also produces.
+ALTER TABLE copilot_drafts
+    ADD COLUMN source_text TEXT;

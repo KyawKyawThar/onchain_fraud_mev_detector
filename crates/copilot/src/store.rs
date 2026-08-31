@@ -33,6 +33,8 @@
 //! in-memory channel fed by the consumer: a channel dies with its process,
 //! and the offset it committed says the work was done.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use events::primitives::{Chain, CustomerId};
@@ -43,7 +45,8 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::grounding::{self, GroundingPolicy, GroundingSummary};
+use crate::capability::{CheckRegistry, Landing};
+use crate::grounding::{GroundingPolicy, GroundingSummary};
 use crate::model::{
     ClaimedJob, Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus,
     Provenance, Review, Reviewed,
@@ -150,119 +153,6 @@ pub fn status_for(stop_reason: &StopReason) -> DraftStatus {
         DraftStatus::Ready
     } else {
         DraftStatus::Blocked
-    }
-}
-
-/// What a completion becomes once it is checked — the single rule that turns a
-/// provider response into stored state.
-///
-/// Every path that lands an answer goes through [`LandingRule::apply`]: the
-/// worker's own `finish`, the cross-pod cache's digest-keyed write, and the
-/// backfill's batch results. That is not tidiness — it is the only way the
-/// three can agree on when a narrative is `ready`. A cache write that skipped
-/// the citation check would let a rebalance promote a draft the worker would
-/// have blocked, which is precisely the sort of divergence nobody notices
-/// until a reviewer approves an ungrounded document.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Landing {
-    pub status: DraftStatus,
-    /// The citation check's findings — `None` for kinds that make no citable
-    /// claims (a rule draft has a compiler, not citations).
-    pub grounding: Option<GroundingSummary>,
-    /// What `grounded_event_ids` becomes: the cited subset for a checked
-    /// narrative, and the window untouched otherwise.
-    pub grounded_event_ids: Vec<Uuid>,
-    pub last_error: Option<String>,
-    /// Why the citation check refused this draft, as its closed metrics label
-    /// (`no_claims`/`uncited`/`fabricated`), or `None` when it passed or did
-    /// not apply.
-    ///
-    /// Carried out of the rule rather than counted inside it: [`land`] is a
-    /// pure function, and a pure function that also increments a counter
-    /// cannot be used to *ask* what would happen — which is exactly what a
-    /// dry run, a threshold sweep, and t5's grounding audit all need to do.
-    /// The one write path records it (see `PgDraftStore::write_landing`).
-    pub rejected: Option<&'static str>,
-}
-
-/// The §20.4 landing decision, as a value the store composes.
-///
-/// A named collaborator rather than a loose `GroundingPolicy` field, because
-/// the store holding a raw policy blurred a real boundary: deciding what a
-/// completion *becomes* is domain logic, and storing the result is
-/// persistence. This is the domain half, and `PgDraftStore` owns one — which
-/// is also what guarantees the three writers apply the same one.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LandingRule {
-    pub grounding: GroundingPolicy,
-}
-
-impl LandingRule {
-    pub fn new(grounding: GroundingPolicy) -> Self {
-        Self { grounding }
-    }
-
-    /// Apply the boundary to one completion. `window` is the event ids the
-    /// model was shown (recorded by `begin_attempt`).
-    pub fn apply(&self, kind: DraftKind, window: &[Uuid], completion: &Completion) -> Landing {
-        land(kind, window, completion, &self.grounding)
-    }
-}
-
-/// Apply the §20.4 boundary to one completion.
-///
-/// Pure and total: no I/O, no metrics, no clock. `window` is the event ids the
-/// model was shown; the narrowing to what the narrative *cites* happens here.
-pub fn land(
-    kind: DraftKind,
-    window: &[Uuid],
-    completion: &Completion,
-    policy: &GroundingPolicy,
-) -> Landing {
-    // A truncated or declined answer is never checked for citations: there is
-    // no narrative to check, and reporting "0 of 0 claims cited" over the top
-    // of a refusal would bury the actual reason in a derived one.
-    if !completion.stop_reason.is_complete() {
-        return Landing {
-            status: DraftStatus::Blocked,
-            grounding: None,
-            grounded_event_ids: window.to_vec(),
-            last_error: Some(format!(
-                "unusable answer: {}",
-                completion.stop_reason.as_str()
-            )),
-            rejected: None,
-        };
-    }
-    if kind != DraftKind::IncidentNarrative {
-        return Landing {
-            status: DraftStatus::Ready,
-            grounding: None,
-            grounded_event_ids: window.to_vec(),
-            last_error: None,
-            rejected: None,
-        };
-    }
-
-    let summary = grounding::evaluate(&completion.text, window);
-    match grounding::verdict(&summary, policy) {
-        Ok(()) => Landing {
-            status: DraftStatus::Ready,
-            grounded_event_ids: summary.cited_event_ids.clone(),
-            grounding: Some(summary),
-            last_error: None,
-            rejected: None,
-        },
-        Err(failure) => Landing {
-            // `blocked`, not `failed`: the call succeeded and was billed, and
-            // re-running it buys another draft with the same fault. A human
-            // looks at it — which is exactly the split `blocked` exists for.
-            status: DraftStatus::Blocked,
-            grounded_event_ids: summary.cited_event_ids.clone(),
-            grounding: Some(summary),
-            last_error: Some(format!("ungrounded draft: {failure}")),
-            rejected: Some(failure.reason()),
-        },
     }
 }
 
@@ -591,28 +481,30 @@ impl<T> DraftStore for T where
 #[derive(Debug, Clone)]
 pub struct PgDraftStore {
     pool: PgPool,
-    /// The §20.4 landing decision this store applies.
+    /// Every kind's landing boundary, resolved once.
     ///
-    /// The store composes the rule — it does not *contain* the policy —
-    /// because every path that lands an answer must apply the same one: the
-    /// worker's write, the cross-pod cache's digest-keyed write, and the
-    /// backfill's batch results. A rule carried by each caller would be three
-    /// rules eventually.
-    rule: LandingRule,
+    /// The store holds the **check** registry and not the generator registry,
+    /// and the difference is load-bearing: a pod must be able to *land* any
+    /// kind (the cross-pod cache lands rows other pods enqueued) while only
+    /// being allowed to *run* the kinds it has generators for. It also means
+    /// every path that lands an answer applies the same boundary — the
+    /// worker's write, the cache's digest-keyed write, the backfill's batch
+    /// results — instead of three callers each carrying their own.
+    checks: Arc<CheckRegistry>,
 }
 
 impl PgDraftStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            rule: LandingRule::default(),
+            checks: Arc::new(CheckRegistry::default()),
         }
     }
 
     /// Override the grounding policy (see [`GroundingPolicy`]).
     pub fn with_grounding(self, policy: GroundingPolicy) -> Self {
         Self {
-            rule: LandingRule::new(policy),
+            checks: Arc::new(CheckRegistry::with_grounding(policy)),
             ..self
         }
     }
@@ -806,9 +698,9 @@ impl DraftQueue for PgDraftStore {
             .map_err(|_| StoreError::malformed(format!("chain id {} exceeds i64", job.chain.0)))?;
         let inserted = sqlx::query!(
             "INSERT INTO copilot_drafts
-                 (draft_id, kind, subject_id, customer_id, chain, source, status, attempts,
-                  created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $8)
+                 (draft_id, kind, subject_id, customer_id, chain, source, source_text, status,
+                  attempts, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $9)
              ON CONFLICT (kind, subject_id) DO NOTHING
              RETURNING draft_id",
             job.draft_id.0,
@@ -817,6 +709,7 @@ impl DraftQueue for PgDraftStore {
             job.customer_id.map(|c| c.0),
             chain,
             job.source.as_wire_str(),
+            job.source_text.as_deref(),
             DraftStatus::Queued.as_wire_str(),
             at,
         )
@@ -906,7 +799,8 @@ impl DraftWorkQueue for PgDraftStore {
                  ) AS claimable
                 WHERE d.draft_id = claimable.draft_id
             RETURNING d.draft_id, d.kind, d.subject_id, d.customer_id, d.chain, d.source,
-                      d.attempts, d.lease_expires_at AS "lease_expires_at!""#,
+                      d.source_text, d.attempts,
+                      d.lease_expires_at AS "lease_expires_at!""#,
             DraftStatus::InFlight.as_wire_str(),
             lease_until,
             at,
@@ -929,6 +823,7 @@ impl DraftWorkQueue for PgDraftStore {
                         customer_id: row.customer_id.map(CustomerId),
                         chain: parse_chain(row.chain)?,
                         source: parse_source(&row.source)?,
+                        source_text: row.source_text,
                     },
                     attempts: row.attempts,
                     lease_expires_at: row.lease_expires_at,
@@ -1086,8 +981,8 @@ impl DraftCache for PgDraftStore {
         // path and blocked on the other, decided by which pod finished first.
         let mut tx = self.pool.begin().await?;
         let waiting = sqlx::query!(
-            r#"SELECT draft_id, kind, subject_id, chain, source, prompt_id, prompt_digest,
-                      grounded_event_ids
+            r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text,
+                      prompt_id, prompt_digest, grounded_event_ids
                  FROM copilot_drafts
                 WHERE request_digest = $1
                   AND model_digest = $2
@@ -1106,8 +1001,10 @@ impl DraftCache for PgDraftStore {
                 draft_id: DraftId(row.draft_id),
                 kind: parse_enum::<DraftKind>("kind", &row.kind)?,
                 subject_id: row.subject_id,
+                customer_id: row.customer_id.map(CustomerId),
                 chain: parse_chain(row.chain)?,
                 source: parse_source(&row.source)?,
+                source_text: row.source_text,
                 provenance: provenance_from(row.prompt_id, row.prompt_digest)?,
                 window: to_uuid_list(Some(row.grounded_event_ids))?,
             };
@@ -1169,8 +1066,8 @@ impl DraftReview for PgDraftStore {
     async fn get(&self, draft_id: DraftId) -> Result<Option<Draft>, StoreError> {
         let row = sqlx::query_as!(
             DraftRow,
-            r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, status, attempts,
-                      model, prompt_id, prompt_digest, stop_reason, body, token_usage,
+            r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,
+                      attempts, model, prompt_id, prompt_digest, stop_reason, body, token_usage,
                       grounded_event_ids, grounding, batch_id, last_error, reviewed_by,
                       reviewed_at, review_note, created_at, updated_at, completed_at
                  FROM copilot_drafts
@@ -1188,8 +1085,8 @@ impl DraftReview for PgDraftStore {
         // compile-time-checked query rather than a string builder.
         let rows = sqlx::query_as!(
             DraftRow,
-            r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, status, attempts,
-                      model, prompt_id, prompt_digest, stop_reason, body, token_usage,
+            r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text, status,
+                      attempts, model, prompt_id, prompt_digest, stop_reason, body, token_usage,
                       grounded_event_ids, grounding, batch_id, last_error, reviewed_by,
                       reviewed_at, review_note, created_at, updated_at, completed_at
                  FROM copilot_drafts
@@ -1274,6 +1171,7 @@ struct DraftRow {
     customer_id: Option<Uuid>,
     chain: i64,
     source: String,
+    source_text: Option<String>,
     status: String,
     attempts: i32,
     model: Option<String>,
@@ -1308,6 +1206,7 @@ impl DraftRow {
             customer_id: self.customer_id.map(CustomerId),
             chain: parse_chain(self.chain)?,
             source: parse_source(&self.source)?,
+            source_text: self.source_text,
             status,
             attempts: self.attempts,
             provenance: provenance_from(self.prompt_id, self.prompt_digest)?,
@@ -1366,7 +1265,8 @@ impl DraftBatchQueue for PgDraftStore {
                  ) AS claimable
                 WHERE d.draft_id = claimable.draft_id
             RETURNING d.draft_id, d.kind, d.subject_id, d.customer_id, d.chain, d.source,
-                      d.attempts, d.lease_expires_at AS "lease_expires_at!""#,
+                      d.source_text, d.attempts,
+                      d.lease_expires_at AS "lease_expires_at!""#,
             DraftStatus::InFlight.as_wire_str(),
             lease_until,
             at,
@@ -1388,6 +1288,7 @@ impl DraftBatchQueue for PgDraftStore {
                         customer_id: row.customer_id.map(CustomerId),
                         chain: parse_chain(row.chain)?,
                         source: parse_source(&row.source)?,
+                        source_text: row.source_text,
                     },
                     attempts: row.attempts,
                     lease_expires_at: row.lease_expires_at,
@@ -1566,8 +1467,14 @@ struct LandingRow {
     draft_id: DraftId,
     kind: DraftKind,
     subject_id: Uuid,
+    /// Whose draft this is. For a rule draft it is the owner the announcement
+    /// names — read from the row, never from the answer.
+    customer_id: Option<CustomerId>,
     chain: Chain,
     source: DraftSource,
+    /// The customer's own request, for a rule draft — the announcement hashes
+    /// it rather than carrying it.
+    source_text: Option<String>,
     provenance: Option<Provenance>,
     /// The audit window the attempt recorded — what the citation check checks
     /// against.
@@ -1582,8 +1489,8 @@ async fn landing_row(
     batch_id: Option<&BatchId>,
 ) -> Result<Option<LandingRow>, StoreError> {
     let row = sqlx::query!(
-        r#"SELECT draft_id, kind, subject_id, chain, source, prompt_id, prompt_digest,
-                  grounded_event_ids
+        r#"SELECT draft_id, kind, subject_id, customer_id, chain, source, source_text,
+                  prompt_id, prompt_digest, grounded_event_ids
              FROM copilot_drafts
             WHERE draft_id = $1
               AND ($2::TEXT IS NULL OR (batch_id = $2 AND status = $3))
@@ -1600,8 +1507,10 @@ async fn landing_row(
             draft_id: DraftId(row.draft_id),
             kind: parse_enum::<DraftKind>("kind", &row.kind)?,
             subject_id: row.subject_id,
+            customer_id: row.customer_id.map(CustomerId),
             chain: parse_chain(row.chain)?,
             source: parse_source(&row.source)?,
+            source_text: row.source_text,
             provenance: provenance_from(row.prompt_id, row.prompt_digest)?,
             window: to_uuid_list(Some(row.grounded_event_ids))?,
         })
@@ -1631,13 +1540,20 @@ impl PgDraftStore {
         completion: &Completion,
         at: DateTime<Utc>,
     ) -> Result<DraftStatus, StoreError> {
-        let landing = self.rule.apply(row.kind, &row.window, completion);
+        let landing = self.checks.apply(row.kind, &row.window, completion);
 
         // Recorded once per landing, on every path and for every draft —
         // passing or not. A sample of only the rejections cannot tell an
         // operator where the threshold should be.
         if let Some(summary) = landing.grounding.as_ref() {
             crate::metrics::record_grounding(summary, landing.rejected);
+        }
+        // A rule draft has no grounding summary — its boundary is the
+        // compiler — so its rejection is counted on its own series. Same
+        // shape, same "alert on this" story: a rising rate means the model is
+        // proposing rules the engine will not accept.
+        if row.kind == DraftKind::RuleDraft {
+            crate::metrics::record_rule_draft(landing.rejected);
         }
 
         sqlx::query!(
@@ -1693,16 +1609,20 @@ impl PgDraftStore {
             draft_id: row.draft_id,
             kind: row.kind,
             subject_id: row.subject_id,
+            owner: row.customer_id,
             chain: row.chain,
             source: row.source,
+            source_text: row.source_text.as_deref(),
             provenance,
             model: &completion.model,
+            body: &completion.text,
             completed_at: at,
             grounding: landing.grounding.as_ref(),
             grounded_event_ids: &landing.grounded_event_ids,
         };
-        let Some(envelope) = crate::announce::drafted_envelope(facts) else {
-            // Not an announceable kind (a rule draft has no narrative event).
+        let Some(envelope) = self.checks.announce(row.kind, facts) else {
+            // Nothing announceable — a draft whose facts do not add up to an
+            // audit record (see `announce::drafted_event`).
             return Ok(());
         };
         let envelope = serde_json::to_value(&envelope)

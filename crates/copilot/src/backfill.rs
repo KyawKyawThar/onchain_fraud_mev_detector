@@ -59,7 +59,7 @@ use llm::cache::CacheKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{AuditSource, IncidentSource};
-use crate::draft::DraftGenerator;
+use crate::capability::DraftCapability;
 use crate::metrics;
 use crate::model::{DraftId, DraftJob, DraftKind};
 use crate::store::{DraftBatchQueue, DraftOutcome, DraftQueue};
@@ -126,7 +126,7 @@ pub struct BackfillRunner {
     store: Arc<dyn DraftBatchQueue>,
     incidents: Arc<dyn IncidentSource>,
     audit: Arc<dyn AuditSource>,
-    generator: Arc<dyn DraftGenerator>,
+    generator: Arc<dyn DraftCapability>,
     batch: Arc<dyn BatchClient>,
     config: BackfillConfig,
 }
@@ -146,7 +146,7 @@ impl BackfillRunner {
         store: Arc<dyn DraftBatchQueue>,
         incidents: Arc<dyn IncidentSource>,
         audit: Arc<dyn AuditSource>,
-        generator: Arc<dyn DraftGenerator>,
+        generator: Arc<dyn DraftCapability>,
         batch: Arc<dyn BatchClient>,
         config: BackfillConfig,
     ) -> Self {

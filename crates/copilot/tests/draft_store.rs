@@ -542,6 +542,136 @@ async fn contract_only_a_ready_draft_is_reviewable(store: &dyn DraftStore) {
         .is_err());
 }
 
+/// §20.4 t4's whole safety argument, exercised on the engine that stores it: a
+/// drafted rule crosses §9's parse boundary inside the landing transaction —
+/// compiles, so `ready` and one `RuleDraftProposed` announcement; does not
+/// compile, so `blocked` with the compiler's own error and **no** announcement
+/// (there is nothing to activate, so the audit trail must not say a rule was
+/// proposed).
+async fn contract_a_rule_draft_lands_behind_the_parse_boundary(store: &dyn DraftStore) {
+    let owner = events::primitives::CustomerId::new();
+
+    for (request, body, expected, announced) in [
+        (
+            "alert me on wallets with a risk score over 80",
+            r#"{"name":"High risk","conditions":[{"risk_score":{"gt":80}}],"logic":"all",
+                "actions":[{"tag_address":{"label":"risky"}}]}"#,
+            DraftStatus::Ready,
+            true,
+        ),
+        (
+            "alert me on unusual trading volume",
+            // A condition §9 does not have. The model can emit it; the engine
+            // can never run it.
+            r#"{"name":"Volume","conditions":[{"unusual_volume":{"gt":"1000"}}],"logic":"all",
+                "actions":[{"tag_address":{"label":"x"}}]}"#,
+            DraftStatus::Blocked,
+            false,
+        ),
+    ] {
+        let job = DraftJob::rule_draft(owner, Chain::ETHEREUM, request);
+        let draft_id = store
+            .enqueue(&job, at(1))
+            .await
+            .expect("enqueue")
+            .draft_id();
+        let claimed = store
+            .claim_batch(Kind::ALL, 10, Duration::from_secs(60), 3, at(2))
+            .await
+            .expect("claim");
+        let claimed = claimed
+            .iter()
+            .find(|c| c.job.draft_id == draft_id)
+            .expect("the rule draft is claimable");
+        assert_eq!(
+            claimed.job.source_text.as_deref(),
+            Some(request),
+            "the worker's whole input has to survive the round trip"
+        );
+
+        store
+            .begin_attempt(
+                draft_id,
+                &CacheKey::new("claude-opus-5", &request_for("rule_draft", request)),
+                // Attributable, or it is not announceable — the same rule the
+                // narrative path holds: a provenance-less regulatory artifact
+                // is one nobody can say what produced.
+                Some(copilot::prompts::rule_draft()),
+                // A rule draft grounds in the customer's sentence, not in
+                // recorded events, so the window is empty by construction.
+                &[],
+                at(3),
+            )
+            .await
+            .expect("begin");
+        let status = store
+            .finish(
+                draft_id,
+                DraftOutcome::Completed(Box::new(Completion {
+                    text: body.to_owned(),
+                    stop_reason: StopReason::EndTurn,
+                    model: "claude-opus-5".to_owned(),
+                    usage: TokenUsage::default(),
+                })),
+                at(4),
+            )
+            .await
+            .expect("finish");
+        assert_eq!(status, expected, "request: {request}");
+
+        let draft = store.get(draft_id).await.expect("get").expect("exists");
+        assert_eq!(draft.status, expected);
+        assert_eq!(draft.source_text.as_deref(), Some(request));
+        match expected {
+            DraftStatus::Ready => {
+                let compiled = draft.compiled_rule().expect("a compiled rule");
+                assert_eq!(compiled.definition().name, "High risk");
+                assert!(draft.last_error.is_none());
+            }
+            _ => {
+                assert!(draft.compiled_rule().is_none());
+                assert!(
+                    draft
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("unusual_volume"),
+                    "the customer reads the parser's own complaint: {:?}",
+                    draft.last_error
+                );
+            }
+        }
+        assert_eq!(
+            announcements_for(store, draft_id).await,
+            usize::from(announced),
+            "request: {request}"
+        );
+    }
+}
+
+/// A request for a purpose other than the narrative default.
+fn request_for(purpose: &'static str, seed: &str) -> CompletionRequest {
+    CompletionRequest::new(purpose, seed)
+}
+
+/// How many `RuleDraftProposed` announcements are pending for this draft.
+async fn announcements_for(store: &dyn DraftStore, draft_id: copilot::DraftId) -> usize {
+    store
+        .pending_announcements(100)
+        .await
+        .expect("pending")
+        .into_iter()
+        .filter(|pending| {
+            serde_json::from_value::<EventEnvelope>(pending.envelope.clone())
+                .ok()
+                .is_some_and(|envelope| match envelope.payload {
+                    DomainEvent::RuleDraftProposed(event) => event.draft_id == draft_id.0,
+                    _ => false,
+                })
+        })
+        .count()
+}
+
 /// A draft `kind` the queue does not distinguish would let t4's rule drafts
 /// collide with t3's narratives for the same subject id.
 async fn contract_kind_is_part_of_the_subject_key(store: &dyn DraftStore) {
@@ -553,6 +683,7 @@ async fn contract_kind_is_part_of_the_subject_key(store: &dyn DraftStore) {
         customer_id: None,
         chain: Chain::ETHEREUM,
         source: DraftSource::Live,
+        source_text: None,
     };
     let rule = DraftJob {
         draft_id: copilot::DraftId::new(),
@@ -1136,6 +1267,8 @@ double_tests! {
         contract_repeated_transient_failures_are_retired,
     double_only_a_ready_draft_is_reviewable => contract_only_a_ready_draft_is_reviewable,
     double_kind_is_part_of_the_subject_key => contract_kind_is_part_of_the_subject_key,
+    double_a_rule_draft_lands_behind_the_parse_boundary =>
+        contract_a_rule_draft_lands_behind_the_parse_boundary,
     double_landing_narrows_ids_and_blocks_a_fabricated_citation =>
         contract_landing_narrows_ids_and_blocks_a_fabricated_citation,
     double_a_landing_files_its_announcement => contract_a_landing_files_its_announcement,
@@ -1201,6 +1334,8 @@ pg_tests! {
         contract_repeated_transient_failures_are_retired,
     pg_only_a_ready_draft_is_reviewable => contract_only_a_ready_draft_is_reviewable,
     pg_kind_is_part_of_the_subject_key => contract_kind_is_part_of_the_subject_key,
+    pg_a_rule_draft_lands_behind_the_parse_boundary =>
+        contract_a_rule_draft_lands_behind_the_parse_boundary,
     pg_landing_narrows_ids_and_blocks_a_fabricated_citation =>
         contract_landing_narrows_ids_and_blocks_a_fabricated_citation,
     pg_a_landing_files_its_announcement => contract_a_landing_files_its_announcement,

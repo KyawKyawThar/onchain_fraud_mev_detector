@@ -9,7 +9,7 @@
 //! container.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,7 @@ use llm::{Completion, CompletionRequest, ContentDigest, PromptDescriptor, StopRe
 use uuid::Uuid;
 
 use crate::audit::{AuditError, AuditSource, AuditStream};
+use crate::capability::{CheckRegistry, Landing};
 use crate::grounding::GroundingPolicy;
 use crate::model::{
     ClaimedJob, Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus,
@@ -28,8 +29,8 @@ use crate::model::{
 };
 use crate::store::{
     batch_failure, DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftOutbox,
-    DraftOutcome, DraftQueue, DraftReview, DraftWorkQueue, Enqueued, Landing, LandingRule,
-    PendingAnnouncement, StoreError, MAX_LIST_LIMIT,
+    DraftOutcome, DraftQueue, DraftReview, DraftWorkQueue, Enqueued, PendingAnnouncement,
+    StoreError, MAX_LIST_LIMIT,
 };
 use llm::batch::{BatchId, BatchItemOutcome};
 
@@ -108,6 +109,10 @@ pub fn claimed(kind: DraftKind) -> ClaimedJob {
             customer_id: None,
             chain: Chain::ETHEREUM,
             source: DraftSource::Live,
+            // A narrative's input is its audit stream; a rule draft's is this
+            // field. `crate::rule_draft`'s own tests build the job that
+            // carries one.
+            source_text: None,
         },
         attempts: 1,
         lease_expires_at: Utc::now(),
@@ -178,6 +183,7 @@ impl Row {
         &mut self,
         landing: Landing,
         completion: &Completion,
+        checks: &CheckRegistry,
         at: DateTime<Utc>,
     ) -> Option<EventEnvelope> {
         self.draft.status = landing.status;
@@ -191,9 +197,10 @@ impl Row {
         if self.draft.status != DraftStatus::Ready {
             return None;
         }
+        let kind = self.draft.kind;
         self.draft
             .drafted_facts()
-            .and_then(crate::announce::drafted_envelope)
+            .and_then(|facts| checks.announce(kind, facts))
     }
 }
 
@@ -220,9 +227,9 @@ pub struct InMemoryDraftStore {
     /// When set, every call fails with the given transience — how a test
     /// drives the consumer's retry-or-park decision.
     fail: Mutex<Option<bool>>,
-    /// The same landing rule the Postgres store composes, for the same reason:
-    /// every path that lands an answer must apply exactly one.
-    rule: Mutex<LandingRule>,
+    /// The same check registry the Postgres store holds, for the same reason:
+    /// every path that lands an answer must apply exactly one boundary.
+    checks: Mutex<Arc<CheckRegistry>>,
     /// `copilot_outbox` — announcements filed by a landing, in order, with
     /// the `published_at` stamp the flusher sets.
     outbox: Mutex<Vec<OutboxRow>>,
@@ -240,12 +247,12 @@ impl InMemoryDraftStore {
     /// Override the grounding policy (mirrors
     /// [`crate::store::PgDraftStore::with_grounding`]).
     pub fn with_grounding(self, policy: GroundingPolicy) -> Self {
-        *self.rule.lock().unwrap() = LandingRule::new(policy);
+        *self.checks.lock().unwrap() = Arc::new(CheckRegistry::with_grounding(policy));
         self
     }
 
-    fn rule(&self) -> LandingRule {
-        *self.rule.lock().unwrap()
+    fn checks(&self) -> Arc<CheckRegistry> {
+        Arc::clone(&self.checks.lock().unwrap())
     }
 
     /// How many drafts a submitted batch carried, as `attach_batch` recorded
@@ -278,6 +285,7 @@ impl InMemoryDraftStore {
         let mut outbox = self.outbox.lock().unwrap();
         let already = outbox.iter().any(|row| match &row.envelope.payload {
             events::DomainEvent::IncidentNarrativeDrafted(event) => event.draft_id == draft_id.0,
+            events::DomainEvent::RuleDraftProposed(event) => event.draft_id == draft_id.0,
             _ => false,
         });
         if !already {
@@ -345,6 +353,7 @@ impl DraftQueue for InMemoryDraftStore {
                     customer_id: job.customer_id,
                     chain: job.chain,
                     source: job.source,
+                    source_text: job.source_text.clone(),
                     status: DraftStatus::Queued,
                     attempts: 0,
                     provenance: None,
@@ -430,6 +439,7 @@ impl DraftWorkQueue for InMemoryDraftStore {
                         customer_id: row.draft.customer_id,
                         chain: row.draft.chain,
                         source: row.draft.source,
+                        source_text: row.draft.source_text.clone(),
                     },
                     attempts: row.draft.attempts,
                     lease_expires_at: at + lease,
@@ -470,13 +480,13 @@ impl DraftAttempt for InMemoryDraftStore {
         at: DateTime<Utc>,
     ) -> Result<DraftStatus, StoreError> {
         self.guard()?;
-        let rule = self.rule();
+        let checks = self.checks();
         let (status, announcement) = self.with_row(draft_id, |row| match outcome {
             DraftOutcome::Completed(completion) => {
                 let landing =
-                    rule.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
+                    checks.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
                 let status = landing.status;
-                (status, row.apply(landing, &completion, at))
+                (status, row.apply(landing, &completion, &checks, at))
             }
             DraftOutcome::Failed { reason, permanent } => {
                 let status = if permanent {
@@ -541,16 +551,17 @@ impl DraftCache for InMemoryDraftStore {
         self.guard()?;
         let mut rows = self.rows.lock().unwrap();
         let mut landed = 0u64;
-        let rule = self.rule();
+        let checks = self.checks();
         let mut announcements: Vec<(DraftId, Option<EventEnvelope>)> = Vec::new();
         for row in rows.values_mut() {
             if row.request_digest == Some(key.request_digest())
                 && row.model_digest == Some(key.model_digest())
                 && row.draft.status == DraftStatus::InFlight
             {
-                let landing = rule.apply(row.draft.kind, &row.draft.grounded_event_ids, completion);
+                let landing =
+                    checks.apply(row.draft.kind, &row.draft.grounded_event_ids, completion);
                 let draft_id = row.draft.draft_id;
-                announcements.push((draft_id, row.apply(landing, completion, at)));
+                announcements.push((draft_id, row.apply(landing, completion, &checks, at)));
                 landed += 1;
             }
         }
@@ -673,6 +684,7 @@ impl DraftBatchQueue for InMemoryDraftStore {
                         customer_id: row.draft.customer_id,
                         chain: row.draft.chain,
                         source: row.draft.source,
+                        source_text: row.draft.source_text.clone(),
                     },
                     attempts: row.draft.attempts,
                     lease_expires_at: at + lease,
@@ -779,7 +791,7 @@ impl DraftBatchQueue for InMemoryDraftStore {
         at: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
         self.guard()?;
-        let rule = self.rule();
+        let checks = self.checks();
         let mut announcement = None;
         let landed = self.with_row(draft_id, |row| {
             if row.draft.batch_id.as_deref() != Some(batch_id.0.as_str())
@@ -790,8 +802,8 @@ impl DraftBatchQueue for InMemoryDraftStore {
             match outcome {
                 BatchItemOutcome::Answered(completion) => {
                     let landing =
-                        rule.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
-                    announcement = row.apply(landing, &completion, at);
+                        checks.apply(row.draft.kind, &row.draft.grounded_event_ids, &completion);
+                    announcement = row.apply(landing, &completion, &checks, at);
                 }
                 other => {
                     row.draft.last_error = Some(batch_failure(&other));

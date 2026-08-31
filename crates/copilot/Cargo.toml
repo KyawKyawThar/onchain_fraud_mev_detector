@@ -46,6 +46,15 @@ rdkafka = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+# §20.4's hallucination-safety mechanism for natural-language rule creation
+# (src/rule_draft.rs): a drafted rule is parsed and compiled through §9's
+# *existing* boundary — `RuleDefinition` -> `Rule::validate` ->
+# `CompiledRuleSet::compile` — before a customer ever sees it. Deliberately not
+# forbidden by arch-conformance's `copilot` rule (unlike `intelligence` or
+# `detection`): this is the validating boundary the safety argument rests on,
+# not a shortcut around one.
+rule-engine = { workspace = true }
+
 # Reading the incident's audit stream out of event-store over its internal
 # HTTP read API (§4). A *client*, not a link edge: §14 forbids reaching into
 # another service's store, which is why this crate has no ClickHouse

@@ -65,6 +65,15 @@ alloy-primitives = { workspace = true }
 ort = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Self-dependency with `test-util` on, so this crate's own tests **and its
+# doctests** see `StubEngine`/`block_descriptor`. Without it the doctests
+# compile against the default feature set, where `test_util` is gated out —
+# and they only passed under `cargo test --workspace` because feature
+# unification with `anomaly-detector`/`backtest` happened to switch the feature
+# on. `cargo test -p inference --doc` failed on its own. Same pattern as
+# `copilot`'s self-dependency, for the same reason: a test whose success
+# depends on which *other* crate is in the build is not a gate.
+inference = { path = ".", features = ["test-util"] }
 # In-memory recorder so the observability tests assert on the series a scrape
 # would see — including that a failed batch still counts the vectors it
 # attempted, which is the under-reporting §14 exists to prevent.
