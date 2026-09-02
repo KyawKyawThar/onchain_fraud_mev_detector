@@ -27,9 +27,17 @@ pub mod intelligence;
 pub mod predictive;
 pub mod primitives;
 pub mod rule_engine;
+/// The schema registry (§17): the committed description of every event, the
+/// compatibility classifier, and the canonical fixtures both are built from.
+/// Behind the `schema` feature — tooling and tests, not the produce/consume path.
+#[cfg(feature = "schema")]
+pub mod schema;
 pub mod scoring;
 pub mod simulation;
 pub mod system;
+/// Reading events written under an older schema version (§17) — the
+/// version-dispatch seam [`EventEnvelope::from_json_slice`] decodes through.
+pub mod upcast;
 
 use chrono::{DateTime, Utc};
 use primitives::{AccountAddress, AlertId, Chain, CrossChainFindingId, CustomerId, IncidentId};
@@ -109,7 +117,8 @@ pub fn topics_for(event_types: &[&str]) -> Vec<String> {
 /// hands Kafka. The `Chain` arm renders the numeric chain id, deliberately *not*
 /// [`Chain`]'s own `chain-1` display, so that easily-missed distinction lives in
 /// exactly one place instead of every call site remembering `.id()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum PartitionKey {
     /// Per-chain ordering for the backbone — a chain's events share a partition (§20).
     Chain(Chain),
@@ -138,6 +147,18 @@ pub enum PartitionKey {
     CrossChainFinding(CrossChainFindingId),
 }
 
+impl PartitionKey {
+    /// The key's *kind* (`chain`, `alert`, `incident`, `customer`,
+    /// `cross_chain_finding`) — what the schema registry records, and what a
+    /// consumer's ordering guarantee actually rests on (§20). Distinct from
+    /// [`Display`](std::fmt::Display), which renders the key's *value*.
+    ///
+    /// Derived from the variant name by `strum`, so it cannot drift.
+    pub fn kind(&self) -> &'static str {
+        self.into()
+    }
+}
+
 impl std::fmt::Display for PartitionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -162,6 +183,26 @@ pub enum EventError {
 
     #[error("unsupported schema version {found} (this build understands up to {supported})")]
     UnsupportedSchemaVersion { found: u16, supported: u16 },
+
+    /// An envelope carries no `schema_version` at all — it was not written by
+    /// any build of this system, so there is no version to migrate it from.
+    #[error("envelope has no schema_version")]
+    MissingSchemaVersion,
+
+    /// An event written under an older version could not be brought up to the
+    /// current shape: the `vN → vN+1` step for it is missing or incomplete
+    /// (§17, `upcast`). Distinct from a plain deserialization failure because
+    /// the fix is different — history is not decodable until a step exists.
+    #[error(
+        "an event written under schema version {found} could not be upcast to \
+         {supported}; the migration step for it is missing (see events::upcast)"
+    )]
+    UnreadableHistoricalEvent {
+        found: u16,
+        supported: u16,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Every domain event in the system (§2). New facts are added here; nothing is
@@ -652,13 +693,18 @@ impl EventEnvelope {
         Ok(serde_json::to_vec(self)?)
     }
 
-    /// Deserialize from JSON bytes, then reject any envelope written under a
-    /// schema version this build cannot read. The inverse of
+    /// Deserialize from JSON bytes: reject any envelope written under a schema
+    /// version this build cannot read, and migrate one written under an older
+    /// version up to the current shape first (§17). The inverse of
     /// [`Self::to_json_vec`].
+    ///
+    /// This is the *single* place the codebase inspects `schema_version`, which
+    /// is what keeps the first incompatible bump a localized change — an
+    /// [`upcast::Upcaster`] and this call site — instead of a version branch in
+    /// every reader. Current-version bytes take a direct deserialize and pay
+    /// nothing for the seam.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, EventError> {
-        let envelope: Self = serde_json::from_slice(bytes)?;
-        envelope.ensure_supported()?;
-        Ok(envelope)
+        upcast::decode(upcast::STEPS, bytes)
     }
 
     /// Reject envelopes written under a schema version this build can't read.

@@ -1,0 +1,19 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "account": "0x3333333333333333333333333333333333333333",
+      "confidence": 1.0,
+      "distance_pct": -3.0,
+      "health_factor": 0.97,
+      "prediction_id": "00000000-0000-0000-0000-0000000000f1",
+      "protocol": "aave",
+      "provisional": true,
+      "severity": "high"
+    },
+    "type": "LiquidationRiskPredicted"
+  },
+  "schema_version": 1
+}

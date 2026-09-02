@@ -1,0 +1,19 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "addresses": [
+        "0x3333333333333333333333333333333333333333"
+      ],
+      "confidence": 0.65,
+      "kind": "sandwich",
+      "prediction_id": "00000000-0000-0000-0000-0000000000f1",
+      "provisional": true,
+      "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "type": "PredictedAlert"
+  },
+  "schema_version": 1
+}

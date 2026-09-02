@@ -30,8 +30,35 @@
 //! runaway-loop valve. An alarm is a sentence addressed to an operator, and
 //! this crate is still a sink that "consumes and stores".
 
+/// The §2 fields this service reads, declared so the schema registry can hold
+/// them (§17).
+///
+/// The registry gate in `events` can prove a field was removed; it cannot know
+/// *who* was reading it, because the dependency points the other way. This is
+/// the other end of that: the same shape as
+/// [`events::topics_for`], which makes a consumer declare the event types it
+/// subscribes to and validates the list against the schema. A field removed out
+/// from under this sink then fails *this crate's* test, naming itself, instead
+/// of turning into a `NULL` column nobody notices for a month.
+///
+/// Every entry is a field [`store::UsageRow`] actually projects.
+pub const EVENT_READS: &[(&str, &str)] = &[
+    ("UsageRecorded", "customer_id"),
+    ("UsageRecorded", "event_type"),
+    ("UsageRecorded", "quantity"),
+    ("UsageRecorded", "timestamp"),
+];
+
 pub mod budget;
 pub mod config;
 pub mod kafka;
 pub mod migrate;
 pub mod store;
+
+#[cfg(test)]
+mod schema_contract {
+    #[test]
+    fn declared_reads_still_exist_in_the_committed_schema() {
+        events::schema::assert_reads("usage", super::EVENT_READS);
+    }
+}

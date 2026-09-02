@@ -1,0 +1,16 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "block": {
+        "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "number": 19800000
+      },
+      "timestamp": 1700000000
+    },
+    "type": "RawBlockReceived"
+  },
+  "schema_version": 1
+}

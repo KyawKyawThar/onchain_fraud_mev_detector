@@ -18,6 +18,14 @@ workspace = true
 # dependency-free for the services that just produce/consume events.
 openapi = ["dep:utoipa"]
 
+# The schema registry engine (§17): the structural description of every event,
+# probed out of this crate's own `Deserialize` impls, the compatibility
+# classifier over two such descriptions, and the canonical event fixtures both
+# are computed from. Off by default — a service producing events links none of
+# it; a service (or test) that wants to assert "the field I read still exists"
+# turns it on, as `crates/events/tests` and the consumer crates' unit tests do.
+schema = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +37,11 @@ thiserror.workspace = true
 utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
+# This crate, with the registry engine on. A self dev-dependency is how a crate
+# enables one of its own optional features for its tests without forcing it on
+# every service that links it (§17) — the lib target is built with `schema` for
+# the test profile, and without it everywhere else.
+events = { path = ".", features = ["schema"] }
 # Property-based round-trip for the event codec: prove `from_json_slice ∘
 # to_json_vec` is the identity over the whole `DomainEvent` value space, not just
 # the hand-picked goldens in `tests/wire_format.rs` (Sprint 4 task 4 / the schema

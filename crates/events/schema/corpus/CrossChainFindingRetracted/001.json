@@ -1,0 +1,13 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "finding_id": "00000000-0000-0000-0000-0000000000fd",
+      "reason": "block 19800000 (0x1111…) reverted by reorg, replaced by 0x4444…"
+    },
+    "type": "CrossChainFindingRetracted"
+  },
+  "schema_version": 1
+}

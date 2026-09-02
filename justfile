@@ -598,6 +598,23 @@ test:
 test-integration:
     cargo nextest run --workspace --run-ignored all --no-tests=pass
 
+# ── Event schema registry (§2, readiness Epic B) ──────────────────
+
+# The compatibility gate on its own: regenerate the schema of every DomainEvent
+# from the real codec, diff it against crates/events/schema/v<SCHEMA_VERSION>/,
+# and replay the whole append-only archive (schema/corpus/) through today's
+# reader. Runs as part of `just test` too — this is for iterating on a change.
+schema-check:
+    cargo test -p events --all-features --test schema_registry
+
+# Re-commit the current version's schema after an intentional change, appending
+# any new shape to the archive (never rewriting one: those bytes are in the event
+# store). Refuses an incompatible change: that needs a SCHEMA_VERSION bump and an
+# events::upcast step (crates/events/SCHEMA.md), after which this writes the new
+# version's directory and leaves the old one frozen.
+schema-bless:
+    cargo test -p events --all-features --test schema_registry -- --ignored --nocapture bless
+
 # ── Backtest / precision-recall gates (§18, §20.2) ────────────────
 
 # Replay the ground-truth fixtures and fail on either committed gate — the CI

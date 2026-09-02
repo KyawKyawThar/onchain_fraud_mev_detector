@@ -22,6 +22,41 @@
 //! Production is Postgres + real HTTP/SMTP; tests use the in-memory doubles
 //! behind the `test-util` feature (mirrors `rule_engine::test_util`).
 
+/// The §2 fields this service reads, declared so the schema registry can hold
+/// them (§17).
+///
+/// The registry gate in `events` can prove a field was removed; it cannot know
+/// *who* was reading it, because the dependency points the other way. This is
+/// the other end of that — the same shape as [`events::topics_for`], which makes
+/// a consumer declare the event types it subscribes to and validates the list
+/// against the schema. A field removed out from under this consumer then fails
+/// *this crate's* test, naming itself, rather than silently dropping a
+/// notification's severity or its recipient.
+///
+/// Routing, dedup and correlation only: fields a [`notice::Notice`] or the
+/// lifecycle correlation is actually built from.
+pub const EVENT_READS: &[(&str, &str)] = &[
+    // The provisional → confirmed → retracted lifecycle (§6, §7).
+    ("PreliminaryAlertCreated", "alert_id"),
+    ("PreliminaryAlertCreated", "addresses"),
+    ("PreliminaryAlertCreated", "kind"),
+    ("PreliminaryAlertCreated", "confidence"),
+    ("PreliminaryAlertCreated", "severity"),
+    ("PreliminaryAlertCreated", "suggested_action"),
+    ("IncidentCreated", "incident_id"),
+    ("IncidentCreated", "alert_id"),
+    ("IncidentCreated", "severity"),
+    ("IncidentCreated", "suggested_action"),
+    ("IncidentRetracted", "incident_id"),
+    ("IncidentRetracted", "reason"),
+    ("IncidentFinalized", "incident_id"),
+    // Customer-owned rule alerts (§9) and the §25 exposure digest.
+    ("RuleAlertCreated", "alert_id"),
+    ("RuleAlertCreated", "address"),
+    ("RuleAlertCreated", "owner"),
+    ("RuleAlertCreated", "explanation"),
+];
+
 pub mod config;
 pub mod consumer;
 pub mod delivery;
@@ -35,3 +70,11 @@ pub mod subscriber_cache;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+
+#[cfg(test)]
+mod schema_contract {
+    #[test]
+    fn declared_reads_still_exist_in_the_committed_schema() {
+        events::schema::assert_reads("notification", super::EVENT_READS);
+    }
+}

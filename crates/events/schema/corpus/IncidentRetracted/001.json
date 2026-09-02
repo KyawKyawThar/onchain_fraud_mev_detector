@@ -1,0 +1,13 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "incident_id": "00000000-0000-0000-0000-00000000001c",
+      "reason": "block reverted"
+    },
+    "type": "IncidentRetracted"
+  },
+  "schema_version": 1
+}
