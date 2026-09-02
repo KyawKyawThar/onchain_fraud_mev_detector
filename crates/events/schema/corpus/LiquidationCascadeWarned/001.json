@@ -1,0 +1,22 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "accounts": [
+        "0x3333333333333333333333333333333333333333"
+      ],
+      "aggregate_at_risk_usd": 40000000.0,
+      "confidence": 1.0,
+      "hub_capped": false,
+      "prediction_id": "00000000-0000-0000-0000-0000000000f1",
+      "provisional": true,
+      "reflexive_depth": 2,
+      "trigger_asset": "0x4444444444444444444444444444444444444444",
+      "trigger_price": 1500.0
+    },
+    "type": "LiquidationCascadeWarned"
+  },
+  "schema_version": 1
+}

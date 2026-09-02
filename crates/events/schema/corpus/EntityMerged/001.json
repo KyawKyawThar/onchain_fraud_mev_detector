@@ -1,0 +1,14 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "absorbed_id": "00000000-0000-0000-0000-0000000000e2",
+      "evidence_ref": "common-funder",
+      "surviving_id": "00000000-0000-0000-0000-0000000000e1"
+    },
+    "type": "EntityMerged"
+  },
+  "schema_version": 1
+}

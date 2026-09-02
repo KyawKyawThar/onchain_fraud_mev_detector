@@ -1,0 +1,1757 @@
+{
+  "registry_format": 1,
+  "schema_version": 1,
+  "envelope": [
+    {
+      "path": "chain",
+      "type": "integer",
+      "required": true
+    },
+    {
+      "path": "event_id",
+      "type": "validated_string",
+      "required": true
+    },
+    {
+      "path": "occurred_at",
+      "type": "validated_string",
+      "required": true
+    },
+    {
+      "path": "payload",
+      "type": "object",
+      "required": true
+    },
+    {
+      "path": "schema_version",
+      "type": "integer",
+      "required": true
+    }
+  ],
+  "events": {
+    "AddressEmbeddingUpdated": {
+      "topic": "mev.events.AddressEmbeddingUpdated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "embedding_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "entity_id",
+          "type": "validated_string",
+          "required": false
+        },
+        {
+          "path": "observations_truncated",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "schema_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "top_factors",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "top_factors[]",
+          "type": "object"
+        },
+        {
+          "path": "top_factors[].feature",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "top_factors[].share",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "top_factors[].value",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "vector",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "vector[]",
+          "type": "float"
+        }
+      ]
+    },
+    "AttributionRetracted": {
+      "topic": "mev.events.AttributionRetracted",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "entity_ids",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "entity_ids[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "AttributionUpdated": {
+      "topic": "mev.events.AttributionUpdated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "entity_ids",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "entity_ids[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "labels",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "labels[]",
+          "type": "string"
+        }
+      ]
+    },
+    "BlockAssembled": {
+      "topic": "mev.events.BlockAssembled",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "trace_available",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "tx_count",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    "BlockCanonicalized": {
+      "topic": "mev.events.BlockCanonicalized",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    "BlockFinalized": {
+      "topic": "mev.events.BlockFinalized",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    "BlockReverted": {
+      "topic": "mev.events.BlockReverted",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "replaced_by",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "BridgeMevDetected": {
+      "topic": "mev.events.BridgeMevDetected",
+      "partition_key": "cross_chain_finding",
+      "fields": [
+        {
+          "path": "bridge",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "deposit_leg",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "deposit_leg.block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "deposit_leg.block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "deposit_leg.block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "deposit_leg.chain",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "deposit_leg.tx",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "entity_hint",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "fill_leg",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "fill_leg.block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "fill_leg.block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "fill_leg.block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "fill_leg.chain",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "fill_leg.tx",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "finding_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "profit",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": false
+        },
+        {
+          "path": "severity",
+          "type": "enum",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "required": true
+        },
+        {
+          "path": "victim_loss",
+          "type": "float",
+          "required": true
+        }
+      ]
+    },
+    "CrossChainFindingRetracted": {
+      "topic": "mev.events.CrossChainFindingRetracted",
+      "partition_key": "cross_chain_finding",
+      "fields": [
+        {
+          "path": "finding_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "reason",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "CrossChainMevDetected": {
+      "topic": "mev.events.CrossChainMevDetected",
+      "partition_key": "cross_chain_finding",
+      "fields": [
+        {
+          "path": "bridge",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "entity_hint",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "finding_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "kind",
+          "type": "enum",
+          "values": [
+            "sandwich",
+            "arbitrage",
+            "liquidation",
+            "flashloan",
+            "rugpull",
+            "wash_trading",
+            "address_poisoning",
+            "anomaly"
+          ],
+          "required": true
+        },
+        {
+          "path": "latency_ms",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "legs",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "legs[]",
+          "type": "object"
+        },
+        {
+          "path": "legs[].block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "legs[].block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "legs[].block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "legs[].chain",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "legs[].tx",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "profit",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": false
+        },
+        {
+          "path": "severity",
+          "type": "enum",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "required": true
+        }
+      ]
+    },
+    "DetectorTriggered": {
+      "topic": "mev.events.DetectorTriggered",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "detector",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "detector.config_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "evidence",
+          "type": "any",
+          "required": true
+        },
+        {
+          "path": "raw_confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "txs",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "txs[]",
+          "type": "validated_string"
+        }
+      ]
+    },
+    "EntityCreated": {
+      "topic": "mev.events.EntityCreated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "entity_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "seed_address",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "EntityLinkProposed": {
+      "topic": "mev.events.EntityLinkProposed",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "anchor",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "anchor_labels",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "anchor_labels[]",
+          "type": "string"
+        },
+        {
+          "path": "candidate",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "candidate_entity",
+          "type": "validated_string",
+          "required": false
+        },
+        {
+          "path": "candidate_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "embedding_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "factors",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "factors[]",
+          "type": "object"
+        },
+        {
+          "path": "factors[].candidate_value",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "factors[].contribution",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "factors[].feature",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "factors[].subject_value",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "schema_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "similarity",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "subject",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "subject_entity",
+          "type": "validated_string",
+          "required": false
+        }
+      ]
+    },
+    "EntityMerged": {
+      "topic": "mev.events.EntityMerged",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "absorbed_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "evidence_ref",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "surviving_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "EntitySplit": {
+      "topic": "mev.events.EntitySplit",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "new_ids",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "new_ids[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "original_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "reason",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "IncidentCreated": {
+      "topic": "mev.events.IncidentCreated",
+      "partition_key": "alert",
+      "fields": [
+        {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "impact_usd",
+          "type": "float",
+          "required": false
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "kind",
+          "type": "enum",
+          "values": [
+            "sandwich",
+            "arbitrage",
+            "liquidation",
+            "flashloan",
+            "rugpull",
+            "wash_trading",
+            "address_poisoning",
+            "anomaly"
+          ],
+          "required": true
+        },
+        {
+          "path": "profit",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "severity",
+          "type": "enum",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "required": true
+        },
+        {
+          "path": "suggested_action",
+          "type": "enum",
+          "values": [
+            "monitor",
+            "investigate",
+            "escalate",
+            "escalate_immediately"
+          ],
+          "required": false
+        },
+        {
+          "path": "txs",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "txs[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "victim_address",
+          "type": "validated_string",
+          "required": false
+        },
+        {
+          "path": "victim_loss",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "victim_loss_usd",
+          "type": "float",
+          "required": false
+        }
+      ]
+    },
+    "IncidentFinalized": {
+      "topic": "mev.events.IncidentFinalized",
+      "partition_key": "incident",
+      "fields": [
+        {
+          "path": "block_hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "IncidentNarrativeDrafted": {
+      "topic": "mev.events.IncidentNarrativeDrafted",
+      "partition_key": "incident",
+      "fields": [
+        {
+          "path": "cited_claims",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "claims",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "draft_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "drafted_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "grounded_event_ids",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "grounded_event_ids[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "model_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "narrative_ref",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "prompt_digest",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "prompt_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "prompt_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "source",
+          "type": "enum",
+          "values": [
+            "live",
+            "backfill"
+          ],
+          "required": true
+        }
+      ]
+    },
+    "IncidentRetracted": {
+      "topic": "mev.events.IncidentRetracted",
+      "partition_key": "incident",
+      "fields": [
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "reason",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "LabelAdded": {
+      "topic": "mev.events.LabelAdded",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "kind",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "source",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "value",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "LabelRevoked": {
+      "topic": "mev.events.LabelRevoked",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "label_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "reason",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "LabelUpdated": {
+      "topic": "mev.events.LabelUpdated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "label_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "new_value",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "old_value",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "source",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "LiquidationCascadeWarned": {
+      "topic": "mev.events.LiquidationCascadeWarned",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "accounts",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "accounts[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "aggregate_at_risk_usd",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "hub_capped",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "prediction_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "reflexive_depth",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "trigger_asset",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "trigger_price",
+          "type": "float",
+          "required": true
+        }
+      ]
+    },
+    "LiquidationRiskPredicted": {
+      "topic": "mev.events.LiquidationRiskPredicted",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "account",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "distance_pct",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "health_factor",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "prediction_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "protocol",
+          "type": "enum",
+          "values": [
+            "aave",
+            "compound"
+          ],
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "severity",
+          "type": "enum",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "required": true
+        }
+      ]
+    },
+    "ModelDriftDetected": {
+      "topic": "mev.events.ModelDriftDetected",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "baseline_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "detector.config_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "drifted",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "drifted[]",
+          "type": "object"
+        },
+        {
+          "path": "drifted[].feature",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "drifted[].magnitude",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "drifted[].shift",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "drifted[].spread",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "feature_version",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "granularity",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "max_magnitude",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "model_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "observed_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "samples",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "threshold",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "window_closed_by",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "PredictedAlert": {
+      "topic": "mev.events.PredictedAlert",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "addresses",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "addresses[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "kind",
+          "type": "enum",
+          "values": [
+            "sandwich",
+            "arbitrage",
+            "liquidation",
+            "flashloan",
+            "rugpull",
+            "wash_trading",
+            "address_poisoning",
+            "anomaly"
+          ],
+          "required": true
+        },
+        {
+          "path": "prediction_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "tx_hash",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "PreliminaryAlertCreated": {
+      "topic": "mev.events.PreliminaryAlertCreated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "addresses",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "addresses[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "detector",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "detector.config_hash",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "detector.version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "impact_usd",
+          "type": "float",
+          "required": false
+        },
+        {
+          "path": "kind",
+          "type": "enum",
+          "values": [
+            "sandwich",
+            "arbitrage",
+            "liquidation",
+            "flashloan",
+            "rugpull",
+            "wash_trading",
+            "address_poisoning",
+            "anomaly"
+          ],
+          "required": true
+        },
+        {
+          "path": "provisional",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "severity",
+          "type": "enum",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "required": false
+        },
+        {
+          "path": "suggested_action",
+          "type": "enum",
+          "values": [
+            "monitor",
+            "investigate",
+            "escalate",
+            "escalate_immediately"
+          ],
+          "required": false
+        }
+      ]
+    },
+    "RawBlockReceived": {
+      "topic": "mev.events.RawBlockReceived",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "block",
+          "type": "object",
+          "required": true
+        },
+        {
+          "path": "block.hash",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "block.number",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "timestamp",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    "RiskScoreUpdated": {
+      "topic": "mev.events.RiskScoreUpdated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "entity_id",
+          "type": "validated_string",
+          "required": false
+        },
+        {
+          "path": "factors",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "factors[]",
+          "type": "object"
+        },
+        {
+          "path": "factors[].delta",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "factors[].evidence_ref",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "factors[].name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "model_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "score",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    "RuleAlertCreated": {
+      "topic": "mev.events.RuleAlertCreated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "explanation",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "owner",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "rule_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "RuleCreated": {
+      "topic": "mev.events.RuleCreated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "definition",
+          "type": "any",
+          "required": true
+        },
+        {
+          "path": "owner",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "rule_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "RuleDraftProposed": {
+      "topic": "mev.events.RuleDraftProposed",
+      "partition_key": "customer",
+      "fields": [
+        {
+          "path": "definition",
+          "type": "any",
+          "required": true
+        },
+        {
+          "path": "draft_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "draft_ref",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "model_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "owner",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "prompt_digest",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "prompt_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "prompt_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "proposed_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "source_text_hash",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "RuleTriggered": {
+      "topic": "mev.events.RuleTriggered",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "context",
+          "type": "any",
+          "required": true
+        },
+        {
+          "path": "matched_events",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "matched_events[]",
+          "type": "string"
+        },
+        {
+          "path": "rule_id",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "SanctionHit": {
+      "topic": "mev.events.SanctionHit",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "entry",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "list",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "ScreeningDecisionRecorded": {
+      "topic": "mev.events.ScreeningDecisionRecorded",
+      "partition_key": "customer",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confidence",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "customer_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "decision",
+          "type": "enum",
+          "values": [
+            "allow",
+            "review",
+            "block"
+          ],
+          "required": true
+        },
+        {
+          "path": "decision_basis",
+          "type": "enum",
+          "values": [
+            "sanctions_hard_block",
+            "score_thresholds"
+          ],
+          "required": true
+        },
+        {
+          "path": "factors",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "factors[]",
+          "type": "object"
+        },
+        {
+          "path": "factors[].delta",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "factors[].evidence_ref",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "factors[].name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "model_version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "policy_name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "policy_version",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "sanctioned",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "score",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "timestamp",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "SimulationCompleted": {
+      "topic": "mev.events.SimulationCompleted",
+      "partition_key": "alert",
+      "fields": [
+        {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "confirmed",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "profit",
+          "type": "float",
+          "required": true
+        },
+        {
+          "path": "victim_loss",
+          "type": "float",
+          "required": true
+        }
+      ]
+    },
+    "SimulationRequested": {
+      "topic": "mev.events.SimulationRequested",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "evidence",
+          "type": "any",
+          "required": true
+        }
+      ]
+    },
+    "UsageRecorded": {
+      "topic": "mev.events.UsageRecorded",
+      "partition_key": "customer",
+      "fields": [
+        {
+          "path": "customer_id",
+          "type": "validated_string",
+          "required": false
+        },
+        {
+          "path": "event_type",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "quantity",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "timestamp",
+          "type": "validated_string",
+          "required": true
+        }
+      ]
+    },
+    "WalletExposureReportReady": {
+      "topic": "mev.events.WalletExposureReportReady",
+      "partition_key": "customer",
+      "fields": [
+        {
+          "path": "address",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "customer_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "headline",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "period_end",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "period_start",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "summary",
+          "type": "any",
+          "required": true
+        }
+      ]
+    }
+  }
+}

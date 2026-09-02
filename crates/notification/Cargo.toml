@@ -81,6 +81,9 @@ metrics = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+# The schema registry (§17), so `EVENT_READS` can be checked against the
+# committed schema of the events this consumer routes on.
+events = { workspace = true, features = ["schema"] }
 tokio = { workspace = true }
 # Self-dependency with `test-util` on, so `tests/` sees the in-memory doubles.
 notification = { path = ".", features = ["test-util"] }

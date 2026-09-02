@@ -1,0 +1,28 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "address": "0x3333333333333333333333333333333333333333",
+      "embedding_version": "behavior-v1",
+      "entity_id": "00000000-0000-0000-0000-0000000000e1",
+      "observations_truncated": false,
+      "schema_hash": "a1b2c3",
+      "top_factors": [
+        {
+          "feature": "edge_count_log",
+          "share": 0.75,
+          "value": 0.5
+        }
+      ],
+      "vector": [
+        0.5,
+        0.25,
+        0.0
+      ]
+    },
+    "type": "AddressEmbeddingUpdated"
+  },
+  "schema_version": 1
+}

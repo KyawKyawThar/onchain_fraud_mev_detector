@@ -39,6 +39,14 @@ fn workspace_graph() -> Result<arch_conformance::DepGraph> {
             .context("package without a dependencies array")?
             .iter()
             .filter_map(|d| d["name"].as_str().map(str::to_owned))
+            // A crate is never its own dependency. `cargo metadata` reports a
+            // *self* dev-dependency — the standard way a crate enables one of
+            // its own optional features for its tests without forcing it on
+            // everything that links it, which `events` does for the `schema`
+            // registry (§17) — as an edge, but it adds nothing to the graph:
+            // no layering to invert, no cycle to create. Counting it would make
+            // a leaf crate look like it had grown a workspace dependency.
+            .filter(|dep| *dep != name)
             .collect();
         graph.insert(name, deps);
     }

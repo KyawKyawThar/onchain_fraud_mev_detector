@@ -1,0 +1,23 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "address": "0x3333333333333333333333333333333333333333",
+      "confidence": 0.7,
+      "entity_id": "00000000-0000-0000-0000-0000000000e1",
+      "factors": [
+        {
+          "delta": 30.0,
+          "evidence_ref": "incident:1c",
+          "name": "sandwich-incidents"
+        }
+      ],
+      "model_version": "risk-v1",
+      "score": 87
+    },
+    "type": "RiskScoreUpdated"
+  },
+  "schema_version": 1
+}

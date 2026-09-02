@@ -1,0 +1,24 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "alert_id": "00000000-0000-0000-0000-0000000000a1",
+      "impact_usd": 120000.0,
+      "incident_id": "00000000-0000-0000-0000-00000000001c",
+      "kind": "sandwich",
+      "profit": 1234.5,
+      "severity": "high",
+      "suggested_action": "escalate",
+      "txs": [
+        "0x2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "victim_address": "0x3333333333333333333333333333333333333333",
+      "victim_loss": 678.9,
+      "victim_loss_usd": 678.9
+    },
+    "type": "IncidentCreated"
+  },
+  "schema_version": 1
+}

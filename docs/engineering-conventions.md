@@ -34,6 +34,7 @@ A change is "done" when:
 - [ ] **New Kafka consumer?** — every line of the §12 conformance list, no exceptions.
 - [ ] **Doc comments state constraints** the code can't express (§13) — never narration of the next line.
 - [ ] **Changed a prompt?** — the artifact is versioned, the manifest is regenerated, and the diff is reviewed (§16).
+- [ ] **Touched the event schema?** — the committed registry is re-blessed and the diff reviewed; an incompatible change bought a `SCHEMA_VERSION` bump and an upcaster (§17).
 
 ---
 
@@ -526,6 +527,76 @@ event-store and exits non-zero when a stored draft makes a claim the record does
 support ([`copilot::grounding_audit`](../crates/copilot/src/grounding_audit.rs)). A
 governance property nobody re-checks after the fact is a governance property that
 holds until the first time it doesn't.
+
+---
+
+## 17. The event schema is a contract, and a compatibility gate is what makes it one
+
+**Rule.** Every `DomainEvent` has a committed schema under
+[`crates/events/schema/`](../crates/events/schema), and a change to any event is
+*classified* before it merges — not merely noticed. Compatible (a new event type,
+a field that reads as defaulted, a widened string): re-commit with `just
+schema-bless` and review the diff. Consumers first (a new value in a closed
+enum): legal, but every consumer deploys before the producer that emits one.
+Breaking (a field removed, retyped or newly required; an event type removed; a
+topic moved; a partition key changed): blessing refuses — it costs a
+`SCHEMA_VERSION` bump plus an [`events::upcast`](../crates/events/src/upcast.rs)
+step.
+
+**Why here.** The wire-format goldens already lock the *bytes*, and that is a
+different property: they say "this changed", never "this change is safe". Safety
+is the operational requirement — a producer and a consumer are deployed minutes
+or days apart, and an event written a year ago is still in the event store
+waiting to be replayed (§4/§18). The sprint plan's #1 risk is schema churn
+rippling downstream, and the half that was still a *convention* ("don't remove a
+field") is now the half that fails the build.
+
+Five design choices carry the weight, and each is worth copying the next time
+something needs a gate rather than a guideline:
+
+- **The schema is probed out of the real `Deserialize` impl**, not derived a
+  second time. Optionality is "delete the field and see whether it still
+  decodes"; a closed enum's variants are read out of serde's own `unknown
+  variant` error; free-form JSON is "accepts three mutually incompatible
+  values". A parallel `schemars`/`utoipa` derive would be a second description
+  of the wire format, free to disagree with the first.
+- **The archive is append-only, and separate from the belief.**
+  `v<N>/registry.json` is rewritten as compatible changes land; `corpus/` only
+  ever grows. Fusing them would destroy the pre-change shape on the very
+  blessing that introduced the change — a snapshot that regenerates itself is
+  not an archive, and this is the failure mode of every "committed golden" that
+  is also its own baseline.
+- **The transport contract is part of the schema.** `topic` and `partition_key`
+  are generated from the real envelope, because a re-keyed event changes every
+  consumer's ordering guarantee without touching a field (§20).
+- **The engine is a library; the gate is a shell** (§1 applied to tooling).
+  Probing and classifying are pure functions in `events::schema`; the file
+  handling and the assertions are the test. That is what lets a *consumer* crate
+  declare the fields it reads and check them itself.
+- **The file format is versioned separately from what it describes**
+  (`registry_format` vs `schema_version`), so a change to the tool never reads
+  as a change to every event.
+
+**Corollary — the consumer declares what it reads.** The gate can prove a field
+was removed; it cannot know who was reading it, because the dependency points
+the other way. So each consumer keeps an `EVENT_READS` list and asserts it
+against the committed schema (`events::schema::assert_reads`), the same shape as
+`topics_for` for topic names — a removed field fails *that* crate's test, naming
+itself.
+
+**Reference.**
+- [`crates/events/SCHEMA.md`](../crates/events/SCHEMA.md) — the rules table, the archive, and the upcasting seam.
+- [`crates/events/src/schema`](../crates/events/src/schema) — the probe, the classifier, the canonical fixtures.
+- [`crates/events/tests/schema_registry.rs`](../crates/events/tests/schema_registry.rs) — the shell that fails the build.
+- `just schema-check` / `just schema-bless`; the `Event schema compatibility` job in both workflows.
+
+**Anti-pattern.** Adding a field without `#[serde(default …)]` because "every
+producer writes it now" — every producer *from now on* writes it; the archive
+does not, and replay is what the event store exists for. And no dynamic-key maps
+(`HashMap<String, T>`) in a `DomainEvent`: serde cannot tell one from a struct,
+so its data keys would be recorded as schema and every new key would read as an
+added field. Free form goes in a `serde_json::Value`; anything with meaningful
+keys is a `Vec` of pairs.
 
 ---
 

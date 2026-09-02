@@ -1,0 +1,14 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "address": "0x3333333333333333333333333333333333333333",
+      "entry": "SDN-123",
+      "list": "OFAC"
+    },
+    "type": "SanctionHit"
+  },
+  "schema_version": 1
+}

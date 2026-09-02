@@ -1,0 +1,32 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "anchor": "0x5555555555555555555555555555555555555555",
+      "anchor_labels": [
+        "known_scammer"
+      ],
+      "candidate": "0x5555555555555555555555555555555555555555",
+      "candidate_entity": "00000000-0000-0000-0000-0000000000e1",
+      "candidate_id": "00000000-0000-0000-0000-00000000011c",
+      "confidence": 0.4,
+      "embedding_version": "behavior-v1",
+      "factors": [
+        {
+          "candidate_value": 0.25,
+          "contribution": 0.125,
+          "feature": "edge_count_log",
+          "subject_value": 0.5
+        }
+      ],
+      "schema_hash": "a1b2c3",
+      "similarity": 0.9375,
+      "subject": "0x3333333333333333333333333333333333333333",
+      "subject_entity": "00000000-0000-0000-0000-0000000000e2"
+    },
+    "type": "EntityLinkProposed"
+  },
+  "schema_version": 1
+}

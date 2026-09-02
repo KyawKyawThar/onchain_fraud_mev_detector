@@ -51,6 +51,29 @@ jobs:
       - name: cargo build (locked)
         run: cargo build --workspace --all-features --locked
 
+  # ── Event schema compatibility (§2, readiness Epic B) ────────────
+  # The committed schema of every DomainEvent, regenerated from the real codec
+  # and diffed against crates/events/schema/v<SCHEMA_VERSION>/. Fails on:
+  #   * compatible drift (a new event type, a new defaulted field) — re-commit
+  #     the schema with `just schema-bless`, reviewed like any other diff;
+  #   * incompatible drift (a removed/retyped/newly-required field, a removed
+  #     event type) — blessing refuses, and it needs a SCHEMA_VERSION bump plus
+  #     an upcaster (crates/events/SCHEMA.md).
+  # It also replays the append-only archive (schema/corpus/ — every distinct shape
+  # ever emitted, including ones no current code can produce) through today's
+  # reader: the check that keeps a producer and a consumer deployable
+  # independently, and history readable.
+  schema-compat:
+    name: Event schema compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Registry diff + archive replay
+        run: cargo test -p events --all-features --locked --test schema_registry
+
   # ── Backtest gates: no regression (§18), nothing live below the
   # promotion floor (§20.2) ────────────────────────────────────────
   backtest:

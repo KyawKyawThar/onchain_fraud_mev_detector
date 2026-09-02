@@ -1,0 +1,16 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "address": "0x3333333333333333333333333333333333333333",
+      "label_id": "00000000-0000-0000-0000-00000000001b",
+      "new_value": "binance-14",
+      "old_value": "binance",
+      "source": "etherscan"
+    },
+    "type": "LabelUpdated"
+  },
+  "schema_version": 1
+}
