@@ -50,6 +50,56 @@ pub async fn connect_with(url: &str, max_connections: u32) -> Result<PgPool> {
     Ok(pool)
 }
 
+/// [`connect`], but every connection in the pool resolves unqualified table
+/// names in `schema` first.
+///
+/// The one use is a **projection rebuild** (`crates/rebuild`): a rebuild writes
+/// its replacement into a staging schema beside the live tables and swaps it in.
+/// Pointing the pool's `search_path` at that schema is what lets the *unmodified*
+/// production write path — the same store impl, the same SQL — target it. The
+/// alternative, threading a schema name through every query, would mean the
+/// rebuild exercised different SQL than production runs, which defeats the
+/// purpose of rebuilding through the live path at all.
+///
+/// `public` stays on the path after `schema`, so shared types and extensions
+/// still resolve. `schema` must be a bare identifier (this is checked): it is
+/// interpolated into a `SET` that cannot be parameterised.
+pub async fn connect_in_schema(url: &str, schema: &str) -> Result<PgPool> {
+    if schema.is_empty()
+        || !schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        anyhow::bail!("schema {schema:?} is not a bare identifier");
+    }
+    // `SET search_path` is per-session, so it must run on *every* connection the
+    // pool opens — including ones opened later to grow the pool, which is why
+    // this is `after_connect` and not a one-off statement after `connect`.
+    let schema = schema.to_owned();
+    let pool = PgPoolOptions::new()
+        .max_connections(DEFAULT_MAX_CONNECTIONS)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .after_connect(move |conn, _meta| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                // `AssertSqlSafe` is sqlx 0.9's explicit escape hatch for SQL
+                // built at runtime. It is honest here and nowhere else in this
+                // statement: `schema` was checked above to be a bare
+                // identifier, and `SET search_path` takes no bind parameters.
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "SET search_path TO {schema}, public"
+                )))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
+        .context("connecting to Postgres")?;
+    Ok(pool)
+}
+
 /// Whether a Postgres error is a **permanent** (never-succeeds-on-retry) fault
 /// rather than a transient one — the shared half of every service's
 /// retry-vs-skip decision (`is_transient()` on its typed store error), kept

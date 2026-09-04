@@ -17,17 +17,34 @@
 //!   - `migrate up` / `migrate down` / `migrate info` — drive the ClickHouse analytics
 //!     migrations explicitly and exit (the boot path always runs `up` too). Mirrors the
 //!     event-store `migrate` subcommand + the sqlx/Postgres `just migrate-*` recipes.
+//!   - `fingerprint [--model M]` — print the read model's content hash and exit.
+//!     Read-only; take one before a risky deploy and compare after.
+//!   - `verify [--model M] [--page-size N]` — **non-destructive.** Rebuild the read
+//!     model into a staging namespace, compare it with the live one, throw the
+//!     staged copy away, and exit non-zero on any divergence. The readiness Epic B
+//!     drill, asserting §2's claim that projections are derived — safe to run on a
+//!     timer against production.
+//!   - `rebuild --yes [--model M] [--page-size N]` — the same run, but the staged
+//!     copy is **promoted** (atomically, for Postgres) over the live one. The
+//!     recovery procedure for a corrupted read model.
+//!
+//! `M` is `incidents` (Postgres), `dashboards` (ClickHouse analytics) or `all`.
+//! Both need `EVENT_STORE_URL`. Only `rebuild` needs `--yes`, because only
+//! `rebuild` changes the live model — `verify` cannot, which is what makes it
+//! schedulable. See `docs/runbooks/projection-rebuild.md`.
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clickhouse::Client;
 use event_bus::{KafkaEventSink, PUBLISH_BACKOFF};
+use rebuild::{ObservedReadModel, Snapshotter};
 use secrecy::ExposeSecret;
 use simulation::ch_migrate;
 use simulation::config::ProjectionConfig;
 use simulation::http;
 use simulation::monitored_wallet_store::{MonitoredWalletStore, PgMonitoredWalletStore};
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
+use simulation::rebuild::{PostgresStore, SimulationReadModel, Stores, Targets};
 use simulation::store::{
     build_clickhouse_client, ClickhouseAnalytics, CrossChainFindingStore, PgIncidentStore,
     TimingStore, WalletExposureStore,
@@ -56,10 +73,188 @@ async fn main() -> Result<()> {
                 .cli(&client, args.next().as_deref())
                 .await
         }
+        Some(mode @ ("rebuild" | "verify" | "fingerprint")) => {
+            run_rebuild(mode, RebuildArgs::parse(args)?, cfg, client).await
+        }
         Some(other) => bail!(
-            "unknown argument {other:?}; expected `migrate up|down|info`, or no args to run the consumer"
+            "unknown argument {other:?}; expected `migrate up|down|info`, \
+             `fingerprint|rebuild|verify [--model incidents|dashboards|all] [--yes] [--page-size N]`, \
+             or no args to run the consumer"
         ),
     }
+}
+
+/// Flags for the three projection-rebuild modes (readiness Epic B). Hand-parsed
+/// to match this binary's existing `migrate` arm rather than pulling `clap` into
+/// the service for three flags.
+struct RebuildArgs {
+    targets: Targets,
+    /// Explicit authorization to **promote** — to replace the live read model
+    /// with the staged one. Never defaulted, never inferred from a TTY. Only
+    /// `rebuild` consults it; `verify` never promotes and so never needs it.
+    confirmed: bool,
+    page_size: u64,
+}
+
+impl RebuildArgs {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self> {
+        let mut parsed = Self {
+            targets: Targets::All,
+            confirmed: false,
+            page_size: rebuild::DEFAULT_PAGE,
+        };
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--yes" => parsed.confirmed = true,
+                "--model" => {
+                    let raw = args.next().context("--model needs a value")?;
+                    parsed.targets = Targets::parse(&raw).with_context(|| {
+                        format!("unknown model {raw:?}; expected incidents|dashboards|all")
+                    })?;
+                }
+                "--page-size" => {
+                    parsed.page_size = args
+                        .next()
+                        .context("--page-size needs a value")?
+                        .parse()
+                        .context("--page-size must be a positive integer")?;
+                }
+                other => bail!("unknown flag {other:?}"),
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+/// Connect the Postgres read model, for the rebuild modes that touch it.
+async fn connect_postgres(cfg: &ProjectionConfig) -> Result<PostgresStore> {
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    // The URL rides along because staging needs a *second* pool pointed at the
+    // staging schema, and a pool cannot be re-pointed once built.
+    Ok(PostgresStore::new(pool, cfg.postgres_url.clone()))
+}
+
+/// Bring the ClickHouse analytics schema up to date and hand the client back.
+/// The schema must exist before the analytics tables can be scanned or
+/// truncated — the same `up` the consumer boot path runs.
+async fn migrated_clickhouse(client: Client) -> Result<Client> {
+    ch_migrate::MIGRATOR
+        .run(&client)
+        .await
+        .context("running ClickHouse analytics migrations")?;
+    Ok(client)
+}
+
+/// Fingerprint / rebuild / verify the read model (readiness Epic B).
+///
+/// All three share one path because the *procedure* is one procedure; only the
+/// verdict differs. `verify` exits non-zero on any divergence (the drill —
+/// projections are supposed to be derived); `rebuild` reports the same diff as a
+/// damage report and exits zero (the recovery — the event store is the system of
+/// record, so the rebuilt state wins by definition).
+async fn run_rebuild(
+    mode: &str,
+    args: RebuildArgs,
+    cfg: ProjectionConfig,
+    client: Client,
+) -> Result<()> {
+    // Connect only what this run touches — here rather than in `run()`, so a
+    // fingerprint of one model does not require the other store to be up.
+    // Building the `Stores` variant *is* the wiring: each arm connects exactly
+    // what its target needs, so there is no "target selected but store missing"
+    // state to check for afterwards.
+    let stores = match args.targets {
+        Targets::Postgres => Stores::Postgres(connect_postgres(&cfg).await?),
+        Targets::Clickhouse => Stores::Clickhouse(migrated_clickhouse(client).await?),
+        Targets::All => Stores::Both {
+            postgres: connect_postgres(&cfg).await?,
+            clickhouse: migrated_clickhouse(client).await?,
+        },
+    };
+    // Wrapped once, here, so §19 metrics are the decorator's job and not a call
+    // scattered through the procedure (conventions §14).
+    let model = ObservedReadModel::new(SimulationReadModel::new(stores));
+
+    if mode == "fingerprint" {
+        let digest = rebuild::fingerprint(&model, &rebuild::Scope::everything())
+            .await
+            .context("fingerprinting the read model")?;
+        println!(
+            "{}: {} row(s)\nroot: {}",
+            model.name(),
+            digest.len(),
+            digest.root().to_hex()
+        );
+        return Ok(());
+    }
+
+    let event_store_url = std::env::var("EVENT_STORE_URL")
+        .context("EVENT_STORE_URL must name the event store to replay from")?;
+    let source = rebuild::EventStoreReplay::new(&event_store_url)
+        .context("building the event-store replay client")?;
+    let plan = rebuild::RebuildPlan {
+        scope: rebuild::Scope::everything(),
+        page_size: args.page_size,
+        confirmed: args.confirmed,
+    };
+
+    // A rebuild runs for minutes to hours; Ctrl-C / SIGTERM must stop it
+    // cleanly, discarding the staging area rather than abandoning it.
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::warn!(
+                "shutdown signal received; the rebuild will stop and discard its staging area"
+            );
+            shutdown.cancel();
+        }
+    });
+
+    tracing::info!(
+        model = model.name(),
+        event_store = %event_store_url,
+        mode,
+        "starting a projection rebuild into a staging namespace; the live read model stays \
+         readable throughout and is replaced only on promotion"
+    );
+
+    let report = match mode {
+        // The drill: build, compare, throw away. Never touches the live model,
+        // so a divergence is the only thing that can fail it.
+        "verify" => match rebuild::verify(&model, &source, &plan, &shutdown).await {
+            Ok(report) => report,
+            Err(rebuild::VerifyFailure::Diverged(report)) => {
+                rebuild::observed::record_report(&report);
+                println!("{}", report.summarize(20));
+                bail!(
+                    "the rebuilt read model differs from the live one — projections are NOT purely \
+                     derived from the event store (see the diff above and \
+                     docs/runbooks/projection-rebuild.md). The live model was NOT modified."
+                );
+            }
+            Err(rebuild::VerifyFailure::Procedure(err)) => {
+                rebuild::observed::record_failure(model.name());
+                return Err(anyhow::Error::new(err).context("verifying the read model"));
+            }
+        },
+        // The recovery: build, compare, promote. The diff is a damage report.
+        _ => match rebuild::rebuild(&model, &source, &plan, &shutdown).await {
+            Ok(report) => report,
+            Err(err) => {
+                rebuild::observed::record_failure(model.name());
+                return Err(anyhow::Error::new(err).context("rebuilding the read model"));
+            }
+        },
+    };
+
+    rebuild::observed::record_report(&report);
+    println!("{}", report.summarize(20));
+    Ok(())
 }
 
 /// Run the consumer: apply pending ClickHouse migrations, connect the stores, then drain the

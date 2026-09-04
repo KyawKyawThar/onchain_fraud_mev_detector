@@ -49,6 +49,12 @@ event-bus = { path = "crates/event-bus" }
 # converts into, instead of each hand-rolling the same status+message+logging
 # shape (see crates/api-error/src/lib.rs).
 api-error = { path = "crates/api-error" }
+# Shared projection-rebuild procedure (readiness Epic B): wipe a read model,
+# replay it out of the event store through the owner service's OWN live fold,
+# and fingerprint both sides. §2 says projections are derived — this crate is
+# how that is proven on every build, and is the recovery procedure for a
+# corrupted read model (see docs/runbooks/projection-rebuild.md).
+rebuild = { path = "crates/rebuild" }
 # Shared JWT bearer verification (§11) — one issuer and one claim set for every
 # service that authenticates a caller (see crates/auth/src/lib.rs).
 auth = { path = "crates/auth" }

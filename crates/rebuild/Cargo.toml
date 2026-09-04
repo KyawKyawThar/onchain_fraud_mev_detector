@@ -1,0 +1,51 @@
+[package]
+name = "rebuild"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The domain schema. A rebuild replays `EventEnvelope`s and hands them to a read
+# model unchanged — this crate never inspects a payload, which is what keeps it
+# usable by every projection owner (§2: projections are derived; this crate only
+# knows how to *re-derive* one).
+events.workspace = true
+
+# Errors + object-safe async seams.
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+# The replay source is the event-store's read API (`GET /v1/replay`, §4/§18) over
+# plain HTTP — deliberately NOT a ClickHouse client. A rebuild must go through the
+# same published read path an operator would, so the runbook and the proof test
+# exercise one code path, and so this crate stays out of the `clickhouse`/
+# `ch-migrate` pairing rule (arch-conformance).
+reqwest.workspace = true
+
+# Canonical row encoding + fingerprints.
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+# Progress/telemetry for a procedure that runs for minutes against production data.
+tracing.workspace = true
+# §19 metrics facade — a near-free no-op until the binary installs the Prometheus
+# exporter. A rebuild drill that nobody is alerted about is a number somebody read
+# once; see src/observed.rs.
+metrics.workspace = true
+# A rebuild runs for hours, so it takes the same `CancellationToken` every other
+# long-running loop in the workspace does (run_consumer, exposure_report, queue).
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Scoped in-memory metrics recorder for the decorator's tests (same pattern as
+# detection/ingestion/simulation's metrics tests).
+metrics-util.workspace = true

@@ -52,6 +52,10 @@ bounded-map = { workspace = true }
 # audit event through the same `EventSink`/`publish_resilient` ingestion/detection
 # use, so the at-least-once policy lives in one place.
 event-bus = { workspace = true }
+# Shared projection-rebuild procedure (readiness Epic B) — the `ReadModel` seam
+# `src/rebuild.rs` implements, the event-store replay client, and the digest/diff
+# machinery. See docs/runbooks/projection-rebuild.md.
+rebuild = { workspace = true }
 telemetry = { workspace = true }
 # §19 metrics facade — a near-free no-op until a binary installs the Prometheus
 # exporter (`telemetry::metrics::init`), so `worker`'s confirmation-rate/latency

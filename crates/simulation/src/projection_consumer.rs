@@ -77,6 +77,21 @@ pub fn consumed_topics() -> Vec<String> {
     events::topics_for(CONSUMED_EVENT_TYPES)
 }
 
+/// The event *types* the projection consumes — the same closed list
+/// [`consumed_topics`] maps to topics, as `event_type` strings.
+///
+/// Exposed for [`crate::rebuild`]: a projection rebuild replays these out of the
+/// event store rather than off Kafka, and it must replay exactly what the live
+/// consumer subscribes to. Sharing the one list means a newly consumed event
+/// type is replayed automatically instead of being silently absent from every
+/// future rebuild — a divergence that would only surface as a wrong read model.
+pub fn consumed_event_types() -> Vec<String> {
+    CONSUMED_EVENT_TYPES
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
 /// Build the consumer. Manual offset commit (`enable.auto.commit=false`) ties the commit to
 /// a successful write-through; `earliest` means a fresh group projects from the start of
 /// retained history (cf. the dispatcher / event-store consumers).

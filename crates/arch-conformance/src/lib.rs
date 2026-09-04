@@ -310,6 +310,42 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── The rebuild seam reads the log through its published API ─────
+        // `rebuild` re-derives a read model from the event store. Its whole
+        // correctness argument is that it replays through the *published*
+        // `GET /v1/replay` endpoint, so every envelope is decoded by
+        // `EventEnvelope::from_json_slice` — and therefore through the
+        // `schema_version` check and the `events::upcast` seam (§17). A
+        // `clickhouse` or `event-store` edge would give the rebuild a second,
+        // unversioned definition of "the log" that skips upcasting, and would
+        // silently mis-fold exactly the historical events the procedure exists
+        // to re-fold. A store client edge (`sqlx`/`redis`) would mean the
+        // generic driver had learned one projection's storage; the owner
+        // service implements `ReadModel`, this crate never does.
+        if krate == "rebuild" {
+            for forbidden in [
+                "clickhouse",
+                "event-store",
+                "sqlx",
+                "redis",
+                "rdkafka",
+                "lapin",
+                "simulation",
+                "intelligence",
+                "detection",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — a projection rebuild \
+                         replays through the event store's published read API (so every \
+                         envelope crosses the upcast seam) and folds through the owner \
+                         service's own `ReadModel` impl; a store client here is a second \
+                         definition of the log or of a projection's storage"
+                    ));
+                }
+            }
+        }
+
         // ── Only backtest composes the detection service crate ───────────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
@@ -514,6 +550,11 @@ mod tests {
             ),
             ("resilience", &[]),
             ("ingestion", &["event-bus", "rdkafka", "resilience"]),
+            // The projection-rebuild seam: the domain schema and an HTTP
+            // client, nothing else. It reaches the log through the event
+            // store's published read API and a projection through the owner
+            // service's `ReadModel` impl.
+            ("rebuild", &["events", "reqwest"]),
         ]);
         assert_eq!(violations(&g), Vec::<String>::new());
     }
@@ -552,6 +593,13 @@ mod tests {
             ("reporting", &["sqlx"], "without the shared `db` crate"),
             ("reporting", &["redis"], "db::redis"),
             ("reporting", &["clickhouse"], "without ch-migrate"),
+            (
+                // Reading the event store's table directly would skip the
+                // upcast seam every replayed envelope must cross.
+                "rebuild",
+                &["events", "clickhouse", "ch-migrate"],
+                "must not depend on clickhouse",
+            ),
             ("ml-features", &["events"], "no detector-api dependency"),
             (
                 "ml-features",

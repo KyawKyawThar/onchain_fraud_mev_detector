@@ -75,6 +75,16 @@
 //!   blocks via `IncidentRetracted` ([`plan_retractions`](reorg::plan_retractions) +
 //!   the [`IncidentIndex`](reorg::IncidentIndex) block→incident seam).
 //!
+//! **Projection rebuild (readiness Epic B):**
+//! - [`rebuild`] — the [`SimulationReadModel`](rebuild::SimulationReadModel):
+//!   the `rebuild::ReadModel` impl that wipes the Postgres read model and/or the
+//!   ClickHouse analytics firehose, replays the event store through
+//!   [`ProjectionConsumer::handle`](projection_consumer::ProjectionConsumer) —
+//!   the *live* fold, not a copy — and fingerprints both sides. §2 says
+//!   projections are derived; this is where that is proven, and it is the
+//!   recovery procedure for a corrupted read model
+//!   (`docs/runbooks/projection-rebuild.md`).
+//!
 //! - [`config`] — env-resolved [`Config`](config::Config), shared by both binaries.
 
 pub mod cache;
@@ -92,6 +102,7 @@ pub mod monitored_wallet_store;
 pub mod projection;
 pub mod projection_consumer;
 pub mod queue;
+pub mod rebuild;
 pub mod reorg;
 pub mod resolver;
 pub mod result;

@@ -110,7 +110,8 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(healthz))
         .routes(routes!(audit_incident))
         .routes(routes!(events_by_address))
-        .routes(routes!(replay));
+        .routes(routes!(replay))
+        .routes(routes!(watermark));
 
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(protected)
@@ -223,6 +224,11 @@ struct FilterParams {
     from: Option<DateTime<Utc>>,
     /// Exclusive upper bound on `occurred_at` (RFC 3339).
     to: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on the server-side ingest stamp `appended_at`
+    /// (RFC 3339) — the *consistent cut* a projection rebuild replays against.
+    /// Take one from `GET /v1/watermark`; see that handler for why event time
+    /// is not a substitute.
+    appended_before: Option<DateTime<Utc>>,
     /// Max events per page (clamped server-side to a hard ceiling).
     limit: Option<u64>,
     /// Opaque cursor from a previous page's `next_cursor`; resumes after it.
@@ -245,6 +251,7 @@ impl FilterParams {
             event_type: self.event_type,
             from: self.from,
             to: self.to,
+            appended_before: self.appended_before,
             cursor,
             limit: self.limit,
         })
@@ -356,6 +363,40 @@ async fn replay(
     Ok(Json(page.into()))
 }
 
+/// The current ingest-time watermark.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct WatermarkResponse {
+    /// RFC 3339, from the store's own clock.
+    #[schema(value_type = String, format = DateTime)]
+    watermark: DateTime<Utc>,
+}
+
+/// `GET /v1/watermark` — the store's current ingest-time cut of the log.
+///
+/// Pair with `appended_before` on the read endpoints to replay a **consistent
+/// snapshot**: pin `W` here, then replay `appended_before=W`. Every lane of a
+/// multi-pass replay then stops at the same point in the log instead of at
+/// whatever the tail happened to be when each finished — which is the
+/// difference between a rebuilt projection that belongs to one instant and one
+/// that is a torn read across several.
+///
+/// Deliberately *not* the caller's own `now()`: the value comes from the
+/// store's clock, so clock skew on a rebuild host cannot silently widen or
+/// narrow the cut.
+#[utoipa::path(
+    get,
+    path = "/v1/watermark",
+    tag = "event-store",
+    responses(
+        (status = 200, description = "The store's current ingest-time watermark", body = WatermarkResponse),
+        (status = 500, description = "Storage failure"),
+    ),
+)]
+async fn watermark(State(state): State<AppState>) -> Result<Json<WatermarkResponse>, ApiError> {
+    let watermark = state.store.watermark().await.map_err(map_query_error)?;
+    Ok(Json(WatermarkResponse { watermark }))
+}
+
 /// Middleware: require a valid `Authorization: Bearer <token>` or reject 401.
 async fn require_write_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let presented = req
@@ -385,6 +426,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn map_query_error(err: QueryError) -> ApiError {
     match err {
         QueryError::UnboundedReplay => ApiError::bad_request(QueryError::UnboundedReplay),
+        // A clock the store itself cannot read is ours, not the caller's.
+        QueryError::UnreadableWatermark => ApiError::internal(QueryError::UnreadableWatermark),
         QueryError::Store(inner) => ApiError::internal(inner),
     }
 }
