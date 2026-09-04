@@ -39,6 +39,12 @@ pub enum QueryError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
+    /// The store's clock returned a value outside the representable range —
+    /// impossible in practice, but a watermark is a correctness input, so it is
+    /// refused rather than silently defaulted.
+    #[error("the event store returned an unreadable watermark")]
+    UnreadableWatermark,
+
     /// [`EventStore::replay`] was called with no narrowing at all. Refused rather
     /// than scanning the entire, indefinitely-retained log — replay must name at
     /// least a chain, an event type, or a time bound.
@@ -99,6 +105,19 @@ pub struct Filters {
     /// Exclusive upper bound on `occurred_at` (half-open `[from, to)` so adjacent
     /// windows tile without overlap).
     pub to: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on **`appended_at`** — the server-side ingest
+    /// stamp, not the event's own time.
+    ///
+    /// This is what makes a replay a *consistent cut* of the log rather than a
+    /// filter over a moving tail. `occurred_at` is not monotonic with respect to
+    /// arrival: an event an hour old can be appended right now, so a rebuild
+    /// bounded only by event time would miss it on one pass and find it on the
+    /// next. Bounding on ingest time gives every reader of a window the same
+    /// answer no matter when they ask (see `crates/rebuild`'s driver docs for
+    /// the residual in-flight race and why idempotent catch-up closes it).
+    ///
+    /// Counts as narrowing, so `GET /v1/replay` with only this set is accepted.
+    pub appended_before: Option<DateTime<Utc>>,
     /// Resume after this point in the sort order (keyset pagination).
     pub cursor: Option<Cursor>,
     /// Max rows for this page; clamped to `[1, MAX_LIMIT]`, defaulting to
@@ -119,6 +138,7 @@ impl Filters {
             || self.event_type.is_some()
             || self.from.is_some()
             || self.to.is_some()
+            || self.appended_before.is_some()
     }
 }
 
@@ -167,6 +187,12 @@ impl Conditions {
             self.push(
                 "occurred_at < fromUnixTimestamp64Milli(?)",
                 [Bound::Millis(to.timestamp_millis())],
+            );
+        }
+        if let Some(appended_before) = filters.appended_before {
+            self.push(
+                "appended_at < fromUnixTimestamp64Milli(?)",
+                [Bound::Millis(appended_before.timestamp_millis())],
             );
         }
         if let Some(cursor) = filters.cursor {
@@ -247,6 +273,25 @@ impl EventStore {
         Ok(self
             .run_paged(conditions, filters.effective_limit())
             .await?)
+    }
+
+    /// The store's current ingest-time watermark, read from **ClickHouse's own
+    /// clock** (`now64(3)`), never the caller's.
+    ///
+    /// A rebuild host whose clock runs fast would otherwise pin a cut in the
+    /// store's future and silently include part of the tail it meant to
+    /// exclude; one whose clock runs slow would re-replay a band of events on
+    /// every run. One clock, so a watermark means the same thing to everyone.
+    pub async fn watermark(&self) -> Result<DateTime<Utc>, QueryError> {
+        // `toUnixTimestamp64Milli` so the value round-trips through the same
+        // millisecond resolution the `DateTime64(3)` column stores.
+        let millis: i64 = self
+            .client()
+            .query("SELECT toUnixTimestamp64Milli(now64(3, 'UTC'))")
+            .fetch_one()
+            .await
+            .map_err(StoreError::from)?;
+        DateTime::<Utc>::from_timestamp_millis(millis).ok_or(QueryError::UnreadableWatermark)
     }
 
     /// Execute a built query: select the canonical columns, order by the keyset,

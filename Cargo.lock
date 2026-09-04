@@ -6067,6 +6067,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rebuild"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "events",
+ "metrics",
+ "metrics-util",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "redis"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7399,6 +7420,7 @@ dependencies = [
  "metrics-util",
  "rayon",
  "rdkafka",
+ "rebuild",
  "revm",
  "secrecy",
  "serde",

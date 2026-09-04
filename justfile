@@ -598,6 +598,45 @@ test:
 test-integration:
     cargo nextest run --workspace --run-ignored all --no-tests=pass
 
+# ── Projection rebuild (§2, readiness Epic B) ─────────────────────
+#
+# "Projections are derived" is a claim; these recipes are the proof, and the
+# same code path is the recovery procedure for a corrupted read model.
+# Full runbook: docs/runbooks/projection-rebuild.md
+
+# The drill, hermetically: build the read model the live way in throwaway
+# Postgres + ClickHouse containers, wipe it, replay it from the event store,
+# and assert the result is byte-identical. Needs Docker. Runs as part of
+# `just test-integration` too — this is for iterating on it.
+# Prove the read model is derived: stage + replay + swap in throwaway containers.
+projection-rebuild-drill:
+    cargo nextest run -p simulation --test projection_rebuild --run-ignored all --no-tests=pass
+
+# Read-only fingerprint of the LIVE read model. Take one before a risky deploy
+# or migration; compare after. Never destructive.
+#   just projection-fingerprint            # both stores
+#   just projection-fingerprint incidents  # Postgres read model only
+# Print the live read model's content hash (read-only).
+projection-fingerprint model="all":
+    cargo run -p simulation --bin simulation-projection -- fingerprint --model {{model}}
+
+# The drill against the LIVE stores — NON-DESTRUCTIVE. Rebuilds into a staging
+# namespace, compares it with the live model, drops the staging copy, and FAILS on
+# any divergence. The live read model is never written to, so this is safe to run
+# on a timer against production (and should be). Needs EVENT_STORE_URL.
+# Prove the LIVE read model is derived — writes nothing, fails on divergence.
+projection-rebuild-verify model="all":
+    cargo run -p simulation --bin simulation-projection -- verify --model {{model}}
+
+# The recovery: the same run, but the staged replacement is PROMOTED over the live
+# model (atomically, for Postgres) and the diff is a damage report rather than a
+# failure. The previous generation is kept in a `…_superseded` schema — read
+# runbook §5 before accepting the result and §6 before dropping it. Stop the
+# projection consumer first.
+# Rebuild the LIVE read model from the event store and promote it (recovery).
+projection-rebuild model="all":
+    cargo run -p simulation --bin simulation-projection -- rebuild --model {{model}} --yes
+
 # ── Event schema registry (§2, readiness Epic B) ──────────────────
 
 # The compatibility gate on its own: regenerate the schema of every DomainEvent
