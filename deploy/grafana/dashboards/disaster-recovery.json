@@ -1,0 +1,205 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["backup", "dr", "mev", "Epic B", "§19"],
+  "time": { "from": "now-7d", "to": "now" },
+  "timezone": "",
+  "title": "Disaster recovery — backups, restore drills, RPO/RTO (Epic B)",
+  "uid": "disaster-recovery",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "RPO — data at risk right now",
+      "description": "Age of the newest artifact, measured from its CUT (not from when the dump finished). This is what would be lost if the store died now — except event-store data still inside Kafka's retention, which is replayable. Thresholds are the configured BACKUP_RPO.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1800 },
+              { "color": "red", "value": 3600 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "backup_artifact_age_seconds",
+          "legendFormat": "{{target}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Evidence age — since the last PASSING drill",
+      "description": "An unverified backup is a belief, not a control. Past BACKUP_DRILL_MAX_AGE the RPO number to the left is unsupported, even while snapshots keep landing on schedule.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 172800 },
+              { "color": "red", "value": 604800 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "backup_drill_age_seconds",
+          "legendFormat": "{{target}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Drill divergence — tables that did not come back",
+      "description": "Non-zero means the newest backup does NOT restore as claimed. `missing` = the restore did not complete; `unexpected` = the scratch destination was not empty; `changed` = the restore succeeded and the data differs (the dangerous one). Always written, including zero.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (target, class) (backup_drill_divergence_tables)",
+          "legendFormat": "{{target}} {{class}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Objectives — measured vs. budget",
+      "description": "The agent exports the configured commitment alongside the measurement, so the alert rules compare two series and hard-code no threshold. A `measured` line crossing its `budget` line is exactly what BackupRpoBreached / BackupRtoBreached fire on.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "backup_objective_seconds{objective=~\"rpo|rto\"}",
+          "legendFormat": "{{target}} {{objective}} {{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Measured restore time (the RTO input)",
+      "description": "Wall clock of integrity check + provision + restore + verify, against the real, current-sized artifact. Alert on GROWTH, not on a fixed value: restore time grows with the data, and an RTO measured once at launch quietly stops being true. The reported RTO adds BACKUP_ORCHESTRATION_OVERHEAD, which is a human estimate, not part of this series.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.90, sum by (le, target) (rate(backup_drill_duration_seconds_bucket[$__range])))",
+          "legendFormat": "{{target}} p90"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Artifact size",
+      "description": "A backup that succeeds and writes far less than usual is the classic silent failure — a table dropped from the dump, a filtered read, a truncated write. The drill cannot catch a shrunken-but-internally-consistent artifact, so this is the independent check on volume (BackupArtifactShrank).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "backup_artifact_bytes",
+          "legendFormat": "{{target}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "backup_artifact_rows",
+          "legendFormat": "{{target}} rows"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Snapshot and drill outcomes",
+      "description": "Counters are the secondary signal here. The primary ones are the ages above: they degrade on their own when nothing happens, which a run counter cannot.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 40 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (target, outcome) (rate(backup_runs_total[$__rate_interval]))",
+          "legendFormat": "snapshot {{target}} {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (target, outcome) (rate(backup_drill_runs_total[$__rate_interval]))",
+          "legendFormat": "drill {{target}} {{outcome}}"
+        }
+      ]
+    }
+  ]
+}

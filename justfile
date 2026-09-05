@@ -637,6 +637,74 @@ projection-rebuild-verify model="all":
 projection-rebuild model="all":
     cargo run -p simulation --bin simulation-projection -- rebuild --model {{model}} --yes
 
+# ── Backups + tested restore (readiness Epic B) ───────────────────
+#
+# "We have backups" is a belief; these recipes are the control. The drill
+# restores the real, newest artifact into a throwaway database and compares it
+# row-for-row with the fingerprint taken inside the dump's own cut — so it is
+# NON-DESTRUCTIVE and belongs on a timer, not a quarterly checklist.
+# Full runbook: docs/runbooks/backup-restore.md
+
+# Where do we stand against the RPO/RTO budgets? Exits 2 on a breach — which
+# includes a *stale drill*, because an unverified backup does not count.
+# Measure RPO/RTO against the configured budgets (exit 2 = breached).
+backup-report:
+    cargo run -p backup -- report
+
+# What is on disk, how old it is, and any notes the snapshot recorded
+# (a skipped table engine, a materialized view whose data is not covered).
+# List backup artifacts with their ages.
+backup-list target="":
+    cargo run -p backup -- list {{ if target == "" { "" } else { "--target " + target } }}
+
+# Take one consistent snapshot now. Do this before a risky migration — and
+# take a `just backup-report` reading after, so the RPO clock is visibly reset.
+# Take one consistent snapshot per configured target.
+backup-snapshot target="":
+    cargo run -p backup -- snapshot {{ if target == "" { "" } else { "--target " + target } }}
+
+# THE CONTROL. Restores the newest artifact into a throwaway database, verifies
+# it row-for-row, drops it, and records the evidence `backup-report` reads.
+# Never writes to a live database; exits 2 on any divergence.
+# Prove the newest backup restores — non-destructive, exit 2 on divergence.
+backup-drill target="":
+    cargo run -p backup -- drill {{ if target == "" { "" } else { "--target " + target } }}
+
+# What is in the LIVE store right now, read-only. Take one before a risky
+# migration and compare after. Read-only *by construction*: the command is
+# handed the narrow `StoreReader` seam, which has no restore or drop on it.
+# Print the live store's per-table row counts and content digests.
+backup-fingerprint target="":
+    cargo run -p backup -- fingerprint {{ if target == "" { "" } else { "--target " + target } }}
+
+# Checksums only — proves the bytes are intact, NOT that they restore. Cheap
+# enough to run against an offsite copy (point BACKUP_DIR at it).
+# Recompute artifact checksums (not a restore).
+backup-verify target="":
+    cargo run -p backup -- verify {{ if target == "" { "" } else { "--target " + target } }}
+
+# The recovery. Restores into a database you name (create it first) and ends
+# with the same fingerprint comparison, so the result is a damage report rather
+# than a hope. Read runbook §5 before cutting over.
+# Restore an artifact into a named database (recovery).
+backup-restore target into:
+    cargo run -p backup -- restore --target {{target}} --into {{into}} --yes
+
+# Apply the retention policy. Never removes the newest artifact for a target,
+# whatever the policy says — a snapshot job that has been failing quietly for a
+# month would otherwise empty the store.
+# Prune artifacts past BACKUP_RETENTION.
+backup-prune target="":
+    cargo run -p backup -- prune {{ if target == "" { "" } else { "--target " + target } }}
+
+# The tested restore, tested: real Postgres + real ClickHouse in throwaway
+# containers, backed up, restored elsewhere, compared row-for-row — including a
+# write landing mid-backup and a materialized view that must not double-write.
+# Needs Docker (and pg_dump on PATH). Runs in `just test-integration` too.
+# Prove the backup/restore path itself against real containers.
+backup-drill-test:
+    cargo nextest run -p backup --test restore_drill --run-ignored all --no-tests=pass
+
 # ── Event schema registry (§2, readiness Epic B) ──────────────────
 
 # The compatibility gate on its own: regenerate the schema of every DomainEvent
@@ -690,7 +758,7 @@ backtest-accept-snapshot:
 # docker matrix). Each entry is `bin[:features[:runtime]]`; detection carries
 # its feature flags inline and builds on the `onnx` runtime flavour, which adds
 # the pinned ONNX Runtime the ML detector loads (§20.2, deploy/Dockerfile).
-k8s_bins := "server ingestion detection:detection/detectors,detection/anomaly:onnx event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive copilot"
+k8s_bins := "server ingestion detection:detection/detectors,detection/anomaly:onnx event-store simulation simulation-worker simulation-projection intelligence rule-engine notification usage predictive copilot backup::pgclient"
 k8s_image := "ghcr.io/kyawkyawthar/onchain_fraud_mev_detector"
 
 # Build every service image locally (:dev) and load it into the kind cluster —

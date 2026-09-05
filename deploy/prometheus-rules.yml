@@ -362,3 +362,114 @@ groups:
         annotations:
           summary: "The token budget monitor has stopped evaluating"
           description: "No successful budget evaluation for over an hour. The monitor fails open by design (§15) — a ClickHouse blip must not take the metering sink down with it — which is exactly why this alert exists: a monitor that has quietly stopped looks identical to a monitor with nothing to report. Check usage_budget_evaluations_total{outcome=\"failed\"} and the usage service's logs. Until it recovers, CopilotTokenBudgetAlarm is reporting a stale number."
+
+  # ── Epic B: disaster recovery — backups, and the proof they restore ──
+  #
+  # These rules compare two *series* rather than hard-coding a threshold: the
+  # `backup` agent exports both the configured budget and the measurement
+  # (`backup_objective_seconds{kind="budget"|"measured"}`), so changing a
+  # commitment in the deployment changes the alert with it and the two can
+  # never drift apart. See docs/runbooks/backup-restore.md.
+  - name: mevwatch-disaster-recovery
+    rules:
+      - alert: BackupRpoBreached
+        expr: |
+          backup_objective_seconds{objective="rpo", kind="measured"}
+            > on(target) backup_objective_seconds{objective="rpo", kind="budget"}
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.target }} has no backup recent enough to meet the RPO"
+          description: "The newest artifact for {{ $labels.target }} is older, measured from its *cut*, than the configured BACKUP_RPO. Everything written since that cut would be lost if the store died now — except for event-store data still inside Kafka's retention, which is replayable. Check the backup agent's logs for a failing snapshot (`backup_runs_total{outcome=\"permanent\"}` should have paged already), then disk headroom on the artifact volume. `just backup-snapshot` takes one immediately."
+
+      - alert: BackupSnapshotFailingPermanently
+        expr: |
+          sum by (target) (increase(backup_runs_total{outcome="permanent"}[1h])) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.target }}'s backups are failing in a way that will not fix itself"
+          description: "A snapshot failed with a PERMANENT classification — the next hundred cycles fail identically, so this pages now rather than waiting for BackupRpoBreached to notice an hour later. Typical causes: a `pg_dump` older than the server after a Postgres upgrade, an unwritable or full artifact volume, a credential change. Contrast `outcome=\"transient\"`, which is the store blipping and is deliberately NOT paged on: the agent retries, and the RPO budget is the backstop if it keeps happening. `outcome=\"cancelled\"` is a rolling deploy and is not a failure at all."
+
+      - alert: BackupSnapshotRetryingPersistently
+        expr: |
+          sum by (target) (increase(backup_runs_total{outcome="transient"}[6h])) > 6
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }}'s backups keep hitting transient failures"
+          description: "Individually retryable failures that are not going away. Each one is fine; a steady stream of them means the store is unhealthy or the network is, and the RPO is being held up by luck. Look before BackupRpoBreached fires."
+
+      - alert: BackupArtifactIncomplete
+        expr: |
+          max by (target) (backup_artifact_incomplete_objects) > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.target }}'s newest backup does not cover part of the store"
+          description: "The snapshot succeeded, the bytes are intact, and part of the store is not in them — so a restore of this artifact restores less than the system holds. This is the one condition under which a *passing* drill would still be bad news, which is why the drill refuses to pass an incomplete artifact at all. Today the only cause is a ClickHouse materialized view declared without an explicit `TO <table>`: its data lives in an inner table whose name embeds a UUID that cannot be recreated in another database. `just backup-list` names the object. Fix the view definition; do not silence this."
+
+      - alert: BackupCyclesSkipped
+        expr: |
+          sum by (target, job) (increase(backup_cycles_skipped_total[6h])) > 3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }}'s {{ $labels.job }} no longer fits its interval"
+          description: "A scheduled cycle came due while the previous one was still running, and was skipped rather than stacked. That is the correct behaviour — overlapping snapshots of the same store would contend — but a steady stream of skips means the job has outgrown its cadence, which will surface as an RPO or verification breach later. Lengthen the interval or make the job faster; this is a capacity signal, caught early."
+
+      - alert: BackupDrillFailing
+        expr: |
+          sum by (target) (backup_drill_divergence_tables) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.target }}'s backup does not restore as claimed"
+          description: "A restore drill restored the newest artifact into a throwaway database and the result did not match the fingerprint taken inside the dump's own cut. This is the failure the whole control exists to catch, and it does NOT show up as a failed backup job — the dump succeeded. The `class` label is the diagnosis: `missing` = the restore did not complete; `unexpected` = the scratch destination was not empty, so the drill measured the wrong thing; `changed` = the restore 'succeeded' and the data differs (check the client/server version pairing in the artifact's manifest first). Runbook §4c."
+
+      - alert: BackupDrillStale
+        expr: |
+          backup_objective_seconds{objective="verification", kind="measured"}
+            > on(target) backup_objective_seconds{objective="verification", kind="budget"}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }}'s backups have not been proven restorable recently"
+          description: "No restore drill has passed for {{ $labels.target }} within BACKUP_DRILL_MAX_AGE. Snapshots may well still be landing — that is exactly why this is a separate alert: an untested backup is a belief, not a control, so the RPO figure currently on the dashboard is unsupported. Check `backup_drill_runs_total{outcome=\"failed\"}` (the drill ran and failed — see BackupDrillFailing) versus no drill series at all (the agent is not running one)."
+
+      - alert: BackupRtoBreached
+        expr: |
+          backup_objective_seconds{objective="rto", kind="measured"}
+            > on(target) backup_objective_seconds{objective="rto", kind="budget"}
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }}'s measured restore time is past the RTO budget"
+          description: "The last passing drill's wall clock, plus the declared BACKUP_ORCHESTRATION_OVERHEAD, exceeds BACKUP_RTO. Restore time grows with the data, so this is expected to fire eventually and is a capacity signal, not a fault: either the commitment needs revising or the restore path needs to get faster (parallel restore, faster artifact storage). Note the measured half is real and the overhead half is an estimate a human wrote down — revisit both."
+
+      - alert: BackupArtifactShrank
+        expr: |
+          backup_artifact_bytes < 0.5 * (backup_artifact_bytes offset 1d)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }}'s newest backup is less than half the size it was yesterday"
+          description: "A backup that succeeds and writes far less than usual is the classic silent failure: a table dropped from the dump, a filtered read, a truncated write. The drill would catch it only if the fingerprint was taken outside the same cut — it is not, so a shrunken-but-internally-consistent artifact passes. This is the independent check on volume. Compare `backup_artifact_rows` and read the artifact's manifest notes (`just backup-list`)."
+
+      - alert: BackupAgentAbsent
+        expr: absent(backup_artifact_age_seconds)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Nothing is reporting on backups"
+          description: "No `backup_artifact_age_seconds` series is being scraped at all. This is the failure mode a CronJob-based backup cannot report on itself and the reason the agent is a long-running Deployment: a job that was deleted, scaled to zero, or never deployed produces no metric, which looks identical on a dashboard to a healthy one. Until this clears, every other rule in this group is silent — there is no evidence either way about whether the platform can be recovered."

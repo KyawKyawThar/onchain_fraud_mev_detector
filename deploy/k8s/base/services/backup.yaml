@@ -1,0 +1,145 @@
+# ── backup (readiness Epic B) — snapshots, restore drills, RPO/RTO ─────
+#
+# A **Deployment, not a CronJob**, and that is the load-bearing choice: a
+# CronJob cannot report that it did not run. Delete it, scale it away, let its
+# image fail to pull, and the metric it would have written is simply absent —
+# indistinguishable on a dashboard from a healthy one. The signals here are
+# *ages* (`backup_artifact_age_seconds` is the measured RPO), and an age has to
+# be published by something that is alive; `up{job="backup"}` then covers the
+# case where the agent itself is what died.
+#
+# Single writer, `Recreate`: two agents would race on the same artifact
+# directory and each drill would provision its own scratch database against the
+# same servers. Same posture as the other single-writer workloads here — never
+# an HPA.
+#
+# It needs `pg_dump`/`pg_restore`, which the default image flavour does not
+# carry. This one binary is built with `RUNTIME=pgclient` (deploy/Dockerfile),
+# which adds the PostgreSQL client at a major version >= the server's — an
+# older client refuses to dump a newer server outright.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup
+  labels:
+    app.kubernetes.io/name: backup
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backup
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backup
+        app.kubernetes.io/part-of: mevwatch
+        app.kubernetes.io/component: backup
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9112"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001 # `appuser` in the runtime image
+        fsGroup: 10001 # so the mounted artifact volume is writable
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backup
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/backup:latest
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            # NOT read-only: pg_dump writes its output through this process,
+            # and the artifact volume is the point of the workload.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: postgres-credentials
+            - secretRef:
+                name: clickhouse-credentials
+          env:
+            - name: BACKUP_DIR
+              value: /var/lib/mevwatch/backups
+            - name: BACKUP_METRICS_ADDR
+              value: 0.0.0.0:9112
+            - name: HEALTH_ADDR
+              value: 0.0.0.0:8092
+            # The commitments. Configured here, exported as metrics, and
+            # compared against measurements by the alert rules — so changing a
+            # budget changes the alert and the two cannot drift.
+            - name: BACKUP_RPO
+              value: "1h"
+            - name: BACKUP_RTO
+              value: "4h"
+            - name: BACKUP_ORCHESTRATION_OVERHEAD
+              value: "30m"
+            - name: BACKUP_DRILL_MAX_AGE
+              value: "7d"
+            - name: BACKUP_DRILL_INTERVAL
+              value: "24h"
+            - name: BACKUP_RETENTION
+              value: "30d"
+          ports:
+            - name: health
+              containerPort: 8092
+            - name: metrics
+              containerPort: 9112
+          volumeMounts:
+            - name: artifacts
+              mountPath: /var/lib/mevwatch/backups
+          startupProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              # A restore drill is IO- and CPU-bound in bursts; a tight limit
+              # here inflates the measured RTO, which is the number this
+              # workload exists to keep honest.
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: backup-artifacts
+---
+# The artifact store. **This must not share a failure domain with the
+# databases it protects** — a backup on the disk that just died is not a
+# backup. In a real cluster that means a StorageClass on different hardware
+# (and offsite replication of this volume, see the runbook §7); the base
+# manifest can only state the requirement, not enforce it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-artifacts
+  labels:
+    app.kubernetes.io/name: backup
+  annotations:
+    mevwatch.io/requirement: >-
+      Bind this to storage in a different failure domain from the postgres and
+      clickhouse PVCs, and replicate it offsite.
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Sized for BACKUP_RETENTION (30d) of both stores. Grow it before the
+      # snapshot job starts failing on ENOSPC — `backup_artifact_bytes` trends
+      # the input.
+      storage: 100Gi

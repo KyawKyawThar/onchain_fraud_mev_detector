@@ -106,6 +106,17 @@ scrape_configs:
         labels:
           service: predictive
 
+  # The backup agent (readiness Epic B). Scraped like the other host-run
+  # services, and worth scraping locally *because* its most important series
+  # are ages: `backup_artifact_age_seconds` climbs on its own when snapshots
+  # stop, so a target that is simply down is itself the alert
+  # (`BackupAgentAbsent`). Run it with: `cargo run -p backup -- serve`.
+  - job_name: backup
+    static_configs:
+      - targets: ["host.docker.internal:9112"] # BACKUP_METRICS_ADDR
+        labels:
+          service: backup
+
   # RabbitMQ sim.jobs work queue (§7/§20) — queue depth is the simulation
   # backpressure signal. Unlike the host-run services above, the broker runs in
   # this compose stack, so it's reachable by service name on the `backend`

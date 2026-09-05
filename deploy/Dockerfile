@@ -20,11 +20,20 @@ ARG RUST_VERSION=1
 ARG DEBIAN_RELEASE=bookworm
 
 # Which runtime flavour the final image is: `plain` (the default — nothing but
-# the binary and CA certs) or `onnx`, which additionally carries the ONNX
-# Runtime shared library the ML detector loads (§20.2). Selected by the last
-# `FROM` in this file, so a `plain` build never even *resolves* the onnxruntime
-# stage — BuildKit prunes stages the target doesn't depend on.
+# the binary and CA certs), `onnx`, which additionally carries the ONNX Runtime
+# shared library the ML detector loads (§20.2), or `pgclient`, which carries
+# the PostgreSQL client binaries the backup agent shells out to (Epic B).
+# Selected by the last `FROM` in this file, so a `plain` build never even
+# *resolves* the other stages — BuildKit prunes stages the target doesn't
+# depend on.
 ARG RUNTIME=plain
+
+# The PostgreSQL client major version for the `pgclient` flavour. It must be
+# **>= the server's**: pg_dump refuses outright to dump a newer server
+# ("server version 18.0; pg_dump version 16.2 — aborting"), so a client that
+# drifts behind an upgraded database turns every backup into a hard failure.
+# Keep this in step with deploy/k8s/base/infra/postgres.yaml.
+ARG PG_MAJOR=18
 
 # The pinned ONNX Runtime release (see the `onnxruntime` stage below).
 # Upgrading means bumping this *and* both digests together.
@@ -132,5 +141,34 @@ COPY --from=onnxruntime /out/libonnxruntime.so /usr/local/lib/libonnxruntime.so
 # Upstream is MIT; the image redistributes the binary, so it carries the licence.
 COPY --from=onnxruntime /out/ONNXRUNTIME-LICENSE /usr/local/share/licenses/ONNXRUNTIME-LICENSE
 ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+
+# The backup flavour (readiness Epic B): + the PostgreSQL client binaries.
+#
+# The backup agent orchestrates and verifies; it does not reimplement pg_dump,
+# so the image has to carry the real client. It comes from the PGDG apt
+# repository rather than Debian's, because Debian's tracks one major version
+# per release and the pairing that matters is client >= server — see PG_MAJOR.
+#
+# Root filesystem is writable for this flavour: pg_dump writes its output, and
+# the artifact volume is the workload's whole purpose.
+FROM runtime-base AS runtime-pgclient
+ARG DEBIAN_RELEASE
+ARG PG_MAJOR
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl gnupg; \
+    curl -fsSL --retry 3 https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${DEBIAN_RELEASE}-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "postgresql-client-${PG_MAJOR}"; \
+    apt-get purge -y gnupg; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*; \
+    pg_dump --version; \
+    pg_restore --version
+USER appuser
 
 FROM runtime-${RUNTIME} AS runtime

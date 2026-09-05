@@ -222,6 +222,10 @@ jobs:
           - bin: usage
           - bin: predictive
           - bin: copilot
+          # The backup agent shells out to the real pg_dump/pg_restore, so its
+          # image carries the PostgreSQL client (readiness Epic B).
+          - bin: backup
+            runtime: pgclient
     env:
       REGISTRY: ghcr.io
       # Lowercased below — GHCR requires lowercase image names.

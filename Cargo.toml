@@ -156,6 +156,13 @@ dataset = { path = "crates/dataset" }
 # which is what keeps §20.4's safety argument ("LLM output is a proposal, never
 # a fact") testable with no network in the test binary.
 llm = { path = "crates/llm" }
+# Backup + tested restore (readiness Epic B) — the DR control for the three
+# stateful stores: a snapshot whose fingerprint is taken inside the same
+# consistent cut as the dump, a restore into throwaway infrastructure that
+# re-derives that fingerprint, and the RPO/RTO those two numbers *measure*
+# rather than declare. A binary, not a library other crates link; listed here
+# so the workspace's crate inventory stays in one place (as `dataset` is).
+backup = { path = "crates/backup" }
 
 # Errors.
 anyhow = "1"
@@ -428,7 +435,10 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 # simulation-projection's existing internal read endpoints. `rustls-tls` keeps the
 # self-contained-image stance (no system OpenSSL); `json` for the page-shaped
 # response bodies.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+# `stream` lets a request body be a file read incrementally (the backup
+# crate streams a multi-gigabyte artifact into a ClickHouse `INSERT`
+# without first materialising it in memory).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "stream"] }
 
 # `WS /v1/stream` (§11): the public API service's own Kafka consumer, built on
 # the shared `event-bus::run_consumer` loop (same as event-store's ingest),
