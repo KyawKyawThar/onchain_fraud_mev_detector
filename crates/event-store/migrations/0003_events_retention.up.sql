@@ -1,0 +1,27 @@
+-- Engineering conventions §18: the events table's retention floor.
+--
+-- Until this migration the store had no TTL — which is not "we keep everything
+-- forever", it is *no decision*, and it is the state that made the copilot's
+-- `CopilotGroundingAuditUnverifiable` alert unanswerable: the audit could see
+-- that a SAR narrative's evidence was gone but had nothing to say whether that
+-- was retention working or retention failing.
+--
+-- The number here is the **floor** (`retention::STATUTORY_ARTIFACT_DAYS` +
+-- `retention::EVIDENCE_MARGIN_DAYS` = 1827 + 365), not the configured policy: a
+-- migration is a static file and the policy is an env-resolved value, so this
+-- guarantees a freshly-migrated store is never unbounded, and
+-- `event_store::retention` reconciles the live table upward at boot when a
+-- deployment has raised the window. Reconciliation only ever *extends* — see
+-- that module for why shortening is refused rather than applied.
+--
+-- Keyed on `occurred_at`, matching PARTITION BY's `toDate(occurred_at)`, so an
+-- expiry drops whole parts instead of rewriting them. Evidence retention is
+-- anchored to occurrence and can never be extended after the fact (this table
+-- is append-only, §4) — which is exactly why the policy carries a margin over
+-- the artifact window rather than matching it.
+--
+-- One statement per migration file (the migrate.rs convention), and no literal
+-- `?` anywhere (the ch-migrate runner rejects it — the clickhouse crate would
+-- bind it as a parameter, comments included).
+ALTER TABLE events
+    MODIFY TTL toDateTime(occurred_at) + toIntervalDay(2192) DELETE;

@@ -35,6 +35,7 @@ A change is "done" when:
 - [ ] **Doc comments state constraints** the code can't express (§13) — never narration of the next line.
 - [ ] **Changed a prompt?** — the artifact is versioned, the manifest is regenerated, and the diff is reviewed (§16).
 - [ ] **Touched the event schema?** — the committed registry is re-blessed and the diff reviewed; an incompatible change bought a `SCHEMA_VERSION` bump and an upcaster (§17).
+- [ ] **Storing a regulatory artifact, or the evidence under one?** — its lifetime comes from the shared `retention::Policy`, never a local constant, and the store enforces it (§18).
 
 ---
 
@@ -597,6 +598,114 @@ does not, and replay is what the event store exists for. And no dynamic-key maps
 so its data keys would be recorded as schema and every new key would read as an
 added field. Free form goes in a `serde_json::Value`; anything with meaningful
 keys is a `Vec` of pairs.
+
+---
+
+## 18. A retention window is a decision, and one decision has one home
+
+**The rule.** How long a regulatory artifact and the evidence under it must live
+is decided **once**, in [`crates/retention`](../crates/retention/), and every
+store that has to make it true reads that value. No service computes a window of
+its own, and no service reads a differently-named environment variable for it.
+A crate that enforces retention without a `retention` dependency fails
+[arch-conformance](../crates/arch-conformance/src/lib.rs).
+
+**Why it needs a rule at all.** The failure is not "somebody forgot to expire
+data" — that is visible, and cheap to fix. It is **two windows that agree**: an
+artifact kept for five years and the evidence under it kept for five years look
+identical in a config map and in every code review, and they are not the same
+policy. They diverge silently, and the first person to notice is the one who
+cannot produce the record. This convention exists because that is exactly what
+happened here: the copilot's grounding audit could see a SAR narrative whose
+evidence was gone and had **nothing to say about whether that was allowed**, so
+its alert could only ask for a decision to be made.
+
+**Four properties any retention policy in this workspace must have.**
+
+1. **A floor that a deployment cannot lower.** `retention::STATUTORY_ARTIFACT_DAYS`
+   carries the citation (31 CFR 1020.320(d); Directive (EU) 2015/849 art. 40) and
+   the constructor refuses anything shorter, so shortening it is a reviewed code
+   change and not an env var. Config resolves *within* a decision; it does not
+   make one (§9).
+2. **The clocks are named, and their difference is a knob with meaning.** An
+   artifact's window runs from its **disposition**; an event's runs from when it
+   **occurred**, and in an append-only store (§4) that can never be extended
+   afterwards. So evidence is kept for the artifact window *plus a margin* — and
+   that margin **is** the furthest back an artifact may be drafted. One knob does
+   both jobs deliberately: it must not be possible to unlock older work without
+   also keeping the evidence that work will cite.
+3. **Automation may widen; only a human may narrow — and the difference is a
+   type, not a comment.** Every irreversible operation takes a
+   [`retention::DestructiveIntent`](../crates/retention/src/lib.rs) witness whose
+   only constructor is `from_operator_flag`. A boot path, a CronJob's default
+   arm or a background task cannot reach one *by signature*, so a reviewer's
+   question stops being "does this delete anything?" (unanswerable without
+   reading the body) and becomes "does this signature mention
+   `DestructiveIntent`?". Grep the type to enumerate every destructive operation
+   in the platform. Same shape as `backup`'s `Scratch`, and for the same reason.
+4. **Destructive work is planned, then applied — and the plan is the whole
+   truth.** `plan()` is pure, printable and testable; `apply()` consumes that
+   exact plan and does nothing else. A dry run is therefore not a second code
+   path that *approximates* the real one: it is the same value with `apply`
+   never called. Counts in a plan come from a `COUNT(*)` over the operation's own
+   predicate, never from "how many the first page happened to hold" — a preview
+   of a destructive action that under-reports is worse than no preview, because
+   the number a human approved is not the number that happened.
+
+**Model the observation, not the convenient subset of it.** The first version of
+this module read the live TTL as `Option<u32>`, and `None` stood for two
+situations with *opposite* safety properties — "there is no window" and "there is
+a window I cannot parse". The planner folded both into "unbounded, free to widen
+into", so a table carrying `INTERVAL 10 YEAR` was rewritten to six years at boot:
+the one thing the module promised never to do, done by the path documented as
+safe. A third case hid in the same `Option`: *imposing* a first bound is not
+"extending from nothing" — everything already older than the new window is
+deleted by the next merge. Three store states, three plans, and the destructive
+two ask the store what they would destroy before anyone approves them.
+
+**And the audit has to be able to tell the two apart.** Once a policy exists,
+"the evidence is gone" is no longer one observation — it is `expired` (past the
+deadline: retention working) or `evidence_missing` (still retained: **the policy
+violated**), on one comparison against the same `Policy::is_expired` the purge
+uses. If a checker and an enforcer can disagree about when a record was
+released, there is a window in which a row is both too old to verify and too
+young to delete, and everything in it is unexplainable.
+
+**Reference implementation.**
+
+- [`crates/retention/src/lib.rs`](../crates/retention/src/lib.rs) — the decision, the floor, the inequality.
+- [`crates/event-store/src/retention.rs`](../crates/event-store/src/retention.rs) — evidence: the ClickHouse TTL, reconciled extend-only at boot.
+- [`crates/copilot/src/retention.rs`](../crates/copilot/src/retention.rs) — artifacts: the purge (dry by default, never touches a legal hold) and the disposition anchor the audit shares.
+- [`docs/runbooks/retention.md`](runbooks/retention.md) — the numbers, the alerts, and how to change them.
+
+**The audit trail covers changes to its own governance.** A retention change and
+a destruction are facts (`RetentionPolicyChanged`, `RetentionPurgeCompleted`),
+published to the backbone and landing in the event store — which is under the
+policy they describe, so the record outlives the change by the margin. A gauge is
+sampled, a counter is aggregated and a pod log has rotated; none of them answers
+"on what date, from what, to what, by whom" or "how many records did we destroy
+last quarter". If a control governs regulatory data, its own operation is
+regulatory data.
+
+**Two clocks are two types.** An artifact's window runs from a `Disposition`, an
+event's from an `Occurrence`, and the pair are newtypes because
+`shortfall(anchored, oldest)` over two `DateTime<Utc>`s compiled with its
+arguments swapped and returned a plausible wrong number — the exact
+under-retention the crate exists to prevent, left representable by the crate
+that prevents it (§4).
+
+**A compliance override is a record, not a bit.** A legal hold carries its
+matter, its date and the person who placed it, with a CHECK constraint making a
+partial one unrepresentable. "Someone set a boolean" is not something anyone can
+stand behind when asked why a document that should have been destroyed still
+exists — or why one under subpoena was not.
+
+**Anti-pattern.** A `const RETENTION_DAYS` beside the store that uses it; a
+`--force`/`--allow-old` flag that lets one half of a policy be satisfied without
+the other; a `bool` parameter selecting between a "preview" and a "real" code
+path; an `Option<T>` standing for two states with different safety properties;
+and a purge that deletes on a schedule with no plan — the flag that costs nothing
+is the one to get wrong.
 
 ---
 

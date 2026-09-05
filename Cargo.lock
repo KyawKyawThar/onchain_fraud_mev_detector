@@ -2227,6 +2227,7 @@ dependencies = [
  "metrics-util",
  "rdkafka",
  "reqwest 0.13.4",
+ "retention",
  "rule-engine",
  "secrecy",
  "serde",
@@ -2990,6 +2991,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "rdkafka",
+ "retention",
  "secrecy",
  "serde",
  "serde_json",
@@ -6289,6 +6291,17 @@ dependencies = [
 [[package]]
 name = "resilience"
 version = "0.1.0"
+
+[[package]]
+name = "retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "telemetry",
+ "thiserror 2.0.18",
+ "uuid",
+]
 
 [[package]]
 name = "revm"

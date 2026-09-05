@@ -11,6 +11,9 @@
 //!   - `backfill [--from RFC3339] [--to RFC3339]` — §20.4's historical
 //!     backfill through the Batch API at half price. A job, not a service:
 //!     bounded window, safe to re-run, safe to interrupt.
+//!   - `retention [--apply] [--limit N]` — destroy drafts the regulatory
+//!     retention policy has released (engineering conventions §18). A dry run
+//!     by default: the flag that costs nothing is the one to get wrong.
 //!   - `ping` — probe Postgres (the copilot schema) *and* the model
 //!     credential, so a misconfigured deployment fails fast and visibly.
 //!
@@ -44,7 +47,11 @@ use copilot::capability::DraftCapability;
 use copilot::config::{Config, HttpConfig};
 use copilot::consumer::{build_consumer, CopilotConsumer};
 use copilot::draft::NarrativeDrafter;
-use copilot::grounding_audit::{AuditConfig, GroundingAuditor, Outcome};
+use copilot::grounding_audit::{AuditConfig, AuditLimits, AuditScope, GroundingAuditor, Outcome};
+use copilot::retention;
+// The shared policy crate; `copilot::retention` is this service's enforcement
+// half and is imported above under its own name.
+use ::retention::DestructiveIntent;
 use copilot::rule_draft::RuleDrafter;
 use copilot::store::PgDraftStore;
 use copilot::worker::{DraftWorkerPool, GeneratorRegistry};
@@ -56,7 +63,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const USAGE: &str = "expected `run` (also the no-arg default), `backfill [--from RFC3339] \
-                     [--to RFC3339]`, `audit [--limit N] [--json]`, `prompts`, or `ping`";
+                     [--to RFC3339]`, `audit [--limit N] [--json]`, \
+                     `retention [--apply] [--limit N]`, `prompts`, or `ping`";
 
 /// How often the outbox flusher drains pending announcements.
 const OUTBOX_INTERVAL: Duration = Duration::from_secs(5);
@@ -107,6 +115,7 @@ async fn dispatch() -> Result<i32> {
         Some("run") | None => run(&cfg).await.map(|()| 0),
         Some("backfill") => backfill(&cfg, args.collect()).await.map(|()| 0),
         Some("audit") => audit(&cfg, args.collect()).await,
+        Some("retention") => retention_purge(&cfg, args.collect()).await.map(|()| 0),
         Some("ping") => ping(&cfg).await.map(|()| 0),
         Some(other) => bail!("unknown argument {other:?}; {USAGE}"),
     }
@@ -122,8 +131,26 @@ async fn dispatch() -> Result<i32> {
 /// re-run and safe to interrupt — the enqueue is idempotent per incident and
 /// an outstanding batch is resumed from the store rather than re-submitted
 /// (see `copilot::backfill`).
+///
+/// **`--from` is now required in practice.** The retention policy (engineering
+/// conventions §18) bounds how far back a narrative may be drafted: past that
+/// point the evidence expires before the artifact does, and the run would spend
+/// real money manufacturing documents nobody can defend. An unbounded window
+/// asks for exactly that, so it is refused with the earliest permissible start
+/// in the message — see `copilot::retention::check_backfill_window`.
 async fn backfill(cfg: &Config, args: Vec<String>) -> Result<()> {
     let (from, to) = parse_window(&args)?;
+    // Before a single token is spent: a window reaching further back than the
+    // retention policy's margin would draft narratives over evidence that
+    // expires before they do (engineering conventions §18). Refused rather than
+    // clamped — a silently narrowed backfill leaves an operator believing the
+    // archive was drafted — and refused for an *unbounded* window too, which is
+    // the shape that reaches the whole archive at once.
+    let from = Some(copilot::retention::check_backfill_window(
+        from,
+        &cfg.retention.for_artifact(None),
+        Utc::now(),
+    )?);
     telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
 
     let shutdown = CancellationToken::new();
@@ -207,7 +234,7 @@ async fn backfill(cfg: &Config, args: Vec<String>) -> Result<()> {
 ///       its narratives). Deliberately not 0: an audit that proved nothing must
 ///       not exit like one that proved everything.
 async fn audit(cfg: &Config, args: Vec<String>) -> Result<i32> {
-    let options = parse_audit_options(&args)?;
+    let (scope, max_findings) = parse_audit_options(&args)?;
 
     let shutdown = CancellationToken::new();
     tokio::spawn({
@@ -234,13 +261,29 @@ async fn audit(cfg: &Config, args: Vec<String>) -> Result<i32> {
         .context("building the event-store HTTP client")?;
     let events = Arc::new(HttpAuditSource::new(http, cfg.event_store_url.clone()));
 
-    let config = AuditConfig {
-        max_audit_events: cfg.pool.max_audit_events,
+    let mut limits = AuditLimits {
         concurrency: cfg.audit_concurrency,
-        ..options
+        max_audit_events: cfg.pool.max_audit_events,
+        ..AuditLimits::default()
     };
+    if let Some(max_findings) = max_findings {
+        limits.max_findings = max_findings;
+    }
+    let config = AuditConfig {
+        scope,
+        limits,
+        // The same policy the purge enforces and event-store's TTL is set
+        // from. It is what lets the sweep say "this narrative's evidence is
+        // gone and it should not be" instead of "this narrative's evidence is
+        // gone and nobody ever decided whether that was allowed".
+        retention: cfg.retention.for_artifact(None),
+    };
+    // One reading, taken here and threaded through every judgement, so the
+    // drafts at the start and the end of a six-hour sweep are held to the same
+    // deadline.
+    let now = Utc::now();
     let report = GroundingAuditor::new(store, events, config)
-        .run(&shutdown)
+        .run(now, &shutdown)
         .await
         .context("the grounding audit could not read the draft store")?;
 
@@ -256,8 +299,9 @@ async fn audit(cfg: &Config, args: Vec<String>) -> Result<i32> {
 }
 
 /// `--limit`, `--since`, `--max-findings` for the audit sweep.
-fn parse_audit_options(args: &[String]) -> Result<AuditConfig> {
-    let mut config = AuditConfig::default();
+fn parse_audit_options(args: &[String]) -> Result<(AuditScope, Option<usize>)> {
+    let mut scope = AuditScope::default();
+    let mut max_findings = None;
     let mut index = 0usize;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -267,17 +311,21 @@ fn parse_audit_options(args: &[String]) -> Result<AuditConfig> {
         };
         match flag {
             "--limit" => {
-                config.max_drafts = raw()?
+                scope.max_drafts = raw()?
                     .parse()
                     .with_context(|| format!("--limit {:?} is not a count", raw()))?
             }
+            // Presentation, but it belongs to the invocation ("show me more"),
+            // so it stays a flag and is copied onto the limits below.
             "--max-findings" => {
-                config.max_findings = raw()?
-                    .parse()
-                    .with_context(|| format!("--max-findings {:?} is not a count", raw()))?
+                max_findings = Some(
+                    raw()?
+                        .parse()
+                        .with_context(|| format!("--max-findings {:?} is not a count", raw()))?,
+                )
             }
             "--since" => {
-                config.since = Some(
+                scope.since = Some(
                     DateTime::parse_from_rfc3339(raw()?)
                         .with_context(|| format!("--since {:?} is not RFC 3339", raw()))?
                         .with_timezone(&Utc),
@@ -287,10 +335,150 @@ fn parse_audit_options(args: &[String]) -> Result<AuditConfig> {
         }
         index += 2;
     }
-    Ok(config)
+    Ok((scope, max_findings))
 }
 
-/// The half-open window a backfill run covers. Both ends optional: no window
+/// `copilot retention [--apply] [--limit N]` — enforce the artifact half of
+/// the regulatory retention policy (engineering conventions §18).
+///
+/// A **dry run unless `--apply`** is passed. This is the only command in the
+/// service that destroys a regulatory artifact, and the difference between
+/// "show me" and "do it" must be a thing somebody typed. What it deletes is
+/// decided entirely by `copilot::retention` — this function resolves config,
+/// hands over a store, and prints.
+///
+/// `--limit` bounds one invocation — how many artifacts it may destroy — and is
+/// the guard against a mis-typed policy emptying the table in one pass. It
+/// bounds the **plan** too, so a dry run says exactly what an apply with the
+/// same flags would do; the plan always reports the full backlog alongside it.
+///
+/// Exit code 0 either way: a purge that found work is not a failure, and a
+/// CronJob whose success depends on there being nothing to delete is a CronJob
+/// that pages every week for the rest of the policy's life.
+async fn retention_purge(cfg: &Config, args: Vec<String>) -> Result<()> {
+    let mut apply = false;
+    let mut limit = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--apply" => {
+                apply = true;
+                index += 1;
+            }
+            "--limit" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--limit needs a number of drafts")?;
+                limit = Some(raw.parse::<usize>().context("--limit is not a number")?);
+                index += 2;
+            }
+            other => bail!("unknown retention argument {other:?}; {USAGE}"),
+        }
+    }
+
+    telemetry::metrics::init(cfg.metrics_addr).context("starting the metrics exporter")?;
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            wait_for_signal().await;
+            tracing::info!("shutdown signal received; the purge will stop after this batch");
+            shutdown.cancel();
+        }
+    });
+
+    let pool = db::connect(cfg.database_url.expose_secret()).await?;
+    let store = Arc::new(PgDraftStore::new(pool));
+    store.ping().await.context("copilot schema not reachable")?;
+
+    let policy = cfg.retention.for_artifact(None);
+    let now = Utc::now();
+
+    // Plan first, always — the dry run and the apply print the same numbers
+    // because they are the same value.
+    let plan = retention::scan(
+        store.as_ref(),
+        &policy,
+        now,
+        limit.unwrap_or(retention::DEFAULT_MAX_PURGED),
+    )
+    .await
+    .context("scanning the draft store for released artifacts")?;
+
+    copilot::metrics::set_retention_held(plan.held);
+    println!("policy: {policy}");
+
+    let outcome = if apply {
+        // The one call site in this binary that mints the witness. Everything
+        // downstream — the store's `purge`, `retention::apply` — demands it, so
+        // no other path can destroy an artifact.
+        Some(
+            retention::apply(
+                &plan,
+                store.as_ref(),
+                DestructiveIntent::from_operator_flag(),
+                retention::DEFAULT_BATCH_SIZE,
+                &shutdown,
+            )
+            .await
+            .context("destroying released artifacts")?,
+        )
+    } else {
+        None
+    };
+
+    let report = retention::PurgeReport { plan, outcome };
+    println!("{report}");
+
+    // The §18 record. Published only when something was actually destroyed:
+    // "we looked and there was nothing" is a log line, while "we destroyed 412
+    // regulatory artifacts on this date under this cutoff" is a fact the audit
+    // trail has to carry. Best-effort — a broker outage must not make the
+    // deletion look like it failed, because it did not, and re-running would
+    // then re-report a backlog that is already gone.
+    if report.applied() && report.purged() > 0 {
+        announce_purge(cfg, &report, &policy, Utc::now()).await;
+    }
+    Ok(())
+}
+
+/// Publish `RetentionPurgeCompleted` (engineering conventions §18).
+///
+/// Deliberately not fatal. The artifacts are already destroyed by the time this
+/// runs; failing the command would tell an operator the purge did not happen
+/// when it did, which is a worse lie than a missing announcement — and the
+/// counter plus this warning are what surface the gap. A durable outbox would
+/// be the stronger answer and is the natural next step if this ever fires.
+async fn announce_purge(
+    cfg: &Config,
+    report: &retention::PurgeReport,
+    policy: &::retention::Policy,
+    at: DateTime<Utc>,
+) {
+    let Some(envelope) = retention::purge_announcement(report, policy, cfg.chain, at) else {
+        return;
+    };
+    match KafkaEventSink::new(&cfg.kafka.brokers) {
+        Ok(sink) => match sink.publish(envelope).await {
+            Ok(()) => tracing::info!(
+                destroyed = report.purged(),
+                "announced the retention purge to the audit trail"
+            ),
+            Err(err) => tracing::error!(
+                error = %err,
+                destroyed = report.purged(),
+                "artifacts were destroyed but RetentionPurgeCompleted could not be published — \
+                 the audit trail is missing a destruction record; re-publish it by hand"
+            ),
+        },
+        Err(err) => tracing::error!(
+            error = %err,
+            "artifacts were destroyed but no producer could be built to announce it"
+        ),
+    }
+}
+
+/// The half-open window a backfill run covers./// The half-open window a backfill run covers. Both ends optional: no window
 /// means the whole archive, which is the usual first run.
 type Window = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 

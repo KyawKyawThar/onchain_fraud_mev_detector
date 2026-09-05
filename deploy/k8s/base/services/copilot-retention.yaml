@@ -1,0 +1,92 @@
+# ── copilot retention purge (engineering conventions §18) ─────────
+# A weekly CronJob that destroys SAR narratives the regulatory retention policy
+# has released — the artifact half of the policy, whose evidence half is the
+# `events` table's ClickHouse TTL (event-store reconciles that at boot; there is
+# no Job for it).
+#
+# Why a CronJob and not a loop inside the copilot Deployment: the same reasons
+# as copilot-audit — an occasional, bounded sweep over the whole table has the
+# shape of a job — plus one this one does not share. **It deletes.** A pod that
+# holds worker leases must not also be the thing that can destroy a regulatory
+# artifact if a config map is edited badly; keeping it a separate workload means
+# the blast radius of a retention mistake is one Job, and the Job's args are
+# where somebody has to have typed `--apply`.
+#
+# `--apply` is here, deliberately visible in `kubectl describe cronjob`. The
+# binary is a dry run without it (see `copilot::retention`), so a cluster that
+# wants the report and not the deletion removes one word, and one word is what
+# a reviewer looks for.
+#
+# Runs on Saturday, a day before copilot-audit's Sunday sweep: the audit reports
+# `expired` for every artifact the purge was entitled to destroy and did not, so
+# purging first makes that count mean "the purge could not", not "the purge has
+# not run yet".
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: copilot-retention
+  labels:
+    app.kubernetes.io/name: copilot-retention
+    app.kubernetes.io/part-of: mevwatch
+    app.kubernetes.io/component: copilot
+spec:
+  schedule: "0 2 * * 6"
+  # Two purges racing over the same backlog would each delete rows the other
+  # has already selected — harmless, but it makes the counts nonsense, and the
+  # counts are what an operator reads to know what was destroyed.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 10
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      # No retries. A purge that failed halfway has already committed the
+      # batches it completed — it is safe to re-run, but it must be re-run
+      # *deliberately*, because "how many records did we destroy" is a question
+      # that gets asked with a lawyer in the room and a silent backoff makes it
+      # unanswerable from the Job history.
+      backoffLimit: 0
+      activeDeadlineSeconds: 10800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: copilot-retention
+            app.kubernetes.io/part-of: mevwatch
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: copilot-retention
+              image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/copilot:latest
+              args: ["retention", "--apply"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              envFrom:
+                - configMapRef:
+                    name: app-config # RETENTION_* rides here, shared with event-store
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-credentials
+                      key: DATABASE_URL
+                # Not used — the purge calls no model — but the config resolves
+                # once, whole, at boot (§9), exactly as copilot-audit does.
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: app-secrets
+                      key: ANTHROPIC_API_KEY
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

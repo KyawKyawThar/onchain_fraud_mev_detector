@@ -465,6 +465,29 @@ copilot-backfill from="" to="":
 copilot-audit *args:
     cargo run -p copilot -- audit {{args}}
 
+# Destroy SAR drafts the regulatory retention policy has released
+# (engineering conventions §18). A PLAN unless you pass --apply: it prints the
+# complete backlog (a COUNT, not a page), the number a legal hold is preserving,
+# and the oldest few by id. `--apply` carries out that same plan, so the number
+# you approved is the number that happens.
+#   just copilot-retention            # what would go
+#   just copilot-retention --apply    # make it go
+# The evidence half of the same policy is event-store's TTL; see
+# `just retention-status`. Full runbook: docs/runbooks/retention.md
+copilot-retention *args:
+    cargo run -p copilot -- retention {{args}}
+
+# What the retention policy is, what the event store actually holds, and what
+# reconciling would do. The one command that compares the three — a config map
+# can tell you the first and only `system.tables` can tell you the second, which
+# is why the `CopilotGroundingAuditUnverifiable` alert points here first.
+#
+# Read-only. Applying is `cargo run -p event-store -- retention apply`, and the
+# destructive directions (narrowing a window, binding an existing archive) need
+# `--i-understand-this-deletes-evidence` on top — boot cannot reach them at all.
+retention-status:
+    cargo run -p event-store -- retention
+
 # Regenerate the checked-in prompt manifest (engineering conventions §16).
 # A prompt edit changes a digest here, so the change cannot merge without a
 # hunk a reviewer sees. Run this after touching anything under

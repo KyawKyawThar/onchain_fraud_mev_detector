@@ -67,6 +67,25 @@ impl AuditStream {
     pub fn event_ids(&self) -> Vec<uuid::Uuid> {
         self.events.iter().map(|e| e.event_id).collect()
     }
+
+    /// When the earliest of `ids` occurred, if any of them are in this stream.
+    ///
+    /// The retention policy's evidence clock runs from occurrence, so the
+    /// *oldest* cited event is the one that expires first and therefore the one
+    /// that decides whether a narrative outlives the record under it
+    /// (engineering conventions §18). Cited ids and not the whole window: the
+    /// window is what the model was shown, and an event nothing cites has no
+    /// bearing on whether the document can be defended.
+    pub fn earliest_occurrence_of(
+        &self,
+        ids: &std::collections::BTreeSet<uuid::Uuid>,
+    ) -> Option<DateTime<Utc>> {
+        self.events
+            .iter()
+            .filter(|event| ids.contains(&event.event_id))
+            .map(|event| event.occurred_at)
+            .min()
+    }
 }
 
 /// One page of the audit endpoint.

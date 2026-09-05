@@ -1341,6 +1341,83 @@
         }
       ]
     },
+    "RetentionPolicyChanged": {
+      "topic": "mev.events.RetentionPolicyChanged",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "applied_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "applied_by",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "current_days",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "destructive",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "previous_days",
+          "type": "integer",
+          "required": false
+        },
+        {
+          "path": "store",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    "RetentionPurgeCompleted": {
+      "topic": "mev.events.RetentionPurgeCompleted",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "artifact_days",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "completed_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "cutoff",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "destroyed",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "held_back",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "store",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "truncated",
+          "type": "boolean",
+          "required": true
+        }
+      ]
+    },
     "RiskScoreUpdated": {
       "topic": "mev.events.RiskScoreUpdated",
       "partition_key": "chain",

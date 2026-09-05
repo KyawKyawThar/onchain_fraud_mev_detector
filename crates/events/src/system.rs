@@ -280,3 +280,79 @@ pub struct DriftedFeature {
     /// below `1` the feature has collapsed, above it has fanned out.
     pub spread: f64,
 }
+
+// ── Regulatory retention (engineering conventions §18) ───────────
+//
+// The audit trail has to cover changes to its own governance.
+//
+// Everything else about retention was observable only as an environment
+// variable, a boot log line and a gauge — and none of those answers the
+// question that gets asked with a lawyer in the room: *on what date did this
+// platform's retention window change, from what, to what, and who applied it?*
+// A gauge is sampled and aggregated; a pod log has rotated by then. A fact on
+// the backbone lands in the event store, which is itself under the policy these
+// events describe, so the record of a change outlives the change by the margin.
+//
+// Both are `System` family: they are statements about the platform, not about a
+// chain, an incident, or a customer.
+
+/// **The evidence or artifact retention window changed.**
+///
+/// Emitted by whichever service actually carried the change out — event-store
+/// when it writes the `events` TTL, the copilot if its artifact window ever
+/// diverges — so the record names the store it applies to rather than implying
+/// a platform-wide edit that may only have reached one pod.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RetentionPolicyChanged {
+    /// Which store's window moved: `"event_store_events"` today. A string and
+    /// not an enum because the set grows with the platform and an old record
+    /// must stay readable after a store is renamed or retired.
+    pub store: String,
+    /// The window before, in days. `None` means there was no window at all —
+    /// the store was unbounded, and this record is the moment a bound was first
+    /// imposed (which deletes anything already older than it).
+    pub previous_days: Option<u32>,
+    /// The window after, in days.
+    pub current_days: u32,
+    /// Whether carrying this out could destroy data already held: a narrowing,
+    /// or a first bound over an existing archive. The single most important bit
+    /// on the record — it separates "we lengthened retention" from "we deleted
+    /// history", which are the same field moving in different directions.
+    pub destructive: bool,
+    /// How it was applied: `"boot"` (automatic, and therefore necessarily
+    /// non-destructive) or `"operator"` (a human typed the flag).
+    pub applied_by: String,
+    pub applied_at: DateTime<Utc>,
+}
+
+/// **Regulatory artifacts were destroyed under the retention policy.**
+///
+/// The record a compliance owner needs and a counter cannot give: how many
+/// documents this platform destroyed, under which cutoff, and how many it left
+/// alone because a legal hold said so. One per purge run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RetentionPurgeCompleted {
+    /// Which artifact store was swept: `"copilot_drafts"` today.
+    pub store: String,
+    /// Every artifact disposed of at or before this instant was in scope.
+    /// Re-deriving it later from `artifact_days` would give a different answer
+    /// once the policy is retuned, which is why the *bound* is recorded rather
+    /// than the setting that produced it.
+    pub cutoff: DateTime<Utc>,
+    /// The policy window in force for this run, for the same reason.
+    pub artifact_days: u32,
+    /// Artifacts destroyed.
+    pub destroyed: u64,
+    /// Artifacts past their deadline that a legal hold preserved. A rising
+    /// number here is the platform deliberately not obeying its own schedule,
+    /// which is exactly what a hold is for and exactly what nobody should be
+    /// able to forget about.
+    pub held_back: i64,
+    /// Whether the run stopped on its budget or a shutdown rather than on an
+    /// empty backlog — so a reader can tell "that was all of them" from "that
+    /// was as many as one run may take".
+    pub truncated: bool,
+    pub completed_at: DateTime<Utc>,
+}

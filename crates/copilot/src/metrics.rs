@@ -194,9 +194,48 @@ pub const GROUNDING_AUDIT_DRAFTS_TOTAL: &str = "copilot_grounding_audit_drafts_t
 pub const GROUNDING_AUDIT_UNRESOLVED_IDS_TOTAL: &str =
     "copilot_grounding_audit_unresolved_ids_total";
 
-pub fn record_grounding_audit(verdict: &'static str, unresolved_ids: usize) {
+/// Counter: landed narratives on course to outlive the evidence under them
+/// (engineering conventions §18).
+///
+/// Its own series and not a `verdict` label, because it is not a verdict: a
+/// draft that checks out perfectly today can still be one whose oldest cited
+/// event expires before the draft may be destroyed. This is the *leading*
+/// indicator — it fires while there is still a year in which raising
+/// `RETENTION_EVIDENCE_MARGIN_DAYS` would actually keep the evidence, whereas
+/// `{verdict="evidence_missing"}` fires once it is too late.
+pub const GROUNDING_AUDIT_AT_RISK_TOTAL: &str = "copilot_grounding_audit_at_risk_total";
+
+pub fn record_grounding_audit(verdict: &'static str, unresolved_ids: usize, at_risk: bool) {
     metrics::counter!(GROUNDING_AUDIT_DRAFTS_TOTAL, "verdict" => verdict).increment(1);
     if unresolved_ids > 0 {
         metrics::counter!(GROUNDING_AUDIT_UNRESOLVED_IDS_TOTAL).increment(unresolved_ids as u64);
     }
+    if at_risk {
+        metrics::counter!(GROUNDING_AUDIT_AT_RISK_TOTAL).increment(1);
+    }
+}
+
+/// Counter: drafts the retention purge destroyed (engineering conventions
+/// §18).
+///
+/// The only §19 series in this platform that counts *deletions of regulatory
+/// artifacts*, which is why it is a counter and not a log line: "how many
+/// records did we destroy last quarter, and when" is a question that gets asked
+/// with a lawyer in the room, and a pod log has rotated by then.
+pub const RETENTION_PURGED_TOTAL: &str = "copilot_retention_purged_total";
+
+/// Gauge: past-deadline drafts a legal hold is preserving. Deliberately
+/// unlabelled — *which* records are held is a §13 column and a court's
+/// business, not a time series' (§19, the same rule the token budget's
+/// customer id follows).
+pub const RETENTION_HELD: &str = "copilot_retention_held";
+
+pub fn record_retention_purged(purged: u64) {
+    if purged > 0 {
+        metrics::counter!(RETENTION_PURGED_TOTAL).increment(purged);
+    }
+}
+
+pub fn set_retention_held(held: i64) {
+    metrics::gauge!(RETENTION_HELD).set(held as f64);
 }

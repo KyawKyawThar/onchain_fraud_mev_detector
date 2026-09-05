@@ -82,6 +82,15 @@ pub struct Config {
     /// (`--since`, `--limit`) stays on the command line, because that is a
     /// property of one run rather than of the deployment.
     pub audit_concurrency: usize,
+    /// The regulatory retention policy (engineering conventions §18): how long
+    /// a SAR narrative and the evidence it cites must both live.
+    ///
+    /// Read from the shared, service-agnostic `RETENTION_*` variables — the
+    /// same ones event-store resolves — because a policy that could differ
+    /// between the store that keeps the evidence and the store that keeps the
+    /// artifact is not one policy. Three things read it: the `retention` purge,
+    /// the `backfill` window guard, and the grounding audit's expiry judgement.
+    pub retention: ::retention::PolicySet,
     /// Address the Prometheus `/metrics` endpoint binds to (§19).
     pub metrics_addr: SocketAddr,
     /// The draft review API, when a deployment serves one. `None` (the
@@ -172,6 +181,7 @@ impl Config {
                 .max(1),
             },
             audit_concurrency: env_parse("COPILOT_AUDIT_CONCURRENCY", DEFAULT_AUDIT_CONCURRENCY)?,
+            retention: ::retention::PolicySet::uniform(::retention::Policy::from_env()?),
             metrics_addr: env_parse(
                 "COPILOT_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9113)),
@@ -310,6 +320,7 @@ mod tests {
             },
             event_store_url: "http://event-store:8080".into(),
             event_store_timeout: Duration::from_secs(30),
+            retention: ::retention::PolicySet::default(),
             llm,
             chain: Chain::ETHEREUM,
             pool: PoolConfig {

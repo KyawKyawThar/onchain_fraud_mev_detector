@@ -35,6 +35,7 @@
 
 use std::sync::Arc;
 
+use ::retention::{DestructiveIntent, Disposition};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use events::primitives::{Chain, CustomerId};
@@ -298,7 +299,136 @@ pub trait DraftReview: Send + Sync + std::fmt::Debug {
     async fn list(&self, filter: &DraftFilter) -> Result<Vec<Draft>, StoreError>;
 }
 
-/// Narrowing for [`DraftReview::list`]. Every field optional: the reviewer's
+/// One draft the retention policy has caught up with — the purge's unit of
+/// work and, on a plan, its unit of report.
+///
+/// Deliberately not a whole [`Draft`]: the purge decides on a row's *dates*,
+/// and reading a five-year backlog's bodies into memory to delete them would
+/// be the largest read this service ever does, for information no step uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredDraft {
+    pub draft_id: DraftId,
+    pub kind: DraftKind,
+    pub subject_id: Uuid,
+    pub status: DraftStatus,
+    /// The disposition instant the deadline was measured from
+    /// (`copilot::retention::anchor`, as SQL).
+    pub anchored_at: Disposition,
+}
+
+impl std::fmt::Display for ExpiredDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} draft={} subject={} status={} disposed={}",
+            self.kind.as_wire_str(),
+            self.draft_id,
+            self.subject_id,
+            self.status.as_wire_str(),
+            self.anchored_at,
+        )
+    }
+}
+
+/// A legal hold, as the store records it.
+///
+/// A value and not a `bool`, because a hold overrides a statutory destruction
+/// schedule: the questions that follow it are always "which matter", "since
+/// when" and "on whose say-so", and a flag can answer none of them. The schema
+/// enforces all-or-nothing (see the migration's CHECK), so this parses cleanly
+/// or the row is [`StoreError::Malformed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegalHold {
+    /// The matter the hold is under — a case number, a request id, whatever the
+    /// compliance team files it as. Opaque to this service on purpose.
+    pub matter: String,
+    pub placed_at: DateTime<Utc>,
+    pub placed_by: String,
+}
+
+/// What a scan of the backlog found, before anything is destroyed.
+///
+/// The **complete** counts, not a page of them: `due` comes from a `COUNT(*)`
+/// rather than from however many rows the first page happened to hold. That
+/// distinction is the whole reason this type exists — a preview of a
+/// destructive action that under-reports is worse than no preview, because the
+/// number a human approves is not the number that happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionScan {
+    /// Every draft at or past the cutoff and not held.
+    pub due: i64,
+    /// Past-deadline drafts a legal hold is preserving.
+    pub held: i64,
+    /// The oldest few, for the operator's eye. Bounded; the counts are not.
+    pub sample: Vec<ExpiredDraft>,
+}
+
+/// Destroying artifacts the retention policy has released (engineering
+/// conventions §18).
+///
+/// Its own trait rather than three more methods on [`DraftReview`], because it
+/// is the only seam in this service that **deletes**: a caller holding an
+/// `Arc<dyn DraftReview>` — the review API, the grounding audit — must not be
+/// one line away from being able to purge, and the audit in particular is only
+/// an audit because it cannot change what it audits.
+///
+/// The read half ([`DraftRetention::scan`], [`DraftRetention::expired`]) and the
+/// write half ([`DraftRetention::purge`]) are on one trait because the purge
+/// runner needs both; the *witness* is what keeps the write out of reach, not
+/// the trait split.
+#[async_trait]
+pub trait DraftRetention: Send + Sync + std::fmt::Debug {
+    /// The complete picture at `cutoff`: how many are due, how many are held,
+    /// and a bounded sample of the oldest.
+    ///
+    /// One round trip per number rather than a page-and-extrapolate, because
+    /// this is what a human reads before approving a deletion.
+    async fn scan(
+        &self,
+        cutoff: Disposition,
+        sample_size: i64,
+    ) -> Result<RetentionScan, StoreError>;
+
+    /// The oldest drafts whose disposition is at or before `cutoff` and that
+    /// no legal hold protects, oldest first.
+    ///
+    /// `cutoff` is [`retention::Policy::purge_cutoff`] — the policy stays in the
+    /// caller, so this seam is a date query and there is no second place a
+    /// retention window is computed.
+    async fn expired(
+        &self,
+        cutoff: Disposition,
+        limit: i64,
+    ) -> Result<Vec<ExpiredDraft>, StoreError>;
+
+    /// Destroy these drafts, returning how many rows went.
+    ///
+    /// Takes the [`DestructiveIntent`] witness: this is the only method in the
+    /// service that destroys a regulatory artifact, and a caller that cannot
+    /// name the witness cannot reach it. Re-checks the legal hold inside the
+    /// statement — the scan that produced these ids ran earlier, and the
+    /// realistic reason a hold appears in between is that somebody is placing
+    /// it *because* the record has just been asked for.
+    async fn purge(
+        &self,
+        draft_ids: &[DraftId],
+        intent: DestructiveIntent,
+    ) -> Result<u64, StoreError>;
+
+    /// Place or lift a hold. Returns the hold now in force, if any.
+    ///
+    /// Present on the seam rather than left to `psql` so that "who held this,
+    /// when, under what matter" goes through one typed path with one shape —
+    /// and so the runbook can stop telling people to hand-write UPDATEs against
+    /// a compliance control.
+    async fn set_legal_hold(
+        &self,
+        draft_id: DraftId,
+        hold: Option<LegalHold>,
+    ) -> Result<Option<LegalHold>, StoreError>;
+}
+
+/// Narrowing for [`DraftReview::list`]. Every field optional/// Narrowing for [`DraftReview::list`]. Every field optional: the reviewer's
 /// default view is "everything, newest first", and each filter is one facet of
 /// the queue (what state, which capability, which path produced it).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1188,6 +1318,167 @@ impl DraftOutbox for PgDraftStore {
         .await?;
         Ok(row.pending)
     }
+}
+
+#[async_trait]
+impl DraftRetention for PgDraftStore {
+    async fn scan(
+        &self,
+        cutoff: Disposition,
+        sample_size: i64,
+    ) -> Result<RetentionScan, StoreError> {
+        // Two aggregates in one statement, over the same predicate the purge
+        // deletes by. Counting in SQL rather than paging is what makes the dry
+        // run's number the same number the apply acts on.
+        let counts = sqlx::query_as::<_, (i64, i64)>(
+            r#"SELECT
+                   COUNT(*) FILTER (WHERE legal_hold_matter IS NULL),
+                   COUNT(*) FILTER (WHERE legal_hold_matter IS NOT NULL)
+                 FROM copilot_drafts
+                WHERE COALESCE(reviewed_at, completed_at, created_at) <= $1"#,
+        )
+        .bind(cutoff.instant())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(RetentionScan {
+            due: counts.0,
+            held: counts.1,
+            sample: self.expired(cutoff, sample_size).await?,
+        })
+    }
+
+    async fn expired(
+        &self,
+        cutoff: Disposition,
+        limit: i64,
+    ) -> Result<Vec<ExpiredDraft>, StoreError> {
+        // `COALESCE(reviewed_at, completed_at, created_at)` is the disposition
+        // anchor, and it is the *same* expression the partial index in
+        // `20260905000000_copilot_retention` is built on — change one and the
+        // purge silently starts sequential-scanning a table it runs against on
+        // a schedule.
+        //
+        // `<=` and not `<`: `retention::Policy::is_expired` is inclusive at the
+        // deadline, and a purge that disagreed with the audit by one instant
+        // would leave a row the audit had already stopped holding to a live
+        // artifact's standard.
+        //
+        // Runtime-checked (not `query!`), the same choice `intelligence`'s
+        // batched label read made and for the same reason: these statements are
+        // added without regenerating the offline `.sqlx` cache, and `FromRow`
+        // maps the aliased anchor column onto `ExpiredRow`. `parse_enum` below
+        // keeps the *typing* honest either way — a row whose `kind`/`status`
+        // this build does not know is `StoreError::Malformed`, never a
+        // plausible-looking value.
+        let rows = sqlx::query_as::<_, ExpiredRow>(
+            r#"SELECT draft_id, kind, subject_id, status,
+                      COALESCE(reviewed_at, completed_at, created_at) AS anchored_at
+                 FROM copilot_drafts
+                WHERE legal_hold_matter IS NULL
+                  AND COALESCE(reviewed_at, completed_at, created_at) <= $1
+                ORDER BY COALESCE(reviewed_at, completed_at, created_at)
+                LIMIT $2"#,
+        )
+        .bind(cutoff.instant())
+        .bind(limit.clamp(1, MAX_LIST_LIMIT))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ExpiredDraft {
+                    draft_id: DraftId(row.draft_id),
+                    kind: parse_enum::<DraftKind>("kind", &row.kind)?,
+                    subject_id: row.subject_id,
+                    status: parse_enum::<DraftStatus>("status", &row.status)?,
+                    anchored_at: Disposition::at(row.anchored_at),
+                })
+            })
+            .collect()
+    }
+
+    async fn purge(
+        &self,
+        draft_ids: &[DraftId],
+        _intent: DestructiveIntent,
+    ) -> Result<u64, StoreError> {
+        if draft_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = draft_ids.iter().map(|id| id.0).collect();
+        // The hold is re-checked here, not trusted from the scan. The
+        // `copilot_outbox` row cascades (its FK says so); that is intended —
+        // the durable copy of the announcement is the `IncidentNarrativeDrafted`
+        // event in event-store, which outlives the draft by the policy's margin.
+        let deleted = sqlx::query(
+            "DELETE FROM copilot_drafts WHERE draft_id = ANY($1) AND legal_hold_matter IS NULL",
+        )
+        .bind(&ids)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(deleted)
+    }
+
+    async fn set_legal_hold(
+        &self,
+        draft_id: DraftId,
+        hold: Option<LegalHold>,
+    ) -> Result<Option<LegalHold>, StoreError> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<DateTime<Utc>>, Option<String>)>(
+            r#"UPDATE copilot_drafts
+                  SET legal_hold_matter = $2,
+                      legal_hold_placed_at = $3,
+                      legal_hold_placed_by = $4,
+                      updated_at = GREATEST(updated_at, COALESCE($3, updated_at))
+                WHERE draft_id = $1
+            RETURNING legal_hold_matter, legal_hold_placed_at, legal_hold_placed_by"#,
+        )
+        .bind(draft_id.0)
+        .bind(hold.as_ref().map(|h| h.matter.as_str()))
+        .bind(hold.as_ref().map(|h| h.placed_at))
+        .bind(hold.as_ref().map(|h| h.placed_by.as_str()))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound { draft_id })?;
+
+        Ok(legal_hold_from_row(row.0, row.1, row.2))
+    }
+}
+
+/// Reassemble a stored hold. The schema's CHECK makes a partial one
+/// impossible, so a partial row here is a corrupt one rather than a state to
+/// interpret — but it is still *read* defensively, because a constraint added
+/// later cannot vouch for rows written earlier.
+fn legal_hold_from_row(
+    matter: Option<String>,
+    placed_at: Option<DateTime<Utc>>,
+    placed_by: Option<String>,
+) -> Option<LegalHold> {
+    match (matter, placed_at, placed_by) {
+        (Some(matter), Some(placed_at), Some(placed_by)) => Some(LegalHold {
+            matter,
+            placed_at,
+            placed_by,
+        }),
+        _ => None,
+    }
+}
+
+/// The four columns the purge scan reads, mapped by name./// The four columns the purge scan reads, mapped by name.
+///
+/// Its own row type rather than [`DraftRow`]: a purge decides on a row's
+/// *dates*, and pulling five years of narrative bodies into memory in order to
+/// delete them would be the largest read this service ever performs, for
+/// information no step uses.
+#[derive(Debug, sqlx::FromRow)]
+struct ExpiredRow {
+    draft_id: Uuid,
+    kind: String,
+    subject_id: Uuid,
+    status: String,
+    anchored_at: DateTime<Utc>,
 }
 
 /// One `copilot_drafts` row, exactly as the two reads select it.

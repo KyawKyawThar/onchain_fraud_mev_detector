@@ -38,6 +38,26 @@ data:
   # db ride separately in the clickhouse-credentials Secret.
   CLICKHOUSE_HTTP_URL: http://clickhouse:8123
 
+  # ── Regulatory retention (engineering conventions §18) ────────
+  # ONE decision, read by BOTH stores that enforce it: event-store sets the
+  # `events` table's TTL from it at boot, and the copilot purges
+  # `copilot_drafts` and judges its grounding audit against it. Deliberately
+  # unprefixed by service — a per-service override would split one compliance
+  # decision in two, and the day they disagree is the day a SAR narrative
+  # outlives the evidence under it.
+  #
+  # Both are commented out on purpose: the shipped defaults ARE the policy
+  # (1827 days = five years from an artifact's disposition, per 31 CFR
+  # 1020.320(d) and Directive (EU) 2015/849 art. 40, plus a 365-day margin so
+  # evidence outlives the narratives written from it). Setting them here means
+  # a cluster has deliberately departed from that, which is a reviewed change.
+  # RETENTION_ARTIFACT_DAYS is a floor: a shorter value is refused at boot.
+  # Raising RETENTION_EVIDENCE_MARGIN_DAYS is also what lengthens the events
+  # TTL and so what makes an older backfill legitimate — it is one knob for
+  # both, on purpose.
+  # RETENTION_ARTIFACT_DAYS: "1827"
+  # RETENTION_EVIDENCE_MARGIN_DAYS: "365"
+
   # ── Simulation work queue (RabbitMQ, §7) ──────────────────────
   RABBITMQ_SIM_QUEUE: sim.jobs
   RABBITMQ_SIM_DLX: sim.jobs.dlx

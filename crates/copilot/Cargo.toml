@@ -16,6 +16,12 @@ publish.workspace = true
 [dependencies]
 events = { workspace = true }
 llm = { workspace = true }
+# The workspace's regulatory retention decision (engineering conventions §18).
+# This service is one of its two enforcement sites — the `copilot_drafts` purge
+# — and the grounding audit reads the *same* policy value to tell evidence that
+# legitimately aged out from evidence that went missing while the artifact was
+# still under retention. Same crate, same env vars, as event-store.
+retention = { workspace = true, features = ["env"] }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
