@@ -1,0 +1,57 @@
+[package]
+name = "backup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Postgres. The fingerprint has to be taken *inside the same MVCC snapshot*
+# `pg_dump` reads, which means holding a real session open across the child
+# process — so this crate speaks sqlx directly rather than shelling everything
+# out. `db` rides along per the workspace seam rule (pool construction +
+# permanent-vs-transient classification live there).
+sqlx.workspace = true
+db.workspace = true
+
+# ClickHouse is reached over its HTTP interface with a plain HTTP client, NOT
+# the `clickhouse` crate — see the crate docs ("Why no ClickHouse client") and
+# the matching arch-conformance rule. `stream` carries a file body into an
+# `INSERT` without reading it into memory first.
+reqwest.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+
+# Manifests are JSON on disk: an artifact has to stay readable by a human (and
+# by a future version of this binary) after the process that wrote it is gone.
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+# Content fingerprints (per-file integrity + per-row digests).
+sha2.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+url.workspace = true
+clap.workspace = true
+secrecy.workspace = true
+
+# `process` drives pg_dump/pg_restore, `fs`/`io-util` stream artifact bytes.
+tokio = { workspace = true, features = ["process", "fs", "io-util"] }
+
+tracing.workspace = true
+# §19 facade — a no-op until the `serve` arm installs the exporter.
+metrics.workspace = true
+telemetry.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "fs"] }
+testcontainers.workspace = true
+testcontainers-modules = { workspace = true, features = ["postgres", "clickhouse"] }
+# Seed data for the integration suite.
+uuid.workspace = true
+metrics-util.workspace = true

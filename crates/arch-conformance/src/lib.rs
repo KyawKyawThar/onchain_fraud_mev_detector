@@ -412,6 +412,50 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             ));
         }
 
+        // ── A backup never migrates what it copies ───────────────────────
+        // `backup` is the DR control for all three stores (readiness Epic B),
+        // so it is the one crate that reads and writes ClickHouse *without*
+        // `ch-migrate` — and it must, because the general rule below would
+        // have it apply DDL at boot to a database it was called to protect.
+        // A backup tool that mutated the schema of the thing it is copying is
+        // the worst kind of bug: the damage is done by the recovery. It also
+        // cannot know the schema in advance — it copies whatever tables exist,
+        // including ones written by a build it has never seen — so the typed
+        // `clickhouse` client's per-table `#[derive(Row)]` is the wrong shape
+        // as well. It goes over the HTTP interface with the shared client.
+        //
+        // Everything else stays forbidden. An `event-store` or service edge
+        // would let a backup reach into another crate's model, and the whole
+        // argument for this crate is that it is *below* every service: it
+        // copies bytes, it does not interpret them.
+        if krate == "backup" {
+            if has("clickhouse") || has("ch-migrate") {
+                out.push(format!(
+                    "{krate}: must not depend on clickhouse/ch-migrate — a backup copies \
+                     whatever schema is there and must never apply DDL to the database it \
+                     was called to protect; it goes over the HTTP interface"
+                ));
+            }
+            for forbidden in [
+                "event-store",
+                "simulation",
+                "intelligence",
+                "rule-engine",
+                "detection",
+                "event-bus",
+                "rdkafka",
+                "lapin",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — the backup control sits \
+                         below every service and copies bytes; interpreting them is a \
+                         projection rebuild's job (crates/rebuild), not a restore's"
+                    ));
+                }
+            }
+        }
+
         // ── ClickHouse access rides ch-migrate (§14) ──────────────────────
         // Every ClickHouse consumer applies its own migrations at boot via the
         // shared migrator (which also rejects the `?`-binding trap).
@@ -555,6 +599,12 @@ mod tests {
             // store's published read API and a projection through the owner
             // service's `ReadModel` impl.
             ("rebuild", &["events", "reqwest"]),
+            // The DR control: store clients and an HTTP client, and
+            // deliberately no `ch-migrate` (see the rule) and no service edge.
+            (
+                "backup",
+                &["sqlx", "db", "reqwest", "telemetry", "metrics", "clap"],
+            ),
         ]);
         assert_eq!(violations(&g), Vec::<String>::new());
     }
@@ -637,6 +687,18 @@ mod tests {
                 "copilot",
                 &["events", "event-bus", "rdkafka", "sqlx", "db", "reqwest"],
                 "no llm dependency",
+            ),
+            (
+                // The rule that keeps a backup from applying DDL to the
+                // database it was called to protect.
+                "backup",
+                &["sqlx", "db", "clickhouse", "ch-migrate"],
+                "must never apply DDL to the database it",
+            ),
+            (
+                "backup",
+                &["sqlx", "db", "reqwest", "event-store"],
+                "copies bytes",
             ),
             (
                 "copilot",
