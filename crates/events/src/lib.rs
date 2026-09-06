@@ -270,10 +270,12 @@ pub enum DomainEvent {
     RuleTriggered(rule_engine::RuleTriggered),
     RuleAlertCreated(rule_engine::RuleAlertCreated),
 
-    // System (§13, §20.5)
+    // System (§13, §20.5) + regulatory retention (engineering conventions §18)
     UsageRecorded(system::UsageRecorded),
     ScreeningDecisionRecorded(system::ScreeningDecisionRecorded),
     ModelDriftDetected(system::ModelDriftDetected),
+    RetentionPolicyChanged(system::RetentionPolicyChanged),
+    RetentionPurgeCompleted(system::RetentionPurgeCompleted),
 
     // Predictive (§16)
     PredictedAlert(predictive::PredictedAlert),
@@ -366,9 +368,11 @@ impl DomainEvent {
             | AddressEmbeddingUpdated(_)
             | EntityLinkProposed(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
-            UsageRecorded(_) | ScreeningDecisionRecorded(_) | ModelDriftDetected(_) => {
-                EventFamily::System
-            }
+            UsageRecorded(_)
+            | ScreeningDecisionRecorded(_)
+            | ModelDriftDetected(_)
+            | RetentionPolicyChanged(_)
+            | RetentionPurgeCompleted(_) => EventFamily::System,
             PredictedAlert(_) | LiquidationRiskPredicted(_) | LiquidationCascadeWarned(_) => {
                 EventFamily::Predictive
             }
@@ -438,7 +442,12 @@ impl DomainEvent {
             // A drift reading is about a model, not an incident. (If a future
             // change wants "which incidents were produced under drifted
             // weights?", that is a join on the detector triple, not a field.)
-            | ModelDriftDetected(_) => None,
+            | ModelDriftDetected(_)
+            // §18 governance facts are about a *store*, not an incident: a
+            // purge that destroyed 412 artifacts names no single one of them,
+            // and a window change names none at all.
+            | RetentionPolicyChanged(_)
+            | RetentionPurgeCompleted(_) => None,
         }
     }
 
@@ -538,7 +547,14 @@ impl DomainEvent {
             // Deliberately chain-keyed (the `None` fallback): drift is per
             // detection instance, and a per-chain instance's readings must stay
             // ordered against that chain's other events.
-            | ModelDriftDetected(_) => None,
+            | ModelDriftDetected(_)
+            // §18 governance facts have no business key worth partitioning on:
+            // they are rare, platform-wide, and read by scanning the type — a
+            // per-store key would put a decade of them on one partition for no
+            // ordering benefit, since two changes to the same window are
+            // already ordered by their own timestamps.
+            | RetentionPolicyChanged(_)
+            | RetentionPurgeCompleted(_) => None,
         }
     }
 
@@ -606,7 +622,13 @@ impl DomainEvent {
             // and statistical, never "which address did something" (there is a
             // property test in `ml-features` for exactly this), so a drift
             // reading over them cannot name an address either.
-            | ModelDriftDetected(_) => Vec::new(),
+            | ModelDriftDetected(_)
+            // §18 governance facts are statements about a store's own
+            // lifecycle. A purge names counts, not the parties whose records it
+            // destroyed — putting those addresses on the *record of their
+            // destruction* would defeat the destruction.
+            | RetentionPolicyChanged(_)
+            | RetentionPurgeCompleted(_) => Vec::new(),
         }
     }
 }

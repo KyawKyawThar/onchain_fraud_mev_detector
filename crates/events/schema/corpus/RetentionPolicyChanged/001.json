@@ -1,0 +1,17 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "applied_at": "2023-11-14T22:13:20Z",
+      "applied_by": "boot",
+      "current_days": 2557,
+      "destructive": false,
+      "previous_days": 2192,
+      "store": "event_store_events"
+    },
+    "type": "RetentionPolicyChanged"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,18 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "artifact_days": 1827,
+      "completed_at": "2023-11-14T22:13:20Z",
+      "cutoff": "2023-11-14T22:13:20Z",
+      "destroyed": 412,
+      "held_back": 3,
+      "store": "copilot_drafts",
+      "truncated": false
+    },
+    "type": "RetentionPurgeCompleted"
+  },
+  "schema_version": 1
+}

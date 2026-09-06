@@ -335,15 +335,40 @@ groups:
           description: "`copilot audit` re-resolved landed narratives against event-store and found at least one that does not hold: `unresolved` = it cites events the store does not have, `drifted` = the row's grounded_event_ids disagrees with the prose a reviewer reads, `unchecked` = a ready/approved draft the citation boundary never ran on. Any of the three means a document that reads as verifiable is not. Run `just copilot-audit` for the draft ids — the sweep names them, the metric deliberately cannot. NOTE: these series exist only where the sweep runs somewhere Prometheus scrapes; the copilot-audit CronJob is short-lived, so in Kubernetes the primary signal is the Job itself failing (kube_job_status_failed{job_name=~\"copilot-audit.*\"}) — this rule is the backstop for a scraped or in-process run."
 
       - alert: CopilotGroundingAuditUnverifiable
-        expr: |
-          sum(increase(copilot_grounding_audit_drafts_total{verdict="unverifiable"}[1d]))
-            / clamp_min(sum(increase(copilot_grounding_audit_drafts_total[1d])), 1e-9) > 0.25
+        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict="evidence_missing"}[1d])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A retained SAR narrative's evidence is gone from the event store"
+          description: "THE RETENTION POLICY HAS BEEN VIOLATED (engineering conventions §18). The audit found a stored narrative whose cited evidence event-store no longer holds, while the narrative itself is still inside its retention window — i.e. the platform is holding a regulatory artifact it can no longer substantiate, and is required to. This is NOT the same as `verdict=\"expired\"`, which is the same observation about an artifact past its deadline and is retention working. Two causes, both actionable: the events table's TTL is shorter than the policy (`event-store retention` prints the store's window next to the policy's — compare with the `event_store_evidence_retention_days` gauge), or evidence was deleted out of band. Run `just copilot-audit` for the draft ids; the metric deliberately cannot name them. Before this alert had a policy to point at it fired on a *share* of unverifiable drafts and could only say the situation might be deliberate; it now fires on one draft, and it is never deliberate."
+
+      - alert: CopilotNarrativesWillOutliveTheirEvidence
+        expr: sum(increase(copilot_grounding_audit_at_risk_total[1d])) > 0
         for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Narratives are being kept longer than the evidence under them"
+          description: "The leading indicator for CopilotGroundingAuditUnverifiable, and the one with time left on the clock. These drafts resolve perfectly today, but the oldest event each one cites expires BEFORE the draft may be destroyed — so they are already scheduled to become undefendable. Overwhelmingly this means a backfill drafted over an archive older than RETENTION_EVIDENCE_MARGIN_DAYS. The fix is that same variable: raising it lengthens the events table's TTL (event-store reconciles it upward at boot), which is what makes the older archive defendable — it is deliberately one knob, so evidence cannot be under-kept by unlocking an older backfill. `just copilot-audit` prints each draft with `outlives-its-evidence-by=Nd`, which is the number of days to add."
+
+      - alert: CopilotRetentionPurgeStalled
+        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict="expired"}[1d])) > 100
+        for: 6h
         labels:
           severity: informational
         annotations:
-          summary: "A quarter of audited narratives can no longer be verified"
-          description: "The audit could not read a subject's stream for a large share of the drafts it examined — event-store retention has overtaken the narratives that cite it, or the store was unreachable during the sweep. This is an archive-policy signal, not a hallucination one: the drafts are not wrong, they are simply no longer checkable. If retention is the cause, that is a decision to make deliberately — a SAR narrative whose evidence has expired is a document nobody can defend."
+          summary: "Artifacts past their retention deadline are still in the draft store"
+          description: "`verdict=\"expired\"` means the audit found a narrative the retention policy has released — the purge was entitled to destroy it and has not. A handful is normal (the purge runs weekly, the audit runs weekly, and they do not run at the same instant). A sustained pile-up means the copilot-retention CronJob is failing or is running without `--apply` (it is a plan by default, on purpose — and the plan reports the full backlog, so a big number there is the honest one), or that a legal hold is preserving them — `copilot retention` prints the held count on every run. Over-retention is a milder failure than under-retention, which is why this is informational, but it is still a policy nobody is keeping."
+
+      - alert: EventStoreRetentionUnreconciled
+        expr: absent(event_store_evidence_retention_days) or changes(event_store_evidence_retention_days[1d]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The event store's evidence retention window is unset or just moved"
+          description: "`event_store_evidence_retention_days` is the window this deployment BELIEVES it enforces, published at boot from the resolved policy. Absent means no event-store pod has reconciled its TTL — the service refuses to start when it finds a window it cannot safely apply (a narrowing, a first bound over an existing archive, or a TTL clause it could not parse), so an absent series alongside a CrashLoopBackOff is that refusal, and the pod log names the plan. A CHANGE means the window moved: correlate with the `RetentionPolicyChanged` fact in the event store, which carries `destructive` — the bit that separates 'we lengthened retention' from 'we deleted history'. Run `just retention-status` for the store's own answer; the gauge is what the pod thinks, `system.tables` is what is true."
 
       - alert: CopilotTokenBudgetAlarm
         expr: max(usage_token_budget_customers{level="alarm"}) > 0

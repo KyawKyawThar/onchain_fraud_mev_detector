@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use ::retention::{DestructiveIntent, Disposition};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use events::primitives::{AlertKind, Chain, IncidentId, Severity, SuggestedAction};
@@ -29,8 +30,8 @@ use crate::model::{
 };
 use crate::store::{
     batch_failure, DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftOutbox,
-    DraftOutcome, DraftQueue, DraftReview, DraftWorkQueue, Enqueued, PendingAnnouncement,
-    StoreError, MAX_LIST_LIMIT,
+    DraftOutcome, DraftQueue, DraftRetention, DraftReview, DraftWorkQueue, Enqueued, ExpiredDraft,
+    LegalHold, PendingAnnouncement, RetentionScan, StoreError, MAX_LIST_LIMIT,
 };
 use llm::batch::{BatchId, BatchItemOutcome};
 
@@ -169,6 +170,11 @@ struct Row {
     lease_expires_at: Option<DateTime<Utc>>,
     request_digest: Option<ContentDigest>,
     model_digest: Option<ContentDigest>,
+    /// `copilot_drafts.legal_hold_*` — the one condition under which the
+    /// retention purge leaves a past-deadline artifact alone. A value, not a
+    /// flag: a hold overrides a statutory destruction schedule, so "which
+    /// matter, since when, on whose say-so" travels with it.
+    legal_hold: Option<LegalHold>,
 }
 
 impl Row {
@@ -369,6 +375,7 @@ impl DraftQueue for InMemoryDraftStore {
                 lease_expires_at: None,
                 request_digest: None,
                 model_digest: None,
+                legal_hold: None,
             },
         );
         Ok(Enqueued::Queued(job.draft_id))
@@ -828,6 +835,104 @@ impl DraftBatchQueue for InMemoryDraftStore {
         })?;
         self.file_announcement(announcement, draft_id);
         Ok(landed)
+    }
+}
+
+#[async_trait]
+impl DraftRetention for InMemoryDraftStore {
+    async fn scan(
+        &self,
+        cutoff: Disposition,
+        sample_size: i64,
+    ) -> Result<RetentionScan, StoreError> {
+        self.guard()?;
+        // The counts come from the same predicate the delete uses — the double
+        // has to reproduce "the preview and the apply agree", which is the
+        // property the Postgres pair exists to guarantee.
+        let (due, held) = {
+            let rows = self.rows.lock().unwrap();
+            rows.values()
+                .filter(|row| crate::retention::anchor(&row.draft) <= cutoff)
+                .fold((0, 0), |(due, held), row| match row.legal_hold {
+                    None => (due + 1, held),
+                    Some(_) => (due, held + 1),
+                })
+        };
+        Ok(RetentionScan {
+            due,
+            held,
+            sample: self.expired(cutoff, sample_size).await?,
+        })
+    }
+
+    async fn expired(
+        &self,
+        cutoff: Disposition,
+        limit: i64,
+    ) -> Result<Vec<ExpiredDraft>, StoreError> {
+        self.guard()?;
+        let mut due: Vec<ExpiredDraft> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.legal_hold.is_none())
+            // The anchor, as the SQL's COALESCE — and via the same function the
+            // purge and the audit use, so the double cannot answer a different
+            // question than Postgres does.
+            .filter(|row| crate::retention::anchor(&row.draft) <= cutoff)
+            .map(|row| ExpiredDraft {
+                draft_id: row.draft.draft_id,
+                kind: row.draft.kind,
+                subject_id: row.draft.subject_id,
+                status: row.draft.status,
+                anchored_at: crate::retention::anchor(&row.draft),
+            })
+            .collect();
+        // Oldest first, exactly as the store's `ORDER BY`.
+        due.sort_by(|a, b| {
+            a.anchored_at
+                .cmp(&b.anchored_at)
+                .then(a.draft_id.0.cmp(&b.draft_id.0))
+        });
+        due.truncate(limit.clamp(1, MAX_LIST_LIMIT) as usize);
+        Ok(due)
+    }
+
+    async fn purge(
+        &self,
+        draft_ids: &[DraftId],
+        _intent: DestructiveIntent,
+    ) -> Result<u64, StoreError> {
+        self.guard()?;
+        let mut rows = self.rows.lock().unwrap();
+        let mut purged = 0;
+        for draft_id in draft_ids {
+            // The hold is re-checked here too: the double must reproduce the
+            // race the SQL closes, or a test could never catch losing it.
+            if rows
+                .get(&draft_id.0)
+                .is_some_and(|row| row.legal_hold.is_none())
+            {
+                rows.remove(&draft_id.0);
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+
+    async fn set_legal_hold(
+        &self,
+        draft_id: DraftId,
+        hold: Option<LegalHold>,
+    ) -> Result<Option<LegalHold>, StoreError> {
+        self.guard()?;
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .get_mut(&draft_id.0)
+            .ok_or(StoreError::NotFound { draft_id })?;
+        row.legal_hold = hold;
+        Ok(row.legal_hold.clone())
     }
 }
 

@@ -167,6 +167,17 @@ const GOLDENS: &[(&str, &str)] = &[
         "ModelDriftDetected",
         r#"{"type":"ModelDriftDetected","payload":{"model_id":"anomaly-iforest","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"feature_version":1,"granularity":"block","baseline_hash":"9f2c","samples":512,"window_closed_by":"full","threshold":3.0,"max_magnitude":4.5,"drifted":[{"feature":"tx_count_log","magnitude":4.5,"shift":4.5,"spread":1.0}],"observed_at":"2023-11-14T22:13:20Z"}}"#,
     ),
+    // §18 governance facts. `previous_days` is present here on purpose: the
+    // golden locks the *nullable* form, so a later change that makes the field
+    // absent rather than null is a diff a reviewer sees.
+    (
+        "RetentionPolicyChanged",
+        r#"{"type":"RetentionPolicyChanged","payload":{"store":"event_store_events","previous_days":2192,"current_days":2557,"destructive":false,"applied_by":"boot","applied_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
+        "RetentionPurgeCompleted",
+        r#"{"type":"RetentionPurgeCompleted","payload":{"store":"copilot_drafts","cutoff":"2023-11-14T22:13:20Z","artifact_days":1827,"destroyed":412,"held_back":3,"truncated":false,"completed_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
     (
         "IncidentNarrativeDrafted",
         r#"{"type":"IncidentNarrativeDrafted","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","draft_id":"00000000-0000-0000-0000-0000000000d1","narrative_ref":"copilot://drafts/00000000-0000-0000-0000-0000000000d1","model_id":"claude-opus-5","prompt_id":"incident_narrative","prompt_version":"v2","prompt_digest":"3f9c","grounded_event_ids":["00000000-0000-0000-0000-0000000000e7"],"claims":6,"cited_claims":5,"source":"backfill","drafted_at":"2023-11-14T22:13:20Z"}}"#,

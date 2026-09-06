@@ -25,6 +25,11 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0002_business_key_columns.up.sql"),
         down: include_str!("../migrations/0002_business_key_columns.down.sql"),
     },
+    Migration {
+        version: "0003_events_retention",
+        up: include_str!("../migrations/0003_events_retention.up.sql"),
+        down: include_str!("../migrations/0003_events_retention.down.sql"),
+    },
 ];
 
 /// The event store's migrator: applied on service boot via

@@ -17,6 +17,11 @@ telemetry.workspace = true
 # Shared ClickHouse migration runner; this service binds it to its own
 # `schema_migrations` table (see src/migrate.rs).
 ch-migrate = { workspace = true }
+# The workspace's regulatory retention decision (engineering conventions §18).
+# This service is one of its two enforcement sites: the `events` table's TTL is
+# how the evidence half of the policy becomes true, and `src/retention.rs`
+# reconciles the live table against the policy at boot.
+retention = { workspace = true, features = ["env"] }
 # Shared Kafka-backbone seam (§20): the resilient at-least-once consume loop
 # (`run_consumer`/`EventHandler`), so the store's Kafka ingest doesn't re-implement
 # the subscribe/decode/trace/commit mechanics.

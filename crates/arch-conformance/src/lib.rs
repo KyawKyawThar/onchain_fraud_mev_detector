@@ -310,6 +310,25 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── One retention decision, not two (engineering conventions §18) ─
+        // How long a SAR narrative and the evidence it cites must live is a
+        // single compliance decision with two enforcement sites in two
+        // different stores: the copilot's Postgres purge and event-store's
+        // ClickHouse TTL. The failure mode is not that a service forgets to
+        // enforce it — it is that a service enforces a *number of its own*,
+        // and the two windows agree right up until somebody tunes one. So the
+        // `retention` crate is not optional for either of them: it owns the
+        // policy, its floor and the arithmetic, and there is no second copy to
+        // drift from. (A third reader, the grounding audit, lives inside
+        // `copilot` and is covered by the same edge.)
+        if matches!(krate.as_str(), "copilot" | "event-store") && !has("retention") {
+            out.push(format!(
+                "{krate}: enforces the regulatory retention policy and must depend on the \
+                 `retention` crate — a window computed locally is a second policy, and \
+                 two policies for one obligation is how a narrative outlives its evidence"
+            ));
+        }
+
         // ── The rebuild seam reads the log through its published API ─────
         // `rebuild` re-derives a read model from the event store. Its whole
         // correctness argument is that it replays through the *published*
@@ -546,6 +565,20 @@ mod tests {
                 &["ml-features", "detector-api", "ort", "metrics"],
             ),
             ("telemetry", &["metrics-exporter-prometheus"]),
+            // The evidence half of the one retention policy.
+            (
+                "event-store",
+                &[
+                    "events",
+                    "clickhouse",
+                    "ch-migrate",
+                    "event-bus",
+                    "retention",
+                ],
+            ),
+            // `telemetry` is optional (the `env` feature); `cargo metadata` still
+            // reports the edge, so the fixture keeps it.
+            ("retention", &["telemetry", "uuid"]),
             ("db", &["sqlx", "redis"]),
             ("ch-migrate", &["clickhouse"]),
             (
@@ -580,6 +613,8 @@ mod tests {
                 &[
                     "events",
                     "llm",
+                    // The one retention policy, shared with event-store.
+                    "retention",
                     // The §20.4 t4 parse boundary — allowed, and the reason
                     // the `copilot` rule's forbidden list deliberately omits
                     // it (see the rule's own comment).
@@ -649,6 +684,18 @@ mod tests {
                 "rebuild",
                 &["events", "clickhouse", "ch-migrate"],
                 "must not depend on clickhouse",
+            ),
+            (
+                // Both enforcement sites of one compliance decision. A local
+                // constant here is a second retention policy.
+                "event-store",
+                &["events", "clickhouse", "ch-migrate"],
+                "must depend on the `retention` crate",
+            ),
+            (
+                "copilot",
+                &["events", "llm", "db", "sqlx"],
+                "must depend on the `retention` crate",
             ),
             ("ml-features", &["events"], "no detector-api dependency"),
             (

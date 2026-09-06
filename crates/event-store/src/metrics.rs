@@ -20,6 +20,22 @@ pub const ROWS_APPENDED_TOTAL: &str = "event_store_rows_appended_total";
 /// [`event_bus::Transience`].
 pub const APPEND_ERRORS_TOTAL: &str = "event_store_append_errors_total";
 
+/// Gauge, days: the regulatory evidence window this deployment is enforcing on
+/// the `events` table (engineering conventions §18).
+///
+/// A gauge and not a log line because the question it answers is comparative:
+/// the copilot's audit reports narratives whose evidence is gone, and the first
+/// thing to check is whether this number moved. Set once, at boot, from the
+/// resolved policy — including on the path where reconciliation *refuses*, so
+/// what the deployment believes is always visible next to what the store does.
+pub const EVIDENCE_RETENTION_DAYS: &str = "event_store_evidence_retention_days";
+
+/// Publish the configured evidence window. One call site, in the binary's
+/// retention reconciliation.
+pub fn set_evidence_retention_days(days: u32) {
+    metrics::gauge!(EVIDENCE_RETENTION_DAYS).set(f64::from(days));
+}
+
 /// Record a successful append of `rows` envelopes, including its latency.
 pub fn record_append_success(elapsed: Duration, rows: usize) {
     metrics::histogram!(APPEND_DURATION_SECONDS).record(elapsed.as_secs_f64());

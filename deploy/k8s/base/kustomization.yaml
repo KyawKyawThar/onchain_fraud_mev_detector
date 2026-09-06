@@ -35,6 +35,7 @@ resources:
   - services/predictive.yaml
   - services/copilot.yaml
   - services/copilot-audit.yaml
+  - services/copilot-retention.yaml
   - services/backup.yaml
 
 # Dashboards/datasources feed both the compose Grafana and this in-cluster one

@@ -46,8 +46,8 @@ use crate::simulation::{
     SimulationRequested, WalletExposureReportReady,
 };
 use crate::system::{
-    DriftedFeature, ModelDriftDetected, ScreeningDecision, ScreeningDecisionBasis,
-    ScreeningDecisionRecorded, UsageRecorded,
+    DriftedFeature, ModelDriftDetected, RetentionPolicyChanged, RetentionPurgeCompleted,
+    ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
 };
 use crate::{DomainEvent, EventEnvelope};
 use alloy_primitives::{Address, B256};
@@ -344,6 +344,26 @@ pub fn sample_events() -> Vec<DomainEvent> {
                 spread: 1.0,
             }],
             observed_at: ts(),
+        }),
+        // §18 governance facts. `previous_days: Some(..)` on purpose: the probe
+        // reads optionality off the real codec, and a `None` here would record
+        // the field as absent rather than as nullable.
+        DomainEvent::RetentionPolicyChanged(RetentionPolicyChanged {
+            store: "event_store_events".into(),
+            previous_days: Some(2192),
+            current_days: 2557,
+            destructive: false,
+            applied_by: "boot".into(),
+            applied_at: ts(),
+        }),
+        DomainEvent::RetentionPurgeCompleted(RetentionPurgeCompleted {
+            store: "copilot_drafts".into(),
+            cutoff: ts(),
+            artifact_days: 1827,
+            destroyed: 412,
+            held_back: 3,
+            truncated: false,
+            completed_at: ts(),
         }),
         DomainEvent::ScreeningDecisionRecorded(ScreeningDecisionRecorded {
             customer_id: customer_id(),

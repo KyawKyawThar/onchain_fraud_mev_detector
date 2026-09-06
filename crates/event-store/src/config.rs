@@ -27,6 +27,30 @@ pub struct Config {
     /// Address the Prometheus `/metrics` endpoint binds to (§19 — append
     /// latency/throughput/errors). Defaults to `0.0.0.0:9102`.
     pub metrics_addr: SocketAddr,
+    /// How long an event must live (engineering conventions §18).
+    ///
+    /// Resolved from the shared `RETENTION_*` variables rather than a
+    /// service-prefixed pair, because the copilot resolves the *same* policy
+    /// from the *same* names: a deployment that could set them differently per
+    /// service would have split one decision into two, which is the failure
+    /// this policy exists to prevent. Enforced on the `events` table's TTL at
+    /// boot ([`crate::retention`]).
+    ///
+    /// A **set** and not a single policy: ClickHouse's TTL is a property of the
+    /// table, so with more than one artifact policy in play the only legal
+    /// window for `events` is the widest of them
+    /// ([`retention::PolicySet::widest_evidence_days`]). One policy today; the
+    /// type is what stops that from being an assumption baked into the call
+    /// site the day a second jurisdiction arrives.
+    pub retention: ::retention::PolicySet,
+    /// Chain stamped on the §18 governance facts this service publishes
+    /// (`RetentionPolicyChanged`).
+    ///
+    /// A **partition key, not a routing key**: the event store is chain-
+    /// agnostic and holds every chain's events, but an envelope needs a key and
+    /// a platform-wide fact has no natural one. Same stance as the copilot's
+    /// `COPILOT_CHAIN`. Read from the deployment-wide `CHAIN_ID`.
+    pub chain: events::primitives::Chain,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base
@@ -87,6 +111,11 @@ impl Config {
                 "EVENT_STORE_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9102)),
             )?,
+            retention: ::retention::PolicySet::uniform(::retention::Policy::from_env()?),
+            chain: events::primitives::Chain(env_parse(
+                "CHAIN_ID",
+                events::primitives::Chain::ETHEREUM.0,
+            )?),
         })
     }
 }

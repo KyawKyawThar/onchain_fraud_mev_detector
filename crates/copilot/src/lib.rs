@@ -107,6 +107,18 @@
 //! the record? It is a job (`copilot audit`), not a monitor, and it reports
 //! through an exit code because a short-lived process is not reliably scraped.
 //!
+//! # Retention (engineering conventions §18)
+//!
+//! The sweep above is what surfaced this: its `unverifiable` verdict fired
+//! exactly when the event store's retention outlived the narratives citing it,
+//! and could say nothing about whether that was allowed, because nothing had
+//! decided. [`retention`] is this service's half of the decision — the purge
+//! that destroys artifacts the policy has released, the disposition anchor the
+//! audit shares with it, and the backfill guard that refuses to draft over
+//! evidence which will expire first. The other half is the `events` table's TTL
+//! in event-store; both read one `retention::Policy` from one pair of
+//! environment variables.
+//!
 //! Per-customer token budget alarms are the cost half of the same task, and
 //! they live in the `usage` service rather than here: spend is a question about
 //! the `UsageRecorded` stream every metering path already publishes to (§13),
@@ -131,6 +143,9 @@ pub mod metrics;
 pub mod model;
 pub mod outbox;
 pub mod prompts;
+// The regulatory retention policy's artifact half (engineering conventions
+// §18): when a SAR draft may be destroyed, and the purge that does it.
+pub mod retention;
 pub mod rule_draft;
 pub mod store;
 pub mod worker;
@@ -138,19 +153,22 @@ pub mod worker;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+pub use self::retention::{PurgeOutcome, PurgePlan, PurgeReport};
 pub use backfill::{BackfillConfig, BackfillReport, BackfillRunner};
 pub use capability::{CheckRegistry, DraftCapability, Grounding, Landing, RegistryError};
 pub use config::Config;
 pub use consumer::CopilotConsumer;
 pub use grounding::{GroundingPolicy, GroundingSummary};
-pub use grounding_audit::{AuditConfig, AuditReport, GroundingAuditor, Outcome};
+pub use grounding_audit::{
+    AuditConfig, AuditLimits, AuditReport, AuditScope, GroundingAuditor, Outcome,
+};
 pub use model::{
     Draft, DraftAnswer, DraftId, DraftJob, DraftKind, DraftSource, DraftStatus, Provenance, Review,
     Reviewed,
 };
 pub use rule_draft::{compile_check, describe, CompiledDraft, RuleDraftError, RuleDrafter};
 pub use store::{
-    DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftQueue, DraftReview, DraftStore,
-    DraftWorkQueue, PgDraftStore,
+    DraftAttempt, DraftBatchQueue, DraftCache, DraftFilter, DraftQueue, DraftRetention,
+    DraftReview, DraftStore, DraftWorkQueue, ExpiredDraft, PgDraftStore,
 };
 pub use worker::{DraftWorkerPool, GeneratorRegistry, PoolConfig};

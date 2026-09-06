@@ -55,6 +55,13 @@ api-error = { path = "crates/api-error" }
 # how that is proven on every build, and is the recovery procedure for a
 # corrupted read model (see docs/runbooks/projection-rebuild.md).
 rebuild = { path = "crates/rebuild" }
+# The regulatory retention decision (engineering conventions §18): how long a SAR narrative and the
+# evidence it cites must both live. One validated `Policy` value, depended on by
+# BOTH stores that enforce it — event-store (the ClickHouse `events` TTL) and
+# copilot (the `copilot_drafts` purge and the grounding audit's expiry
+# judgement) — because a retention window that lives in two places is a window
+# that is already wrong in one of them.
+retention = { path = "crates/retention" }
 # Shared JWT bearer verification (§11) — one issuer and one claim set for every
 # service that authenticates a caller (see crates/auth/src/lib.rs).
 auth = { path = "crates/auth" }
