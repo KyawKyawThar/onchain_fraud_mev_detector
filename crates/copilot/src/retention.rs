@@ -208,8 +208,9 @@ impl std::fmt::Display for PurgePlan {
         if self.budget_bound() {
             write!(
                 f,
-                "\n  ! this run would destroy {} of them ({}); re-run to continue",
-                self.budget, "--limit bounds one invocation"
+                "\n  ! this run would destroy {} of them (--limit bounds one invocation); \
+                 re-run to continue",
+                self.budget
             )?;
         }
         for draft in &self.sample {
