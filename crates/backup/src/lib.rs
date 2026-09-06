@@ -97,7 +97,12 @@
 //! ## Usage
 //!
 //! ```no_run
-//! # async fn example() -> backup::Result<()> {
+//! // `anyhow` at the boundary, deliberately: `Config` resolves the environment
+//! // and returns `anyhow::Result` (the workspace's config discipline), while
+//! // the operations return the typed [`BackupError`] so a caller can act on
+//! // transient-vs-permanent. A binary absorbs both; only the scheduled agent
+//! // needs to branch on the classification.
+//! # async fn example() -> anyhow::Result<()> {
 //! use backup::{artifact::ArtifactStore, config::Config, drill, snapshot};
 //!
 //! let config = Config::from_env()?;
