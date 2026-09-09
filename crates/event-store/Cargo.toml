@@ -74,3 +74,8 @@ alloy-primitives.workspace = true
 # Scoped in-memory metrics recorder for the store metrics tests (same pattern
 # as detection/ingestion/simulation's metrics tests).
 metrics-util.workspace = true
+# The retention floor, so the integration suite can assert its own fixtures are
+# still inside the window the `events` TTL enforces (a fixture older than the
+# floor is deleted by ClickHouse mid-test). Already a normal dependency, but an
+# integration test is its own crate and does not inherit one.
+retention.workspace = true

@@ -73,6 +73,32 @@ fn sample_events() -> Vec<EventEnvelope> {
     ]
 }
 
+/// Every fixture this suite appends must still sit inside the store's retention
+/// window. Since migration `0003_events_retention` the `events` table deletes
+/// rows older than the policy floor, and it does so *in the background while a
+/// test runs* — so a stale fixture does not fail as "bad timestamp", it fails as
+/// rows vanishing from a query result, at a different assertion on every run.
+///
+/// This check needs no Docker, so it fails in the fast gate with an explanation
+/// instead of leaving the `#[ignore]`d suite to fail mysteriously. It matters
+/// because [`sample_events`] is anchored to a hard-coded 2023 date, which will
+/// drift out of the window on its own — the point is to be told when.
+#[test]
+fn every_fixture_is_inside_the_retention_window() {
+    let floor_days =
+        i64::from(retention::STATUTORY_ARTIFACT_DAYS + retention::EVIDENCE_MARGIN_DAYS);
+    let cutoff = Utc::now() - chrono::TimeDelta::days(floor_days);
+    for event in sample_events() {
+        assert!(
+            event.occurred_at > cutoff,
+            "fixture {} is dated {}, older than the {floor_days}-day retention floor: \
+             ClickHouse will delete it mid-test. Re-anchor the fixture clock.",
+            event.event_id,
+            event.occurred_at,
+        );
+    }
+}
+
 /// Connect an [`EventStore`] to a testcontainer ClickHouse (default user, no
 /// password, `default` database).
 fn store_for(http_port: u16) -> EventStore {
@@ -167,7 +193,24 @@ async fn query_api_finds_events_by_incident_address_and_window() {
         .await
         .expect("migrate");
 
-    let at = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).unwrap();
+    // Fixture timestamps are offsets from a *recent* epoch, deliberately not
+    // from 1970. The events table now carries a retention TTL (migration
+    // `0003_events_retention`: occurred_at + 2192 days), so a bare
+    // `from_timestamp_millis(1_000)` dates these rows 1970-01-01 — expired by
+    // half a century. ClickHouse then deletes them in the background *while the
+    // test is running*, and because the table partitions by
+    // `(chain, event_type, toDate(occurred_at))` it drops them one event type
+    // at a time. The symptom is an arbitrary-looking subset of a query result
+    // going missing, at a *different assertion on each run* (the trail on a
+    // slow run, the replay window on a fast one) — which reads like a
+    // write-path bug rather than like retention.
+    //
+    // Anchored to `now` rather than to a fixed recent date so it cannot rot
+    // back out of the window: a hard-coded 2023 base would start failing this
+    // same way in 2029. Whole milliseconds because the `DateTime64(3)` column
+    // stores no more, and these values must survive the round trip.
+    let epoch = Utc::now().timestamp_millis();
+    let at = |ms: i64| DateTime::<Utc>::from_timestamp_millis(epoch + ms).unwrap();
     let incident = IncidentId(Uuid::from_u128(0x5151));
     let address = AccountAddress::repeat_byte(0x42);
 
