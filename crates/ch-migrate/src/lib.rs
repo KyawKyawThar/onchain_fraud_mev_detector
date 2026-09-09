@@ -188,10 +188,18 @@ impl Migrator {
         Ok(())
     }
 
-    /// Reject a malformed migration set before any DDL runs: a literal `?`
-    /// anywhere in a file (the clickhouse client would bind it), or versions
-    /// not strictly ascending (list order is apply order).
-    fn validate(&self) -> Result<()> {
+    /// Reject a malformed migration set before any DDL runs: a literal bind
+    /// placeholder anywhere in a file (the clickhouse client would bind it), or
+    /// versions not strictly ascending (list order is apply order).
+    ///
+    /// **Public so every migrator can be checked without a container.** This
+    /// runs inside [`Migrator::run`], which means a malformed set is otherwise
+    /// only discovered when something actually reaches a live ClickHouse — a
+    /// service boot, or a `#[ignore]`d integration test. Both are the wrong
+    /// place to find out: the set is a compile-time constant, so a plain unit
+    /// test calling this catches it on every `cargo test`. Each owning crate
+    /// has one.
+    pub fn validate(&self) -> Result<()> {
         for migration in self.migrations {
             for (sql, direction) in [(migration.up, "up"), (migration.down, "down")] {
                 if sql.contains('?') {

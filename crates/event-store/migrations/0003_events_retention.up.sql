@@ -21,7 +21,9 @@
 -- the artifact window rather than matching it.
 --
 -- One statement per migration file (the migrate.rs convention), and no literal
--- `?` anywhere (the ch-migrate runner rejects it — the clickhouse crate would
--- bind it as a parameter, comments included).
+-- question mark anywhere -- the ch-migrate runner rejects the character even
+-- inside a comment, because the clickhouse client would bind it as a parameter.
+-- (Spelled out rather than written, for exactly that reason: the first draft of
+-- this comment used the glyph and broke every migration run in the workspace.)
 ALTER TABLE events
     MODIFY TTL toDateTime(occurred_at) + toIntervalDay(2192) DELETE;

@@ -36,3 +36,26 @@ const MIGRATIONS: &[Migration] = &[
 /// [`run`](Migrator::run), or driven explicitly through the
 /// `event-store migrate up|down|info` subcommand ([`cli`](Migrator::cli)).
 pub const MIGRATOR: Migrator = Migrator::new("event store", "schema_migrations", MIGRATIONS);
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATOR;
+
+    /// The migration set is a compile-time constant, so its well-formedness is
+    /// a compile-time property — but `Migrator::run` only checks it against a
+    /// live ClickHouse, which in practice means a service boot or a `#[ignore]`d
+    /// integration test. Neither runs on an ordinary `cargo test`, so a
+    /// malformed file sits green in every fast gate and takes down event store the
+    /// first time anything touches a real database.
+    ///
+    /// That is not hypothetical: a comment in `0003_events_retention.up.sql`
+    /// that *warned about* the literal-bind-placeholder rule contained the
+    /// character it warned about, and broke every ClickHouse-backed test in the
+    /// workspace — discovered only in CI's Docker-gated job.
+    #[test]
+    fn the_migration_set_is_well_formed() {
+        MIGRATOR
+            .validate()
+            .expect("migration set must be valid without a container");
+    }
+}
