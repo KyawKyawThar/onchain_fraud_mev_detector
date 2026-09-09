@@ -52,6 +52,13 @@ pub struct Migrator {
     migrations: &'static [Migration],
 }
 
+/// Merge-conflict markers, checked against every migration's SQL.
+///
+/// Matched at the start of a line only — `=======` is a plausible thing to
+/// write inside a comment rule, and a guard that fires on it would be one
+/// people route around.
+const CONFLICT_MARKERS: &[&str] = &["<<<<<<<", ">>>>>>>"];
+
 impl Migrator {
     pub const fn new(
         display_name: &'static str,
@@ -188,10 +195,18 @@ impl Migrator {
         Ok(())
     }
 
-    /// Reject a malformed migration set before any DDL runs: a literal `?`
-    /// anywhere in a file (the clickhouse client would bind it), or versions
-    /// not strictly ascending (list order is apply order).
-    fn validate(&self) -> Result<()> {
+    /// Reject a malformed migration set before any DDL runs: a literal bind
+    /// placeholder anywhere in a file (the clickhouse client would bind it), or
+    /// versions not strictly ascending (list order is apply order).
+    ///
+    /// **Public so every migrator can be checked without a container.** This
+    /// runs inside [`Migrator::run`], which means a malformed set is otherwise
+    /// only discovered when something actually reaches a live ClickHouse — a
+    /// service boot, or a `#[ignore]`d integration test. Both are the wrong
+    /// place to find out: the set is a compile-time constant, so a plain unit
+    /// test calling this catches it on every `cargo test`. Each owning crate
+    /// has one.
+    pub fn validate(&self) -> Result<()> {
         for migration in self.migrations {
             for (sql, direction) in [(migration.up, "up"), (migration.down, "down")] {
                 if sql.contains('?') {
@@ -199,6 +214,25 @@ impl Migrator {
                         "migration {}.{direction}.sql contains a literal '?' (even in a \
                          comment): the clickhouse client parses every '?' as a bind \
                          placeholder — reword it",
+                        migration.version
+                    );
+                }
+                // An unresolved merge conflict is valid UTF-8, contains no bind
+                // placeholder, and is `include_str!`'d into a `const` — so it
+                // compiles, passes every other check here, and is first refused
+                // by ClickHouse itself at boot. That is precisely the discovery
+                // point this function exists to move earlier: a conflict landed
+                // in `0003_events_retention.up.sql` and the failure surfaced as
+                // a crashlooping event-store rather than a red unit test.
+                if let Some(marker) = CONFLICT_MARKERS
+                    .iter()
+                    .find(|marker| sql.contains(*marker))
+                {
+                    bail!(
+                        "migration {}.{direction}.sql contains an unresolved merge \
+                         conflict ({marker}) — resolve it; a migration set is a \
+                         compile-time constant, so this would otherwise reach a live \
+                         ClickHouse before anything noticed",
                         migration.version
                     );
                 }
@@ -268,6 +302,39 @@ mod tests {
         Migrator::new("test", "t_migrations", OK)
             .validate()
             .expect("valid set");
+    }
+
+    /// The regression: this exact shape compiled, validated, and only failed
+    /// against a live ClickHouse.
+    #[test]
+    fn an_unresolved_merge_conflict_is_rejected_before_it_reaches_clickhouse() {
+        const CONFLICTED: &[Migration] = &[Migration {
+            version: "0001_a",
+            up: "-- a comment\n<<<<<<< HEAD\n-- one wording\n=======\n-- another\n>>>>>>> main\nCREATE TABLE a (x UInt8) ENGINE = MergeTree ORDER BY x",
+            down: "DROP TABLE a",
+        }];
+
+        let err = Migrator::new("test", "t", CONFLICTED)
+            .validate()
+            .expect_err("conflict markers are not SQL")
+            .to_string();
+        assert!(err.contains("merge conflict"), "got: {err}");
+        assert!(err.contains("0001_a"), "the error must name the file: {err}");
+    }
+
+    /// …and the guard must not fire on a migration that merely *discusses*
+    /// them, or the next person to document this rule cannot.
+    #[test]
+    fn a_migration_that_only_mentions_conflicts_still_validates() {
+        const TALKS_ABOUT_IT: &[Migration] = &[Migration {
+            version: "0001_a",
+            up: "-- resolve merge conflicts before committing a migration\nCREATE TABLE a (x UInt8) ENGINE = MergeTree ORDER BY x",
+            down: "DROP TABLE a",
+        }];
+
+        Migrator::new("test", "t", TALKS_ABOUT_IT)
+            .validate()
+            .expect("prose about conflicts is not a conflict");
     }
 
     #[test]

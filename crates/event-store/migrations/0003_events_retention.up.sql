@@ -21,9 +21,10 @@
 -- the artifact window rather than matching it.
 --
 -- One statement per migration file (the migrate.rs convention), and no literal
--- question mark anywhere (the ch-migrate runner rejects it — the clickhouse
--- crate would bind it as a parameter, comments included). This comment cannot
--- name the character it is warning about: doing so is what made the guard
--- reject this very file, and event-store then failed to boot.
+-- question mark anywhere: the ch-migrate runner rejects the character even
+-- inside a comment, because the clickhouse client binds every one of them as a
+-- parameter. Spelled out rather than written, for exactly that reason — the
+-- first draft of this comment used the glyph, which broke every migration run
+-- in the workspace and left event-store unable to boot.
 ALTER TABLE events
     MODIFY TTL toDateTime(occurred_at) + toIntervalDay(2192) DELETE;
