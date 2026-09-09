@@ -329,6 +329,45 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             ));
         }
 
+        // ── The load harness measures from outside, like a customer ─────
+        // `loadtest` offers load and reads a verdict. Its whole claim is that
+        // the path it drove is the path production takes, which holds only
+        // while it enters through the same doors anything else does: Kafka for
+        // blocks, HTTP for the API, and a `/metrics` scrape for the answer.
+        //
+        // A store edge is the failure that matters, and it is a tempting one:
+        // "did the alert land?" is far easier to answer with a ClickHouse
+        // query than by scraping a histogram, and a harness that learned to do
+        // that would be measuring a path with no consumer, no serialization
+        // and no broker in it — reporting a latency the platform never
+        // delivers. A service edge (`intelligence`, `server`, `event-store`)
+        // would be worse still: an in-process call is not a load test of a
+        // network service, and the moment the subject is a library call the
+        // number stops being about the deployment. The one service crate it
+        // may depend on is `detection`, and only for the *names* of the series
+        // it scrapes, so a rename breaks the build instead of silently
+        // scraping nothing and passing on an empty histogram.
+        if krate == "loadtest" {
+            for forbidden in [
+                "sqlx",
+                "redis",
+                "clickhouse",
+                "db",
+                "lapin",
+                "intelligence",
+                "event-store",
+                "server",
+                "simulation",
+                "rule-engine",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — a load test enters                          through the same doors as a customer (Kafka, HTTP, a metrics                          scrape). A store or service edge measures a path production                          does not take, and reports a latency it never delivers"
+                    ));
+                }
+            }
+        }
+
         // ── The rebuild seam reads the log through its published API ─────
         // `rebuild` re-derives a read model from the event store. Its whole
         // correctness argument is that it replays through the *published*
@@ -365,13 +404,24 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
-        // ── Only backtest composes the detection service crate ───────────
+        // ── Only detection's own harnesses compose the service crate ────
         // Everything else that wants detector vocabulary takes detector-api;
         // depending on `detection` couples a crate to the whole service.
-        if has("detection") && krate != "backtest" {
+        //
+        // The two exceptions are the harnesses whose *subject* is detection,
+        // which is a different relationship from coupling to it: `backtest`
+        // replays fixtures through the pure detection core, and `loadtest`
+        // drives the service and reads its metric names from the module that
+        // defines them — so renaming a series breaks the build instead of
+        // leaving the gate scraping a name that no longer exists and passing on
+        // an empty histogram. Neither is a shipped service, and `loadtest` is
+        // separately forbidden every store and every *other* service edge (see
+        // its own rule above).
+        if has("detection") && !matches!(krate.as_str(), "backtest" | "loadtest") {
             out.push(format!(
                 "{krate}: depends on the `detection` service crate — depend on \
-                 `detector-api` instead (only `backtest` replays through detection)"
+                 `detector-api` instead (only detection's own harnesses, `backtest` \
+                 and `loadtest`, compose the service)"
             ));
         }
 
@@ -640,6 +690,21 @@ mod tests {
                 "backup",
                 &["sqlx", "db", "reqwest", "telemetry", "metrics", "clap"],
             ),
+            // The load harness: the producer seam, an HTTP client, `detection`
+            // for the *names* of the series it scrapes, and `demo-detector` for
+            // the firing schedule its generated block numbers must satisfy —
+            // no store, no other service.
+            (
+                "loadtest",
+                &[
+                    "event-bus",
+                    "events",
+                    "detection",
+                    "demo-detector",
+                    "reqwest",
+                    "telemetry",
+                ],
+            ),
         ]);
         assert_eq!(violations(&g), Vec::<String>::new());
     }
@@ -657,6 +722,16 @@ mod tests {
                 "evil-detector",
                 &["detector-api", "intelligence"],
                 "must not depend on intelligence",
+            ),
+            (
+                "loadtest",
+                &["event-bus", "clickhouse"],
+                "must not depend on clickhouse",
+            ),
+            (
+                "loadtest",
+                &["event-bus", "server"],
+                "must not depend on server",
             ),
             (
                 "evil-detector",

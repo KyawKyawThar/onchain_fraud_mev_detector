@@ -1,0 +1,76 @@
+[package]
+name = "loadtest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Load-test harness (readiness Epic D) — drive the platform at a target
+# throughput and decide whether the §6 fast path still holds its < 1s p99.
+#
+# The claim this crate exists to test is the platform's headline latency number,
+# and until now it had only ever been reasoned about, never measured against a
+# saturated pipeline. A detector's own `detect` call is microseconds and stays
+# microseconds no matter how deep the queue in front of it gets — so every
+# existing latency signal in the workspace reports health exactly when the
+# claim is most likely to be false. This harness offers load and then reads
+# `detection_fast_path_duration_seconds`, the one series that spans the queue.
+#
+# It talks to a *running* stack (Kafka + detection + the API), not to an
+# in-process fake: a load test whose subject is a library call has measured a
+# library call. Everything it needs is an endpoint, so the same binary runs
+# against docker-compose locally and against staging in CI.
+
+[[bin]]
+name = "loadtest"
+path = "src/main.rs"
+
+[dependencies]
+# The block generator publishes through the same producer seam every real
+# producer uses (§20) — a hand-rolled rdkafka producer here would be a second
+# publish policy, and the load it offers would not be the load production
+# takes.
+event-bus = { workspace = true }
+events = { workspace = true }
+# The SLO gate reads detection's own metric *names* from the crate that defines
+# them, so a rename breaks the build rather than silently making the gate scrape
+# a series that no longer exists and pass on zero samples — the failure mode
+# that would otherwise look exactly like a clean pass.
+#
+# There is deliberately no `server` dependency: the API side of the test is
+# measured *client-side* (see `api`), which is the number a customer
+# experiences and the one that includes connection queueing the server's own
+# middleware never sees.
+detection = { workspace = true }
+
+anyhow = { workspace = true }
+# The `LoadSource`/`SubjectMetrics` seams are object-safe async traits (§2), so
+# the orchestrator can be driven against in-memory doubles instead of a broker.
+async-trait = { workspace = true }
+# The demo detector's firing schedule is a *shared* rule, not one this crate
+# reimplements: `demo_detector::fires_on` decides which generated block numbers
+# alert, so changing that schedule cannot silently desync the generator.
+demo-detector = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+alloy-primitives = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+telemetry = { workspace = true }
+futures-util = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` — the drain polls on a 1s timer, and a
+# test of "does a pipeline that never settles time out" must not actually take
+# the timeout. Auto-advancing time makes the procedure tests instant, which is
+# what keeps them run rather than skipped.
+tokio = { workspace = true, features = ["test-util"] }

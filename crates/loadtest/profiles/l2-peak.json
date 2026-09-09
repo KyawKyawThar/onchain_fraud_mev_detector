@@ -1,0 +1,34 @@
+{
+  "name": "l2-peak",
+  "rationale": "Base (chain 8453), the highest block rate any supported chain presents. 2s blocks means 0.5 blocks/s on chain; this offers 10.0 blocks/s, 20x that, on the same burst reasoning as mainnet-peak. Base blocks are smaller and more frequent, so 120 tx/block gives 1200 declared tps -- the highest chain rate in the fleet, and where the block-rate side of the fast path breaks first if it breaks at all. Alerting fraction 1.0, as in mainnet-peak. The API mix is held identical on purpose: the API does not care which chain produced the load, and holding it constant is what makes the two profiles' API numbers comparable. The screening route is driven as a POST because that is what it is (\u00a711 -- a screening decision is a billable, audited event, not a cacheable read); a GET-only driver would collect 405s in microseconds and report the route as the fastest thing in the system.",
+  "chain": 8453,
+  "blocks_per_second": 10.0,
+  "txs_per_block": 120,
+  "alerting_block_fraction": 1.0,
+  "api_qps": 100.0,
+  "api_routes": [
+    {
+      "path": "/v1/address/{address}/screen",
+      "weight": 6,
+      "method": "POST"
+    },
+    {
+      "path": "/v1/address/{address}/risk",
+      "weight": 2,
+      "method": "GET"
+    },
+    {
+      "path": "/v1/address/{address}/labels",
+      "weight": 1,
+      "method": "GET"
+    },
+    {
+      "path": "/v1/incidents?limit=20",
+      "weight": 1,
+      "method": "GET"
+    }
+  ],
+  "warmup": 30,
+  "duration": 300,
+  "drain_timeout": 120
+}

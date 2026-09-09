@@ -1,0 +1,13 @@
+{
+  "name": "smoke",
+  "rationale": "Not a load test: a 30-second wiring check that the generator reaches Kafka, detection consumes, alerts are emitted, and the fast-path series is scrapeable. It cannot collect enough alerting samples to satisfy min_alert_samples and so reports INCONCLUSIVE (exit 2) even when everything works -- deliberately, and pinned by a test. That is the point: it fails loudly on a broken harness without spending a full run, and it can never be mistaken for a passing load test.",
+  "chain": 1,
+  "blocks_per_second": 2.0,
+  "txs_per_block": 200,
+  "alerting_block_fraction": 1.0,
+  "api_qps": 0.0,
+  "api_routes": [],
+  "warmup": 5,
+  "duration": 30,
+  "drain_timeout": 30
+}

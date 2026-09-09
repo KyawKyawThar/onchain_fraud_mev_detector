@@ -36,6 +36,7 @@ A change is "done" when:
 - [ ] **Changed a prompt?** — the artifact is versioned, the manifest is regenerated, and the diff is reviewed (§16).
 - [ ] **Touched the event schema?** — the committed registry is re-blessed and the diff reviewed; an incompatible change bought a `SCHEMA_VERSION` bump and an upcaster (§17).
 - [ ] **Storing a regulatory artifact, or the evidence under one?** — its lifetime comes from the shared `retention::Policy`, never a local constant, and the store enforces it (§18).
+- [ ] **Stating a latency or throughput number?** — one series spans the whole claim (not its cheapest stage), and a load gate reads it under load with a three-way verdict where "could not decide" exits non-zero (§19).
 
 ---
 
@@ -706,6 +707,66 @@ the other; a `bool` parameter selecting between a "preview" and a "real" code
 path; an `Option<T>` standing for two states with different safety properties;
 and a purge that deletes on a schedule with no plan — the flag that costs nothing
 is the one to get wrong.
+
+---
+
+## 19. A performance claim needs an instrument that can fail it
+
+**The rule.** If the product states a latency or throughput number, there must
+be **one series that spans exactly the claim**, measured end to end across every
+component the claim covers — including the queues and the network hops between
+them — and a gate that reads *that* series under load. A metric that measures
+one component of a multi-component claim is not a weak version of the right
+instrument; it is a different instrument, and it will report health precisely
+when the claim is most at risk.
+
+Concretely:
+
+1. **Measure the span, not a stage.** The clock starts where the claim starts
+   (the producer's timestamp), not where the measuring process happens to
+   receive the work.
+2. **Load-generate on an absolute schedule, and stamp work with the time it was
+   *due*.** A generator that paces itself by sleeping after each send slows down
+   when the system does, and reports the latency of a system under light load.
+3. **Drain before measuring.** The work still queued when the load stops is the
+   slowest work there is.
+4. **Measure a window, not a lifetime.** Difference two scrapes, or a
+   long-running service's healthy idle history dilutes the breach.
+5. **A verdict is three-way.** Held, breached, and *could not decide* — and the
+   third one exits non-zero. A performance test has more ways to be
+   uninformative than to fail, and every one of them produces a clean-looking
+   number over a subset of the work.
+
+**Why it needs a rule.** §6's "preliminary alert in under one second" is the
+platform's headline claim, and for most of this codebase's life the only
+latency it exported was `detector_detect_duration_seconds` — the wall time of a
+single `DetectorPlugin::detect` call. That number is microseconds on a
+header-only block, and it is *arithmetically unaffected* by a queue building up
+in front of it. The Prometheus rule guarding the claim
+(`FastPathLatencyHigh`) read that series, so the alert named after the fast path
+could not fire on the failure it named: blocks backing up behind detection would
+have left every panel green while alerts arrived seconds late. Nothing was
+broken, nothing was untested, and the claim was unfalsifiable — which is worse
+than an untested claim, because it looks measured.
+
+The fix is structural, not a bigger dashboard:
+[`detection::metrics::FAST_PATH_SECONDS`](../crates/detection/src/metrics.rs)
+measures `BlockAssembled.occurred_at` → the alert's durable publication, across
+the broker hop and the scheduler's bounded work channel, split into a queue-wait
+and a processing term so a breach says *which* half grew.
+
+**Reference.** [`crates/loadtest`](../crates/loadtest/) — the four rules above as
+code, and the three-way [`Outcome`](../crates/loadtest/src/slo.rs). Note in
+particular that a bucketed quantile is treated as a **bound**: the verdict is
+"≥99% of samples at or below the budget", which the shared ladder decides
+exactly, and a budget with no bucket boundary on it is rejected when the SLO
+loads rather than making every future run silently inconclusive.
+
+**Anti-pattern.** A p99 panel over the cheapest stage of a pipeline, labelled
+with the whole pipeline's budget; a load generator that awaits each response
+before issuing the next; a "SLO met" that was computed the instant the load
+stopped; and — the one that undoes all the rest — a CI job that treats "could
+not measure" as a pass.
 
 ---
 

@@ -24,6 +24,23 @@ use events::primitives::{AlertKind, Confidence};
 /// Confidence stamped on the synthetic finding — a fixed, obviously-test value.
 const DEMO_CONFIDENCE: f64 = 0.42;
 
+/// Does this detector fire on `block_number`?
+///
+/// Public because the schedule is a **contract with the load-test harness**, not
+/// an implementation detail. `loadtest` controls "peak alert volume" by choosing
+/// block-number parity, and it is the only lever available while the source is
+/// header-only — so the harness needs to know this rule. It calls *this*
+/// function rather than reimplementing the parity test, which means changing the
+/// schedule here cannot silently desync the harness: it would otherwise keep
+/// generating the old pattern, offer the wrong alert volume, and report an
+/// inconclusive run whose message points at the wrong cause.
+///
+/// Bitwise even-test, not `% 2`/`is_multiple_of`, to dodge the rustc-version /
+/// clippy disagreement those trigger across toolchains.
+pub const fn fires_on(block_number: u64) -> bool {
+    (block_number & 1) == 0
+}
+
 /// The `demo-v0.1` detector. Stateless; construct with [`plugin`].
 #[derive(Debug, Clone, Default)]
 pub struct DemoDetector;
@@ -62,10 +79,10 @@ impl DetectorPlugin for DemoDetector {
         let block = ctx.block();
         // Deterministic synthetic signal: fire on even blocks only, so the
         // hit-rate metric (`hits / runs`) lands near 0.5 over a stream rather than
-        // a flat 1.0. Odd blocks are a "run" with no finding (a miss). Bitwise
-        // even-test, not `% 2`/`is_multiple_of`, to dodge the rustc-version /
-        // clippy disagreement those trigger across toolchains.
-        if (block.number & 1) == 1 {
+        // a flat 1.0. Odd blocks are a "run" with no finding (a miss). The rule
+        // itself lives in [`fires_on`] — one definition, shared with the
+        // load-test harness that generates blocks against it.
+        if !fires_on(block.number) {
             return Vec::new();
         }
 

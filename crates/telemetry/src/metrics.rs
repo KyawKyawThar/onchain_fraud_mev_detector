@@ -31,7 +31,13 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 /// The ladder spans ~10µs (a pure in-process detector on a header-only block) to
 /// 10s (a slow detector over a full block), roughly 2–3 buckets per decade — fine
 /// resolution where detector latencies actually sit without exploding cardinality.
-const LATENCY_BUCKETS_SECONDS: &[f64] = &[
+///
+/// Public because it is a contract, not an implementation detail: a latency SLO
+/// can only be decided from a histogram if the ladder has a bucket boundary
+/// exactly on the budget, so anything that gates on one (the load-test harness)
+/// validates its thresholds against this list rather than keeping a copy that
+/// can drift.
+pub const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];

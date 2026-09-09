@@ -1,0 +1,161 @@
+name: Load test (fast path SLO)
+
+# Readiness Epic D: "load test is a recurring CI/nightly job".
+#
+# Stands up the pipeline the fast path actually runs on (Kafka + a detection
+# instance), offers load at a committed profile, drains, and reads
+# `detection_fast_path_duration_seconds` — the only series §6's "< 1 second"
+# claim can be checked against.
+#
+# Two things about this job are deliberate and easy to get wrong later:
+#
+#  * It is **nightly and manual, never a PR gate.** A load test needs a quiet
+#    machine and several minutes of steady traffic; run on a shared PR runner
+#    alongside other jobs it would measure the runner's contention and fail
+#    randomly, and a flaky gate is a gate people disable.
+#  * Exit `2` (undecided) **fails the job.** An unloaded system, an undrained
+#    pipeline or an empty SLO series all produce a clean-looking p99, so
+#    treating `2` as success would re-create the exact blind spot this job
+#    exists to close. `continue-on-error` here would do the same.
+#
+# A GitHub-hosted runner is not a capacity measurement — its absolute numbers
+# say little about production hardware. What it does give is a *regression*
+# signal on the same runner class night after night, plus proof that the
+# harness itself still works. The staging run at 1.5x peak (the Epic D exit
+# gate) is `workflow_dispatch` against a real environment.
+#
+# The default profile is `ci-fastpath`, which offers **no API load**: this job
+# stands up Kafka and detection, which is what §6's claim is about. Adding an
+# API dimension would mean Postgres, Redis, ClickHouse, intelligence and the
+# API server here, and a nightly latency job that six other services can break
+# is a job that goes red for reasons unrelated to latency. `api_qps: 0` makes
+# that absence *deliberate* rather than undecided — exit 2 must always mean
+# something went wrong, never "this job does not cover that".
+#
+# The profiles that do drive the API (`mainnet-peak`, `l2-peak`) are for the
+# staging dispatch, where `LOADTEST_API_BASE_URL` and a token are set.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly, off-peak
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Committed profile to offer"
+        type: choice
+        default: crates/loadtest/profiles/ci-fastpath.json
+        options:
+          - crates/loadtest/profiles/ci-fastpath.json
+          - crates/loadtest/profiles/mainnet-peak.json
+          - crates/loadtest/profiles/l2-peak.json
+          - crates/loadtest/profiles/smoke.json
+      headroom:
+        description: "Rate multiplier (the readiness exit gate asks for 1.5)"
+        type: string
+        default: "1.0"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false # never cancel a run mid-measurement
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  SQLX_OFFLINE: "true"
+
+jobs:
+  fast-path-slo:
+    name: fast path < 1s p99 under load
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      # KRaft single-node broker — same shape as deploy/k8s (no ZooKeeper).
+      kafka:
+        image: bitnami/kafka:3.7
+        ports: ["9092:9092"]
+        env:
+          KAFKA_CFG_NODE_ID: "0"
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@127.0.0.1:9093
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          ALLOW_PLAINTEXT_LISTENER: "yes"
+          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+
+      # Release, not debug: a debug build's detector fan-out is several times
+      # slower, so a debug run would measure rustc's optimiser rather than the
+      # platform, and would fail a budget that production comfortably holds.
+      - name: Build detection + the harness (release)
+        run: |
+          cargo build --release --locked -p loadtest
+          cargo build --release --locked -p detection --features detectors,demo
+
+      # `demo` is required: it is the only detector that fires on a header-only
+      # BlockAssembled, so without it the run collects zero alerting samples and
+      # (correctly) refuses to conclude anything. See docs/runbooks/load-test.md.
+      - name: Start detection (fast path under test)
+        env:
+          KAFKA_BROKERS: 127.0.0.1:9092
+          CHAIN_ID: "1"
+          DETECTION_METRICS_ADDR: 0.0.0.0:9100
+          DETECTION_CONSUMER_GROUP: loadtest-detection
+          RUST_LOG: info
+        run: |
+          ./target/release/detection > detection.log 2>&1 &
+          echo $! > detection.pid
+          # Wait for the exporter rather than sleeping a guessed interval: the
+          # harness's own pre-flight scrape would fail anyway, but failing here
+          # points at the service instead of at the measurement.
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9100/metrics >/dev/null && exit 0
+            sleep 1
+          done
+          echo "detection never exposed /metrics" >&2
+          cat detection.log >&2
+          exit 1
+
+      - name: Offer load and judge the fast path
+        env:
+          KAFKA_BROKERS: 127.0.0.1:9092
+          # One replica here; the variable takes a comma-separated list, and a
+          # staging run against an HPA'd deployment must name every pod — the
+          # SLO is `sum by (le)` over all of them, so a single endpoint would
+          # let one healthy replica carry a struggling one to a pass.
+          LOADTEST_DETECTION_METRICS_URL: http://127.0.0.1:9100/metrics
+          RUST_LOG: info
+        # One run, two renderings: the text goes to the log (what someone reads
+        # when this is red), the JSON to the artifact. Repeating the run to get
+        # the other format would offer a second load and report different
+        # numbers.
+        run: |
+          ./target/release/loadtest \
+            --profile "${{ inputs.profile || 'crates/loadtest/profiles/ci-fastpath.json' }}" \
+            --headroom "${{ inputs.headroom || '1.0' }}" \
+            --json-out load-test-report.json
+
+      - name: Stop detection
+        if: always()
+        run: kill "$(cat detection.pid)" 2>/dev/null || true
+
+      - name: Archive the report and the service log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-report
+          path: |
+            load-test-report.json
+            detection.log
+          retention-days: 30

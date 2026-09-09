@@ -755,6 +755,31 @@ schema-bless:
 backtest:
     cargo run -p backtest --all-features --locked
 
+# ── Load test (readiness Epic D) ─────────────────────────────────
+# Offer load at a target throughput and check the §6 fast path still holds its
+# < 1s p99 *under* that load. Exit code is the deliverable: 0 held, 1 breached,
+# 2 undecided (an unloaded system, an undrained pipeline, or too few alerting
+# samples — never a soft pass).
+#
+# The subject must be a detection build with the `demo` detector linked: it is
+# the only detector that fires on a header-only BlockAssembled, so without it
+# the run collects zero alerting samples and correctly refuses to conclude.
+# `just run-detection-demo` is that build.
+
+# Smoke the harness end to end (~1 min): generator → Kafka → detection →
+# fast-path series. Reports inconclusive by design (too few samples) — it
+# proves the wiring, not the latency.
+load-test-smoke:
+    cargo run -p loadtest --locked -- --profile crates/loadtest/profiles/smoke.json
+
+# The real run: Ethereum L1 at projected peak, 5 minutes plus warmup and drain.
+load-test profile="crates/loadtest/profiles/mainnet-peak.json":
+    cargo run -p loadtest --release --locked -- --profile {{profile}}
+
+# The readiness exit gate's bar: 1.5× projected peak.
+load-test-headroom profile="crates/loadtest/profiles/mainnet-peak.json":
+    cargo run -p loadtest --release --locked -- --profile {{profile}} --headroom 1.5
+
 # Score a real ML model bundle (§20.2) alongside the heuristics: loads the
 # bundle through detection's own boot path and adds the ML fixtures, so the
 # promotion gate reports whether those weights have earned their way out of
