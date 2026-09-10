@@ -19,6 +19,9 @@
 //!   order, and versions sort lexically (zero-pad the numeric prefix), so a
 //!   mis-ordered or copy-pasted entry is a bug caught at boot, not a schema
 //!   applied out of order.
+//! - **No unresolved merge conflict** — everywhere else in this workspace a
+//!   stray marker is a build error, but a migration is `include_str!`'d into a
+//!   `const`, so it compiles and is first refused by ClickHouse itself.
 
 use std::collections::HashSet;
 
@@ -51,13 +54,6 @@ pub struct Migrator {
     bookkeeping_table: &'static str,
     migrations: &'static [Migration],
 }
-
-/// Merge-conflict markers, checked against every migration's SQL.
-///
-/// Matched at the start of a line only — `=======` is a plausible thing to
-/// write inside a comment rule, and a guard that fires on it would be one
-/// people route around.
-const CONFLICT_MARKERS: &[&str] = &["<<<<<<<", ">>>>>>>"];
 
 impl Migrator {
     pub const fn new(
@@ -217,22 +213,23 @@ impl Migrator {
                         migration.version
                     );
                 }
-                // An unresolved merge conflict is valid UTF-8, contains no bind
-                // placeholder, and is `include_str!`'d into a `const` — so it
-                // compiles, passes every other check here, and is first refused
-                // by ClickHouse itself at boot. That is precisely the discovery
-                // point this function exists to move earlier: a conflict landed
-                // in `0003_events_retention.up.sql` and the failure surfaced as
-                // a crashlooping event-store rather than a red unit test.
-                if let Some(marker) = CONFLICT_MARKERS
-                    .iter()
-                    .find(|marker| sql.contains(*marker))
-                {
+                // SQL is the one place a merge conflict survives the compiler.
+                // Anywhere else in this workspace a stray marker is a build
+                // error; here the file is `include_str!`'d into a `const`, so it
+                // compiles, carries no bind placeholder, and is first refused by
+                // ClickHouse itself — behind a `#[ignore]`d integration test.
+                // A conflict landed in `0003_events_retention.up.sql` exactly
+                // this way and surfaced as a crashlooping event-store.
+                //
+                // Only the opening and closing markers are matched: `=======` is
+                // a plausible thing to write in a comment rule, and a guard that
+                // fires on prose is one people route around.
+                if sql.contains("<<<<<<<") || sql.contains(">>>>>>>") {
                     bail!(
                         "migration {}.{direction}.sql contains an unresolved merge \
-                         conflict ({marker}) — resolve it; a migration set is a \
-                         compile-time constant, so this would otherwise reach a live \
-                         ClickHouse before anything noticed",
+                         conflict — resolve it; a migration set is a compile-time \
+                         constant, so this would otherwise reach a live ClickHouse \
+                         before anything noticed",
                         migration.version
                     );
                 }
@@ -319,7 +316,10 @@ mod tests {
             .expect_err("conflict markers are not SQL")
             .to_string();
         assert!(err.contains("merge conflict"), "got: {err}");
-        assert!(err.contains("0001_a"), "the error must name the file: {err}");
+        assert!(
+            err.contains("0001_a"),
+            "the error must name the file: {err}"
+        );
     }
 
     /// …and the guard must not fire on a migration that merely *discusses*
