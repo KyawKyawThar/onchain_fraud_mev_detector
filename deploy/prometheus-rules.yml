@@ -5,7 +5,10 @@
 #
 # Thresholds are PROVISIONAL. `FastPathLatencyHigh` and `ScreeningLatencyP50High`
 # are seeded from hard numbers the source doc actually states (§6: fast path
-# < 1s p99; §19: screening p50 < 100ms) — every other threshold below is a
+# < 1s p99; §19: screening p50 < 100ms) — and `FastPathLatencyHigh` is the one
+# rule here now *validated against measured load*, by `crates/loadtest` and the
+# nightly `load-test.yml` job, which read the same series with the same
+# threshold. Every other threshold below is a
 # conservative placeholder picked with no production traffic to calibrate
 # against — tune them once real load/latency data exists,
 # per production_readiness.md's own framing of this as an open, iterative
@@ -16,14 +19,58 @@
 groups:
   - name: mevwatch-slo
     rules:
+      # The §6 claim, on the series that can actually break it.
+      #
+      # This rule previously read `detector_detect_duration_seconds` — one
+      # `detect` call. That is microseconds on a header-only block and is
+      # *unchanged* by a queue building up in front of it, so the alert was
+      # structurally incapable of firing on the failure it names: blocks
+      # backing up behind detection would leave it green while alerts arrived
+      # seconds late. `detection_fast_path_duration_seconds` spans the broker
+      # hop and the scheduler's bounded work channel, which is where a
+      # saturated pipeline's latency actually accumulates.
+      #
+      # `outcome="alert"` because §6 claims a *preliminary alert* within a
+      # second; a block in which no detector fired is not evidence either way.
       - alert: FastPathLatencyHigh
-        expr: histogram_quantile(0.99, sum(rate(detector_detect_duration_seconds_bucket[5m])) by (le)) > 1
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(detection_fast_path_duration_seconds_bucket{outcome="alert"}[5m])) by (le)
+          ) > 1
         for: 5m
         labels:
           severity: page
         annotations:
-          summary: "Detector fast-path p99 latency exceeds the §6 <1s SLO"
-          description: "detector_detect_duration_seconds p99 has been above 1s for 5m. The fast path (block → provisional alert) is the platform's headline latency claim; investigate detector CPU or a rayon pool backlog."
+          summary: "Fast path p99 exceeds the §6 <1s SLO"
+          description: "detection_fast_path_duration_seconds{outcome=\"alert\"} p99 (block occurred_at → alert published) has been above 1s for 5m. This is the platform's headline latency claim. Split it: detection_queue_wait_seconds large ⇒ detection is the bottleneck (roster cost, rayon backlog); detection_block_process_seconds large ⇒ the work or the publish path; both small ⇒ the time is outside the process (broker transit, consumer lag, or clock skew between ingestion and detection). docs/runbooks/load-test.md."
+
+      # The backpressure term on its own, at a tighter bound than the budget.
+      # A leading indicator: queue wait grows before the total breaches, so
+      # this fires while there is still headroom to act.
+      - alert: FastPathQueueWaitHigh
+        expr: |
+          histogram_quantile(0.99, sum(rate(detection_queue_wait_seconds_bucket[5m])) by (le)) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blocks are queueing in front of detection"
+          description: "detection_queue_wait_seconds p99 above 500ms for 10m — half the §6 budget is being spent before a detector runs. The bounded work channel is filling, which means detection is not keeping up with the block rate."
+
+      # Monitoring the monitor (engineering conventions §15): a fast path that
+      # stopped producing samples and a fast path with nothing to report render
+      # identically on a quantile, because a histogram with no new observations
+      # holds its last value. A detection instance that has stopped consuming
+      # is the most consequential silent failure in the platform.
+      - alert: FastPathSilent
+        expr: |
+          sum(rate(detection_fast_path_duration_seconds_count[10m])) by (chain) == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Detection has recorded no fast-path samples for 15m"
+          description: "No block has completed the fast path on chain {{ $labels.chain }} in 15 minutes. Either ingestion stopped producing BlockAssembled or detection stopped consuming — the latency panels will look healthy either way, because a quantile over no samples reports the last one."
 
       - alert: ApiLatencyHigh
         expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 1

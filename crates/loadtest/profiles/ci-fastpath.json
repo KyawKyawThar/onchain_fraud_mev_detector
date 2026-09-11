@@ -1,0 +1,13 @@
+{
+  "name": "ci-fastpath",
+  "rationale": "The nightly CI profile: chain load only, no API. The job stands up Kafka and one detection instance, which is what the \u00a76 claim is about; standing up Postgres, Redis, ClickHouse, intelligence and the API server to add an API dimension would make a nightly latency job depend on six more things that can be broken by someone else's change, and a flaky gate is a gate people switch off. api_qps is 0 so the API checks are not merely undecided but deliberately absent -- exit 2 must mean something went wrong, never 'this job does not test that'. The full-stack run at 1.5x peak against staging is the workflow_dispatch, and it is the Epic D exit gate. 180s at 4 blocks/s yields 720 alerting samples, comfortably over the SLO's 500 floor while keeping the job under five minutes.",
+  "chain": 1,
+  "blocks_per_second": 4.0,
+  "txs_per_block": 250,
+  "alerting_block_fraction": 1.0,
+  "api_qps": 0.0,
+  "api_routes": [],
+  "warmup": 20,
+  "duration": 180,
+  "drain_timeout": 60
+}

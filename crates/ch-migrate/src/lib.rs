@@ -19,6 +19,9 @@
 //!   order, and versions sort lexically (zero-pad the numeric prefix), so a
 //!   mis-ordered or copy-pasted entry is a bug caught at boot, not a schema
 //!   applied out of order.
+//! - **No unresolved merge conflict** — everywhere else in this workspace a
+//!   stray marker is a build error, but a migration is `include_str!`'d into a
+//!   `const`, so it compiles and is first refused by ClickHouse itself.
 
 use std::collections::HashSet;
 
@@ -210,6 +213,26 @@ impl Migrator {
                         migration.version
                     );
                 }
+                // SQL is the one place a merge conflict survives the compiler.
+                // Anywhere else in this workspace a stray marker is a build
+                // error; here the file is `include_str!`'d into a `const`, so it
+                // compiles, carries no bind placeholder, and is first refused by
+                // ClickHouse itself — behind a `#[ignore]`d integration test.
+                // A conflict landed in `0003_events_retention.up.sql` exactly
+                // this way and surfaced as a crashlooping event-store.
+                //
+                // Only the opening and closing markers are matched: `=======` is
+                // a plausible thing to write in a comment rule, and a guard that
+                // fires on prose is one people route around.
+                if sql.contains("<<<<<<<") || sql.contains(">>>>>>>") {
+                    bail!(
+                        "migration {}.{direction}.sql contains an unresolved merge \
+                         conflict — resolve it; a migration set is a compile-time \
+                         constant, so this would otherwise reach a live ClickHouse \
+                         before anything noticed",
+                        migration.version
+                    );
+                }
             }
         }
         for pair in self.migrations.windows(2) {
@@ -276,6 +299,42 @@ mod tests {
         Migrator::new("test", "t_migrations", OK)
             .validate()
             .expect("valid set");
+    }
+
+    /// The regression: this exact shape compiled, validated, and only failed
+    /// against a live ClickHouse.
+    #[test]
+    fn an_unresolved_merge_conflict_is_rejected_before_it_reaches_clickhouse() {
+        const CONFLICTED: &[Migration] = &[Migration {
+            version: "0001_a",
+            up: "-- a comment\n<<<<<<< HEAD\n-- one wording\n=======\n-- another\n>>>>>>> main\nCREATE TABLE a (x UInt8) ENGINE = MergeTree ORDER BY x",
+            down: "DROP TABLE a",
+        }];
+
+        let err = Migrator::new("test", "t", CONFLICTED)
+            .validate()
+            .expect_err("conflict markers are not SQL")
+            .to_string();
+        assert!(err.contains("merge conflict"), "got: {err}");
+        assert!(
+            err.contains("0001_a"),
+            "the error must name the file: {err}"
+        );
+    }
+
+    /// …and the guard must not fire on a migration that merely *discusses*
+    /// them, or the next person to document this rule cannot.
+    #[test]
+    fn a_migration_that_only_mentions_conflicts_still_validates() {
+        const TALKS_ABOUT_IT: &[Migration] = &[Migration {
+            version: "0001_a",
+            up: "-- resolve merge conflicts before committing a migration\nCREATE TABLE a (x UInt8) ENGINE = MergeTree ORDER BY x",
+            down: "DROP TABLE a",
+        }];
+
+        Migrator::new("test", "t", TALKS_ABOUT_IT)
+            .validate()
+            .expect("prose about conflicts is not a conflict");
     }
 
     #[test]

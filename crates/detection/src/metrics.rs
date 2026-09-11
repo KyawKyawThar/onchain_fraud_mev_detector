@@ -1,4 +1,18 @@
-//! Per-detector metrics (§19, Sprint 4 task 3): hit rate + latency.
+//! Detection's metrics (§19): the per-detector hit rate + latency, and the
+//! **fast path's own clock**.
+//!
+//! Two call sites, each the only one of its kind:
+//!
+//! - [`record_fast_path`] — once per block, at the end of the §6 fast path.
+//!   This is the series the "< 1 second" claim is checked against; see
+//!   [`FAST_PATH_SECONDS`] for why it is measured from the *source's* timestamp
+//!   rather than from anything in this process.
+//! - [`record_detector_run`] — once per detector invocation (below).
+//!
+//! The distinction matters under load and only under load: a detector's own
+//! `detect` call is unaffected by a queue building up in front of it, so the
+//! per-detector histogram stays flat while the pipeline misses its budget by
+//! seconds. Both are needed; neither substitutes for the other.
 //!
 //! One function, [`record_detector_run`], called once per detector invocation —
 //! from every emit path (`Block` sequential + rayon-parallel in [`crate::emit`],
@@ -37,6 +51,69 @@ pub const HITS_TOTAL: &str = "detector_hits_total";
 pub const FINDINGS_TOTAL: &str = "detector_findings_total";
 /// Histogram: `detect` call wall-clock latency, in seconds.
 pub const DETECT_SECONDS: &str = "detector_detect_duration_seconds";
+
+/// Histogram: the **§6 fast path** — `BlockAssembled.occurred_at` (stamped by
+/// ingestion) to the moment this block's events are durably published.
+///
+/// This is the platform's headline latency number, and the only series the
+/// "< 1 second" claim can be checked against. It deliberately spans the broker
+/// hop and the scheduler's bounded work queue, because those are exactly what a
+/// saturated pipeline adds: [`DETECT_SECONDS`] measures one detector call and
+/// stays flat under load, so a fast path judged on it would report health while
+/// blocks queued for seconds behind it.
+///
+/// Labeled `outcome` (`alert` | `no_alert`) — §6 claims a *preliminary alert*
+/// in under a second, so the SLO reads `outcome="alert"`. The other half is
+/// kept rather than dropped because a run in which no detector fired proves
+/// nothing about the claim, and the two must be distinguishable: a gate that
+/// cannot tell them apart passes a pipeline that emitted no alerts at all.
+///
+/// Not to be confused with `notification_alert_end_to_end_seconds`, which
+/// measures block → *delivered notification* — a strictly larger budget over a
+/// different (slow-path-inclusive) span.
+pub const FAST_PATH_SECONDS: &str = "detection_fast_path_duration_seconds";
+
+/// Histogram: how long a decoded block waited in the bounded work channel
+/// before the scheduler picked it up.
+///
+/// The backpressure component of [`FAST_PATH_SECONDS`], split out because it is
+/// the term that grows when detection is the bottleneck. In-process and
+/// monotonic ([`std::time::Instant`]), so it is immune to the wall clock
+/// stepping mid-block.
+pub const QUEUE_WAIT_SECONDS: &str = "detection_queue_wait_seconds";
+
+/// Histogram: scheduler pickup → durably published — the work itself (roster
+/// fan-out, cross-block slots, publish + its retries).
+///
+/// [`QUEUE_WAIT_SECONDS`] + this ≈ the in-process share of
+/// [`FAST_PATH_SECONDS`]; whatever the fast path has left over is the broker
+/// hop and any clock skew between ingestion and this process.
+pub const BLOCK_PROCESS_SECONDS: &str = "detection_block_process_seconds";
+
+/// One block's fast-path timings, recorded together by [`record_fast_path`].
+#[derive(Debug, Clone, Copy)]
+pub struct FastPathSample {
+    /// Enqueue → scheduler pickup.
+    pub queue_wait: Duration,
+    /// Scheduler pickup → durably published.
+    pub processing: Duration,
+    /// Source `occurred_at` → durably published: the §6 budget.
+    pub total: Duration,
+    /// Whether this block produced at least one `PreliminaryAlertCreated`.
+    pub alerted: bool,
+}
+
+/// Record one block's trip through the fast path. Called from the single site
+/// that completes it ([`crate::scheduler::Scheduler::run`], after the block's
+/// events are published) — the same one-call-site discipline
+/// [`record_detector_run`] uses, so the three series always describe the same
+/// block.
+pub fn record_fast_path(sample: FastPathSample) {
+    let outcome = if sample.alerted { "alert" } else { "no_alert" };
+    metrics::histogram!(FAST_PATH_SECONDS, "outcome" => outcome).record(sample.total.as_secs_f64());
+    metrics::histogram!(QUEUE_WAIT_SECONDS).record(sample.queue_wait.as_secs_f64());
+    metrics::histogram!(BLOCK_PROCESS_SECONDS).record(sample.processing.as_secs_f64());
+}
 
 /// Counter: `ModelDriftDetected` events published, labeled by `model` (§20.5).
 ///
@@ -121,6 +198,65 @@ mod tests {
             Some(DebugValue::Counter(n)) => Some(*n),
             _ => None,
         }
+    }
+
+    fn histogram_len(series: &Series, name: &str) -> Option<usize> {
+        match value(series, name) {
+            Some(DebugValue::Histogram(samples)) => Some(samples.len()),
+            _ => None,
+        }
+    }
+
+    /// The label the SLO query filters on. A run that emitted no alert must not
+    /// contribute to the series §6's claim is read from — a gate that cannot
+    /// tell the two apart passes a pipeline that alerted on nothing.
+    fn outcome_labels(series: &Series, name: &str) -> Vec<String> {
+        series
+            .iter()
+            .filter(|(ck, ..)| ck.key().name() == name)
+            .flat_map(|(ck, ..)| ck.key().labels())
+            .filter(|l| l.key() == "outcome")
+            .map(|l| l.value().to_owned())
+            .collect()
+    }
+
+    fn a_sample(total_ms: u64, alerted: bool) -> FastPathSample {
+        FastPathSample {
+            queue_wait: Duration::from_millis(total_ms / 4),
+            processing: Duration::from_millis(total_ms / 4),
+            total: Duration::from_millis(total_ms),
+            alerted,
+        }
+    }
+
+    #[test]
+    fn a_fast_path_sample_records_the_total_and_both_of_its_terms() {
+        let series = captured(|| record_fast_path(a_sample(800, true)));
+
+        assert_eq!(histogram_len(&series, FAST_PATH_SECONDS), Some(1));
+        assert_eq!(histogram_len(&series, QUEUE_WAIT_SECONDS), Some(1));
+        assert_eq!(histogram_len(&series, BLOCK_PROCESS_SECONDS), Some(1));
+    }
+
+    #[test]
+    fn an_alerting_block_and_a_quiet_one_land_on_different_outcome_labels() {
+        let series = captured(|| {
+            record_fast_path(a_sample(400, true));
+            record_fast_path(a_sample(400, false));
+        });
+
+        let mut labels = outcome_labels(&series, FAST_PATH_SECONDS);
+        labels.sort();
+        assert_eq!(labels, vec!["alert".to_owned(), "no_alert".to_owned()]);
+    }
+
+    #[test]
+    fn the_terms_are_unlabeled_so_they_aggregate_across_both_outcomes() {
+        let series = captured(|| record_fast_path(a_sample(400, true)));
+        assert!(
+            outcome_labels(&series, QUEUE_WAIT_SECONDS).is_empty(),
+            "queue wait is a property of the pipeline, not of whether a detector fired"
+        );
     }
 
     #[test]

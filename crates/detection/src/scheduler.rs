@@ -51,7 +51,7 @@
 //! contexts + mock detectors).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use event_bus::dlq::DeadLetterQueue;
@@ -77,10 +77,69 @@ use crate::reorg::CrossBlockStates;
 /// over, or a reorg revert to roll cross-block state back through.
 #[derive(Debug)]
 pub enum BlockEvent {
-    /// A block was assembled: run the detector roster over it.
-    Assembled(DetectionCtx),
+    /// A block was assembled: run the detector roster over it. Carries the
+    /// [`FastPathClock`] started when the record was decoded, so the §6 budget
+    /// is measured over the whole trip rather than over the detector call.
+    ///
+    /// The context is already an [`Arc`] here rather than at the point of use:
+    /// the rayon fan-out needs one regardless, and a bare `DetectionCtx` inline
+    /// would make this variant hundreds of bytes wider than `Reverted` — every
+    /// item on the work channel paying for a shape only one variant uses.
+    Assembled(Arc<DetectionCtx>, FastPathClock),
     /// A block was orphaned by a reorg: rewind cross-block state (tip-first; §15).
+    ///
+    /// No fast-path clock: a revert publishes nothing, so there is no "< 1s to
+    /// an alert" claim to measure. Timing it anyway would dilute the SLO series
+    /// with samples that can never breach it.
     Reverted(BlockReverted),
+}
+
+/// The §6 fast path's clock, started when a `BlockAssembled` record is decoded
+/// and read once when that block's events are published.
+///
+/// Two clocks, deliberately, because they answer different questions and fail
+/// differently:
+///
+/// - `source` is the producer's wall-clock `occurred_at`. The budget is
+///   measured from here so the broker hop and the work queue are *inside* the
+///   number. It is a cross-process comparison, so it inherits any clock skew
+///   between ingestion and detection — the load harness runs both against one
+///   clock for exactly this reason, and a deployment needs NTP for this series
+///   to mean anything.
+/// - `received` is a local [`Instant`]. Monotonic, so the in-process split
+///   (queue wait vs. processing) stays correct across a wall-clock step, which
+///   the `source` term cannot promise.
+#[derive(Debug, Clone, Copy)]
+pub struct FastPathClock {
+    source: chrono::DateTime<chrono::Utc>,
+    received: Instant,
+}
+
+impl FastPathClock {
+    /// Start the clock for a record whose producer stamped `occurred_at`.
+    pub fn started(source: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            source,
+            received: Instant::now(),
+        }
+    }
+
+    /// How long this block has been in the process — read at pickup for the
+    /// queue wait, and again at publish for the whole in-process span.
+    fn in_process(&self) -> Duration {
+        self.received.elapsed()
+    }
+
+    /// Source `occurred_at` → now. Clamped at zero: a producer's clock running
+    /// ahead of ours would otherwise record a negative duration as a garbage
+    /// sample, and a skew this measurement cannot detect is better reported as
+    /// an implausible zero than as a fabricated number (cf.
+    /// `notification::delivery::count_delivery`).
+    fn total(&self) -> Duration {
+        (chrono::Utc::now() - self.source)
+            .to_std()
+            .unwrap_or_default()
+    }
 }
 
 /// [`Scheduler::process`]'s result: the events to publish, paired with exactly
@@ -183,8 +242,7 @@ impl Scheduler {
     /// common ancestor and publishes nothing.
     pub async fn process(&mut self, event: BlockEvent) -> ProcessOutcome {
         match event {
-            BlockEvent::Assembled(ctx) => {
-                let ctx = Arc::new(ctx);
+            BlockEvent::Assembled(ctx, _clock) => {
                 // CPU-bound: fan the pure Block detectors out on rayon, off the
                 // reactor. The plan + ctx are shared into the blocking pool.
                 let plan = Arc::clone(&self.plan);
@@ -279,33 +337,7 @@ impl Scheduler {
                         }
                     }
                     Some((Some(event), token)) => {
-                        let outcome = self.process(event).await;
-                        // Publish borrowing only the individual `Sync` fields (sink,
-                        // shutdown) — never a shared `&self`, which would force the
-                        // whole `Scheduler` (and so every cross-block slot) to be
-                        // `Sync`; the slots run serially and needn't be.
-                        for payload in outcome.events {
-                            publish_resilient(
-                                self.sink.as_ref(),
-                                EventEnvelope::new(self.chain, payload),
-                                self.publish_backoff,
-                                &self.shutdown,
-                            )
-                            .await;
-                        }
-                        // One `DetectorRun` usage fact per block, batched to the
-                        // exact count run — no customer in scope (detection is
-                        // chain-wide, §13).
-                        if outcome.detector_runs > 0 {
-                            UsageFact::new(UsageEventType::DetectorRun, outcome.detector_runs)
-                                .record(
-                                    self.sink.as_ref(),
-                                    self.chain,
-                                    self.publish_backoff,
-                                    &self.shutdown,
-                                )
-                                .await;
-                        }
+                        self.handle_one(event).await;
                         // Block is durably published — safe to advance its offset.
                         // A closed `done` (committer gone) means we're shutting down.
                         if done.send(token).await.is_err() {
@@ -321,6 +353,83 @@ impl Scheduler {
             }
         }
     }
+    /// Handle one work item, **timing the fast path around it** (§14).
+    ///
+    /// The wrapper/`_inner` split is what makes the §6 measurement structural
+    /// rather than remembered: `_inner` gains a branch, an early return or a
+    /// `?` and the sample still fires, because it fires from out here. The
+    /// alternative — recording at the one call site that happens to publish
+    /// today — is how a metric silently under-counts six months after someone
+    /// adds a second publishing path.
+    ///
+    /// Unlike `inference`'s `ObservedEngine` this cannot be a decorator over a
+    /// seam: the span being measured *starts before the call* (a block's queue
+    /// wait is time it spent waiting to be handed to this function at all), so
+    /// the clock arrives on the work item and the wrapper reads it rather than
+    /// starting it. Same discipline, one rung weaker, and worth saying so.
+    async fn handle_one(&mut self, event: BlockEvent) {
+        // Split the fast path at pickup: everything before this moment was
+        // queueing (the term that grows when detection is the bottleneck),
+        // everything after is the work itself.
+        let timing = match &event {
+            BlockEvent::Assembled(_, clock) => Some((*clock, clock.in_process())),
+            // A revert publishes nothing, so it makes no §6 claim to measure.
+            BlockEvent::Reverted(_) => None,
+        };
+
+        let alerted = self.handle_one_inner(event).await;
+
+        // The fast path ends when the work does — at the alert's durable
+        // publication, not at the offset commit the caller performs next (§6).
+        if let Some((clock, queue_wait)) = timing {
+            crate::metrics::record_fast_path(crate::metrics::FastPathSample {
+                queue_wait,
+                processing: clock.in_process().saturating_sub(queue_wait),
+                total: clock.total(),
+                alerted,
+            });
+        }
+    }
+
+    /// Run the roster, publish what it produced, and meter it. Returns whether
+    /// this block produced at least one `PreliminaryAlertCreated` — the one bit
+    /// [`Self::handle_one`] needs and the only thing it learns about the work.
+    async fn handle_one_inner(&mut self, event: BlockEvent) -> bool {
+        let outcome = self.process(event).await;
+        let alerted = outcome
+            .events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::PreliminaryAlertCreated(_)));
+
+        // Publish borrowing only the individual `Sync` fields (sink, shutdown) —
+        // never a shared `&self`, which would force the whole `Scheduler` (and
+        // so every cross-block slot) to be `Sync`; the slots run serially and
+        // needn't be.
+        for payload in outcome.events {
+            publish_resilient(
+                self.sink.as_ref(),
+                EventEnvelope::new(self.chain, payload),
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await;
+        }
+
+        // One `DetectorRun` usage fact per block, batched to the exact count run
+        // — no customer in scope (detection is chain-wide, §13).
+        if outcome.detector_runs > 0 {
+            UsageFact::new(UsageEventType::DetectorRun, outcome.detector_runs)
+                .record(
+                    self.sink.as_ref(),
+                    self.chain,
+                    self.publish_backoff,
+                    &self.shutdown,
+                )
+                .await;
+        }
+
+        alerted
+    }
 }
 
 /// Decode one domain-event envelope into the work the scheduler acts on, or `None`
@@ -331,10 +440,19 @@ impl Scheduler {
 /// [module docs](self)); `BlockReverted` carries straight through.
 pub fn block_event(envelope: EventEnvelope) -> Option<BlockEvent> {
     let chain = envelope.chain;
+    let occurred_at = envelope.occurred_at;
     match envelope.payload {
-        DomainEvent::BlockAssembled(assembled) => Some(BlockEvent::Assembled(DetectionCtx::new(
-            BlockBundle::new(chain, assembled.block, Vec::new()),
-        ))),
+        DomainEvent::BlockAssembled(assembled) => Some(BlockEvent::Assembled(
+            Arc::new(DetectionCtx::new(BlockBundle::new(
+                chain,
+                assembled.block,
+                Vec::new(),
+            ))),
+            // The clock starts here — at decode, the earliest point this
+            // process can name the record — and is anchored to the producer's
+            // `occurred_at`, not to now.
+            FastPathClock::started(occurred_at),
+        )),
         DomainEvent::BlockReverted(reverted) => Some(BlockEvent::Reverted(reverted)),
         _ => None,
     }
@@ -564,11 +682,14 @@ mod tests {
     }
 
     fn assembled(n: u64) -> BlockEvent {
-        BlockEvent::Assembled(DetectionCtx::new(BlockBundle::new(
-            Chain::ETHEREUM,
-            BlockRef::new(n, hash(n as u8)),
-            Vec::new(),
-        )))
+        BlockEvent::Assembled(
+            Arc::new(DetectionCtx::new(BlockBundle::new(
+                Chain::ETHEREUM,
+                BlockRef::new(n, hash(n as u8)),
+                Vec::new(),
+            ))),
+            FastPathClock::started(Utc::now()),
+        )
     }
 
     fn a_ref(id: &'static str) -> DetectorRef {
@@ -780,6 +901,64 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// The §6 budget is measured from the *producer's* timestamp, so the decode
+    /// must carry it through. Anchoring the clock to `Utc::now()` here instead
+    /// would silently exclude the broker hop and every second a record spent
+    /// waiting in consumer lag — the exact terms a saturated pipeline adds.
+    #[test]
+    fn the_fast_path_clock_is_anchored_to_the_producers_timestamp_not_to_receipt() {
+        let stamped = Utc::now() - chrono::Duration::seconds(4);
+        let envelope = EventEnvelope::with_metadata(
+            uuid::Uuid::new_v4(),
+            stamped,
+            Chain::ETHEREUM,
+            DomainEvent::BlockAssembled(events::chain::BlockAssembled {
+                block: BlockRef::new(5, hash(5)),
+                tx_count: 9,
+                trace_available: false,
+            }),
+        );
+
+        let Some(BlockEvent::Assembled(_, clock)) = block_event(envelope) else {
+            panic!("expected an assembled block");
+        };
+        assert!(
+            clock.total() >= std::time::Duration::from_secs(4),
+            "a block stamped 4s ago must already be 4s into its budget, not 0"
+        );
+        assert!(
+            clock.in_process() < std::time::Duration::from_secs(1),
+            "the in-process term starts at decode, not at the producer's clock"
+        );
+    }
+
+    /// Clock skew: a producer running ahead of this process would otherwise
+    /// record a negative duration. Clamped to zero — an implausible zero is a
+    /// visible symptom, a fabricated number is not.
+    #[test]
+    fn a_producer_clock_running_ahead_clamps_to_zero_rather_than_recording_garbage() {
+        let clock = FastPathClock::started(Utc::now() + chrono::Duration::seconds(30));
+        assert_eq!(clock.total(), std::time::Duration::ZERO);
+    }
+
+    /// A revert publishes nothing, so it has no fast-path claim to time.
+    /// Sampling it anyway would fill the SLO series with observations that can
+    /// never breach it and flatter the p99.
+    #[test]
+    fn a_revert_carries_no_fast_path_clock() {
+        let envelope = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::BlockReverted(BlockReverted {
+                block: BlockRef::new(5, hash(5)),
+                replaced_by: hash(0x55),
+            }),
+        );
+        assert!(matches!(
+            block_event(envelope),
+            Some(BlockEvent::Reverted(_))
+        ));
+    }
+
     #[test]
     fn block_event_decodes_assembled_and_reverted_and_ignores_others() {
         let assembled = EventEnvelope::new(
@@ -792,7 +971,7 @@ mod tests {
         );
         assert!(matches!(
             block_event(assembled),
-            Some(BlockEvent::Assembled(_))
+            Some(BlockEvent::Assembled(..))
         ));
 
         let reverted = EventEnvelope::new(
