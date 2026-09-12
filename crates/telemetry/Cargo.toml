@@ -15,6 +15,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The recording facade. `telemetry` configures the exporter and owns
+# `record_duration`, the one call site where a metric's declared bucket class is
+# checked against the ladder the exporter will actually apply.
+metrics.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true

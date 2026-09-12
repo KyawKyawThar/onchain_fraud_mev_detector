@@ -374,7 +374,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::scrape::OrderedBound;
-    use crate::slo::{Outcome, Verdict};
+    use crate::slo::{LatencyBudget, Outcome, Verdict};
     use crate::source::{self, Offered, Outcomes, Window};
 
     /// A subject whose successive reads are scripted. The last entry repeats,
@@ -485,8 +485,8 @@ mod tests {
 
     fn slo() -> Slo {
         Slo {
-            fast_path_p99_seconds: 1.0,
-            api_p99_seconds: 0.5,
+            fast_path_p99_seconds: LatencyBudget::try_from(1.0).unwrap(),
+            api_p99_seconds: LatencyBudget::try_from(0.5).unwrap(),
             min_alert_samples: 100,
             min_achieved_ratio: 0.95,
             min_api_success_ratio: 0.99,

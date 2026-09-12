@@ -3,19 +3,89 @@
 # `rule_files`, evaluated by Prometheus, routed through Alertmanager
 # (deploy/alertmanager.yml).
 #
-# Thresholds are PROVISIONAL. `FastPathLatencyHigh` and `ScreeningLatencyP50High`
-# are seeded from hard numbers the source doc actually states (§6: fast path
-# < 1s p99; §19: screening p50 < 100ms) — and `FastPathLatencyHigh` is the one
-# rule here now *validated against measured load*, by `crates/loadtest` and the
-# nightly `load-test.yml` job, which read the same series with the same
-# threshold. Every other threshold below is a
-# conservative placeholder picked with no production traffic to calibrate
-# against — tune them once real load/latency data exists,
-# per production_readiness.md's own framing of this as an open, iterative
-# task, not a one-shot. `severity: page` alerts are the ones with load-bearing
-# numbers; `severity: informational` alerts have no numeric baseline yet and
-# exist so the panel/rule wiring is proven end-to-end before real thresholds
-# land — expect to tune or delete them once traffic exists.
+# ── Where these numbers come from (calibrated 2026-09-11) ───────────────────
+#
+# Every threshold below is one of exactly three things, and each rule names
+# which. There is no fourth category; a number that is none of these does not
+# belong in this file.
+#
+#   1. A PUBLISHED CLAIM — §6's fast path < 1s p99, §19's screening p50
+#      < 100ms. These are promises about the product. Load does not move them;
+#      it only says whether we are keeping them.
+#
+#   2. AN EXPORTED GAUGE — `model_drift_threshold`, `backup_objective_seconds
+#      {kind="budget"}`, `event_store_evidence_retention_days`. The rule
+#      compares two *series*, so the deployment's own configuration IS the
+#      threshold and the two cannot drift apart. A literal in these rules would
+#      be a second definition of the same policy, wrong for anyone who tuned
+#      theirs and silently stale the moment the default moves.
+#
+#   3. A MEASUREMENT — the 2026-09-07 `mainnet-peak` load-test run
+#      (`crates/loadtest`, docs/runbooks/load-test.md): 4 blocks/s, 1001
+#      declared tps, 1200 alerting samples, 100 API qps, every service and the
+#      generator co-resident on one dev host. It measured:
+#
+#        fast path p99 bound   0.250s  API idle    →  1.000s  API loaded
+#        detection queue wait  0.0025s API idle    →  0.500s  API loaded
+#        API p99 share         0.974 against the 0.500s budget  (breached)
+#        API success ratio     0.883 against the 0.990 budget   (breached)
+#
+#      A 4x fast-path degradation landing exactly on the published budget,
+#      driven entirely by contention the fast path does not control. That run
+#      is NOT a production capacity claim — it is the proof that the instrument
+#      moves at all, and the numbers it produced are what the rules below are
+#      calibrated against. The budgets it checks live in crates/loadtest/
+#      slo.json; where a rule watches a series that file also gates on, the two
+#      carry the SAME number on purpose, so the nightly job and Alertmanager
+#      cannot come to different conclusions about the same SLO.
+#
+# ── The bucket-ladder rule (this is a correctness constraint, not style) ────
+#
+# EVERY LATENCY THRESHOLD MUST LAND ON A BOUNDARY of
+# `telemetry::metrics::LATENCY_BUCKETS_SECONDS` — ..., 0.1, 0.25, 0.5, 1.0,
+# 2.5, 5.0, 10.0 — which every `_seconds` histogram in the platform shares.
+# `histogram_quantile` interpolates *inside* a bucket, so a threshold between
+# two rungs is compared against a number the histogram never observed. Worse, a
+# threshold ABOVE 10.0 can never fire at all: a quantile falling in the `+Inf`
+# bucket reports the highest finite bound, so the expression is capped at 10
+# whatever it names. Two rules here were exactly that — `AlertEndToEndLatency
+# High` at 30s and `EmbeddingSweepLapTooSlow` at 6h, both structurally incapable
+# of firing since the day they were written. This is the same defect class as
+# the pre-2026-09-07 `FastPathLatencyHigh`, which watched a series a backlog
+# could not move. Both are fixed below; a lap measured in hours cannot be
+# expressed on a 10s ladder at all, so that SLI moved to a gauge.
+#
+# ── What is still uncalibrated, and says so ─────────────────────────────────
+#
+# The load test drives the chain and the API. It does NOT drive simulation,
+# embeddings, clustering, the copilot, or notification delivery — so nothing in
+# those groups is measurement-backed, and none of them pretends to be. They
+# survive on category 2 (compared against the deployment's own configured
+# number) or on a structural condition: a count of something that should be
+# zero, or two series that contradict each other. Rules that had neither — an
+# invented number attached to an *observation* rather than a fault — have been
+# deleted rather than left as green decoration. A rule nobody can act on
+# teaches operators to ignore the ones they can.
+#
+# ── These constraints are a TEST, not this comment ──────────────────────────
+#
+# `crates/alert-conformance` parses this file and fails `cargo test` on: a
+# quantile threshold off its metric's ladder or above its ceiling; a batch-job
+# series read through a window narrower than the job's cadence, or through
+# `increase`/`rate` instead of `max_over_time`; an unroutable severity; a new
+# `informational` rule; a missing annotation; a duplicate alert name.
+#
+# It reads `telemetry::metrics::buckets_for` rather than a copy of the ladder,
+# so a threshold is always checked against the boundaries its metric is really
+# exported on. Everything in this header existed as prose first, and prose is
+# how four unfireable rules got here — see engineering conventions §19b.
+#
+# ── Severity is a response, not a confidence level ──────────────────────────
+#
+# `page` = wake someone now. `warning` = look at this today. `informational` is
+# no longer the parking space for "we have not tuned this yet": exactly one
+# rule below carries it, and it does so because over-retention is genuinely the
+# milder failure — an argued severity, not an unpicked number.
 groups:
   - name: mevwatch-slo
     rules:
@@ -44,18 +114,28 @@ groups:
           summary: "Fast path p99 exceeds the §6 <1s SLO"
           description: "detection_fast_path_duration_seconds{outcome=\"alert\"} p99 (block occurred_at → alert published) has been above 1s for 5m. This is the platform's headline latency claim. Split it: detection_queue_wait_seconds large ⇒ detection is the bottleneck (roster cost, rayon backlog); detection_block_process_seconds large ⇒ the work or the publish path; both small ⇒ the time is outside the process (broker transit, consumer lag, or clock skew between ingestion and detection). docs/runbooks/load-test.md."
 
-      # The backpressure term on its own, at a tighter bound than the budget.
-      # A leading indicator: queue wait grows before the total breaches, so
-      # this fires while there is still headroom to act.
+      # The backpressure term on its own — CALIBRATED (category 3), and the
+      # clearest thing the 2026-09-07 run changed.
+      #
+      # This was 0.5, chosen as "half the §6 budget" before anything had been
+      # measured. The run then measured queue wait at *exactly* 0.500s in the
+      # same window the fast path reached 1.000s — so the old threshold fired
+      # simultaneously with `FastPathLatencyHigh`, or a beat after it. A leading
+      # indicator that leads by nothing is just a second page for one incident.
+      #
+      # Healthy is 0.0025s (same profile, API idle). 0.25 is the next ladder
+      # rung down: 100x the measured healthy value, so ordinary variation will
+      # not reach it, and half the measured degraded value, so it fires while
+      # the total still has headroom — which is the entire job of this rule.
       - alert: FastPathQueueWaitHigh
         expr: |
-          histogram_quantile(0.99, sum(rate(detection_queue_wait_seconds_bucket[5m])) by (le)) > 0.5
+          histogram_quantile(0.99, sum(rate(detection_queue_wait_seconds_bucket[5m])) by (le)) > 0.25
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Blocks are queueing in front of detection"
-          description: "detection_queue_wait_seconds p99 above 500ms for 10m — half the §6 budget is being spent before a detector runs. The bounded work channel is filling, which means detection is not keeping up with the block rate."
+          description: "detection_queue_wait_seconds p99 above 250ms for 10m — a quarter of the §6 budget is being spent before a detector runs, against a measured healthy value of 2.5ms. The bounded work channel is filling. Act now: at 500ms of queue wait the 2026-09-07 load test had the fast path sitting on its 1s budget, and FastPathLatencyHigh is next. What the load test found doing this to a healthy pipeline was contention from a co-resident API, NOT anything detection controls — check what else is scheduled on these nodes before tuning the roster."
 
       # Monitoring the monitor (engineering conventions §15): a fast path that
       # stopped producing samples and a fast path with nothing to report render
@@ -72,14 +152,43 @@ groups:
           summary: "Detection has recorded no fast-path samples for 15m"
           description: "No block has completed the fast path on chain {{ $labels.chain }} in 15 minutes. Either ingestion stopped producing BlockAssembled or detection stopped consuming — the latency panels will look healthy either way, because a quantile over no samples reports the last one."
 
+      # CALIBRATED (category 3). Was 1s, "a placeholder pending a real SLA".
+      # The SLA it was waiting for already existed: crates/loadtest/slo.json
+      # declares `api_p99_seconds: 0.5`, and the 2026-09-07 run BREACHED it
+      # (p99 share 0.974 against a 0.99 floor) while this alert sat green,
+      # because it was watching the same series through a threshold twice as
+      # loose. That is the disagreement `FastPathLatencyHigh` was rewired to
+      # eliminate, repeated on the API: the nightly job fails, the dashboard
+      # says fine, and nobody can say which one is lying.
+      #
+      # 0.5 is a ladder boundary and is now the single definition of the API
+      # p99 budget — change it here and in slo.json together, or not at all.
       - alert: ApiLatencyHigh
-        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 1
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
         for: 5m
         labels:
           severity: page
         annotations:
-          summary: "api-service p99 request latency is high"
-          description: "http_request_duration_seconds p99 has been above 1s for 5m. Threshold is a placeholder pending a real SLA — tune once load-test/production numbers exist."
+          summary: "api-service p99 request latency is over its 500ms budget"
+          description: "http_request_duration_seconds p99 has been above 500ms for 5m — the budget in crates/loadtest/slo.json (api_p99_seconds), which the nightly load test gates on with this same number. Note this is the aggregate across routes; ScreeningLatencyP50High is the contractual one (§11 sits inline on customer withdrawals). If both fire, treat the screening path first."
+
+      # CALIBRATED (category 3) — a rule the measurement demanded and that did
+      # not exist. The 2026-09-07 run measured an API success ratio of 0.883
+      # against slo.json's `min_api_success_ratio: 0.99`, driven by event-store
+      # 5xx under load. The load test could see that; Prometheus could not,
+      # because nothing here watched http_requests_total at all. A latency
+      # panel is blind to this by construction — a fast 500 is fast.
+      - alert: ApiErrorRatioHigh
+        expr: |
+          sum(rate(http_requests_total{status="5xx"}[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total[5m])), 1e-9) > 0.01
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Over 1% of API requests are failing"
+          description: "The 5xx share of http_requests_total has been above 1% for 5m — the complement of slo.json's min_api_success_ratio (0.99), carrying the same number so the nightly gate and this alert agree. 4xx is deliberately excluded: a client sending bad requests is not an outage. The 2026-09-07 load test reached 0.883 success here, and the cause was upstream — the API proxies event-store and simulation-projection (§11), so check those before api-service itself, and check http_requests_total by `route` to see whether one upstream or all of them."
 
       - alert: ScreeningLatencyP50High
         expr: |
@@ -129,35 +238,33 @@ groups:
           summary: "{{ $labels.job }} is not being scraped"
           description: "Prometheus has failed to scrape {{ $labels.job }} ({{ $labels.instance }}) for 2m — the process is down, unreachable, or its /metrics endpoint hung."
 
-      - alert: SimulationConfirmationRateAnomaly
-        expr: |
-          sum(rate(simulation_jobs_total{outcome="confirmed"}[1h]))
-          /
-          clamp_min(sum(rate(simulation_jobs_total[1h])), 1e-9) < 0.01
-        for: 1h
-        labels:
-          severity: informational
-        annotations:
-          summary: "Simulation confirmation rate looks anomalously low"
-          description: "Confirmed/(confirmed+unconfirmed) has been below 1% for 1h. No real baseline exists yet (production_readiness.md Epic E) — this is a placeholder to prove the panel/alert wiring, not a tuned SLO. Revisit once precision/recall baselines exist."
-
-      - alert: ReorgFrequencyHigh
-        expr: sum(rate(reorgs_total[1h])) by (chain) > 0.5
-        for: 1h
-        labels:
-          severity: informational
-        annotations:
-          summary: "Reorg frequency is elevated on {{ $labels.chain }}"
-          description: "More than 1 reorg per 2h sustained for 1h on {{ $labels.chain }} — a placeholder threshold (no production baseline yet); a real spike here is worth a manual look regardless (RPC endpoint on a minority fork, or a genuinely unstable chain head)."
-
+      # REPAIRED. This read `> 30` on a histogram whose top finite bucket is
+      # 10s, so `histogram_quantile` could return at most 10 and the rule was
+      # incapable of firing — it has been green since it was written, and that
+      # green meant nothing. Same defect as the old `FastPathLatencyHigh`, in a
+      # different disguise: there, the series could not move; here, the
+      # comparison could not be reached.
+      #
+      # 5.0 is the largest ladder boundary that leaves the expression decidable
+      # (at 10.0 the rule is unfireable again, since 10 is also the ceiling),
+      # and it is defensible on its own terms rather than being merely the
+      # largest legal number: the fast path is MEASURED to reach 1.000s to
+      # durable publication under load, and everything after that is the
+      # notification consumer's dedup, routing and delivery. Five times the
+      # measured publication point is real headroom for one HTTP/SMTP hop and a
+      # retry, and any p95 past it means the delivery path, not the pipeline.
+      #
+      # Honest caveat: the load test does NOT drive notification, so unlike the
+      # two rules above this end is reasoned from the measurement rather than
+      # measured. It is a bound worth having, not an SLA.
       - alert: AlertEndToEndLatencyHigh
-        expr: histogram_quantile(0.95, sum(rate(notification_alert_end_to_end_seconds_bucket[10m])) by (le)) > 30
+        expr: histogram_quantile(0.95, sum(rate(notification_alert_end_to_end_seconds_bucket[10m])) by (le)) > 5
         for: 10m
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "Block → notification latency (p95) is elevated"
-          description: "notification_alert_end_to_end_seconds p95 has been above 30s for 10m — the §19 headline end-to-end panel. Placeholder threshold; tune once a real customer-facing SLA is set."
+          description: "notification_alert_end_to_end_seconds p95 has been above 5s for 10m — the §19 headline end-to-end panel, measured block occurred_at → delivery. Compare against detection_fast_path_duration_seconds: if the fast path is inside its 1s budget then the time is being spent after publication (delivery retries, a slow webhook endpoint, SMTP, or the dedup ledger), and notification_alert_end_to_end_seconds is labeled by `channel` — one bad customer endpoint can carry the whole p95. If the fast path is ALSO high, this is downstream of that and FastPathLatencyHigh is the one to work."
 
   # ── Model serving + governance (§17, §20.2, §20.5; Sprint 18 t5) ──────
   #
@@ -178,17 +285,37 @@ groups:
           /
           clamp_min(sum by (detector, version) (rate(detector_runs_total[1h])), 1e-9)
 
+      # CALIBRATED (category 3). Was 0.25 — "a quarter of the budget", which
+      # sounded conservative and was not: the 2026-09-07 run measured the
+      # *entire* fast path at a p99 bound of 0.250s with the API idle. A single
+      # detector reaching the old threshold meant one detector alone was
+      # consuming what the whole block → alert path costs when healthy, by
+      # which point the budget is already gone and this has stopped being an
+      # early warning.
+      #
+      # 0.05 is the ladder rung that makes it one again. Nine detectors run per
+      # block (sandwich, arb, flashloan, liquidation, rugpull, poisoning,
+      # washtrading, anomaly, demo); 9 x 50ms = 450ms still fits inside the 1s
+      # §6 budget, so the roster can be fully at this threshold without
+      # breaching — it flags the outlier, not the roster. Keep the arithmetic
+      # honest when detectors are added or removed.
+      #
+      # Read it next to the fast-path rules, never alone: the load test's whole
+      # lesson is that `detector_detect_duration_seconds` is measured in
+      # microseconds on a header-only block and did not move at all during the
+      # 4x degradation, because the time was in the queue. A high value here is
+      # a real finding; a low one proves nothing.
       - alert: DetectorLatencyBudgetExceeded
         expr: |
           histogram_quantile(0.99,
             sum by (detector, le) (rate(detector_detect_duration_seconds_bucket[5m]))
-          ) > 0.25
+          ) > 0.05
         for: 10m
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "{{ $labels.detector }} p99 detect latency is eating the fast-path budget"
-          description: "One detector's p99 has been above 250ms for 10m. The §6 SLO is <1s for the *whole* block → alert path, and every detector in the roster runs on it, so a single detector at a quarter of the budget is the early warning that FastPathLatencyHigh is coming. For the ML detector this is the §20.2 inference budget — cross-check model_inference_duration_seconds. Threshold is a share-of-budget judgement, not a measured baseline; tune with the roster size."
+          description: "One detector's p99 detect call has been above 50ms for 10m, against a measured healthy whole-path p99 of 250ms. Every detector in the roster runs on the §6 block → alert path, so one outlier at 50ms is the early warning that FastPathLatencyHigh is coming. For the ML detector this is the §20.2 inference budget — cross-check model_inference_duration_seconds. Note this series is deliberately NOT the fast-path SLO: it is one `detect` call and is unmoved by a queue building up in front of it (docs/runbooks/load-test.md), so a quiet value here does not mean the fast path is healthy."
 
       - alert: ModelServingSkew
         expr: sum(rate(model_drift_rejected_total[15m])) by (model) > 0
@@ -226,7 +353,7 @@ groups:
           max by (model) (model_drift_threshold)
         for: 30m
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "{{ $labels.model }}: feature {{ $labels.feature }} has drifted from its training snapshot"
           description: "The serving-time distribution of {{ $labels.feature }} has sat past this deployment's drift threshold for 30m — its median has moved that many training spreads, or its variance has changed by e^that (see ml_features::drift). §20.5's point is that this is visible *before* precision decays: check the §18 backtest numbers for this model and consider a retrain on a recent window. The durable record is the `ModelDriftDetected` event in the event store, which names the exact (id, version, config_hash) triple that was serving."
@@ -254,7 +381,7 @@ groups:
           sum by (model) (rate(model_drift_windows_total[1h])) > 0
         for: 2h
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "{{ $labels.model }} is serving but publishing no drift readings"
           description: "This model has scored vectors for an hour without closing a single drift window (§20.5). Expected briefly after a deploy and on a very low-traffic chain — a window needs ml_features::MIN_WINDOW samples before it will report at all, even past its age bound. Sustained for 2h it means monitoring is effectively off: check that `drift.disabled` isn't set in anomaly.json, and check model_drift_skipped_total."
@@ -263,7 +390,7 @@ groups:
         expr: sum by (model, reason) (rate(model_drift_skipped_total[30m])) > 0
         for: 30m
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "{{ $labels.model }} drift observations are being dropped ({{ $labels.reason }})"
           description: "The monitor is failing open — by design, it must never block the fast path — but it is losing data. `contended`: the accumulator lock was held, which today's one-block-at-a-time scheduler should make impossible, so this means the concurrency model changed. `poisoned`: something panicked inside the accumulator; the partial window was discarded and it recovered, but the panic is a bug. `undrained`: readings were evicted before the scheduler drained them, so `ModelDriftDetected` events are being lost."
@@ -272,42 +399,41 @@ groups:
         expr: sum(rate(intelligence_embedding_sweep_budget_exhausted_total[1h])) > 0
         for: 2h
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "The behavior-embedding sweep is not finishing its windows"
           description: "The §20.3 sweep hit its per-tick address budget (INTEL_EMBEDDING_SWEEP_BUDGET) and stopped early. It resumes from its cursor on the next tick, so nothing is skipped — but sustained exhaustion means behavior vectors are getting older than one sweep interval. Check intelligence_embedding_sweep_lap_seconds for the actual staleness. Fixes, in order of preference: add shards (raise replicas AND INTEL_EMBEDDING_SHARD_TOTAL together), raise the budget, shorten the interval. A burst after a backfill is expected and self-clears."
 
+      # REPAIRED, and it needed a code change to be repairable at all.
+      #
+      # This read `histogram_quantile(0.9, ...sweep_lap_seconds...) > 21600`.
+      # `intelligence_embedding_sweep_lap_seconds` ends in `_seconds`, so it
+      # gets telemetry's shared latency ladder, whose top finite bucket is 10s
+      # — a ladder sized for detector calls, holding a quantity measured in
+      # hours. Every observation landed in `+Inf`, the quantile could return at
+      # most 10, and a threshold of 21600 was unreachable by five orders of
+      # magnitude. The staleness SLI Sprint 19 t1 deliberately built has been
+      # unwatched since the day it was wired.
+      #
+      # A lap in hours cannot be expressed on that ladder at any threshold, so
+      # the fix is not a number: `intelligence_embedding_sweep_last_lap_seconds`
+      # is a gauge (crates/intelligence/src/embedding_sweep.rs), which has no
+      # buckets and no ceiling. The histogram stays for the distribution's
+      # shape; this rule reads the gauge.
+      #
+      # 6h is category 1, not 3 — it is the staleness bound similarity search
+      # (§20.3, Sprint 19 t2) and the clustering signal (t3) inherit and quote,
+      # not something load measured. `max` without grouping is deliberate: with
+      # sharding each replica walks its own slice, and the staleness every
+      # consumer actually inherits is the slowest shard's, not the average.
       - alert: EmbeddingSweepLapTooSlow
-        expr: |
-          histogram_quantile(0.9, sum(rate(intelligence_embedding_sweep_lap_seconds_bucket[6h])) by (le)) > 21600
-        for: 6h
+        expr: max(intelligence_embedding_sweep_last_lap_seconds) > 21600
+        for: 1h
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "Behavior vectors are going stale faster than the sweep refreshes them"
-          description: "The p90 time to walk one sweep window has exceeded 6h. This is the *staleness SLI*: it is the age bound that similarity search (§20.3, Sprint 19 t2) and the clustering signal (t3) inherit — a stale vector makes 'behaves like this actor' an answer about last week. Unlike the budget alert this fires even when every tick completes, which is the case where the job looks healthy and is simply too slow. Threshold is a placeholder with no production graph to calibrate against."
-
-      - alert: EmbeddingChangeDetectionNotPaying
-        expr: |
-          sum(rate(intelligence_embeddings_skipped_total[6h]))
-            / sum(rate(intelligence_embeddings_computed_total[6h])) < 0.5
-        for: 6h
-        labels:
-          severity: informational
-        annotations:
-          summary: "Most behavior-vector recomputations are producing changed vectors"
-          description: "Change detection exists so an unchanged recomputation is neither stored nor published; a healthy steady state skips most of what it computes, because most addresses are dormant on any given hour. A sustained low skip ratio means either the graph really is that busy, or something is making vectors move that shouldn't — the clock is supposed to enter a vector at day resolution precisely so a dormant address is stable within a day. Check intelligence_embeddings_written_total by `reason`: a flood of `refresh` means INTEL_EMBEDDING_REFRESH_INTERVAL_SECS is too short, a flood of `schema_changed` means a version rollout is in flight, a flood of `changed` means the day-quantization assumption is broken."
-
-      - alert: EmbeddingsMostlyTruncated
-        expr: |
-          sum(rate(intelligence_embeddings_truncated_total[1h]))
-            / sum(rate(intelligence_embeddings_computed_total[1h])) > 0.25
-        for: 2h
-        labels:
-          severity: informational
-        annotations:
-          summary: "Over a quarter of behavior vectors are computed over a truncated history"
-          description: "INTEL_EMBEDDING_HISTORY_CAP is biting on more of the graph than it was sized for: those vectors describe a recent activity window rather than an address's whole life (the §8.2 hub rule at edge granularity), and they carry `is_hub = 1` to say so. That is correct behavior, not a fault — but at this share the cadence features are measuring the cap more than the addresses, so raise the cap or accept the narrower window deliberately. Threshold is a placeholder with no production graph to calibrate against."
+          description: "The slowest shard's last completed sweep lap exceeded 6h — the staleness bound similarity search and the clustering signal inherit, so past it 'behaves like this actor' is an answer about last week. Unlike EmbeddingSweepFallingBehind this fires even when every tick completes, which is the case where the job looks healthy and is simply too slow. Fixes in order of preference: add shards (raise replicas AND INTEL_EMBEDDING_SHARD_TOTAL together), raise INTEL_EMBEDDING_SWEEP_BUDGET, shorten the interval. NOTE the gauge is written only when a window COMPLETES, so a sweep that has stalled outright holds its last healthy value here — EmbeddingSweepFallingBehind is what covers that, and the two are meant to be read together."
 
       # ── The §20.3 clustering signal (Sprint 19 t3) ────────────────────
       - alert: ClusteringSignalProposingNothing
@@ -316,7 +442,7 @@ groups:
             and sum(rate(intelligence_link_candidates_total{outcome="new"}[24h])) == 0
         for: 24h
         labels:
-          severity: informational
+          severity: warning
         annotations:
           summary: "The clustering signal is searching but proposing nothing"
           description: "Searches are running (the expensive part) and producing zero new candidate links over a day. Usually one of three things, and intelligence_link_signal_suppressed_total{reason} says which: `below_threshold` dominating means INTEL_LINK_MIN_SIMILARITY is set above what this population actually produces; `no_anchor` dominating means the label coverage is too thin for the signal to have anything to anchor on (seed more feeds — §8.1); `already_clustered` dominating means the graph is reaching these addresses first, which is the good outcome and means the signal is buying little here. A silent zero is worth an alert precisely because a signal that proposes nothing looks identical to one that is working."
@@ -330,24 +456,6 @@ groups:
         annotations:
           summary: "The clustering signal cannot standardize: no population baseline"
           description: "Over half of subjects are being skipped because no usable population baseline exists for this (chain, embedding_version) — run `intelligence embedding-baseline`, and check intelligence_similarity_baseline_age_seconds. Until it resolves the signal is consuming its topic and proposing nothing, which the queue makes look like 'no links exist' rather than 'nothing was compared'."
-      - alert: ClusteringSignalProposalFlood
-        expr: |
-          sum(rate(intelligence_link_signal_suppressed_total{reason="capped"}[1h]))
-            / clamp_min(sum(rate(intelligence_link_candidates_total{outcome="new"}[1h])), 1e-9) > 5
-        for: 2h
-        labels:
-          severity: informational
-        annotations:
-          summary: "The per-subject proposal cap is doing most of the filtering"
-          description: "Subjects are routinely matching far more anchors than INTEL_LINK_MAX_PER_SUBJECT will accept, so the cap — a safety bound — has become the actual selection criterion. That usually means INTEL_LINK_MIN_SIMILARITY is too low for a dense behavioral neighbourhood (every sandwich bot resembles every other), and the queue is being filled by the same few clusters. Raise the threshold rather than the cap: the cap protects the queue, the threshold decides what deserves to be in it."
-      - alert: ClusteringSignalSecondOrderTaint
-        expr: sum(rate(intelligence_link_signal_suppressed_total{reason="derived_anchor_only"}[6h])) > 0.05
-        for: 6h
-        labels:
-          severity: informational
-        annotations:
-          summary: "Behavioral matches are landing on derived labels"
-          description: "Neighbours are being refused as anchors because the only actor-kind labels they carry are themselves entity-derived — the refusal that stops taint spreading transitively (a guess about a guess). Sustained non-zero means the derived labels are pooling into a behavioral cluster of their own, which is worth looking at: either a genuine cluster the graph has not merged, or the signal repeatedly circling the same neighbourhood. It is NOT a reason to relax the rule; there is no confidence discount that makes second-order taint honest."
       - alert: ClusteringSignalRecoveringLostAnnouncements
         expr: sum(rate(intelligence_link_signal_recovered_total[1h])) > 0
         for: 5m
@@ -361,6 +469,31 @@ groups:
   # These alerts watch a machine that writes suspicious-activity reports. The
   # failure they exist for is not an outage: it is a plausible, well-formatted,
   # confidently-cited document that nothing in the record supports.
+  #
+  # CALIBRATED 2026-09-11 against the audit's actual cadence, which is what
+  # "these have never fired against real volume" turned out to mean. The four
+  # audit rules read `increase(...[1d])`; the audit is a WEEKLY CronJob
+  # (`0 3 * * 0`, deploy/k8s/base/services/copilot-audit.yaml). Two independent
+  # defects followed, and either alone was enough to keep them green forever:
+  #
+  #   - A one-day window over a seven-day cadence. Even for a run that lands
+  #     perfectly, its findings sit inside the window for 24 of every 168 hours;
+  #     for the other six days the rule reads zero no matter what the audit
+  #     found. The window is now [8d] — one full cadence plus slack, so a
+  #     result stays visible until the next run replaces it.
+  #   - `increase()` needs two samples in the window to return anything at all.
+  #     A short-lived Job may be scraped once, or never. `max_over_time()` needs
+  #     one, and on a counter from a fresh process that starts at zero it is the
+  #     right reading of "what did that run report".
+  #
+  # Neither fix conjures a series that is never scraped: in Kubernetes the
+  # durable signal for a findings run remains the Job failing (exit 1,
+  # `backoffLimit: 0`). A `kube_job_status_failed` rule is deliberately NOT
+  # added here — kube-state-metrics is not deployed in deploy/, and adding a
+  # rule that cannot resolve its own series is the exact defect this pass exists
+  # to remove. Deploy kube-state-metrics and that rule becomes worth writing;
+  # until then these are the backstop for a scraped or in-process run, and the
+  # CronJob's own status is the primary.
   - name: mevwatch-copilot-governance
     rules:
       - alert: CopilotFabricatedCitations
@@ -373,7 +506,7 @@ groups:
           description: "copilot_grounding_rejected_total{reason=\"fabricated\"} is non-zero: a narrative cited event ids that were not in the audit window the model was given. The drafts themselves are safe — they land `blocked`, never `ready` — so this pages for the *cause*, not the consequence: a prompt change that stopped demanding full ids, a model swap, or an audit-window read that is returning less than the prompt claims. Check the most recent change to crates/copilot/prompts/ (engineering conventions §16) before assuming the model."
 
       - alert: CopilotGroundingAuditFindings
-        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict=~"unresolved|drifted|unchecked"}[1d])) > 0
+        expr: sum(max_over_time(copilot_grounding_audit_drafts_total{verdict=~"unresolved|drifted|unchecked"}[8d])) > 0
         for: 5m
         labels:
           severity: page
@@ -382,7 +515,7 @@ groups:
           description: "`copilot audit` re-resolved landed narratives against event-store and found at least one that does not hold: `unresolved` = it cites events the store does not have, `drifted` = the row's grounded_event_ids disagrees with the prose a reviewer reads, `unchecked` = a ready/approved draft the citation boundary never ran on. Any of the three means a document that reads as verifiable is not. Run `just copilot-audit` for the draft ids — the sweep names them, the metric deliberately cannot. NOTE: these series exist only where the sweep runs somewhere Prometheus scrapes; the copilot-audit CronJob is short-lived, so in Kubernetes the primary signal is the Job itself failing (kube_job_status_failed{job_name=~\"copilot-audit.*\"}) — this rule is the backstop for a scraped or in-process run."
 
       - alert: CopilotGroundingAuditUnverifiable
-        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict="evidence_missing"}[1d])) > 0
+        expr: sum(max_over_time(copilot_grounding_audit_drafts_total{verdict="evidence_missing"}[8d])) > 0
         for: 5m
         labels:
           severity: page
@@ -391,7 +524,7 @@ groups:
           description: "THE RETENTION POLICY HAS BEEN VIOLATED (engineering conventions §18). The audit found a stored narrative whose cited evidence event-store no longer holds, while the narrative itself is still inside its retention window — i.e. the platform is holding a regulatory artifact it can no longer substantiate, and is required to. This is NOT the same as `verdict=\"expired\"`, which is the same observation about an artifact past its deadline and is retention working. Two causes, both actionable: the events table's TTL is shorter than the policy (`event-store retention` prints the store's window next to the policy's — compare with the `event_store_evidence_retention_days` gauge), or evidence was deleted out of band. Run `just copilot-audit` for the draft ids; the metric deliberately cannot name them. Before this alert had a policy to point at it fired on a *share* of unverifiable drafts and could only say the situation might be deliberate; it now fires on one draft, and it is never deliberate."
 
       - alert: CopilotNarrativesWillOutliveTheirEvidence
-        expr: sum(increase(copilot_grounding_audit_at_risk_total[1d])) > 0
+        expr: sum(max_over_time(copilot_grounding_audit_at_risk_total[8d])) > 0
         for: 1h
         labels:
           severity: warning
@@ -400,7 +533,7 @@ groups:
           description: "The leading indicator for CopilotGroundingAuditUnverifiable, and the one with time left on the clock. These drafts resolve perfectly today, but the oldest event each one cites expires BEFORE the draft may be destroyed — so they are already scheduled to become undefendable. Overwhelmingly this means a backfill drafted over an archive older than RETENTION_EVIDENCE_MARGIN_DAYS. The fix is that same variable: raising it lengthens the events table's TTL (event-store reconciles it upward at boot), which is what makes the older archive defendable — it is deliberately one knob, so evidence cannot be under-kept by unlocking an older backfill. `just copilot-audit` prints each draft with `outlives-its-evidence-by=Nd`, which is the number of days to add."
 
       - alert: CopilotRetentionPurgeStalled
-        expr: sum(increase(copilot_grounding_audit_drafts_total{verdict="expired"}[1d])) > 100
+        expr: sum(max_over_time(copilot_grounding_audit_drafts_total{verdict="expired"}[8d])) > 100
         for: 6h
         labels:
           severity: informational
@@ -417,6 +550,18 @@ groups:
           summary: "The event store's evidence retention window is unset or just moved"
           description: "`event_store_evidence_retention_days` is the window this deployment BELIEVES it enforces, published at boot from the resolved policy. Absent means no event-store pod has reconciled its TTL — the service refuses to start when it finds a window it cannot safely apply (a narrowing, a first bound over an existing archive, or a TTL clause it could not parse), so an absent series alongside a CrashLoopBackOff is that refusal, and the pod log names the plan. A CHANGE means the window moved: correlate with the `RetentionPolicyChanged` fact in the event store, which carries `destructive` — the bit that separates 'we lengthened retention' from 'we deleted history'. Run `just retention-status` for the store's own answer; the gauge is what the pod thinks, `system.tables` is what is true."
 
+      # Category 2 — the threshold is the deployment's own USAGE_TOKEN_BUDGET,
+      # folded into the exported gauge, so there is no literal here to tune.
+      #
+      # But this alarm has never fired against real volume, and calibrating it
+      # turned up the reason: it CANNOT fire as shipped. `usage::budget::run`
+      # returns immediately when USAGE_TOKEN_BUDGET is unset or 0, exporting no
+      # series at all, and deploy/k8s/ does not set it. So in the default
+      # deployment `usage_token_budget_customers` never exists, `max()` over
+      # nothing is an empty vector, and the rule is permanently silent. That is
+      # the deliberate ships-dark decision (production_readiness.md Epic E), not
+      # a bug — but it means A GREEN ALARM HERE IS NOT EVIDENCE OF BOUNDED
+      # SPEND, it is the absence of a question. Arming it is a deploy-time act.
       - alert: CopilotTokenBudgetAlarm
         expr: max(usage_token_budget_customers{level="alarm"}) > 0
         for: 15m
@@ -424,16 +569,67 @@ groups:
           severity: warning
         annotations:
           summary: "A customer's LLM token spend is over the configured budget"
-          description: "At least one spender has passed USAGE_TOKEN_BUDGET over the configured window. Nothing has been refused — this platform meters and never gates — so this is a 'look at it' signal, not an incident: a stuck retry loop, a backfill pointed at the wrong window, or genuine heavy use. Run `just usage-budget` to see *who*; the series carries no customer label on purpose (an unbounded id set has no business in a time series, §19). `usage_token_budget_max_ratio` says how far over the worst one is."
+          description: "At least one spender has passed USAGE_TOKEN_BUDGET over the configured window. Nothing has been refused — this platform meters and never gates — so this is a 'look at it' signal, not an incident: a stuck retry loop, a backfill pointed at the wrong window, or genuine heavy use. Run `just usage-budget` to see *who*; the series carries no customer label on purpose (an unbounded id set has no business in a time series, §19). `usage_token_budget_max_ratio` says how far over the worst one is. Silent unless USAGE_TOKEN_BUDGET is set — see CopilotTokenBudgetDisarmed."
 
+      # Once the loop has run, a death leaves the gauges holding their last
+      # values while this timestamp goes stale, and the rule fires. The blind
+      # spot was a monitor that never armed at all: it exports no timestamp,
+      # `max()` over nothing is empty, and this rule was silent about the one
+      # state it most needs to distinguish from health. Now that arming is an
+      # exported fact, the two states are told apart explicitly — this rule
+      # scopes itself to armed deployments, `CopilotTokenBudgetDisarmed` owns
+      # the other, and neither can be satisfied by an absence.
       - alert: CopilotTokenBudgetMonitorStale
-        expr: time() - max(usage_budget_last_success_timestamp_seconds) > 3600
+        expr: |
+          max(usage_token_budget_enabled) == 1
+          and
+          time() - max(usage_budget_last_success_timestamp_seconds) > 3600
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "The token budget monitor has stopped evaluating"
-          description: "No successful budget evaluation for over an hour. The monitor fails open by design (§15) — a ClickHouse blip must not take the metering sink down with it — which is exactly why this alert exists: a monitor that has quietly stopped looks identical to a monitor with nothing to report. Check usage_budget_evaluations_total{outcome=\"failed\"} and the usage service's logs. Until it recovers, CopilotTokenBudgetAlarm is reporting a stale number."
+          description: "No successful budget evaluation for over an hour. The monitor fails open by design (§15) — a ClickHouse blip must not take the metering sink down with it — which is exactly why this alert exists: a monitor that has quietly stopped looks identical to a monitor with nothing to report. Check usage_budget_evaluations_total{outcome=\"failed\"} and the usage service's logs. Until it recovers, CopilotTokenBudgetAlarm is reporting a stale number. Gated on usage_token_budget_enabled == 1, so it is scoped to deployments that actually armed the monitor and cannot be satisfied vacuously by a disarmed one — CopilotTokenBudgetDisarmed covers that case explicitly."
+
+      # The gap the two rules above leave between them, and the reason neither
+      # has ever fired. A deployment with USAGE_TOKEN_BUDGET unset has every LLM
+      # cost control off, and the two alerts that would say so are both
+      # structurally silent, because absence satisfies them.
+      #
+      # This reads an EXPLICIT arming fact (`usage::budget::BUDGET_ENABLED`,
+      # published unconditionally before the disabled-path return), not
+      # `absent()`. That was the first cut and it was wrong: `absent()` also
+      # fires on a renamed metric, a relabelled scrape job, or a scrape that
+      # never landed, and it silently stops working the day anything else
+      # exports the name — an alert that infers a fact from a missing series is
+      # the same shape of mistake as one that cannot reach its threshold.
+      #
+      # `informational` would be the easy call and would be wrong — but so
+      # would `page`, since shipping dark is the documented default and paging
+      # on it would train people to silence it on day one. `warning` with a long
+      # `for` is the honest severity: somebody decided not to set a budget, and
+      # that decision should be visible and deliberate rather than inherited.
+      - alert: CopilotTokenBudgetDisarmed
+        expr: max(usage_token_budget_enabled) == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The usage service is running with no LLM token budget configured"
+          description: "usage_token_budget_enabled is 0 — USAGE_TOKEN_BUDGET is unset or 0 and per-customer spend alarms are off (crates/usage/src/budget.rs returns immediately when disabled, after publishing this gauge so the state is a fact rather than an absence). This is the shipped default and is not a fault, but while it holds, CopilotTokenBudgetAlarm and CopilotTokenBudgetMonitorStale are both silent for the same reason and neither is evidence of anything. Check LLM_SPEND_CEILING_TOKENS too — the platform-wide runaway valve ships dark the same way, and is the one that actually bounds a loop (the budget only alarms; nothing here ever refuses a customer, by product decision). Set both in deploy/k8s/ or accept the gap explicitly."
+
+      # The counter whose own doc comment says "Alert on any non-zero rate" and
+      # which had no rule — named in production_readiness.md Epic E as the one
+      # loose end of the batch-billing fix. Structural, not calibrated: there is
+      # no acceptable rate of drafts a batch failed to account for.
+      - alert: CopilotBackfillStragglers
+        expr: sum(rate(copilot_backfill_stragglers_total[1h])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A backfill batch returned results that could not be matched to its drafts"
+          description: "copilot_backfill_stragglers_total is rising: a batch closed with drafts it never accounted for, released back to the queue so the drain could close the batch. Either the provider's results stream drifted from the wire format this build parses, or `custom_id` minting is wrong. Not data loss — the drafts return to the queue — but it is the symptom of the bug this path was rebuilt around: the open-batch set used to be derived from drafts still in_flight, so a short batch stayed open forever and was re-polled, re-fetched and RE-METERED every lap. Fetch-once is schema now (copilot_batches.results_fetched_at) and the batch closes unconditionally, so a straggler should be rare and never sustained."
 
   # ── Epic B: disaster recovery — backups, and the proof they restore ──
   #

@@ -472,6 +472,10 @@ impl BudgetMonitor {
 
     /// Evaluate on the policy's interval until cancelled.
     pub async fn run(&self, shutdown: CancellationToken) {
+        // Before the early return, always: a disabled monitor that exports
+        // nothing is indistinguishable from a healthy one. See BUDGET_ENABLED.
+        metrics::gauge!(BUDGET_ENABLED).set(f64::from(u8::from(self.policy.is_enabled())));
+
         if !self.policy.is_enabled() {
             tracing::info!(
                 "per-customer token budget alarms are off (USAGE_TOKEN_BUDGET unset or 0)"
@@ -589,6 +593,29 @@ pub const BUDGET_EVALUATIONS_TOTAL: &str = "usage_budget_evaluations_total";
 /// signal for an alarm that can go quiet by failing rather than by passing.
 pub const BUDGET_LAST_SUCCESS_TIMESTAMP: &str = "usage_budget_last_success_timestamp_seconds";
 
+/// Gauge (`1`/`0`): whether this process armed the budget monitor at all.
+///
+/// **Published unconditionally, before the disabled-path return**, and that
+/// ordering is the whole point. `USAGE_TOKEN_BUDGET` ships unset and is not set
+/// in `deploy/k8s/`, so on a default deployment [`Budget::run`] returns
+/// immediately and every other series in this module is simply *absent*. Absent
+/// satisfies a threshold rule vacuously: `max(usage_token_budget_customers
+/// {level="alarm"}) > 0` is an empty vector, and so is the staleness rule that
+/// exists to catch a monitor that stopped — so the monitor, its alarm, AND its
+/// monitor-of-the-monitor were all green for the same reason, which was that
+/// nobody had asked the question.
+///
+/// Inferring that state from `absent()` in PromQL is possible and fragile: it
+/// also fires on a renamed metric, a relabelled job, or a scrape that never
+/// landed, and it silently stops working the day anything else exports the
+/// name. An explicit arming fact has one meaning.
+///
+/// Generalised as engineering conventions §15's sibling — *declare your arming
+/// state* — because every opt-in control here has the same shape:
+/// `LLM_SPEND_CEILING_TOKENS`, `COPILOT_HTTP_ADDR`, `DETECTION_ANOMALY_CONFIG`.
+/// A control that ships dark must say so in a series, or green means nothing.
+pub const BUDGET_ENABLED: &str = "usage_token_budget_enabled";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +700,58 @@ mod tests {
         assert_eq!(report.alarming, 1);
         assert_eq!(report.alarms[0].spend.customer, None);
         assert!(report.alarms[0].spend.name().contains("platform"));
+    }
+
+    /// A monitor that shipped dark exported nothing at all, which made its own
+    /// alarm and its own staleness rule vacuously green. The arming gauge is
+    /// the fix, so this asserts the series exists on the path that returns
+    /// early — the only path where its absence was the bug.
+    #[test]
+    fn a_disabled_monitor_still_says_that_it_is_disabled() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        #[derive(Debug)]
+        struct NoSpend;
+        #[async_trait]
+        impl SpendSource for NoSpend {
+            async fn token_spend(
+                &self,
+                _since: DateTime<Utc>,
+                _limit: usize,
+            ) -> Result<SpendWindow, StoreError> {
+                Ok(SpendWindow::new(Vec::new(), 0))
+            }
+        }
+
+        let armed = |tokens: u64| -> f64 {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let monitor = BudgetMonitor::new(Arc::new(NoSpend), policy(tokens));
+                        let shutdown = CancellationToken::new();
+                        shutdown.cancel();
+                        monitor.run(shutdown).await;
+                    });
+            });
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == BUDGET_ENABLED)
+                .map(|(.., value)| match value {
+                    DebugValue::Gauge(v) => v.into_inner(),
+                    other => panic!("{BUDGET_ENABLED} must be a Gauge, got {other:?}"),
+                })
+                .expect("the arming gauge is published on every path, armed or not")
+        };
+
+        assert_eq!(armed(0), 0.0, "an unset USAGE_TOKEN_BUDGET must say so");
+        assert_eq!(armed(1_000), 1.0, "an armed monitor must say so too");
     }
 
     /// Disabled is disabled: no thresholds, no division, no alarms.

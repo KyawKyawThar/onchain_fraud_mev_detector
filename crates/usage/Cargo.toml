@@ -44,6 +44,10 @@ tracing.workspace = true
 metrics.workspace = true
 
 [dev-dependencies]
+# In-memory recorder, test-only: the arming-gauge test asserts on what is
+# actually exported, since the bug it guards against is a series that is absent
+# rather than wrong.
+metrics-util.workspace = true
 # The schema registry (§17), so `EVENT_READS` can be checked against the
 # committed schema of the events this sink consumes.
 events = { workspace = true, features = ["schema"] }

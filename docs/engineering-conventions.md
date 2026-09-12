@@ -460,6 +460,36 @@ reason}` counting `contended` / `poisoned` / `undrained`.
 about not panicking, silent about having given up, and permanent once the lock
 is poisoned.
 
+### 15b. Declare your arming state
+
+**Rule.** An optional control — anything that can be switched off by config —
+publishes a `..._enabled` gauge (`1`/`0`) **unconditionally at boot, before the
+disabled path returns**. Never infer "this is off" from a series being absent.
+
+**Why here.** A control that ships dark exports nothing at all, and *absence
+satisfies a threshold rule vacuously*: `max(x{level="alarm"}) > 0` over a
+missing series is an empty vector, which is not a breach. So the control, its
+alarm, and the §15 liveness rule watching the alarm are all green — for the
+same reason, which is that nobody ever asked the question. This is §15's
+failure one level up: §15 stops a *running* monitor from dying silently; this
+stops a monitor that never started from looking like one with nothing to report.
+
+`absent()` in PromQL is the tempting shortcut and is not equivalent. It also
+fires on a renamed metric, a relabelled scrape job, or a scrape that never
+landed, and it silently stops working the day anything else exports that name.
+An alert that infers a fact from a missing series is the same shape of mistake
+as one whose threshold cannot be reached.
+
+**Reference.** [`usage::budget::BUDGET_ENABLED`](../crates/usage/src/budget.rs)
+— set before the `USAGE_TOKEN_BUDGET`-unset return, with
+`CopilotTokenBudgetDisarmed` reading it directly and
+`CopilotTokenBudgetMonitorStale` gated on it so a disarmed deployment cannot
+satisfy the staleness rule by accident. The same shape is owed by
+`LLM_SPEND_CEILING_TOKENS`, `COPILOT_HTTP_ADDR` and `DETECTION_ANOMALY_CONFIG`.
+
+**Anti-pattern.** `if !enabled { return; }` as the first statement of a
+monitor's run loop. Correct, and it makes the "off" state invisible.
+
 ---
 
 ## 16. A prompt is code, and a prompt change is a reviewed diff
@@ -767,6 +797,86 @@ with the whole pipeline's budget; a load generator that awaits each response
 before issuing the next; a "SLO met" that was computed the instant the load
 stopped; and — the one that undoes all the rest — a CI job that treats "could
 not measure" as a pass.
+
+### 19b. An alert rule is code, and it has no failing state
+
+**Rule.** Thresholds in `deploy/prometheus-rules.yml` are one of exactly three
+things, and each rule says which: a **published claim** (§6's <1s), an
+**exported gauge** (the deployment's own config, compared as a series), or a
+**measurement**. Latency thresholds must land on a boundary of the ladder their
+metric is exported on, and strictly below its ceiling. Both are enforced by
+[`crates/alert-conformance`](../crates/alert-conformance/), not by review.
+
+**Why here.** This is §19's argument applied to the instrument that watches
+production, and the asymmetry is what makes it worth a crate. Almost everything
+else in this workspace announces its own failure — a test goes red, a service
+crash-loops, a type stops compiling. **An alert has no failing state.** A rule
+whose threshold is unreachable, whose series is never scraped, or whose window
+is narrower than the job that writes it is *indistinguishable from a healthy
+system*: it is green, and green is what you were hoping to see.
+
+Four rules shipped in exactly that condition and were found by a human reading
+PromQL. Two compared a `histogram_quantile` against a number above the ladder's
+top bucket — and since a quantile landing in `+Inf` reports the highest finite
+bound, neither expression could ever exceed 10, whatever it named. Four more
+read a **weekly** CronJob's counters through a one-day `increase()`, blind six
+days in seven and needing two samples where a short-lived Job may be scraped
+once. None of this was a mis-tuned number; every one was a rule that could not
+fire.
+
+**Corollary — one ladder is not enough.** `_seconds` does not distinguish "how
+long did this call take" from "how long until this comes round again". A
+quantity that legitimately runs for minutes or hours belongs in
+[`telemetry::metrics::JOB_DURATION_METRICS`](../crates/telemetry/src/metrics.rs);
+left on the latency ladder its quantiles are silently pinned at 10s, which is
+how the §19 lead-time signal — the predictive pipeline's headline claim — came
+to be incapable of reporting a lead time above ten seconds. Note the damage is
+confined to quantiles: `_sum`/`_count` are exact whatever the bucketing, so a
+*mean* was always right. `histogram_quantile` returning the ceiling is worse
+than an error, because 10.0 looks like an answer.
+
+**Never keep a second copy of a ladder or a rule set.** `loadtest` imports
+`LATENCY_BUCKETS_SECONDS` rather than copying it; `alert-conformance` asks
+`buckets_for` rather than assuming; Kubernetes *generates* its rules ConfigMap
+from `deploy/prometheus-rules.yml`. The inlined K8s copy that this replaced had
+drifted for three sprints, and production was running a `FastPathLatencyHigh`
+still pointed at the series the load test had already proved could not move.
+
+**Severity is a response, not a confidence level.** `informational` is not the
+parking space for an untuned number: if the threshold is invented *and* the
+condition is an observation rather than a fault, the rule does not belong in the
+file. `INFORMATIONAL_ALLOWLIST` is a short, argued list, and conformance fails
+on an addition to it.
+
+**Two gates, not one.** `alert-conformance` asks whether a rule *can fire*;
+`promtool check rules` asks whether Prometheus will *load the file*. They are
+complementary and both are required: a syntax error drops **every** alert in the
+file, not just the broken one. `just alerts-check` runs both in CI's order.
+
+**The ladders are a workaround, and there is an exit.** Prometheus **native
+histograms** use exponential auto-scaling buckets: no top bucket, so no
+threshold can sit above a ceiling, and no boundary alignment, because resolution
+is relative rather than enumerated. The exporter already supports them
+and the migration is opt-in on **two independent axes**:
+`TELEMETRY_NATIVE_HISTOGRAMS` (this cluster's Prometheus can read them) *and*
+`NATIVE_HISTOGRAM_METRICS` (these specific series have been moved, currently
+empty). Both are required, and that is the design, not caution theatre: native
+histograms render only in protobuf and this exporter *stores* a metric as native
+once configured, so a migrated metric on a cluster that cannot render it is
+**lost, not degraded**. A single suffix-matched switch would move every duration
+metric in the platform at once — if the protobuf negotiation were wrong, every
+latency panel and every SLO alert would go blank in the same instant, which is
+the largest blast radius obtainable from one boolean. Migrate one metric,
+confirm it renders, then widen; reverting is deleting a line. Nothing in
+`deploy/` enables the flag, so until this is exercised against a real Prometheus
+the path is code-complete and unproven. Migrating a metric also takes it outside
+the ladder rules above, so conformance and deployment move together.
+
+**Anti-pattern.** A threshold whose provenance nobody can state; `absent()` used
+to infer that a subsystem is switched off (§15b); a cadence restated in Rust
+next to the CronJob YAML that already declares it; and a contract written as a
+comment at the top of a config file, which is what all of the above was before
+it was a test.
 
 ---
 

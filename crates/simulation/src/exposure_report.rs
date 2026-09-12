@@ -51,6 +51,11 @@ const MAX_CONCURRENCY: usize = 16;
 /// Histogram: one sample per completed [`run_cycle`] call, spanning every
 /// page and every wallet — the cycle's total wall-clock cost.
 pub const EXPOSURE_REPORT_CYCLE_DURATION_SECONDS: &str = "exposure_report_cycle_duration_seconds";
+/// [`EXPOSURE_REPORT_CYCLE_DURATION_SECONDS`] with its bucket ladder attached —
+/// a **job duration**: one full report cycle runs in minutes, well past the
+/// latency ladder's 10s ceiling.
+pub const EXPOSURE_REPORT_CYCLE: telemetry::metrics::DurationMetric =
+    telemetry::metrics::DurationMetric::job_duration(EXPOSURE_REPORT_CYCLE_DURATION_SECONDS);
 /// Counter: one increment per wallet processed this cycle, labeled `outcome`
 /// (`published`/`exposure_fetch_failed`) — mirrors `SIMULATION_JOBS_TOTAL`'s
 /// outcome-label convention (`crate::metrics`).
@@ -213,7 +218,7 @@ pub async fn run_cycle(
 /// `metrics::with_local_recorder`-testable in isolation, the same split
 /// `notification::delivery`'s `count_delivery` uses.
 fn record_cycle(elapsed: Duration, stats: &CycleStats) {
-    metrics::histogram!(EXPOSURE_REPORT_CYCLE_DURATION_SECONDS).record(elapsed.as_secs_f64());
+    telemetry::metrics::record_duration(EXPOSURE_REPORT_CYCLE, elapsed.as_secs_f64());
     metrics::counter!(EXPOSURE_REPORT_WALLETS_TOTAL, "outcome" => "published")
         .increment(stats.wallets_published as u64);
     metrics::counter!(EXPOSURE_REPORT_WALLETS_TOTAL, "outcome" => "exposure_fetch_failed")

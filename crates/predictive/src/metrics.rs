@@ -54,6 +54,17 @@ pub const PREDICTIONS_TOTAL: &str = "predictive_predictions_total";
 /// lead-time-to-actual-liquidation accuracy signal
 /// ([`crate::lead_time::LeadTimeTracker`]).
 pub const LIQUIDATION_LEAD_TIME_SECONDS: &str = "predictive_liquidation_lead_time_seconds";
+/// [`LIQUIDATION_LEAD_TIME_SECONDS`] with its bucket ladder attached.
+///
+/// A **job-duration** metric, not a latency one, and the distinction was not
+/// academic: a useful lead time is minutes to hours, and on the shared 10s
+/// latency ladder every sample landed in `+Inf` — so `histogram_quantile` over
+/// the §19 signal for this pipeline's headline claim could never report a lead
+/// time above ten seconds. (`_sum`/`_count` were always exact, so the mean was
+/// right; only quantiles lied.) Recorded through `record_duration`, which
+/// asserts the exporter agrees.
+pub const LIQUIDATION_LEAD_TIME: telemetry::metrics::DurationMetric =
+    telemetry::metrics::DurationMetric::job_duration(LIQUIDATION_LEAD_TIME_SECONDS);
 
 /// Counter: a real liquidation the cascade engine never forecast (no prior
 /// `LiquidationRiskPredicted` recorded for that `(protocol, account)`) — the
@@ -79,7 +90,7 @@ pub fn record_prediction(event_type: &'static str) {
 pub fn record_liquidation_lead_time(lead_time: Option<std::time::Duration>) {
     match lead_time {
         Some(duration) => {
-            metrics::histogram!(LIQUIDATION_LEAD_TIME_SECONDS).record(duration.as_secs_f64());
+            telemetry::metrics::record_duration(LIQUIDATION_LEAD_TIME, duration.as_secs_f64());
         }
         None => {
             metrics::counter!(LIQUIDATIONS_UNPREDICTED_TOTAL).increment(1);

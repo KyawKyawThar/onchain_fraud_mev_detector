@@ -31,6 +31,11 @@ pub const JOBS_IN_FLIGHT: &str = "copilot_jobs_in_flight";
 /// took end to end — audit-stream read, model call and bookkeeping. The
 /// §14 timed-wrapper split: `Worker::run` times, `run_inner` works.
 pub const JOB_DURATION_SECONDS: &str = "copilot_job_duration_seconds";
+/// [`JOB_DURATION_SECONDS`] with its bucket ladder attached — a **job
+/// duration**, since an LLM call routinely runs for tens of seconds and the
+/// Batch API path far longer than the latency ladder's 10s ceiling.
+pub const JOB_DURATION: telemetry::metrics::DurationMetric =
+    telemetry::metrics::DurationMetric::job_duration(JOB_DURATION_SECONDS);
 
 pub fn record_enqueued(kind: &'static str, outcome: &'static str) {
     metrics::counter!(DRAFTS_ENQUEUED_TOTAL, "kind" => kind, "outcome" => outcome).increment(1);
@@ -61,7 +66,7 @@ pub fn set_in_flight(count: usize) {
 /// counter and the histogram are sliceable the same way.
 pub fn record_finished(kind: &'static str, status: &'static str, started: Instant) {
     metrics::counter!(DRAFTS_FINISHED_TOTAL, "kind" => kind, "status" => status).increment(1);
-    metrics::histogram!(JOB_DURATION_SECONDS, "kind" => kind, "status" => status)
+    metrics::histogram!(JOB_DURATION.name_checked(), "kind" => kind, "status" => status)
         .record(started.elapsed().as_secs_f64());
 }
 

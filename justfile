@@ -769,6 +769,19 @@ backtest:
 # Smoke the harness end to end (~1 min): generator → Kafka → detection →
 # fast-path series. Reports inconclusive by design (too few samples) — it
 # proves the wiring, not the latency.
+# Conformance asks whether a rule CAN FIRE; promtool asks whether Prometheus
+# will load the file at all — a syntax error there drops EVERY alert silently,
+# not just the broken one. Same image tag CI uses (§11: local == CI).
+# Check Prometheus rule syntax with promtool.
+prometheus-rules-check:
+    docker run --rm -v "$PWD/deploy:/deploy:ro" \
+      --entrypoint promtool prom/prometheus:v2.53.0 \
+      check rules /deploy/prometheus-rules.yml
+
+# Both halves of the alert-rule gate, in the order CI runs them.
+alerts-check: prometheus-rules-check
+    cargo test -p alert-conformance --locked
+
 load-test-smoke:
     cargo run -p loadtest --locked -- --profile crates/loadtest/profiles/smoke.json
 

@@ -42,6 +42,26 @@ resources:
 # from the same source files (deploy/grafana/...) — one place to edit, no
 # drift between the two deploy targets (§19, Sprint 13 t4).
 configMapGenerator:
+  # The alert rules are generated from deploy/prometheus-rules.yml — the SAME
+  # file the compose Prometheus loads — for the reason stated above the Grafana
+  # block, and because the alternative was tried and failed. This manifest used
+  # to inline its own copy of the rules "so the tree stays self-contained"; the
+  # copy then drifted for three sprints. It was missing FastPathQueueWaitHigh,
+  # FastPathSilent, ScreeningLatencyP50High and the entire copilot, backup,
+  # embedding and clustering groups — and, worst of all, its FastPathLatencyHigh
+  # still read `detector_detect_duration_seconds`, the series the 2026-09-07
+  # load test proved cannot fire on the failure it names. The platform's
+  # headline SLO alert was fixed in the compose file and left broken in the one
+  # that actually runs in production. A rule is environment-agnostic (it does
+  # not care how its targets were discovered), so there was never a second
+  # version to maintain — only a second chance to be wrong.
+  #
+  # The name-suffix hash is deliberately kept: Prometheus does not watch its
+  # rule files, so the hash changing on a rule edit is what rolls the pod and
+  # makes the new rules actually load.
+  - name: prometheus-rules
+    files:
+      - alerts.yml=../../prometheus-rules.yml
   - name: grafana-dashboards
     files:
       - ../../grafana/dashboards/api-service.json

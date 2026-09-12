@@ -29,6 +29,29 @@ env:
   SQLX_OFFLINE: "true"          # build against the committed .sqlx cache, no live DB
 
 jobs:
+  # ── Prometheus rule syntax (fast, no Rust toolchain) ──────────────
+  #
+  # `crates/alert-conformance` proves the rules satisfy OUR invariants — that a
+  # threshold is on its metric's ladder, that a batch window spans its job's
+  # cadence. It cannot prove Prometheus will LOAD the file: a rule can pass
+  # every one of those checks and still be a syntax error, in which case
+  # Prometheus refuses the whole file and every alert in it is silently gone.
+  # That is the worst outcome in the same family as an unfireable rule, so the
+  # two checks are complementary and both are required.
+  #
+  # `promtool` ships inside the Prometheus image, so there is nothing to install
+  # and the version is pinned to what the deployment actually runs.
+  promtool:
+    name: promtool check rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/deploy:/deploy:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 \
+            check rules /deploy/prometheus-rules.yml
+
   # ── fmt + clippy (fast feedback, runs first) ─────────────────────
   lint:
     name: fmt + clippy
