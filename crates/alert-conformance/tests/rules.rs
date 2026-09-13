@@ -154,6 +154,7 @@ fn the_parser_still_sees_the_whole_file() -> Result<()> {
     for required in [
         "FastPathLatencyHigh",
         "ScreeningLatencyP50High",
+        "ScreeningLatencyP99High",
         "BackupAgentAbsent",
         "CopilotFabricatedCitations",
     ] {

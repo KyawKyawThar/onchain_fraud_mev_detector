@@ -67,6 +67,14 @@ db = { workspace = true }
 # shared connection builder, but the limiter itself uses `redis::Script`/
 # `ConnectionManager` directly (same pattern as `intelligence`/`rule-engine`).
 redis = { workspace = true }
+# Last-known-good screening snapshots (§11 graceful degradation, `src/degrade.rs`)
+# are stored as protobuf wrapping the same `ScreeningFactsReply` the gRPC wire
+# carries, so a snapshot and a live reply cannot drift apart.
+prost = { workspace = true }
+# The shared circuit breaker (`crates/resilience`) guards the screening read path
+# (`src/facts_source.rs`) — the same state machine ingestion's RPC pool and the
+# LLM seam use, not a third copy.
+resilience = { workspace = true }
 # `PgPolicyStore` (§11, Sprint 14 t2): the customer-authored decision-policy
 # table lives in this crate (it's this service's own concern, unlike rules),
 # so unlike `rule-engine` it needs `sqlx` directly rather than through a
@@ -98,6 +106,9 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Paused-clock tests (`start_paused`) for the screening fresh-budget race in
+# `src/degrade.rs` — latency is the subject, so it is scripted, not slept.
+tokio = { workspace = true, features = ["test-util"] }
 # Shared recording `EventSink` for the usage-publisher tests (§13).
 event-bus = { workspace = true, features = ["test-util"] }
 # A real `IntelligenceReadService` (in-memory stores) for the end-to-end

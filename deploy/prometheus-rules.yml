@@ -200,7 +200,131 @@ groups:
           severity: page
         annotations:
           summary: "Screening endpoint p50 latency exceeds the §19 <100ms SLO"
-          description: "http_request_duration_seconds{route=\"/v1/address/{address}/screen\"} p50 has been above 100ms for 5m — this is the headline synchronous-screening SLO (§19), not a placeholder. Check the screening rate limiter (§rate_limit's SCREENING_RATE_LIMIT_ERRORS_TOTAL — a failing-open Redis adds no latency itself, but a saturated/slow Redis can) and the intelligence gRPC deadline/cache hit rate first."
+          description: "http_request_duration_seconds{route=\"/v1/address/{address}/screen\"} p50 has been above 100ms for 5m — this is the headline synchronous-screening SLO (§19), not a placeholder. Check the screening rate limiter (§rate_limit's SCREENING_RATE_LIMIT_ERRORS_TOTAL — a failing-open Redis adds no latency itself, but a saturated/slow Redis can) and the intelligence gRPC deadline/cache hit rate first. If ScreeningServingStaleFacts is firing too, intelligence is the cause and degradation is absorbing it: stale answers arrive at SCREENING_FRESH_BUDGET_MS (150ms by default), which is above this threshold by design. The same number gates the nightly load test as slo.json's screen_p50_seconds."
+
+      # PUBLISHED CLAIM (category 1) — readiness Epic D's "bounded p99 budget
+      # under load" for the one API surface whose latency is contractual. 0.25
+      # is a ladder boundary and the single definition of that budget:
+      # crates/loadtest/slo.json's `screen_p99_seconds` gates a load run on the
+      # same number, and server::config sizes the degradation defaults to land
+      # inside it (150ms fresh budget + 25ms snapshot read = 175ms, pinned by a
+      # unit test there). Change all three together, or not at all. Not yet a
+      # measurement: the nightly `ci-fastpath` profile drives no API, so this
+      # holds only as far as a `mainnet-peak` run has been made to show it.
+      #
+      # Why a p99 rule beside the p50 one: degradation makes a slow intelligence
+      # *bounded*, not fast. Without it the tail sat at SCREENING_DEADLINE_MS
+      # (500ms); with it, a request with a snapshot is answered by ~175ms, and
+      # one without still waits the deadline. A breach here while stale serving
+      # is also firing means the snapshot substrate is thin — see
+      # screening_snapshot_lookups_total{result="missing"}.
+      - alert: ScreeningLatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{route="/v1/address/{address}/screen"}[5m])) by (le)
+          ) > 0.25
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Screening endpoint p99 latency exceeds its 250ms budget"
+          description: "http_request_duration_seconds{route=\"/v1/address/{address}/screen\"} p99 has been above 250ms for 5m — slo.json's screen_p99_seconds. Customer withdrawals are waiting on this call. Look at screening_degraded_total by outcome: served_fresh_late or failed_closed growing means requests with no usable snapshot are riding the full SCREENING_DEADLINE_MS (check screening_snapshot_lookups_total{result=\"missing\"} and ScreeningSnapshotWritesLost); neither growing means the slowness is in the API service itself (policy-store Postgres, rate-limiter Redis) rather than intelligence."
+
+      # STRUCTURAL — a count that should be zero. Every stale screening
+      # decision is a withdrawal decided on facts intelligence could not confirm
+      # in time, so there is no healthy non-zero rate to calibrate against.
+      # `warning`, not `page`: customers are being answered, and each answer is
+      # flagged — the incident is intelligence's, and its own rules page for it.
+      - alert: ScreeningServingStaleFacts
+        expr: sum(rate(screening_facts_served_total{freshness="stale"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Screening decisions are being rendered over last-known-good facts"
+          description: "For 10m, /screen has been answering from Redis snapshots because intelligence is slow or unavailable (server::degrade). Customers receive stale: true with the facts' age; anything that changed since — including a new sanctions designation — is not reflected, bounded by SCREENING_STALE_MAX_AGE_SECS. Break down screening_degraded_total by reason (intelligence_slow vs intelligence_unavailable) and fix intelligence; this clears on its own when fresh reads return inside SCREENING_FRESH_BUDGET_MS."
+
+      # STRUCTURAL — should be zero. A withdrawal that could be answered neither
+      # fresh nor from a snapshot got a 502. ApiErrorRatioHigh sees this only
+      # past 1% of *all* API traffic, where screening can be a small share.
+      - alert: ScreeningFailingClosed
+        expr: sum(rate(screening_degraded_total{outcome="failed_closed"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Screening calls are failing closed — customer withdrawals are getting 502s"
+          description: "Intelligence is slow or unavailable AND no usable last-known-good snapshot exists for the addresses being screened, so /screen is returning 502 rather than a decision (it never allows by default). Restore intelligence first. screening_snapshot_lookups_total by result says why the fallback had nothing: missing (never screened, or ScreeningSnapshotWritesLost), too_old (outage longer than SCREENING_STALE_MAX_AGE_SECS), or error (Redis). If screening_degradation_enabled is 0, degradation is switched off and every intelligence fault lands here."
+
+      # STRUCTURAL (§15) — should be zero. The fallback's substrate fails open:
+      # a lost write costs a future stale answer, never a present decision,
+      # which is exactly why it must be visible. Otherwise the first sign would
+      # be ScreeningFailingClosed during the next intelligence incident.
+      - alert: ScreeningSnapshotWritesLost
+        expr: sum(rate(screening_snapshot_writes_lost_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last-known-good screening snapshots are not being saved"
+          description: "screening_snapshot_writes_lost_total is increasing: cause=\"queue\" means the writer is behind (raise SCREENING_SNAPSHOT_CHANNEL_CAPACITY or check Redis latency), cause=\"store\" means Redis is refusing writes. Screening decisions are unaffected right now; the next intelligence incident will find older or missing snapshots and fail closed more often."
+
+      # §15b arming state, read explicitly rather than inferred from absence
+      # (same shape and the same severity argument as CopilotTokenBudgetDisarmed).
+      # A disarmed deployment exports no stale or degradation series at all, so
+      # the three rules above are green for that reason alone.
+      # STRUCTURAL — the breaker is a state, not a threshold anyone tuned. Open
+      # means consecutive intelligence reads were failing or slower than the
+      # fresh budget ceiling, and /screen is answering straight from snapshots
+      # without trying intelligence first (server::facts_source). Customers are
+      # served (ScreeningServingStaleFacts fires beside this); this rule names
+      # the cause, so it is `warning` — intelligence's own rules page.
+      - alert: ScreeningIntelligenceBreakerOpen
+        expr: max(screening_intelligence_breaker_state) == 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The API service has stopped calling intelligence for screening (circuit open)"
+          description: "screening_intelligence_breaker_state has been 2 (open) for 5m on at least one API pod: SCREENING_BREAKER_FAILURE_THRESHOLD consecutive screening reads failed or answered slower than SCREENING_FRESH_BUDGET_MS, so /screen serves last-known-good snapshots immediately and probes intelligence once every SCREENING_BREAKER_COOLDOWN_SECS. Fix intelligence (GetScreeningFacts latency, its Redis cache hit rate, its Postgres); the breaker closes on its own after a successful probe."
+
+      # EXPORTED GAUGE (category 2) — compared against the deployment's own
+      # refresh interval, never a literal age: five missed refreshes is stale
+      # whatever SCREENING_SANCTIONS_REFRESH_SECS is set to. The synced timestamp
+      # is published as 0 before the first successful sync (§15b), so a view
+      # that never loaded fires this rather than satisfying it by absence.
+      - alert: ScreeningSanctionsViewStale
+        expr: |
+          (time() - min(screening_sanctions_view_synced_timestamp_seconds))
+            / max(screening_sanctions_refresh_interval_seconds) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An API pod's sanctions view has not refreshed from intelligence"
+          description: "The pod-local sanctions view (server::sanctions_view) is more than five refresh intervals old. Fresh screening decisions still carry intelligence's own sanctions matches, but a *stale* decision can no longer be vouched for — every stale allow is held as review until the view refreshes (screening_sanctions_refresh_total{outcome=\"failed\"} says why: intelligence unreachable, or the list changing on every walk). If screening_sanctions_view_addresses is 0 the view never loaded."
+
+      # STRUCTURAL — should be zero. The bulkhead refuses intelligence reads
+      # past SCREENING_MAX_IN_FLIGHT rather than queueing them; each refusal is
+      # answered from a snapshot or fails closed. Sustained refusals mean the
+      # pod is running at its concurrency ceiling against a slow intelligence.
+      - alert: ScreeningBulkheadRejecting
+        expr: sum(rate(screening_bulkhead_rejected_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Screening reads are being refused at the per-pod concurrency ceiling"
+          description: "screening_bulkhead_rejected_total has been increasing for 10m: API pods hold SCREENING_MAX_IN_FLIGHT intelligence reads open at once, and further /screen calls skip the fresh read. Usually intelligence is slow (check ScreeningIntelligenceBreakerOpen and GetScreeningFacts latency); if intelligence is healthy, the API deployment needs more replicas or a higher ceiling."
+
+      - alert: ScreeningDegradationDisarmed
+        expr: max(screening_degradation_enabled) == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Screening graceful degradation is switched off"
+          description: "SCREENING_STALE_MAX_AGE_SECS=0 on the API service: a slow intelligence read holds /screen for the full SCREENING_DEADLINE_MS and then returns 502, blocking the customer's withdrawal, instead of answering from a flagged snapshot. That can be a deliberate compliance choice (no decision on unconfirmed facts) — if so, silence this knowingly; otherwise set a max age."
 
       - alert: KafkaConsumerLagHigh
         expr: max(kafka_consumer_lag) by (consumer) > 10000

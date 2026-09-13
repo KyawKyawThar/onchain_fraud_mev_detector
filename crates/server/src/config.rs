@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 /// Re-exported: JWT verification is shared (`crates/auth`), so this service
 /// configures it but does not define it.
 pub use auth::JwtConfig;
+use resilience::circuit::BreakerConfig;
 use secrecy::SecretString;
 
 /// Broadcast channel capacity for `WS /v1/stream` when `WS_ALERT_CHANNEL_CAPACITY`
@@ -24,6 +25,44 @@ const DEFAULT_USAGE_CHANNEL_CAPACITY: usize = 1024;
 /// (no production traffic to calibrate against yet, same posture
 /// `deploy/prometheus-rules.yml`'s provisional SLO thresholds document).
 const DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE: u32 = 120;
+
+/// `/screen`'s fresh-answer budget when `SCREENING_FRESH_BUDGET_MS` is unset
+/// (§11 graceful degradation, `src/degrade.rs`). Above the p50 < 100ms claim, so
+/// a healthy-but-busy read is not flagged stale; and budget plus
+/// [`crate::degrade::SNAPSHOT_READ_TIMEOUT`] (175ms) stays under
+/// `crates/loadtest/slo.json`'s 250ms `screen_p99_seconds`, so a degraded answer
+/// still lands inside the p99 budget.
+const DEFAULT_SCREENING_FRESH_BUDGET_MS: u64 = 150;
+
+/// The oldest snapshot allowed to decide a withdrawal when
+/// `SCREENING_STALE_MAX_AGE_SECS` is unset. A conservative placeholder: the
+/// value is a compliance decision (the window in which a new designation can be
+/// missed), so a deployment should set it deliberately — every stale decision
+/// discloses its age regardless.
+const DEFAULT_SCREENING_STALE_MAX_AGE_SECS: u64 = 900;
+
+/// Snapshot-writer queue capacity when `SCREENING_SNAPSHOT_CHANNEL_CAPACITY` is
+/// unset.
+const DEFAULT_SCREENING_SNAPSHOT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Floor of the adaptive fresh budget when `SCREENING_FRESH_BUDGET_FLOOR_MS` is
+/// unset: below the p50 < 100ms claim with room for one Redis snapshot read, so
+/// even a fast intelligence cannot tighten the budget into flagging ordinary
+/// jitter as stale.
+const DEFAULT_SCREENING_FRESH_BUDGET_FLOOR_MS: u64 = 60;
+const DEFAULT_SCREENING_BREAKER_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_SCREENING_BREAKER_COOLDOWN_SECS: u64 = 10;
+/// Per-pod ceiling on in-flight intelligence reads when
+/// `SCREENING_MAX_IN_FLIGHT` is unset — far above healthy concurrency (a
+/// 100 qps pod at a 20ms read holds ~2), so it only binds when intelligence is
+/// already slow.
+const DEFAULT_SCREENING_MAX_IN_FLIGHT: usize = 256;
+const DEFAULT_SCREENING_HEDGE_RATIO: f64 = 0.05;
+const DEFAULT_SCREENING_SNAPSHOT_L1_CAPACITY: usize = 50_000;
+
+/// Sanctions-view refresh interval when `SCREENING_SANCTIONS_REFRESH_SECS` is
+/// unset. A designation reaches every pod's view within about this long.
+const DEFAULT_SCREENING_SANCTIONS_REFRESH_SECS: u64 = 60;
 
 /// Screening access-audit queue capacity when `AUDIT_CHANNEL_CAPACITY` is
 /// unset (§11, Sprint 14 t3).
@@ -84,6 +123,21 @@ pub struct Config {
     /// elsewhere. From `SCREENING_RATE_LIMIT_PER_MINUTE`, defaulting to
     /// [`DEFAULT_SCREENING_RATE_LIMIT_PER_MINUTE`].
     pub screening_rate_limit_per_minute: u32,
+    /// `/screen`'s graceful degradation (§11, readiness Epic D,
+    /// `src/degrade.rs`): the fresh-answer budget and the oldest snapshot that
+    /// may answer past it. `None` when `SCREENING_STALE_MAX_AGE_SECS=0` disarms
+    /// it — fresh or fail closed, as before.
+    pub screening_degradation: Option<crate::degrade::Degradation>,
+    /// Capacity of the queue between the request path and the snapshot writer
+    /// — how many snapshots may await Redis before further ones are dropped
+    /// (and counted) rather than slowing a screening call.
+    pub screening_snapshot_channel_capacity: usize,
+    /// How often the pod-local sanctions view (`src/sanctions_view.rs`) is
+    /// refreshed from intelligence, from `SCREENING_SANCTIONS_REFRESH_SECS`.
+    pub screening_sanctions_refresh: Duration,
+    /// How the screening read reaches intelligence (`src/facts_source.rs`):
+    /// breaker, bulkhead, hedging, adaptive budget, and the snapshot memory tier.
+    pub screening_resilience: ScreeningResilience,
     /// Address the Prometheus `/metrics` endpoint binds to (§19). Exposes this
     /// service's counters — including `usage_events_recorded_total` /
     /// `usage_events_dropped_total` (§13, `src/usage.rs`) and the request
@@ -92,6 +146,26 @@ pub struct Config {
     /// default is picked distinct from `DETECTION_METRICS_ADDR`'s `9100` so
     /// both binaries can run on one host in local dev without colliding.
     pub metrics_addr: SocketAddr,
+}
+
+/// The screening read path's resilience settings, validated together because
+/// they constrain one another (the budget floor sits under the degradation
+/// budget; a hedge ratio is a share).
+#[derive(Debug, Clone)]
+pub struct ScreeningResilience {
+    /// Lower bound of the adaptive fresh budget.
+    pub fresh_budget_floor: Duration,
+    /// Breaker over intelligence reads (slow answers count as failures).
+    pub breaker: BreakerConfig,
+    /// Most intelligence reads one pod holds open at once.
+    pub max_in_flight: usize,
+    /// Where hedged reads go; `None` is a second connection to the primary
+    /// address.
+    pub hedge_addr: Option<String>,
+    /// Hedges as a share of requests; `0` disables hedging.
+    pub hedge_ratio: f64,
+    /// Addresses held in the per-pod snapshot tier; `0` disables it.
+    pub snapshot_l1_capacity: usize,
 }
 
 /// How to reach Kafka: the `WS /v1/stream` consumer (§11) subscribes to the
@@ -114,6 +188,8 @@ impl Config {
         let http_addr = format!("{}:{}", env("SERVER_HOST")?, env("SERVER_PORT")?)
             .parse()
             .context("SERVER_HOST:SERVER_PORT is not a valid socket address")?;
+        // Read first: the degradation budget is validated against it.
+        let screening_deadline = screening_deadline()?;
 
         Ok(Self {
             http_addr,
@@ -142,8 +218,52 @@ impl Config {
                 "AUDIT_CHANNEL_CAPACITY",
                 DEFAULT_AUDIT_CHANNEL_CAPACITY,
             )?,
-            screening_deadline: screening_deadline()?,
+            screening_deadline,
             screening_rate_limit_per_minute: screening_rate_limit_per_minute()?,
+            screening_degradation: screening_degradation(
+                env_parse(
+                    "SCREENING_FRESH_BUDGET_MS",
+                    DEFAULT_SCREENING_FRESH_BUDGET_MS,
+                )?,
+                env_parse(
+                    "SCREENING_STALE_MAX_AGE_SECS",
+                    DEFAULT_SCREENING_STALE_MAX_AGE_SECS,
+                )?,
+                screening_deadline,
+            )?,
+            screening_snapshot_channel_capacity: channel_capacity(
+                "SCREENING_SNAPSHOT_CHANNEL_CAPACITY",
+                DEFAULT_SCREENING_SNAPSHOT_CHANNEL_CAPACITY,
+            )?,
+            screening_resilience: screening_resilience(
+                env_parse(
+                    "SCREENING_FRESH_BUDGET_FLOOR_MS",
+                    DEFAULT_SCREENING_FRESH_BUDGET_FLOOR_MS,
+                )?,
+                env_parse(
+                    "SCREENING_BREAKER_FAILURE_THRESHOLD",
+                    DEFAULT_SCREENING_BREAKER_FAILURE_THRESHOLD,
+                )?,
+                env_parse(
+                    "SCREENING_BREAKER_COOLDOWN_SECS",
+                    DEFAULT_SCREENING_BREAKER_COOLDOWN_SECS,
+                )?,
+                env_parse("SCREENING_MAX_IN_FLIGHT", DEFAULT_SCREENING_MAX_IN_FLIGHT)?,
+                std::env::var("INTELLIGENCE_GRPC_HEDGE_ADDR").ok(),
+                env_parse("SCREENING_HEDGE_RATIO", DEFAULT_SCREENING_HEDGE_RATIO)?,
+                env_parse(
+                    "SCREENING_SNAPSHOT_L1_CAPACITY",
+                    DEFAULT_SCREENING_SNAPSHOT_L1_CAPACITY,
+                )?,
+                env_parse(
+                    "SCREENING_FRESH_BUDGET_MS",
+                    DEFAULT_SCREENING_FRESH_BUDGET_MS,
+                )?,
+            )?,
+            screening_sanctions_refresh: positive_secs(
+                "SCREENING_SANCTIONS_REFRESH_SECS",
+                DEFAULT_SCREENING_SANCTIONS_REFRESH_SECS,
+            )?,
             metrics_addr: env_parse(
                 "SERVER_METRICS_ADDR",
                 SocketAddr::from(([0, 0, 0, 0], 9112)),
@@ -166,6 +286,38 @@ fn screening_deadline() -> Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
+/// Validate `/screen`'s degradation settings (pure, so the rules are tested
+/// without touching the process environment).
+///
+/// A max age of zero disarms degradation — the one explicit off switch. A fresh
+/// budget at or past the hard deadline is rejected rather than accepted as
+/// inert: the read would always fail before a snapshot could answer a slow one,
+/// so the fallback would silently react only to outright faults.
+fn screening_degradation(
+    fresh_budget_ms: u64,
+    stale_max_age_secs: u64,
+    deadline: Duration,
+) -> Result<Option<crate::degrade::Degradation>> {
+    if stale_max_age_secs == 0 {
+        return Ok(None);
+    }
+    let fresh_budget = Duration::from_millis(fresh_budget_ms);
+    if fresh_budget.is_zero() {
+        bail!("SCREENING_FRESH_BUDGET_MS must be >= 1, got 0 (set SCREENING_STALE_MAX_AGE_SECS=0 to disarm degradation)");
+    }
+    if fresh_budget >= deadline {
+        bail!(
+            "SCREENING_FRESH_BUDGET_MS ({fresh_budget_ms}) must be below SCREENING_DEADLINE_MS ({}) — \
+             otherwise a slow intelligence read fails before a snapshot can ever answer it",
+            deadline.as_millis()
+        );
+    }
+    Ok(Some(crate::degrade::Degradation {
+        fresh_budget,
+        max_stale_age: Duration::from_secs(stale_max_age_secs),
+    }))
+}
+
 /// Resolve `SCREENING_RATE_LIMIT_PER_MINUTE`. Zero would reject every
 /// screening call unconditionally — caught here with the same
 /// fail-fast-at-boot contract as [`screening_deadline`].
@@ -178,6 +330,63 @@ fn screening_rate_limit_per_minute() -> Result<u32> {
         bail!("SCREENING_RATE_LIMIT_PER_MINUTE must be >= 1, got 0");
     }
     Ok(limit)
+}
+
+/// Validate the screening read path's resilience settings (pure; tested
+/// without the process environment).
+#[allow(clippy::too_many_arguments)]
+fn screening_resilience(
+    fresh_budget_floor_ms: u64,
+    breaker_failure_threshold: u32,
+    breaker_cooldown_secs: u64,
+    max_in_flight: usize,
+    hedge_addr: Option<String>,
+    hedge_ratio: f64,
+    snapshot_l1_capacity: usize,
+    fresh_budget_ceiling_ms: u64,
+) -> Result<ScreeningResilience> {
+    if fresh_budget_floor_ms == 0 || fresh_budget_floor_ms > fresh_budget_ceiling_ms {
+        bail!(
+            "SCREENING_FRESH_BUDGET_FLOOR_MS ({fresh_budget_floor_ms}) must be in \
+             1..=SCREENING_FRESH_BUDGET_MS ({fresh_budget_ceiling_ms})"
+        );
+    }
+    if breaker_failure_threshold == 0 {
+        bail!("SCREENING_BREAKER_FAILURE_THRESHOLD must be >= 1, got 0");
+    }
+    if breaker_cooldown_secs == 0 {
+        bail!("SCREENING_BREAKER_COOLDOWN_SECS must be >= 1, got 0");
+    }
+    if max_in_flight == 0 {
+        bail!(
+            "SCREENING_MAX_IN_FLIGHT must be >= 1, got 0 — every screening read would be refused"
+        );
+    }
+    if !(0.0..=1.0).contains(&hedge_ratio) {
+        bail!("SCREENING_HEDGE_RATIO is a share of requests in 0..=1, got {hedge_ratio}");
+    }
+    Ok(ScreeningResilience {
+        fresh_budget_floor: Duration::from_millis(fresh_budget_floor_ms),
+        breaker: BreakerConfig {
+            failure_threshold: breaker_failure_threshold,
+            open_cooldown: Duration::from_secs(breaker_cooldown_secs),
+            success_threshold: 1,
+        },
+        max_in_flight,
+        hedge_addr: hedge_addr.filter(|addr| !addr.trim().is_empty()),
+        hedge_ratio,
+        snapshot_l1_capacity,
+    })
+}
+
+/// Resolve a whole-seconds duration that must be at least one second — zero
+/// would be a busy loop or a view that can never be current.
+fn positive_secs(key: &str, default: u64) -> Result<Duration> {
+    let secs: u64 = env_parse(key, default)?;
+    if secs == 0 {
+        bail!("{key} must be >= 1, got 0");
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// Resolve and validate a channel-capacity env var. A non-positive value
@@ -216,5 +425,92 @@ where
             )
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEADLINE: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn the_defaults_arm_degradation_inside_the_deadline() {
+        let degradation = screening_degradation(
+            DEFAULT_SCREENING_FRESH_BUDGET_MS,
+            DEFAULT_SCREENING_STALE_MAX_AGE_SECS,
+            crate::intelligence_client::DEFAULT_SCREENING_DEADLINE,
+        )
+        .unwrap()
+        .expect("armed by default");
+        assert!(degradation.fresh_budget < crate::intelligence_client::DEFAULT_SCREENING_DEADLINE);
+    }
+
+    /// The default budget's documented contract: a degraded answer lands inside
+    /// the p99 budget the load test and `ScreeningLatencyP99High` share.
+    #[test]
+    fn a_degraded_answer_fits_the_screening_p99_budget() {
+        let worst_degraded = Duration::from_millis(DEFAULT_SCREENING_FRESH_BUDGET_MS)
+            + crate::degrade::SNAPSHOT_READ_TIMEOUT;
+        assert!(worst_degraded < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn a_zero_max_age_is_the_off_switch() {
+        assert_eq!(screening_degradation(150, 0, DEADLINE).unwrap(), None);
+    }
+
+    #[test]
+    fn a_budget_at_or_past_the_deadline_is_rejected_not_inert() {
+        assert!(screening_degradation(500, 900, DEADLINE).is_err());
+        assert!(screening_degradation(900, 900, DEADLINE).is_err());
+        assert!(screening_degradation(499, 900, DEADLINE).unwrap().is_some());
+    }
+
+    fn resilience(floor: u64, ratio: f64, in_flight: usize) -> Result<ScreeningResilience> {
+        screening_resilience(floor, 5, 10, in_flight, Some(" ".into()), ratio, 1000, 150)
+    }
+
+    #[test]
+    fn the_resilience_defaults_are_valid() {
+        let r = screening_resilience(
+            DEFAULT_SCREENING_FRESH_BUDGET_FLOOR_MS,
+            DEFAULT_SCREENING_BREAKER_FAILURE_THRESHOLD,
+            DEFAULT_SCREENING_BREAKER_COOLDOWN_SECS,
+            DEFAULT_SCREENING_MAX_IN_FLIGHT,
+            None,
+            DEFAULT_SCREENING_HEDGE_RATIO,
+            DEFAULT_SCREENING_SNAPSHOT_L1_CAPACITY,
+            DEFAULT_SCREENING_FRESH_BUDGET_MS,
+        )
+        .unwrap();
+        assert!(
+            r.fresh_budget_floor < Duration::from_millis(100),
+            "the floor sits under the p50 claim"
+        );
+    }
+
+    #[test]
+    fn resilience_settings_that_would_disable_the_path_are_rejected() {
+        assert!(resilience(0, 0.05, 10).is_err(), "zero floor");
+        assert!(
+            resilience(151, 0.05, 10).is_err(),
+            "floor above the ceiling"
+        );
+        assert!(resilience(60, 1.5, 10).is_err(), "a ratio is a share");
+        assert!(
+            resilience(60, 0.05, 0).is_err(),
+            "a zero bulkhead refuses everything"
+        );
+        let ok = resilience(60, 0.0, 10).unwrap();
+        assert_eq!(
+            ok.hedge_addr, None,
+            "a blank hedge address means the primary"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_is_rejected() {
+        assert!(screening_degradation(0, 900, DEADLINE).is_err());
     }
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT name, version, review_at, block_at\n               FROM screening_policies\n               WHERE owner = $1 AND name = $2\n               ORDER BY version DESC\n               LIMIT 1",
+  "query": "SELECT name, version, review_at, block_at, on_stale\n               FROM screening_policies\n               WHERE owner = $1 AND name = $2\n               ORDER BY version DESC\n               LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -46,6 +46,17 @@
             "name": "block_at"
           }
         }
+      },
+      {
+        "ordinal": 4,
+        "name": "on_stale",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "on_stale"
+          }
+        }
       }
     ],
     "parameters": {
@@ -58,8 +69,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "59935581696219b9b12ed699d180a4b2db19ed4e64ec38e9162e16999e79a094"
+  "hash": "5fe4b961cf2847ab7ee9ac35da4f58b23d1f4a2df0321cd3250e7bae5f9babe0"
 }

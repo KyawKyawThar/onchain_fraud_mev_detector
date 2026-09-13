@@ -153,6 +153,7 @@ each one:
 | **New value in a closed enum** | **consumers first** | Old consumers reject an unknown variant — legal, but every consumer deploys *before* the producer that emits it |
 | Field removed, or retyped | **breaking** | Archived events carry it; deployed readers expect it |
 | Field added as *required* | **breaking** | No archived event has it, so replay stops |
+| Required field added *inside an object that is itself new and optional* | compatible | No archived event carries the object, so none can lack what is inside it; the object's own row decides (`ScreeningDecisionRecorded.facts_staleness`) |
 | Optional → required; any narrowing along the string lattice | **breaking** | Values already on disk may no longer parse |
 | Event type removed; topic moved; partition key changed | **breaking** | History drops out of replay (§18), or the ordering guarantee silently changes |
 

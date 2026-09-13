@@ -46,8 +46,9 @@ use crate::simulation::{
     SimulationRequested, WalletExposureReportReady,
 };
 use crate::system::{
-    DriftedFeature, ModelDriftDetected, RetentionPolicyChanged, RetentionPurgeCompleted,
-    ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
+    DriftedFeature, FactsStaleness, ModelDriftDetected, RetentionPolicyChanged,
+    RetentionPurgeCompleted, ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded,
+    ScreeningStaleReason, UsageRecorded,
 };
 use crate::{DomainEvent, EventEnvelope};
 use alloy_primitives::{Address, B256};
@@ -382,6 +383,11 @@ pub fn sample_events() -> Vec<DomainEvent> {
                 evidence_ref: "sanctions:ofac_sdn".into(),
             }],
             timestamp: ts(),
+            facts_staleness: Some(FactsStaleness {
+                reason: ScreeningStaleReason::IntelligenceSlow,
+                observed_at: ts(),
+                age_ms: 1500,
+            }),
         }),
         // AI copilot (§20.4)
         DomainEvent::IncidentNarrativeDrafted(IncidentNarrativeDrafted {

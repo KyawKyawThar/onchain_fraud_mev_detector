@@ -1,0 +1,23 @@
+{
+  "name": "screening-degraded",
+  "rationale": "Readiness Epic D's graceful-degradation claim, measured rather than asserted: an intelligence that is slow, not down, while customers screen withdrawals. Warmup (60s) runs healthy so the subject builds what production has when an incident starts -- snapshots for the counterparties in play, a synced sanctions view, latency history. Then 300ms is added to every intelligence response for the measurement window: above the default fresh budget ceiling (150ms), below the hard deadline (500ms), so the stale path is what is exercised and, after SCREENING_BREAKER_FAILURE_THRESHOLD slow reads, the open breaker. 50 screening qps over a 500-address pool: counterparties repeat (warmup screens each ~6 times), which is what makes a snapshot exist; a pool of fresh addresses would measure fail-closed only. The chain runs at 4 blocks/s fully alerting so the fast-path gates collect their 500 samples and the run is not inconclusive for a reason unrelated to screening. Judged on screen_p50 and screen_p99 over the degraded window (the breaker is what keeps p50 under 100ms once open), and screen_failed_closed (<= 1% 502s); screen_stale_share is reported beside them.",
+  "chain": 1,
+  "blocks_per_second": 4.0,
+  "txs_per_block": 250,
+  "alerting_block_fraction": 1.0,
+  "api_qps": 50.0,
+  "api_routes": [
+    {
+      "path": "/v1/address/{address}/screen",
+      "weight": 1,
+      "method": "POST"
+    }
+  ],
+  "address_pool": 500,
+  "fault": {
+    "intelligence_latency_ms": 300
+  },
+  "warmup": 60,
+  "duration": 180,
+  "drain_timeout": 120
+}

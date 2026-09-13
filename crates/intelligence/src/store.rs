@@ -462,6 +462,18 @@ pub trait SanctionsStore: Send + Sync {
         address: &AccountAddress,
     ) -> Result<Vec<SanctionEntry>, StoreError>;
 
+    /// Every designation, one page at a time, in `(address, list_name)` order:
+    /// the rows strictly after `after`, at most `limit` of them. Keyset paging
+    /// on the primary key, so a page costs the same at row 50,000 as at row 1.
+    async fn sanctions_page(
+        &self,
+        after: Option<(&AccountAddress, &str)>,
+        limit: u32,
+    ) -> Result<Vec<SanctionEntry>, StoreError>;
+
+    /// The table's current [`SanctionsWatermark`](crate::model::SanctionsWatermark).
+    async fn sanctions_watermark(&self) -> Result<crate::model::SanctionsWatermark, StoreError>;
+
     /// Designations for several addresses at once — the batched form of
     /// [`sanction_matches`](Self::sanction_matches). An unsanctioned address
     /// is absent from the map (the common case, so seeding empties would be
@@ -1690,6 +1702,51 @@ impl SanctionsStore for PgIntelligenceStore {
             out.entry(record.address).or_default().push(record);
         }
         Ok(out)
+    }
+
+    // Runtime-checked like `sanction_matches_many`: the two shapes differ only
+    // by the keyset predicate, and neither is on a hot request path.
+    async fn sanctions_page(
+        &self,
+        after: Option<(&AccountAddress, &str)>,
+        limit: u32,
+    ) -> Result<Vec<SanctionEntry>, StoreError> {
+        let limit = i64::from(limit);
+        let rows = match after {
+            None => {
+                sqlx::query_as::<_, SanctionRow>(
+                    "SELECT address, list_name, entry, listed_at
+                     FROM sanctions ORDER BY address, list_name LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some((address, list_name)) => {
+                sqlx::query_as::<_, SanctionRow>(
+                    "SELECT address, list_name, entry, listed_at
+                     FROM sanctions WHERE (address, list_name) > ($1, $2)
+                     ORDER BY address, list_name LIMIT $3",
+                )
+                .bind(address_key(address))
+                .bind(list_name)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn sanctions_watermark(&self) -> Result<crate::model::SanctionsWatermark, StoreError> {
+        let (rows, last_imported_at): (i64, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT COUNT(*), MAX(imported_at) FROM sanctions")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(crate::model::SanctionsWatermark {
+            rows: u64::try_from(rows).unwrap_or(0),
+            last_imported_at,
+        })
     }
 }
 

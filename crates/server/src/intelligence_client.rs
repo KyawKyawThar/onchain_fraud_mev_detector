@@ -54,13 +54,24 @@ pub fn to_api_error(status: Status) -> ApiError {
     match status.code() {
         Code::NotFound => ApiError::not_found(status.message()),
         Code::InvalidArgument | Code::OutOfRange => ApiError::bad_request(status.message()),
-        Code::Unavailable
-        | Code::DeadlineExceeded
-        | Code::ResourceExhausted
-        | Code::Aborted
-        | Code::Cancelled => ApiError::bad_gateway(format!("intelligence: {status}")),
+        _ if is_transient(&status) => ApiError::bad_gateway(format!("intelligence: {status}")),
         _ => ApiError::internal(format!("intelligence: {status}")),
     }
+}
+
+/// The transient class of [`to_api_error`]'s taxonomy: the read path is
+/// momentarily unavailable, so a retry — or, on `/screen`, a last-known-good
+/// snapshot (`crate::degrade`) — is a legitimate answer. One definition, so the
+/// caller's retry contract and the degradation trigger cannot disagree.
+pub fn is_transient(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Aborted
+            | Code::Cancelled
+    )
 }
 
 /// Distill the wire reply into the decision layer's input — the one place
@@ -280,6 +291,61 @@ impl IntelligenceClient {
             .get_entity_timeline(EntityTimelineRequest { entity_id })
             .await?;
         Ok(response.into_inner())
+    }
+}
+
+/// Deadline on one `ListSanctions` page. Background refresh, never on a request
+/// path, so generous — but bounded, or a hung intelligence would stall the
+/// refresher forever instead of failing and being counted.
+const SANCTIONS_PAGE_DEADLINE: Duration = Duration::from_secs(10);
+
+#[async_trait::async_trait]
+impl crate::sanctions_view::SanctionsSource for IntelligenceClient {
+    async fn page(
+        &self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<crate::sanctions_view::SanctionsPage, Status> {
+        let mut client = self.inner.clone();
+        let mut request = Request::new(intelligence::pb::ListSanctionsRequest {
+            after: after.unwrap_or_default(),
+            limit,
+        });
+        request.set_timeout(SANCTIONS_PAGE_DEADLINE);
+        let reply = tokio::time::timeout(SANCTIONS_PAGE_DEADLINE, client.list_sanctions(request))
+            .await
+            .map_err(|_| Status::deadline_exceeded("sanctions page deadline exceeded"))??
+            .into_inner();
+
+        // Rows arrive in (address, list) order, so one address's designations
+        // are adjacent within a page; grouping here keeps the view's type free
+        // of the wire's row shape.
+        let mut entries: Vec<(AccountAddress, Vec<intelligence::pb::SanctionMatch>)> = Vec::new();
+        for row in reply.entries {
+            let address: AccountAddress = row.address.parse().map_err(|err| {
+                Status::internal(format!(
+                    "intelligence listed an unparseable sanctioned address {:?}: {err}",
+                    row.address
+                ))
+            })?;
+            let designation = intelligence::pb::SanctionMatch {
+                list: row.list,
+                entry: row.entry,
+            };
+            match entries.last_mut() {
+                Some((last, found)) if *last == address => found.push(designation),
+                _ => entries.push((address, vec![designation])),
+            }
+        }
+        let watermark = reply.watermark.unwrap_or_default();
+        Ok(crate::sanctions_view::SanctionsPage {
+            entries,
+            next_after: (!reply.next_after.is_empty()).then_some(reply.next_after),
+            watermark: crate::sanctions_view::Watermark {
+                rows: watermark.rows,
+                last_imported_unix_millis: watermark.last_imported_unix_millis,
+            },
+        })
     }
 }
 

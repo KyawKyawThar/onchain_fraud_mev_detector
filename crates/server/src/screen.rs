@@ -24,6 +24,7 @@
 //! policy's thresholds.
 
 use events::intelligence::RiskFactor;
+use events::system::FactsStaleness;
 
 /// The screening outcome and its basis are the shared §11 domain vocabulary,
 /// so their canonical types live on the schema crate (they ride the
@@ -147,6 +148,8 @@ pub struct Policy {
     pub name: String,
     pub version: i32,
     pub thresholds: Thresholds,
+    /// What this policy does with a decision over stale facts.
+    pub on_stale: StalePolicy,
 }
 
 impl Policy {
@@ -179,7 +182,15 @@ impl Policy {
             name,
             version,
             thresholds,
+            on_stale: StalePolicy::default(),
         })
+    }
+
+    /// This policy with a different stale-facts behaviour.
+    #[must_use]
+    pub fn with_on_stale(mut self, on_stale: StalePolicy) -> Self {
+        self.on_stale = on_stale;
+        self
     }
 
     /// This policy's name is one of the reserved built-ins
@@ -211,7 +222,10 @@ pub fn builtin_policy(name: &str) -> Option<Policy> {
         ),
         "strict" => Some(
             Policy::new("strict", BUILTIN_VERSION, 20, Some(50))
-                .expect("built-in strict policy is valid"),
+                .expect("built-in strict policy is valid")
+                // A customer who picks `strict` has asked to hold more, and a
+                // decision on unconfirmed facts is exactly such a case.
+                .with_on_stale(StalePolicy::Review),
         ),
         "monitor-only" => Some(
             Policy::new("monitor-only", BUILTIN_VERSION, 40, None)
@@ -234,6 +248,51 @@ pub fn builtin_catalog() -> Vec<Policy> {
 /// The policy name a screening call uses when its request body names none —
 /// `POST /v1/address/{addr}/screen`'s implicit default.
 pub const DEFAULT_POLICY_NAME: &str = "default";
+
+/// What a policy does with a decision that must be rendered over **stale** facts
+/// — a last-known-good snapshot, because intelligence was slow or unavailable
+/// (`crate::degrade`). Part of a policy's versioned identity, like its
+/// thresholds: changing it mints a new version.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StalePolicy {
+    /// Decide on stale facts as on fresh ones. The decision still discloses
+    /// `stale: true` and the facts' age. How every policy behaved before this
+    /// existed, hence the default.
+    #[default]
+    Serve,
+    /// Never auto-allow on facts intelligence could not confirm: a stale `allow`
+    /// is held as `review`. A stale `block` stays a block.
+    Review,
+}
+
+impl StalePolicy {
+    /// The stored form — identical to the serde form, pinned by a test.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            StalePolicy::Serve => "serve",
+            StalePolicy::Review => "review",
+        }
+    }
+
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "serve" => Some(StalePolicy::Serve),
+            "review" => Some(StalePolicy::Review),
+            _ => None,
+        }
+    }
+}
 
 /// The two decision-driving facts, distilled from the intelligence reply at
 /// the transport edge (`crate::intelligence_client`'s `From` impl — the only
@@ -271,23 +330,64 @@ pub struct Verdict {
     pub factors: Vec<RiskFactor>,
 }
 
+/// Whether the facts a decision was rendered over were confirmed by
+/// intelligence on this request, or served from a last-known-good snapshot
+/// (`crate::degrade`). A named enum rather than a bare `Option`, so a call site
+/// states which case it is in instead of passing a `None` that could mean
+/// "fresh" or "forgot".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    Fresh,
+    Stale {
+        staleness: FactsStaleness,
+        /// The pod-local sanctions view (`crate::sanctions_view`) is current
+        /// enough to vouch that an address it does not list is not sanctioned.
+        /// When it is not, nothing on this request confirms sanctions status,
+        /// so a stale `allow` is held whatever the policy says.
+        sanctions_verified: bool,
+    },
+}
+
+impl Freshness {
+    /// The disclosure a stale decision carries; `None` when fresh.
+    pub fn staleness(self) -> Option<FactsStaleness> {
+        match self {
+            Freshness::Fresh => None,
+            Freshness::Stale { staleness, .. } => Some(staleness),
+        }
+    }
+}
+
 /// Map the decision-driving facts through `policy` to the §11 outcome.
 /// Sanctions first: the hard block bypasses the thresholds no matter how low
 /// the score is (a freshly-listed address may not have accumulated score yet
 /// — the list membership alone is the legal signal) and no matter which
 /// policy — `monitor-only` softens score-driven blocking, never the
 /// sanctions override.
-pub fn decide(input: ScreeningInput, policy: &Policy) -> Verdict {
+///
+/// Stale facts, third: a stale `allow` is held as `review`
+/// ([`DecisionBasis::StaleFactsReview`]) when the policy says `on_stale: review`
+/// or the sanctions view cannot vouch for the address. The hold is the
+/// platform's for the second reason — an unverifiable sanctions status is not a
+/// customer's trade to make — and never applies to a `block` or a `review`.
+pub fn decide(input: ScreeningInput, policy: &Policy, freshness: Freshness) -> Verdict {
     // Taken by value so the factor breakdown *moves* into the verdict (and on
     // into the audit event) with no clone on the p50 < 100ms path; the caller
     // captures the Copy `sanctioned` flag before deciding if it still needs it.
     let (decision, basis) = if input.sanctioned {
         (Decision::Block, DecisionBasis::SanctionsHardBlock)
     } else {
-        (
-            policy.thresholds.classify(input.score),
-            DecisionBasis::ScoreThresholds,
-        )
+        match (policy.thresholds.classify(input.score), freshness) {
+            (
+                Decision::Allow,
+                Freshness::Stale {
+                    sanctions_verified, ..
+                },
+            ) if policy.on_stale == StalePolicy::Review || !sanctions_verified => {
+                (Decision::Review, DecisionBasis::StaleFactsReview)
+            }
+            (decision, _) => (decision, DecisionBasis::ScoreThresholds),
+        }
     };
     Verdict {
         decision,
@@ -316,21 +416,48 @@ mod tests {
     #[test]
     fn default_policy_maps_to_the_spec_boundaries() {
         let policy = builtin_policy("default").unwrap();
-        assert_eq!(decide(input(0, false), &policy).decision, Decision::Allow);
-        assert_eq!(decide(input(39, false), &policy).decision, Decision::Allow);
-        assert_eq!(decide(input(40, false), &policy).decision, Decision::Review);
-        assert_eq!(decide(input(79, false), &policy).decision, Decision::Review);
-        assert_eq!(decide(input(80, false), &policy).decision, Decision::Block);
-        assert_eq!(decide(input(100, false), &policy).decision, Decision::Block);
+        assert_eq!(
+            decide(input(0, false), &policy, Freshness::Fresh).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(input(39, false), &policy, Freshness::Fresh).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(input(40, false), &policy, Freshness::Fresh).decision,
+            Decision::Review
+        );
+        assert_eq!(
+            decide(input(79, false), &policy, Freshness::Fresh).decision,
+            Decision::Review
+        );
+        assert_eq!(
+            decide(input(80, false), &policy, Freshness::Fresh).decision,
+            Decision::Block
+        );
+        assert_eq!(
+            decide(input(100, false), &policy, Freshness::Fresh).decision,
+            Decision::Block
+        );
     }
 
     /// `strict` holds and blocks at lower scores than `default`.
     #[test]
     fn strict_policy_is_stricter_than_default() {
         let policy = builtin_policy("strict").unwrap();
-        assert_eq!(decide(input(19, false), &policy).decision, Decision::Allow);
-        assert_eq!(decide(input(20, false), &policy).decision, Decision::Review);
-        assert_eq!(decide(input(50, false), &policy).decision, Decision::Block);
+        assert_eq!(
+            decide(input(19, false), &policy, Freshness::Fresh).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(input(20, false), &policy, Freshness::Fresh).decision,
+            Decision::Review
+        );
+        assert_eq!(
+            decide(input(50, false), &policy, Freshness::Fresh).decision,
+            Decision::Block
+        );
     }
 
     /// `monitor-only` never blocks on score alone — the worst a clean-of-
@@ -338,10 +465,16 @@ mod tests {
     #[test]
     fn monitor_only_never_blocks_on_score() {
         let policy = builtin_policy("monitor-only").unwrap();
-        assert_eq!(decide(input(39, false), &policy).decision, Decision::Allow);
-        assert_eq!(decide(input(40, false), &policy).decision, Decision::Review);
         assert_eq!(
-            decide(input(100, false), &policy).decision,
+            decide(input(39, false), &policy, Freshness::Fresh).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(input(40, false), &policy, Freshness::Fresh).decision,
+            Decision::Review
+        );
+        assert_eq!(
+            decide(input(100, false), &policy, Freshness::Fresh).decision,
             Decision::Review,
             "monitor-only caps at review even for a maximal score"
         );
@@ -355,7 +488,7 @@ mod tests {
     fn sanctions_hard_block_survives_every_policy() {
         for name in BUILTIN_POLICY_NAMES {
             let policy = builtin_policy(name).unwrap();
-            let verdict = decide(input(0, true), &policy);
+            let verdict = decide(input(0, true), &policy, Freshness::Fresh);
             assert_eq!(verdict.decision, Decision::Block, "policy {name}");
             assert_eq!(
                 verdict.basis,
@@ -365,7 +498,7 @@ mod tests {
 
             // High score + sanctions still reports the sanctions basis — the
             // stronger, legally-weighted reason wins the explanation.
-            let verdict = decide(input(100, true), &policy);
+            let verdict = decide(input(100, true), &policy, Freshness::Fresh);
             assert_eq!(verdict.decision, Decision::Block, "policy {name}");
             assert_eq!(
                 verdict.basis,
@@ -379,7 +512,7 @@ mod tests {
     #[test]
     fn verdict_carries_the_policy_name_and_version() {
         let policy = Policy::new("acme-strict", 3, 10, Some(60)).unwrap();
-        let verdict = decide(input(70, false), &policy);
+        let verdict = decide(input(70, false), &policy, Freshness::Fresh);
         assert_eq!(verdict.policy_name, "acme-strict");
         assert_eq!(verdict.policy_version, 3);
     }
@@ -390,7 +523,7 @@ mod tests {
         let policy = builtin_policy("default").unwrap();
         for score in [0, 50, 90] {
             assert_eq!(
-                decide(input(score, false), &policy).basis,
+                decide(input(score, false), &policy, Freshness::Fresh).basis,
                 DecisionBasis::ScoreThresholds
             );
         }
@@ -410,6 +543,103 @@ mod tests {
         assert_eq!(
             serde_json::to_value(DecisionBasis::ScoreThresholds).unwrap(),
             "score_thresholds"
+        );
+    }
+
+    fn stale(verified: bool) -> Freshness {
+        Freshness::Stale {
+            staleness: events::system::FactsStaleness {
+                reason: events::system::ScreeningStaleReason::IntelligenceSlow,
+                observed_at: chrono::Utc::now(),
+                age_ms: 30_000,
+            },
+            sanctions_verified: verified,
+        }
+    }
+
+    #[test]
+    fn a_serve_policy_decides_stale_facts_like_fresh_ones_when_sanctions_are_verified() {
+        let policy = builtin_policy("default").unwrap();
+        let verdict = decide(input(10, false), &policy, stale(true));
+        assert_eq!(verdict.decision, Decision::Allow);
+        assert_eq!(verdict.basis, DecisionBasis::ScoreThresholds);
+    }
+
+    #[test]
+    fn a_review_policy_holds_a_stale_allow() {
+        let policy = builtin_policy("default")
+            .unwrap()
+            .with_on_stale(StalePolicy::Review);
+        let verdict = decide(input(10, false), &policy, stale(true));
+        assert_eq!(verdict.decision, Decision::Review);
+        assert_eq!(verdict.basis, DecisionBasis::StaleFactsReview);
+
+        // Fresh facts are unaffected by the stale setting.
+        assert_eq!(
+            decide(input(10, false), &policy, Freshness::Fresh).decision,
+            Decision::Allow
+        );
+    }
+
+    /// An unverifiable sanctions status is the platform's hold, not a policy
+    /// choice: even `serve` and `monitor-only` hold a stale allow.
+    #[test]
+    fn unverifiable_sanctions_hold_a_stale_allow_under_every_policy() {
+        for name in BUILTIN_POLICY_NAMES {
+            let policy = builtin_policy(name).unwrap();
+            let verdict = decide(input(0, false), &policy, stale(false));
+            assert_eq!(verdict.decision, Decision::Review, "policy {name}");
+            assert_eq!(
+                verdict.basis,
+                DecisionBasis::StaleFactsReview,
+                "policy {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn staleness_never_softens_a_block_or_a_sanctions_hit() {
+        let policy = builtin_policy("default").unwrap();
+        assert_eq!(
+            decide(input(90, false), &policy, stale(false)).decision,
+            Decision::Block
+        );
+        let sanctioned = decide(input(0, true), &policy, stale(false));
+        assert_eq!(sanctioned.decision, Decision::Block);
+        assert_eq!(sanctioned.basis, DecisionBasis::SanctionsHardBlock);
+        assert_eq!(
+            decide(input(50, false), &policy, stale(false)).basis,
+            DecisionBasis::ScoreThresholds,
+            "an existing review is not relabelled"
+        );
+    }
+
+    #[test]
+    fn strict_holds_stale_allows_and_the_others_serve() {
+        assert_eq!(
+            builtin_policy("strict").unwrap().on_stale,
+            StalePolicy::Review
+        );
+        assert_eq!(
+            builtin_policy("default").unwrap().on_stale,
+            StalePolicy::Serve
+        );
+        assert_eq!(
+            builtin_policy("monitor-only").unwrap().on_stale,
+            StalePolicy::Serve
+        );
+    }
+
+    #[test]
+    fn stale_policy_wire_forms_agree_across_serde_and_storage() {
+        for policy in [StalePolicy::Serve, StalePolicy::Review] {
+            assert_eq!(serde_json::to_value(policy).unwrap(), policy.as_wire());
+            assert_eq!(StalePolicy::from_wire(policy.as_wire()), Some(policy));
+        }
+        assert_eq!(StalePolicy::from_wire("sometimes"), None);
+        assert_eq!(
+            serde_json::to_value(DecisionBasis::StaleFactsReview).unwrap(),
+            "stale_facts_review"
         );
     }
 

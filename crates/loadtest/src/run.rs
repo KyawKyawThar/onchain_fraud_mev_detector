@@ -123,6 +123,120 @@ const DRAIN_POLL: Duration = Duration::from_secs(1);
 /// a low block rate and declare a still-backlogged pipeline settled.
 const QUIET_POLLS_TO_SETTLE: u32 = 2;
 
+/// The API service's screening counters, as of one scrape — or, differenced,
+/// over the measurement window. Plain `f64`s because Prometheus counters are.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScreeningCounters {
+    pub fresh: f64,
+    pub stale: f64,
+    pub failed_closed: f64,
+}
+
+impl ScreeningCounters {
+    /// This scrape minus an earlier one. A counter that went *down* means a
+    /// replica restarted mid-run, which silently discards its history — an
+    /// error, the same stance [`Histogram::since`] takes.
+    pub fn since(&self, baseline: &Self) -> Result<Self> {
+        let window = Self {
+            fresh: self.fresh - baseline.fresh,
+            stale: self.stale - baseline.stale,
+            failed_closed: self.failed_closed - baseline.failed_closed,
+        };
+        anyhow::ensure!(
+            window.fresh >= 0.0 && window.stale >= 0.0 && window.failed_closed >= 0.0,
+            "a screening counter went backwards — an API replica restarted during the run"
+        );
+        Ok(window)
+    }
+
+    fn plus(&self, other: &Self) -> Self {
+        Self {
+            fresh: self.fresh + other.fresh,
+            stale: self.stale + other.stale,
+            failed_closed: self.failed_closed + other.failed_closed,
+        }
+    }
+
+    /// Screening calls that left the fresh path at all.
+    pub fn degraded(&self) -> f64 {
+        self.stale + self.failed_closed
+    }
+
+    /// Of every screening call the service handled, the share that got a
+    /// decision (fresh or stale) rather than a fail-closed 502.
+    pub fn decided_share(&self) -> Option<f64> {
+        let total = self.fresh + self.stale + self.failed_closed;
+        (total > 0.0).then(|| (self.fresh + self.stale) / total)
+    }
+
+    /// Of the decisions rendered, the share rendered over stale facts.
+    pub fn stale_share(&self) -> Option<f64> {
+        let decided = self.fresh + self.stale;
+        (decided > 0.0).then(|| self.stale / decided)
+    }
+}
+
+/// Reads the API service's screening counters.
+#[async_trait]
+pub trait ScreeningMetrics: Send + Sync {
+    async fn sample(&self) -> Result<ScreeningCounters>;
+}
+
+/// Every API replica's `/metrics`, summed — the same reasoning as
+/// [`CompositeSubject`]: the budget is about the deployment, not one pod.
+pub struct PrometheusScreeningScrape {
+    client: reqwest::Client,
+    urls: Vec<String>,
+}
+
+impl PrometheusScreeningScrape {
+    pub fn new(client: reqwest::Client, urls: &[String]) -> Self {
+        Self {
+            client,
+            urls: urls.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl ScreeningMetrics for PrometheusScreeningScrape {
+    async fn sample(&self) -> Result<ScreeningCounters> {
+        let served = telemetry::metrics::SCREENING_FACTS_SERVED_TOTAL;
+        let degraded = telemetry::metrics::SCREENING_DEGRADED_TOTAL;
+        let mut total = ScreeningCounters::default();
+        for url in &self.urls {
+            let body = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("scraping {url}"))?
+                .error_for_status()
+                .with_context(|| format!("{url} returned an error status"))?
+                .text()
+                .await
+                .context("reading the API metrics body")?;
+            let exposition = Exposition::parse(&body);
+            total = total.plus(&ScreeningCounters {
+                fresh: exposition.counter(served, &[("freshness", "fresh")]),
+                stale: exposition.counter(served, &[("freshness", "stale")]),
+                failed_closed: exposition.counter(degraded, &[("outcome", "failed_closed")]),
+            });
+        }
+        Ok(total)
+    }
+}
+
+/// Instruments a run may carry beyond the fast path. Default is none of them —
+/// what [`run`] passes.
+#[derive(Default)]
+pub struct RunExtras<'a> {
+    /// The fault proxy the subject's intelligence traffic passes through.
+    pub fault: Option<&'a crate::fault::LatencyProxy>,
+    /// The API service's screening counters.
+    pub screening: Option<&'a dyn ScreeningMetrics>,
+}
+
 /// Run the whole procedure and return the report.
 ///
 /// Never treats an unreachable subject as a pass: the pre-flight scrape fails
@@ -136,6 +250,46 @@ pub async fn run(
     metrics: &dyn SubjectMetrics,
     shutdown: CancellationToken,
 ) -> Result<Report> {
+    run_with(
+        profile,
+        slo,
+        sources,
+        metrics,
+        RunExtras::default(),
+        shutdown,
+    )
+    .await
+}
+
+/// [`run`], with the degraded-mode instruments.
+///
+/// The fault is switched on **when the measurement window opens** and off when
+/// the load stops: warmup runs against a healthy intelligence so the subject has
+/// the snapshots, sanctions view and latency history production would have when
+/// an incident begins. A profile that declares a fault without a proxy to
+/// inject it is refused before any load is offered — the alternative is a run
+/// that measures a healthy system and reports it under the fault's name.
+pub async fn run_with(
+    profile: &Profile,
+    slo: &Slo,
+    sources: &[Arc<dyn LoadSource>],
+    metrics: &dyn SubjectMetrics,
+    extras: RunExtras<'_>,
+    shutdown: CancellationToken,
+) -> Result<Report> {
+    anyhow::ensure!(
+        profile.fault.is_none() || extras.fault.is_some(),
+        "profile `{}` injects a fault but no fault proxy is configured — set \
+         LOADTEST_INTELLIGENCE_PROXY_LISTEN and LOADTEST_INTELLIGENCE_UPSTREAM, and point \
+         the subject's INTELLIGENCE_GRPC_ADDR at the proxy",
+        profile.name
+    );
+    if let Some(screening) = extras.screening {
+        screening
+            .sample()
+            .await
+            .context("pre-flight read of the API service's screening counters")?;
+    }
     metrics
         .sample()
         .await
@@ -159,6 +313,22 @@ pub async fn run(
         .sample()
         .await
         .context("reading the subject at the start of the measurement window")?;
+    let screening_baseline = match extras.screening {
+        Some(screening) => Some(
+            screening
+                .sample()
+                .await
+                .context("reading the screening counters at the start of the window")?,
+        ),
+        None => None,
+    };
+    if let (Some(proxy), Some(fault)) = (extras.fault, profile.fault) {
+        proxy.set_delay(Duration::from_millis(fault.intelligence_latency_ms));
+        tracing::info!(
+            latency_ms = fault.intelligence_latency_ms,
+            "intelligence fault injected for the measurement window"
+        );
+    }
     tracing::info!(
         warmup_secs = window.warmup.as_secs(),
         duration_secs = window.duration.as_secs(),
@@ -178,6 +348,22 @@ pub async fn run(
             .unwrap_or(usize::MAX)
     });
 
+    // The API load has stopped, so its window is closed: read the counters now,
+    // then lift the fault so the drain is not measuring it.
+    let screening = match (extras.screening, screening_baseline) {
+        (Some(screening), Some(baseline)) => Some(
+            screening
+                .sample()
+                .await
+                .context("reading the screening counters at the close of the window")?
+                .since(&baseline)?,
+        ),
+        _ => None,
+    };
+    if let Some(proxy) = extras.fault {
+        proxy.set_delay(Duration::ZERO);
+    }
+
     let drained = drain(metrics, profile.drain_timeout).await?;
     let measured = metrics
         .sample()
@@ -193,6 +379,7 @@ pub async fn run(
         window: &measured,
         window_share: window.measured_share(),
         drain: &drained,
+        screening: screening.as_ref(),
     };
 
     Ok(Report::new(
@@ -229,6 +416,13 @@ fn observations(run: &RunData<'_>) -> Vec<Observation> {
             Some(Measured::Count(run.window.quiet.count)),
         ),
     ];
+    if let Some(screening) = run.screening {
+        observations.push(Observation::new(
+            "screen_stale_share",
+            "share of screening decisions rendered over last-known-good facts",
+            screening.stale_share().map(Measured::Share),
+        ));
+    }
     if let Some(api) = run.source(crate::source::API) {
         if let Some(latency) = &api.latency {
             observations.push(Observation::p99(
@@ -487,9 +681,12 @@ mod tests {
         Slo {
             fast_path_p99_seconds: LatencyBudget::try_from(1.0).unwrap(),
             api_p99_seconds: LatencyBudget::try_from(0.5).unwrap(),
+            screen_p50_seconds: LatencyBudget::try_from(0.1).unwrap(),
+            screen_p99_seconds: LatencyBudget::try_from(0.25).unwrap(),
             min_alert_samples: 100,
             min_achieved_ratio: 0.95,
             min_api_success_ratio: 0.99,
+            max_screen_failed_closed_share: 0.01,
         }
     }
 
@@ -506,6 +703,8 @@ mod tests {
             warmup: Duration::from_secs(1),
             duration: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(30),
+            address_pool: None,
+            fault: None,
         }
     }
 

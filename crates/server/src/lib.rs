@@ -12,7 +12,12 @@
 //! screening layer's named policies resolve against beyond the built-in
 //! catalog (Sprint 14 t2), [`rate_limit`] is the dedicated per-customer
 //! request ceiling on `POST /v1/address/{addr}/screen` that protects its
-//! p50 < 100ms SLO from noisy-neighbor traffic (§19, Sprint 14 t4), and
+//! p50 < 100ms SLO from noisy-neighbor traffic (§19, Sprint 14 t4), [`degrade`]
+//! is that endpoint's graceful degradation — a flagged last-known-good snapshot
+//! when intelligence is slow or unavailable (readiness Epic D) — with
+//! [`facts_source`]'s breaker/bulkhead/hedging in front of the fresh read,
+//! [`snapshot_tier`]'s per-pod memory tier and [`sanctions_view`]'s pod-local
+//! sanctions list behind it — and
 //! [`http`] assembles the whole router.
 //!
 //! Keeping this in a library (mirrors `event-store`) is what lets the router/
@@ -21,12 +26,16 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod degrade;
+pub mod facts_source;
 pub mod http;
 pub mod intelligence_client;
 pub mod metrics;
 pub mod policy_store;
 pub mod rate_limit;
+pub mod sanctions_view;
 pub mod screen;
+pub mod snapshot_tier;
 pub mod stream;
 pub mod upstream;
 pub mod usage;

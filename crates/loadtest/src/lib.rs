@@ -58,6 +58,7 @@
 
 pub mod api;
 pub mod chain;
+pub mod fault;
 pub mod gates;
 pub mod profile;
 pub mod report;

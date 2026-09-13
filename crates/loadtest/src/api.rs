@@ -14,6 +14,7 @@
 //! response before issuing the next one offers less load precisely when the
 //! system is slow, and reports a latency that never happened.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,15 +74,24 @@ impl LoadSource for ApiLoad {
 /// Shared counters the request tasks fold into. Requests are issued
 /// concurrently (a schedule that waits for a response is not a schedule), so the
 /// tallies are atomics rather than a returned value per task.
-#[derive(Default)]
 struct Tally {
     responded: AtomicU64,
     succeeded: AtomicU64,
     client_errors: AtomicU64,
     server_errors: AtomicU64,
     failed: AtomicU64,
-    /// One counter per bucket of the shared ladder, plus a final overflow slot
-    /// for samples above the top bound.
+    /// Every answered request, whatever its status — §19's aggregate API panel.
+    all: LadderTally,
+    /// Successful responses only, per route template: the population a
+    /// per-route budget is judged over. A 429 or a fail-closed 502 answers in
+    /// microseconds and is not a decision, so counting it would flatter exactly
+    /// the route that is failing.
+    routes: BTreeMap<String, LadderTally>,
+}
+
+/// One histogram under construction: a counter per bucket of the shared ladder,
+/// plus a final overflow slot for samples above the top bound.
+struct LadderTally {
     buckets: Vec<AtomicU64>,
     sum_micros: AtomicU64,
 }
@@ -104,13 +114,11 @@ async fn drive(
     }
 
     let ladder = telemetry::metrics::LATENCY_BUCKETS_SECONDS;
-    let tally = Arc::new(Tally {
-        buckets: (0..=ladder.len()).map(|_| AtomicU64::new(0)).collect(),
-        ..Default::default()
-    });
+    let tally = Arc::new(Tally::new(ladder, &profile.api_routes));
 
     let mix = RouteMix::new(&profile.api_routes)
-        .context("building the request mix from the profile's routes")?;
+        .context("building the request mix from the profile's routes")?
+        .with_address_pool(profile.address_pool);
     let total = (window.total().as_secs_f64() * profile.api_qps).round() as u64;
     let interval = Duration::from_secs_f64(1.0 / profile.api_qps);
     let start = Instant::now();
@@ -149,20 +157,14 @@ async fn drive(
             request = request.bearer_auth(token);
         }
         let tally = Arc::clone(&tally);
+        let template = call.template;
         inflight.spawn(async move {
             let sent = Instant::now();
             let outcome = request.send().await;
             let elapsed = sent.elapsed();
             match outcome {
                 Ok(response) => {
-                    tally.responded.fetch_add(1, Ordering::Relaxed);
-                    match response.status().as_u16() / 100 {
-                        2 => &tally.succeeded,
-                        4 => &tally.client_errors,
-                        _ => &tally.server_errors,
-                    }
-                    .fetch_add(1, Ordering::Relaxed);
-                    tally.record(elapsed);
+                    tally.observe(&template, response.status().as_u16(), elapsed);
                 }
                 Err(err) => {
                     tally.failed.fetch_add(1, Ordering::Relaxed);
@@ -182,6 +184,79 @@ async fn drive(
 }
 
 impl Tally {
+    fn new(ladder: &[f64], routes: &[ApiRoute]) -> Self {
+        Self {
+            responded: AtomicU64::new(0),
+            succeeded: AtomicU64::new(0),
+            client_errors: AtomicU64::new(0),
+            server_errors: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            all: LadderTally::new(ladder),
+            routes: routes
+                .iter()
+                .map(|route| (route.path.clone(), LadderTally::new(ladder)))
+                .collect(),
+        }
+    }
+
+    /// Fold one answered request in: its status class, the aggregate
+    /// histogram, and — on success — its route's own histogram.
+    fn observe(&self, template: &str, status: u16, elapsed: Duration) {
+        self.responded.fetch_add(1, Ordering::Relaxed);
+        match status / 100 {
+            2 => &self.succeeded,
+            4 => &self.client_errors,
+            _ => &self.server_errors,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        self.all.record(elapsed);
+        if status / 100 == 2 {
+            if let Some(route) = self.routes.get(template) {
+                route.record(elapsed);
+            }
+        }
+    }
+
+    fn finish(
+        &self,
+        scheduled: u64,
+        elapsed: Duration,
+        max_lateness: Duration,
+        ladder: &[f64],
+        target_qps: f64,
+    ) -> Offered {
+        Offered {
+            source: source::API,
+            unit: "qps",
+            scheduled,
+            delivered: self.responded.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            target_rate: target_qps,
+            elapsed,
+            max_lateness: Some(max_lateness),
+            latency: Some(self.all.histogram(ladder)),
+            route_latency: self
+                .routes
+                .iter()
+                .map(|(route, tally)| (route.clone(), tally.histogram(ladder)))
+                .collect(),
+            outcomes: Some(Outcomes {
+                succeeded: self.succeeded.load(Ordering::Relaxed),
+                client_errors: self.client_errors.load(Ordering::Relaxed),
+                server_errors: self.server_errors.load(Ordering::Relaxed),
+            }),
+        }
+    }
+}
+
+impl LadderTally {
+    fn new(ladder: &[f64]) -> Self {
+        Self {
+            buckets: (0..=ladder.len()).map(|_| AtomicU64::new(0)).collect(),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+
     fn record(&self, elapsed: Duration) {
         let ladder = telemetry::metrics::LATENCY_BUCKETS_SECONDS;
         let seconds = elapsed.as_secs_f64();
@@ -196,14 +271,7 @@ impl Tally {
 
     /// Fold the per-slot counts into the cumulative form a Prometheus histogram
     /// has, so both sides of this test are read by the same code.
-    fn finish(
-        &self,
-        scheduled: u64,
-        elapsed: Duration,
-        max_lateness: Duration,
-        ladder: &[f64],
-        target_qps: f64,
-    ) -> Offered {
+    fn histogram(&self, ladder: &[f64]) -> Histogram {
         let mut buckets = std::collections::BTreeMap::new();
         let mut cumulative = 0u64;
         for (index, bound) in ladder.iter().enumerate() {
@@ -214,26 +282,10 @@ impl Tally {
         // finite bucket, so a quantile above the ladder reports as unbounded
         // rather than silently pinned to the top bound.
         let overflow = self.buckets[ladder.len()].load(Ordering::Relaxed);
-
-        Offered {
-            source: source::API,
-            unit: "qps",
-            scheduled,
-            delivered: self.responded.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
-            target_rate: target_qps,
-            elapsed,
-            max_lateness: Some(max_lateness),
-            latency: Some(Histogram {
-                buckets,
-                count: cumulative + overflow,
-                sum: self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            }),
-            outcomes: Some(Outcomes {
-                succeeded: self.succeeded.load(Ordering::Relaxed),
-                client_errors: self.client_errors.load(Ordering::Relaxed),
-                server_errors: self.server_errors.load(Ordering::Relaxed),
-            }),
+        Histogram {
+            buckets,
+            count: cumulative + overflow,
+            sum: self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         }
     }
 }
@@ -241,6 +293,9 @@ impl Tally {
 /// One resolved request: where to send it, how, and with what.
 struct Call {
     path: String,
+    /// The profile's path template this call was resolved from — the key its
+    /// latency is filed under, since `path` carries a per-request address.
+    template: String,
     method: Method,
     body: Option<serde_json::Value>,
 }
@@ -253,6 +308,9 @@ struct Call {
 struct RouteMix {
     /// Expanded routes, one entry per unit of weight.
     slots: Vec<ApiRoute>,
+    /// Distinct addresses to cycle through, if bounded (see
+    /// [`Profile::address_pool`]).
+    address_pool: Option<u64>,
 }
 
 impl RouteMix {
@@ -265,7 +323,16 @@ impl RouteMix {
             !slots.is_empty(),
             "every route has weight 0 — the driver would request nothing"
         );
-        Ok(Self { slots })
+        Ok(Self {
+            slots,
+            address_pool: None,
+        })
+    }
+
+    /// Cycle through `pool` addresses instead of one per request.
+    fn with_address_pool(mut self, pool: Option<u64>) -> Self {
+        self.address_pool = pool;
+        self
     }
 
     /// The request for ordinal `n`, with `{address}` substituted for a spread
@@ -277,12 +344,16 @@ impl RouteMix {
     fn call_for(&self, n: u64) -> Call {
         let route = &self.slots[(n as usize) % self.slots.len()];
         let path = if route.path.contains("{address}") {
-            route.path.replace("{address}", &synthetic_address(n))
+            route.path.replace(
+                "{address}",
+                &synthetic_address(self.address_pool.map_or(n, |pool| n % pool)),
+            )
         } else {
             route.path.clone()
         };
         Call {
             path,
+            template: route.path.clone(),
             method: route.method,
             body: route.body.clone(),
         }
@@ -300,6 +371,7 @@ fn synthetic_address(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::SCREEN_ROUTE;
 
     fn routes() -> Vec<ApiRoute> {
         vec![
@@ -337,6 +409,20 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_address_pool_repeats_counterparties() {
+        // The mix cycles 4 slots (3 screen + 1 incidents) and the pool 3
+        // addresses, so ordinals 0 and 12 land on the same slot AND the same
+        // address; 0 and 4 share a slot but not an address.
+        let mix = RouteMix::new(&routes()).unwrap().with_address_pool(Some(3));
+        assert_eq!(
+            mix.call_for(0).path,
+            mix.call_for(12).path,
+            "the address wraps"
+        );
+        assert_ne!(mix.call_for(0).path, mix.call_for(4).path);
+    }
+
+    #[test]
     fn a_zero_weight_mix_is_rejected_rather_than_silently_idle() {
         let none = vec![ApiRoute {
             path: "/v1/incidents".into(),
@@ -362,17 +448,39 @@ mod tests {
         );
     }
 
+    /// Per-route latency is judged over successes alone, while the aggregate
+    /// still sees every response.
+    #[test]
+    fn per_route_latency_counts_only_that_routes_successes() {
+        let ladder = telemetry::metrics::LATENCY_BUCKETS_SECONDS;
+        let tally = Tally::new(ladder, &routes());
+        tally.observe(SCREEN_ROUTE, 200, Duration::from_millis(80));
+        tally.observe(SCREEN_ROUTE, 429, Duration::from_micros(50));
+        tally.observe(SCREEN_ROUTE, 502, Duration::from_micros(50));
+        tally.observe("/v1/incidents", 200, Duration::from_millis(2));
+
+        let load = tally.finish(4, Duration::from_secs(1), Duration::ZERO, ladder, 4.0);
+        let screen = &load.route_latency[SCREEN_ROUTE];
+        assert_eq!(
+            screen.count, 1,
+            "only the successful screening call is timed"
+        );
+        assert_eq!(screen.share_at_most(0.1), Some(1.0));
+        assert_eq!(load.route_latency["/v1/incidents"].count, 1);
+        assert_eq!(
+            load.latency.expect("aggregate").count,
+            4,
+            "the aggregate panel still sees every response"
+        );
+    }
+
     #[test]
     fn client_latency_lands_in_the_same_ladder_the_server_uses() {
         let ladder = telemetry::metrics::LATENCY_BUCKETS_SECONDS;
-        let tally = Tally {
-            buckets: (0..=ladder.len()).map(|_| AtomicU64::new(0)).collect(),
-            ..Default::default()
-        };
-        tally.responded.fetch_add(3, Ordering::Relaxed);
-        tally.record(Duration::from_millis(30)); // → the 0.05 bucket
-        tally.record(Duration::from_millis(30));
-        tally.record(Duration::from_secs(30)); // → over the top of the ladder
+        let tally = Tally::new(ladder, &routes());
+        tally.observe(SCREEN_ROUTE, 200, Duration::from_millis(30)); // → the 0.05 bucket
+        tally.observe(SCREEN_ROUTE, 200, Duration::from_millis(30));
+        tally.observe(SCREEN_ROUTE, 200, Duration::from_secs(30)); // → over the top of the ladder
 
         let load = tally.finish(3, Duration::from_secs(1), Duration::ZERO, ladder, 3.0);
         let latency = load.latency.expect("the API measures its own latency");

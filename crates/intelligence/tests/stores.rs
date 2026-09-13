@@ -557,6 +557,80 @@ async fn concurrent_split_and_link_address_never_strands_a_membership_row() {
     }
 }
 
+/// The sanctions view's source (`ListSanctions`): keyset pages over the primary
+/// key walk every row exactly once, including an address whose designations
+/// straddle a page boundary, and the watermark moves when the list does.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn sanctions_page_by_keyset_and_the_watermark_moves_with_the_list() {
+    let (store, _pg) = pg_store().await;
+
+    let empty = store.sanctions_watermark().await.expect("watermark");
+    assert_eq!(empty.rows, 0);
+    assert_eq!(empty.last_imported_at, None);
+
+    let entry = |byte: u8, list: &str| SanctionEntry {
+        address: addr(byte),
+        list_name: list.into(),
+        entry: format!("entry-{byte}"),
+        listed_at: None,
+    };
+    store
+        .seed_sanctions(&[
+            entry(0x02, "ofac_sdn"),
+            entry(0x01, "ofac_sdn"),
+            entry(0x01, "eu_consolidated"),
+        ])
+        .await
+        .expect("seed");
+    let seeded = store.sanctions_watermark().await.expect("watermark");
+    assert_eq!(seeded.rows, 3);
+    assert!(seeded.last_imported_at.is_some());
+
+    let first = store.sanctions_page(None, 2).await.expect("page 1");
+    let last = first.last().expect("a full first page");
+    let second = store
+        .sanctions_page(Some((&last.address, last.list_name.as_str())), 2)
+        .await
+        .expect("page 2");
+    let walked: Vec<(Address, String)> = first
+        .iter()
+        .chain(&second)
+        .map(|e| (e.address, e.list_name.clone()))
+        .collect();
+    assert_eq!(
+        walked,
+        vec![
+            (addr(0x01), "eu_consolidated".to_owned()),
+            (addr(0x01), "ofac_sdn".to_owned()),
+            (addr(0x02), "ofac_sdn".to_owned()),
+        ],
+        "every row once, in key order, across the split address"
+    );
+    assert_eq!(second.len(), 1, "a short page is the last page");
+
+    // A feed refresh re-imports rows in place: the row count holds, but the
+    // import time moves — so a reader never skips a refreshed list.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    store
+        .seed_sanctions(&[entry(0x02, "ofac_sdn")])
+        .await
+        .expect("re-import");
+    let refreshed = store.sanctions_watermark().await.expect("watermark");
+    assert_eq!(refreshed.rows, 3);
+    assert_ne!(refreshed, seeded, "a re-import must move the watermark");
+
+    store
+        .seed_sanctions(&[entry(0x03, "ofac_sdn")])
+        .await
+        .expect("new designation");
+    let grown = store.sanctions_watermark().await.expect("watermark");
+    assert_eq!(
+        grown.rows, 4,
+        "a new designation always moves the watermark"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers Postgres)"]
 async fn attribution_upserts_and_sanctions_reimport_idempotently() {
