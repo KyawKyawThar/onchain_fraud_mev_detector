@@ -318,6 +318,7 @@ pub fn to_json(report: &Report) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slo::LatencyBudget;
 
     /// The property the type split buys: there is no way to pass an
     /// observation to the fold, so context cannot become an exit code. Under
@@ -410,8 +411,8 @@ mod tests {
                 drain_timeout: std::time::Duration::from_secs(1),
             },
             crate::slo::Slo {
-                fast_path_p99_seconds: 1.0,
-                api_p99_seconds: 0.5,
+                fast_path_p99_seconds: LatencyBudget::try_from(1.0).unwrap(),
+                api_p99_seconds: LatencyBudget::try_from(0.5).unwrap(),
                 min_alert_samples: 1,
                 min_achieved_ratio: 0.95,
                 min_api_success_ratio: 0.99,

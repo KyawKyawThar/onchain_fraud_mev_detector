@@ -34,6 +34,61 @@ use serde::{Deserialize, Serialize};
 // the first time the ladder gains a bucket.
 use telemetry::metrics::LATENCY_BUCKETS_SECONDS;
 
+/// A latency budget that is **known** to sit exactly on a boundary of the
+/// shared latency ladder.
+///
+/// The invariant was previously enforced by [`Slo::validate`], one call away
+/// from the field it guards. That works until someone adds a budget and
+/// forgets the line — the same failure mode as the `DraftKind` whose
+/// answer-check fell through a `match` arm and reached a customer. Here the
+/// check moved into `Deserialize` itself (`#[serde(try_from)]`), so an
+/// unaligned budget cannot be *parsed*, and the only way to build one in Rust
+/// is through the same fallible conversion.
+///
+/// Why the invariant matters: a bucketed quantile is a bound, not a point. With
+/// a boundary exactly on the budget, "99% at or below 1.0s" is decidable
+/// without interpolating; a budget between two rungs is a question the
+/// histogram cannot answer, and the gate would report *undecided* on every run
+/// forever — which looks like a passing pipeline, not a broken gate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct LatencyBudget(f64);
+
+impl LatencyBudget {
+    /// The budget in seconds.
+    pub fn seconds(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for LatencyBudget {
+    type Error = String;
+
+    fn try_from(seconds: f64) -> std::result::Result<Self, Self::Error> {
+        if LATENCY_BUCKETS_SECONDS.contains(&seconds) {
+            Ok(Self(seconds))
+        } else {
+            Err(format!(
+                "{seconds} is not a bucket boundary of the shared latency ladder, so no \
+                 histogram can decide it — pick one of {LATENCY_BUCKETS_SECONDS:?}, or add \
+                 the boundary to telemetry::metrics::LATENCY_BUCKETS_SECONDS"
+            ))
+        }
+    }
+}
+
+impl From<LatencyBudget> for f64 {
+    fn from(budget: LatencyBudget) -> Self {
+        budget.0
+    }
+}
+
+impl std::fmt::Display for LatencyBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The committed budgets a load run is judged against.
 ///
 /// Every field here must be read by some [`crate::gates::GateRule`], and a test
@@ -47,9 +102,9 @@ pub struct Slo {
     /// (`telemetry::metrics`), or no histogram can decide it — validated at
     /// load, so an unmeasurable threshold fails at startup rather than turning
     /// every future run inconclusive.
-    pub fast_path_p99_seconds: f64,
+    pub fast_path_p99_seconds: LatencyBudget,
     /// Client-observed API p99, in seconds (§19's API panel).
-    pub api_p99_seconds: f64,
+    pub api_p99_seconds: LatencyBudget,
     /// The minimum number of *alerting* fast-path samples a run must collect
     /// before its p99 is allowed to mean anything.
     ///
@@ -252,17 +307,10 @@ impl Slo {
     /// boundary exactly on it (see [`crate::scrape`]). Catching that here turns
     /// a silently-always-inconclusive gate into a startup error.
     pub(crate) fn validate(&self) -> Result<()> {
-        for (name, budget) in [
-            ("fast_path_p99_seconds", self.fast_path_p99_seconds),
-            ("api_p99_seconds", self.api_p99_seconds),
-        ] {
-            anyhow::ensure!(
-                LATENCY_BUCKETS_SECONDS.contains(&budget),
-                "{name} = {budget} is not a bucket boundary of the shared latency ladder, \
-                 so no histogram can decide it — pick one of {LATENCY_BUCKETS_SECONDS:?} \
-                 or add the boundary to telemetry::metrics"
-            );
-        }
+        // The bucket-boundary check that used to live here is now
+        // [`LatencyBudget`]'s, enforced during deserialization — an unaligned
+        // budget never reaches this function, and a newly added budget gets the
+        // check by its type rather than by someone remembering to add a line.
         anyhow::ensure!(
             (0.0..=1.0).contains(&self.min_achieved_ratio),
             "min_achieved_ratio is a fraction"
@@ -282,8 +330,8 @@ mod tests {
 
     fn a_slo() -> Slo {
         Slo {
-            fast_path_p99_seconds: 1.0,
-            api_p99_seconds: 0.5,
+            fast_path_p99_seconds: LatencyBudget::try_from(1.0).expect("on the ladder"),
+            api_p99_seconds: LatencyBudget::try_from(0.5).expect("on the ladder"),
             min_alert_samples: 100,
             min_achieved_ratio: 0.95,
             min_api_success_ratio: 0.99,
@@ -360,14 +408,40 @@ mod tests {
         assert!(Verdict::share_at_least(None, 0.99, "x").is_inconclusive());
     }
 
+    /// The invariant is now the type's, so it is enforced where the value
+    /// enters the program rather than by a `validate` call someone has to
+    /// remember. Note what this test can no longer do: build an `Slo` with an
+    /// unaligned budget at all — that is the improvement, and it is why this
+    /// asserts on JSON rather than on a struct literal.
     #[test]
-    fn a_budget_off_the_bucket_ladder_is_rejected_at_load() {
-        let slo = Slo {
-            fast_path_p99_seconds: 0.75,
-            ..a_slo()
-        };
-        let err = slo.validate().unwrap_err().to_string();
+    fn a_budget_off_the_bucket_ladder_cannot_be_parsed() {
+        let json = r#"{
+            "fast_path_p99_seconds": 0.75,
+            "api_p99_seconds": 0.5,
+            "min_alert_samples": 100,
+            "min_achieved_ratio": 0.95,
+            "min_api_success_ratio": 0.99
+        }"#;
+        let err = serde_json::from_str::<Slo>(json)
+            .expect_err("0.75 is between the 0.5 and 1.0 rungs")
+            .to_string();
         assert!(err.contains("bucket boundary"), "got: {err}");
+        assert!(
+            err.contains("0.5") && err.contains("1"),
+            "the error must name the usable rungs: {err}"
+        );
+    }
+
+    /// A boundary value still parses — otherwise the check above could be
+    /// passing because nothing parses.
+    #[test]
+    fn a_budget_on_the_ladder_parses() {
+        assert_eq!(
+            serde_json::from_str::<LatencyBudget>("0.25")
+                .unwrap()
+                .seconds(),
+            0.25
+        );
     }
 
     #[test]
@@ -383,7 +457,8 @@ mod tests {
     fn the_committed_slo_parses_and_states_the_published_claim() {
         let slo = Slo::load(&Slo::committed_path()).expect("slo.json must be valid");
         assert_eq!(
-            slo.fast_path_p99_seconds, 1.0,
+            slo.fast_path_p99_seconds.seconds(),
+            1.0,
             "§6's < 1s is a published claim; changing it here changes the product"
         );
     }

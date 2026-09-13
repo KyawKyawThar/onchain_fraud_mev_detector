@@ -55,6 +55,31 @@ pub const SWEEP_PAGES_TOTAL: &str = "intelligence_embedding_sweep_pages_total";
 /// window shows up as a *missing* observation next to a rising
 /// `..._budget_exhausted_total`.
 pub const SWEEP_LAP_SECONDS: &str = "intelligence_embedding_sweep_lap_seconds";
+/// [`SWEEP_LAP_SECONDS`] with its bucket ladder attached, so the class travels
+/// with the declaration instead of only with the list in `telemetry`. Recorded
+/// through `telemetry::metrics::record_duration`, which asserts in debug builds
+/// that the exporter agrees — the check that would have caught this metric
+/// sitting on the 10s latency ladder on the first test that touched it.
+pub const SWEEP_LAP: telemetry::metrics::DurationMetric =
+    telemetry::metrics::DurationMetric::job_duration(SWEEP_LAP_SECONDS);
+/// The most recently completed lap, as a **gauge** — the alertable form of
+/// [`SWEEP_LAP_SECONDS`], and the reason this SLI has a second export rather
+/// than one.
+///
+/// Every `_seconds` histogram in the platform shares
+/// [`telemetry::metrics::LATENCY_BUCKETS_SECONDS`], whose top finite bucket is
+/// **10s**, because that ladder was sized for detector latencies. A sweep lap
+/// is measured in hours: every observation lands in `+Inf`, and
+/// `histogram_quantile` reports the highest finite bound for a quantile that
+/// falls there — so a PromQL alert on the histogram tops out at 10 and can
+/// never fire, whatever threshold it names. The histogram stays, because the
+/// *shape* of the distribution is still worth a panel; the gauge is what
+/// `EmbeddingSweepLapTooSlow` compares against.
+///
+/// Written only when a window completes, exactly like the histogram — so a
+/// sweep that has stalled outright holds its last healthy value forever. That
+/// gap is [`SWEEP_BUDGET_EXHAUSTED_TOTAL`]'s to cover, not this gauge's.
+pub const SWEEP_LAST_LAP_SECONDS: &str = "intelligence_embedding_sweep_last_lap_seconds";
 
 /// Operator-tunable bounds for the schedule.
 #[derive(Debug, Clone, Copy)]
@@ -226,7 +251,8 @@ impl EmbeddingSweep {
                 if let Some(opened_at) = state.window_opened_at {
                     let lap = now.signed_duration_since(opened_at);
                     if let Ok(lap) = lap.to_std() {
-                        metrics::histogram!(SWEEP_LAP_SECONDS).record(lap.as_secs_f64());
+                        telemetry::metrics::record_duration(SWEEP_LAP, lap.as_secs_f64());
+                        metrics::gauge!(SWEEP_LAST_LAP_SECONDS).set(lap.as_secs_f64());
                     }
                 }
                 state.cursor = None;
@@ -383,6 +409,75 @@ mod tests {
             .map(|e| e.address)
             .collect();
         assert_eq!(second, vec![addr(3), addr(4)]);
+    }
+
+    /// The staleness SLI has to be readable by an *alert*, not just a panel.
+    ///
+    /// `SWEEP_LAP_SECONDS` is a histogram on telemetry's shared latency ladder,
+    /// whose top finite bucket is 10s — so a lap measured in hours lands in
+    /// `+Inf` and `histogram_quantile` can never report more than 10, which
+    /// made `EmbeddingSweepLapTooSlow` unfireable at any threshold. The gauge
+    /// is the fix, so this asserts the two things the alert depends on: that a
+    /// completed window writes it, and that it carries the real lap rather than
+    /// a bucketed bound.
+    #[test]
+    fn a_completed_window_exports_its_lap_as_an_unbucketed_gauge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let h = harness();
+                    h.graph.append(&[adjacency_edge(1, 2, 0)]).await.unwrap();
+                    let sweep = sweep(
+                        &h,
+                        SweepLimits {
+                            page_size: 2,
+                            budget: 2,
+                            ..Default::default()
+                        },
+                    );
+                    let shutdown = CancellationToken::new();
+                    let mut state = SweepState::default();
+
+                    // Opens the window and stops on its budget, leaving it open.
+                    let first = sweep.tick(&mut state, at(HOUR), &shutdown).await.unwrap();
+                    assert!(first.budget_exhausted && !first.window_completed);
+
+                    // Two hours later the window runs dry and the lap closes.
+                    let second = sweep
+                        .tick(&mut state, at(3 * HOUR), &shutdown)
+                        .await
+                        .unwrap();
+                    assert!(second.window_completed);
+                });
+        });
+
+        // One snapshot only — it drains the recorder.
+        let series = snapshotter.snapshot().into_vec();
+        let gauge = series
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == SWEEP_LAST_LAP_SECONDS)
+            .map(|(_, _, _, value)| value)
+            .expect("a completed window exports the last-lap gauge");
+
+        match gauge {
+            DebugValue::Gauge(v) => assert_eq!(
+                v.into_inner(),
+                (2 * HOUR) as f64,
+                "the gauge carries the real lap, well past the 10s histogram ladder \
+                 that made the old histogram-based alert unfireable"
+            ),
+            other => panic!(
+                "last-lap must be a Gauge, not {other:?} — a histogram \
+                             cannot express an hours-scale lap on the shared ladder"
+            ),
+        }
     }
 
     #[tokio::test]

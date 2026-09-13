@@ -1,0 +1,38 @@
+[package]
+name = "alert-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The alert rules' own invariants, as a test (docs/engineering-conventions.md
+# §19). Sibling of `arch-conformance`, same shape and the same argument: the
+# constraints on `deploy/prometheus-rules.yml` were written as a comment at the
+# top of that file, and a comment does not fail a build. Four rules shipped
+# structurally incapable of firing before anyone noticed by reading.
+#
+# See src/lib.rs for the rules; tests/rules.rs runs them against the real file.
+
+[lints]
+workspace = true
+
+[dependencies]
+# The bucket ladders, NOT a copy of them (`telemetry::metrics::buckets_for`).
+# The entire point of this crate is that a threshold is checked against the
+# ladder its metric is actually exported on; a private copy here would go stale
+# the first time a ladder gains a rung, and would do so silently.
+telemetry.workspace = true
+# PromQL is extracted with anchored patterns rather than parsed. These rules
+# ask narrow structural questions ("what does this quantile read", "what is the
+# literal it is compared against", "how wide is the range selector"), and a
+# hand-rolled scanner for them would be more code and more places to be wrong
+# than one regex each.
+regex.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true }
+# YAML, test-only: the I/O shell parses the real deploy file. `yaml-rust2` over
+# `serde_yaml` deliberately — serde_yaml is archived upstream, and Epic C's
+# supply-chain item (`cargo deny`, unmaintained-crate denials) would land on it
+# the day it is wired. No serde derive is needed to walk six known keys.
+yaml-rust2 = { workspace = true }

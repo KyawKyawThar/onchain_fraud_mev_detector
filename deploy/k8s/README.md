@@ -88,7 +88,13 @@ already carries:
   `prometheus.io/port` annotations — one job covers every annotated pod
   instead of a static target per service. SLO alert rules
   (`FastPathLatencyHigh`, `ApiLatencyHigh`, `KafkaConsumerLagHigh`, …) are
-  inlined in its ConfigMap, same PromQL as `deploy/prometheus-rules.yml`.
+  **generated from `deploy/prometheus-rules.yml`** by the `prometheus-rules`
+  `configMapGenerator`, the same single-source treatment the Grafana dashboards
+  get — not inlined. They were inlined once, drifted for three sprints, and
+  production ended up running a rule set that was missing whole groups and
+  whose headline `FastPathLatencyHigh` still watched a series a backlog could
+  not move. Edit the rules in one place; the generator's name hash rolls the
+  Prometheus pod so they actually load.
 - **Alertmanager** routes firing alerts — a placeholder webhook receiver
   (no real Slack/PagerDuty/email destination; swap before go-live, see the
   manifest's header comment).

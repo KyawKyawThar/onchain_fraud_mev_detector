@@ -410,7 +410,7 @@ pub fn fast_path_verdict(slo: &Slo, alerting: &Histogram) -> Verdict {
         ));
     }
     Verdict::share_at_least(
-        alerting.share_at_most(slo.fast_path_p99_seconds),
+        alerting.share_at_most(slo.fast_path_p99_seconds.seconds()),
         P99,
         format!(
             "the exported histogram has no bucket boundary at {}s, so this threshold \
@@ -441,7 +441,7 @@ impl GateRule for ApiLatency {
         let share = api
             .latency
             .as_ref()
-            .and_then(|h| h.share_at_most(run.slo.api_p99_seconds));
+            .and_then(|h| h.share_at_most(run.slo.api_p99_seconds.seconds()));
         Some(Gate::new(
             self.id(),
             format!("client-observed API p99 < {}s", run.slo.api_p99_seconds),

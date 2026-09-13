@@ -173,6 +173,13 @@ backup = { path = "crates/backup" }
 
 # Errors.
 anyhow = "1"
+# Anchored PromQL extraction for `alert-conformance`'s rules (§19).
+regex = "1"
+# YAML, used only by `alert-conformance`'s test shell to read the deployed
+# alert rules. `yaml-rust2` rather than the archived `serde_yaml`: no serde
+# derive is needed to walk six known keys, and Epic C's `cargo deny` item would
+# land on an unmaintained crate the day it is wired.
+yaml-rust2 = "0.11"
 thiserror = "2"
 
 # Serialization & domain primitives (event schema, §2).

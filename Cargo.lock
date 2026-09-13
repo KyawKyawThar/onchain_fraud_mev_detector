@@ -54,6 +54,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alert-conformance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "telemetry",
+ "yaml-rust2",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1152,6 +1162,12 @@ dependencies = [
  "num-traits",
  "rand 0.8.6",
 ]
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayref"
@@ -7921,6 +7937,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -8662,6 +8679,7 @@ dependencies = [
  "event-bus",
  "events",
  "metrics",
+ "metrics-util",
  "rdkafka",
  "secrecy",
  "serde",
@@ -9351,6 +9369,17 @@ name = "xxhash-rust"
 version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
+
+[[package]]
+name = "yaml-rust2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b36710ce3a279cfce8465dbab826f161675a262950b922cb2c3663852dfe9eb0"
+dependencies = [
+ "arraydeque",
+ "encoding_rs",
+ "hashlink",
+]
 
 [[package]]
 name = "yoke"
