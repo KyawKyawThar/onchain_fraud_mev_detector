@@ -501,6 +501,35 @@ impl SanctionsStore for InMemoryIntelligenceStore {
         matches.sort_by(|a, b| a.list_name.cmp(&b.list_name));
         Ok(matches)
     }
+
+    async fn sanctions_page(
+        &self,
+        after: Option<(&AccountAddress, &str)>,
+        limit: u32,
+    ) -> Result<Vec<SanctionEntry>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        let mut rows: Vec<SanctionEntry> = state.sanctions.values().cloned().collect();
+        let key = |e: &SanctionEntry| (crate::model::address_key(&e.address), e.list_name.clone());
+        rows.sort_by_key(key);
+        let after =
+            after.map(|(address, list)| (crate::model::address_key(address), list.to_owned()));
+        Ok(rows
+            .into_iter()
+            .filter(|e| after.as_ref().is_none_or(|a| key(e) > *a))
+            .take(limit as usize)
+            .collect())
+    }
+
+    /// The double records no import time, so its watermark moves on row count
+    /// alone — enough for the paging contract; the real table's import time is
+    /// covered by the Postgres store test.
+    async fn sanctions_watermark(&self) -> Result<crate::model::SanctionsWatermark, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(crate::model::SanctionsWatermark {
+            rows: state.sanctions.len() as u64,
+            last_imported_at: None,
+        })
+    }
 }
 
 /// In-memory [`HotCache`]. TTLs are not simulated — the double tests the

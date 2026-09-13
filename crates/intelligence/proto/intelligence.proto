@@ -26,6 +26,11 @@ service IntelligenceRead {
   // API service's policy layer, not this service's. Cache-aside over one
   // Redis bundle (§8.3 hot path); a miss computes live and repopulates.
   rpc GetScreeningFacts(ScreeningFactsRequest) returns (ScreeningFactsReply);
+  // The full sanctions list, paged in (address, list) order, with a watermark
+  // over the table (§8.5). What the API service's pod-local sanctions view is
+  // built from, so a screening decision rendered over stale facts can never
+  // miss a designation imported since. `limit = 0` returns the watermark alone.
+  rpc ListSanctions(ListSanctionsRequest) returns (ListSanctionsReply);
 
   // The builder/relay leaderboard (§10, Sprint 11 t2): top builders by
   // confirmed sandwich volume, and each configured relay's market share by
@@ -145,6 +150,37 @@ message ScreeningFactsReply {
   // `RiskScoreUpdated.factors` is (§8.3) — the explainability contract
   // `POST /v1/address/{addr}/screen` surfaces on a block/review (§11).
   repeated RiskFactor factors = 9;
+}
+
+message ListSanctionsRequest {
+  // Opaque cursor from the previous page's `next_after`; empty = from the start.
+  string after = 1;
+  // Rows per page, clamped server-side; 0 = the watermark alone.
+  uint32 limit = 2;
+}
+
+// One designation: an address can appear once per list.
+message SanctionsListEntry {
+  // 0x-prefixed lowercase hex.
+  string address = 1;
+  string list = 2;
+  string entry = 3;
+}
+
+// A point-in-time identity of the sanctions table. It moves on every import
+// (row count or latest import time), so a reader can skip a re-walk when it has
+// not moved and detect an import that landed mid-walk when it has.
+message SanctionsWatermark {
+  uint64 rows = 1;
+  // Unix milliseconds of the latest import; 0 when the table is empty.
+  int64 last_imported_unix_millis = 2;
+}
+
+message ListSanctionsReply {
+  repeated SanctionsListEntry entries = 1;
+  // Cursor for the next page; empty on the last.
+  string next_after = 2;
+  SanctionsWatermark watermark = 3;
 }
 
 message BuilderLeaderboardRequest {

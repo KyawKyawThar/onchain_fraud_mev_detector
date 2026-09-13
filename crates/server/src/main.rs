@@ -25,10 +25,20 @@ use rule_engine::store::PgRuleStore;
 use secrecy::ExposeSecret;
 use server::audit::{self, AuditRecorder};
 use server::config::Config;
+use server::degrade::{
+    self, FactsSource, RedisSnapshotStore, ScreeningFallback, SnapshotRecorder, SnapshotStore,
+};
+use server::facts_source::{
+    AdaptiveBudget, BreakerSource, BulkheadSource, HedgeBudget, HedgedSource, LatencyTracker,
+    TrackedSource, BUDGET_QUANTILE, HEDGE_BURST, HEDGE_MIN_DELAY, LATENCY_MIN_SAMPLES,
+    LATENCY_WINDOW,
+};
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
 use server::policy_store::PgPolicyStore;
 use server::rate_limit::{RedisScreeningRateLimiter, SCREENING_RATE_LIMIT_WINDOW};
+use server::sanctions_view::{self, SanctionsSource, SanctionsView};
+use server::snapshot_tier::TieredSnapshotStore;
 use server::stream;
 use server::usage::{self, UsageRecorder};
 use tokio_util::sync::CancellationToken;
@@ -96,6 +106,96 @@ async fn main() -> Result<()> {
     let redis_conn = db::redis::connect(cfg.redis_url.expose_secret())
         .await
         .context("connecting Redis for the screening rate limiter")?;
+
+    // ── Screening read path (§11, readiness Epic D) ────────────────────
+    // Outermost first: the bulkhead refuses at the pod's concurrency ceiling
+    // before the breaker sees the call (a full pod is not evidence against
+    // intelligence); the breaker counts slow and failed reads; the tracker
+    // measures one *logical* read, hedge included, which is what the adaptive
+    // budget must follow.
+    let resilience = &cfg.screening_resilience;
+    let tracker = Arc::new(LatencyTracker::new(LATENCY_WINDOW, LATENCY_MIN_SAMPLES));
+    let fresh_ceiling = cfg
+        .screening_degradation
+        .map_or(cfg.screening_deadline, |degradation| {
+            degradation.fresh_budget
+        });
+    let primary: Arc<dyn FactsSource> = Arc::new(intelligence.clone());
+    let hedged: Arc<dyn FactsSource> = if resilience.hedge_ratio > 0.0 {
+        let hedge_addr = resilience
+            .hedge_addr
+            .clone()
+            .unwrap_or_else(|| cfg.intelligence_grpc_addr.clone());
+        // Its own channel, so its own HTTP/2 connection: behind a ClusterIP a
+        // separate connection is balanced to a pod independently of the first.
+        let secondary = IntelligenceClient::connect_warm(hedge_addr, INTELLIGENCE_DIAL_TIMEOUT)
+            .await
+            .context("building the hedged intelligence gRPC channel")?
+            .with_screening_deadline(cfg.screening_deadline);
+        Arc::new(HedgedSource::new(
+            primary,
+            Arc::new(secondary),
+            tracker.clone(),
+            HEDGE_MIN_DELAY,
+            (fresh_ceiling / 2).max(HEDGE_MIN_DELAY),
+            HedgeBudget::new(resilience.hedge_ratio, HEDGE_BURST),
+        ))
+    } else {
+        primary
+    };
+    let screening_source: Arc<dyn FactsSource> = Arc::new(BulkheadSource::new(
+        Arc::new(BreakerSource::new(
+            Arc::new(TrackedSource::new(hedged, tracker.clone())),
+            resilience.breaker,
+            fresh_ceiling,
+        )),
+        resilience.max_in_flight,
+    ));
+
+    // ── Screening graceful degradation (§11, readiness Epic D) ─────────
+    // Last-known-good snapshots share the limiter's Redis under their own key
+    // prefix. The arming gauge is published on both paths (§15b): a disarmed
+    // fallback exports nothing else.
+    degrade::publish_arming(cfg.screening_degradation.is_some());
+    let (screening_fallback, snapshot_writer) = match cfg.screening_degradation {
+        Some(degradation) => {
+            let redis_store: Arc<dyn SnapshotStore> = Arc::new(RedisSnapshotStore::new(
+                redis_conn.clone(),
+                degradation.max_stale_age,
+            ));
+            let store: Arc<dyn SnapshotStore> = if resilience.snapshot_l1_capacity > 0 {
+                // Unchanged facts are rewritten to Redis at a quarter of the max
+                // age, so another pod's copy is never more than that behind.
+                Arc::new(TieredSnapshotStore::new(
+                    redis_store,
+                    resilience.snapshot_l1_capacity,
+                    degradation.max_stale_age / 4,
+                ))
+            } else {
+                redis_store
+            };
+            let (recorder, rx) = SnapshotRecorder::channel(cfg.screening_snapshot_channel_capacity);
+            (
+                Some(
+                    ScreeningFallback::new(degradation, store.clone(), recorder)
+                        .with_adaptive_budget(AdaptiveBudget::new(
+                            tracker.clone(),
+                            BUDGET_QUANTILE,
+                            resilience.fresh_budget_floor,
+                            degradation.fresh_budget,
+                        )),
+                ),
+                Some((store, rx)),
+            )
+        }
+        None => {
+            tracing::warn!(
+                "screening degradation is disarmed (SCREENING_STALE_MAX_AGE_SECS=0): a slow \
+                 intelligence read holds /screen for the full deadline and then fails closed"
+            );
+            (None, None)
+        }
+    };
     let screening_rate_limit = Arc::new(RedisScreeningRateLimiter::new(
         redis_conn,
         cfg.screening_rate_limit_per_minute,
@@ -106,6 +206,16 @@ async fn main() -> Result<()> {
     // `RuleCreated` announcement (§9) share it.
     let sink: Arc<dyn EventSink> =
         Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka producer")?);
+
+    // ── Sanctions view (§8.5, readiness Epic D) ────────────────────────
+    // Every screening decision is checked against the full sanctions list held
+    // in this pod, so a stale answer cannot miss a designation. Refreshed in the
+    // background below; until the first refresh succeeds it cannot vouch, and
+    // stale allows are held for review.
+    let sanctions = Arc::new(SanctionsView::for_refresh_interval(
+        cfg.screening_sanctions_refresh,
+    ));
+    let sanctions_source: Arc<dyn SanctionsSource> = Arc::new(intelligence.clone());
 
     let state = AppState {
         intelligence,
@@ -120,6 +230,9 @@ async fn main() -> Result<()> {
         events: sink.clone(),
         policies: Arc::new(policy_store),
         screening_rate_limit,
+        screening_fallback,
+        sanctions: sanctions.clone(),
+        screening_source: Some(screening_source),
     };
 
     let shutdown = CancellationToken::new();
@@ -154,6 +267,18 @@ async fn main() -> Result<()> {
         sink,
         audit_rx,
         PUBLISH_BACKOFF,
+        shutdown.clone(),
+    ));
+
+    // ── Screening snapshot writer (§11 degradation, background task) ────
+    let snapshot_task = snapshot_writer
+        .map(|(store, rx)| tokio::spawn(degrade::run_snapshot_writer(store, rx, shutdown.clone())));
+
+    // ── Sanctions view refresher (background task) ─────────────────────
+    let sanctions_task = tokio::spawn(sanctions_view::run_refresher(
+        sanctions,
+        sanctions_source,
+        cfg.screening_sanctions_refresh,
         shutdown.clone(),
     ));
 
@@ -192,6 +317,13 @@ async fn main() -> Result<()> {
     audit_task
         .await
         .context("screening audit publisher task panicked")?;
+    sanctions_task
+        .await
+        .context("sanctions view refresher task panicked")?;
+    if let Some(task) = snapshot_task {
+        task.await
+            .context("screening snapshot writer task panicked")?;
+    }
     let stream_result = stream_task
         .await
         .context("/v1/stream consumer task panicked")?;

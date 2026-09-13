@@ -1,7 +1,10 @@
 {
   "fast_path_p99_seconds": 1.0,
   "api_p99_seconds": 0.5,
+  "screen_p50_seconds": 0.1,
+  "screen_p99_seconds": 0.25,
   "min_alert_samples": 500,
   "min_achieved_ratio": 0.95,
-  "min_api_success_ratio": 0.99
+  "min_api_success_ratio": 0.99,
+  "max_screen_failed_closed_share": 0.01
 }

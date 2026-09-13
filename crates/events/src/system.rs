@@ -126,6 +126,41 @@ pub enum ScreeningDecisionBasis {
     SanctionsHardBlock,
     /// The score fell through the policy's thresholds.
     ScoreThresholds,
+    /// The thresholds alone would have allowed, but the facts were stale
+    /// (rendered over a last-known-good snapshot) and the decision was held for
+    /// review rather than auto-allowed on facts intelligence could not confirm —
+    /// because the customer's policy asks for that (`on_stale: review`), or
+    /// because the sanctions view could not vouch for the address. A stale
+    /// `block` is never softened this way.
+    StaleFactsReview,
+}
+
+/// Why a screening decision was rendered over a last-known-good snapshot rather
+/// than a fresh intelligence read (§11 graceful degradation, readiness Epic D).
+/// Typed on the wire for the same reason as [`ScreeningDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ScreeningStaleReason {
+    /// Intelligence did not answer inside the fresh-answer budget.
+    IntelligenceSlow,
+    /// Intelligence answered with a transient fault (unreachable, overloaded).
+    IntelligenceUnavailable,
+}
+
+/// The disclosure attached to a decision rendered over stale facts: the API
+/// response and the access-audit record carry this same type, so what the
+/// customer was told and what the trail records cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FactsStaleness {
+    pub reason: ScreeningStaleReason,
+    /// When the API service last received these facts fresh from intelligence
+    /// — anything that changed after this instant (a new sanctions designation
+    /// included) is not reflected in the decision.
+    pub observed_at: DateTime<Utc>,
+    /// How old the facts were when the decision was made, in milliseconds.
+    pub age_ms: u64,
 }
 
 /// One synchronous counterparty-screening decision (§11, Sprint 14 t3): the
@@ -160,6 +195,14 @@ pub struct ScreeningDecisionRecorded {
     /// was close to the line is just as reconstructible as a `block`.
     pub factors: Vec<RiskFactor>,
     pub timestamp: DateTime<Utc>,
+    /// `Some` when the decision was rendered over a last-known-good snapshot
+    /// because intelligence was slow or unavailable; `None` when the facts were
+    /// fresh. Additive (SCHEMA.md): defaulted, because every record written
+    /// before degradation existed *was* rendered over fresh facts — there was
+    /// no other path — so `None` is the true reading of an old record, not a
+    /// guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts_staleness: Option<FactsStaleness>,
 }
 
 #[cfg(test)]

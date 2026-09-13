@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO screening_policies (owner, name, version, review_at, block_at, created_at)\n               VALUES ($1, $2, $3, $4, $5, $6)\n               RETURNING name, version, review_at, block_at",
+  "query": "SELECT DISTINCT ON (name) name, version, review_at, block_at, on_stale\n               FROM screening_policies\n               WHERE owner = $1\n               ORDER BY name, version DESC",
   "describe": {
     "columns": [
       {
@@ -46,24 +46,31 @@
             "name": "block_at"
           }
         }
+      },
+      {
+        "ordinal": 4,
+        "name": "on_stale",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "screening_policies",
+            "name": "on_stale"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Int4",
-        "Int2",
-        "Int2",
-        "Timestamptz"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "f44ab38f2197d998e749b2aebfe1c5cbbb1d110d87d4a7e8bd8ddc2e582e50e9"
+  "hash": "6061d39960a37e2291310bf02b019504f1a31f434d859fbe6277a54e7fbc713d"
 }

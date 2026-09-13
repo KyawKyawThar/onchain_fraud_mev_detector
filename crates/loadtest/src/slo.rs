@@ -105,6 +105,14 @@ pub struct Slo {
     pub fast_path_p99_seconds: LatencyBudget,
     /// Client-observed API p99, in seconds (§19's API panel).
     pub api_p99_seconds: LatencyBudget,
+    /// `POST /v1/address/{address}/screen`'s p50, in seconds — the §11/§19
+    /// contractual < 100ms, judged over that route's *successful* responses
+    /// only (see [`crate::gates::SCREEN_ROUTE`]).
+    pub screen_p50_seconds: LatencyBudget,
+    /// `/screen`'s bounded p99, in seconds (readiness Epic D). The same number
+    /// `ScreeningLatencyP99High` alerts on, and the bound `server::config`
+    /// sizes the degradation defaults to fit inside.
+    pub screen_p99_seconds: LatencyBudget,
     /// The minimum number of *alerting* fast-path samples a run must collect
     /// before its p99 is allowed to mean anything.
     ///
@@ -124,6 +132,13 @@ pub struct Slo {
     /// cheap and fast; a run that 429s or 500s its way to a good p99 has
     /// measured the error path.
     pub min_api_success_ratio: f64,
+    /// Under an injected intelligence fault (a profile's `fault`), the largest
+    /// share of screening calls allowed to fail closed with a 502 instead of
+    /// getting a decision (readiness Epic D: "serve a stale-but-flagged score
+    /// rather than block the customer's path"). Read from the API service's own
+    /// counters, not client status codes, so a 502 from anything else — an
+    /// unreachable policy store — is not mistaken for the degradation path.
+    pub max_screen_failed_closed_share: f64,
 }
 
 /// A measurement, with its unit.
@@ -332,9 +347,12 @@ mod tests {
         Slo {
             fast_path_p99_seconds: LatencyBudget::try_from(1.0).expect("on the ladder"),
             api_p99_seconds: LatencyBudget::try_from(0.5).expect("on the ladder"),
+            screen_p50_seconds: LatencyBudget::try_from(0.1).expect("on the ladder"),
+            screen_p99_seconds: LatencyBudget::try_from(0.25).expect("on the ladder"),
             min_alert_samples: 100,
             min_achieved_ratio: 0.95,
             min_api_success_ratio: 0.99,
+            max_screen_failed_closed_share: 0.01,
         }
     }
 

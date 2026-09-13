@@ -793,6 +793,15 @@ load-test profile="crates/loadtest/profiles/mainnet-peak.json":
 load-test-headroom profile="crates/loadtest/profiles/mainnet-peak.json":
     cargo run -p loadtest --release --locked -- --profile {{profile}} --headroom 1.5
 
+# Readiness Epic D's degraded-mode screening run: intelligence made slow (not
+# down) for the measurement window, through a latency proxy the harness owns.
+# The subject API service must reach intelligence THROUGH the proxy
+# (INTELLIGENCE_GRPC_ADDR=http://<proxy_listen>) and its /metrics must be scraped
+# (LOADTEST_API_METRICS_URL) — docs/runbooks/load-test.md, "Degraded mode".
+load-test-degraded proxy_listen="127.0.0.1:50061" upstream="127.0.0.1:50051":
+    LOADTEST_INTELLIGENCE_PROXY_LISTEN={{proxy_listen}} LOADTEST_INTELLIGENCE_UPSTREAM={{upstream}} \
+      cargo run -p loadtest --release --locked -- --profile crates/loadtest/profiles/screening-degraded.json
+
 # Score a real ML model bundle (§20.2) alongside the heuristics: loads the
 # bundle through detection's own boot path and adds the ML fixtures, so the
 # promotion gate reports whether those weights have earned their way out of

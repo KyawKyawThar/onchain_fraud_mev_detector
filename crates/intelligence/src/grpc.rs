@@ -158,6 +158,10 @@ pub struct IntelligenceReadService {
     links: Arc<dyn LinkCandidateStore>,
 }
 
+/// The largest sanctions page one `ListSanctions` call returns, whatever the
+/// caller asks for — bounds one response's size and one query's cost.
+pub const MAX_SANCTIONS_PAGE: u32 = 10_000;
+
 impl IntelligenceReadService {
     pub fn new(
         stores: StoreSeams,
@@ -532,6 +536,70 @@ impl IntelligenceRead for IntelligenceReadService {
         );
 
         Ok(Response::new(to_pb_screening(&facts)))
+    }
+
+    /// The full sanctions list for the API service's sanctions view (§8.5), in
+    /// keyset pages. The watermark is read *before* the page, so a reader that
+    /// sees the same watermark on its first and last page walked a list no
+    /// import changed underneath it.
+    async fn list_sanctions(
+        &self,
+        request: Request<crate::pb::ListSanctionsRequest>,
+    ) -> Result<Response<crate::pb::ListSanctionsReply>, Status> {
+        let request = request.into_inner();
+        let limit = request.limit.min(MAX_SANCTIONS_PAGE);
+        let watermark = self
+            .stores
+            .sanctions
+            .sanctions_watermark()
+            .await
+            .map_err(status_for)?;
+        let watermark = Some(crate::pb::SanctionsWatermark {
+            rows: watermark.rows,
+            last_imported_unix_millis: watermark
+                .last_imported_at
+                .map(|at| at.timestamp_millis())
+                .unwrap_or(0),
+        });
+        if limit == 0 {
+            return Ok(Response::new(crate::pb::ListSanctionsReply {
+                entries: Vec::new(),
+                next_after: String::new(),
+                watermark,
+            }));
+        }
+
+        let after = match request.after.split_once('|') {
+            None if request.after.is_empty() => None,
+            None => return Err(Status::invalid_argument("malformed sanctions cursor")),
+            Some((address, list)) => Some((parse_address(address)?, list.to_owned())),
+        };
+        let rows = self
+            .stores
+            .sanctions
+            .sanctions_page(after.as_ref().map(|(a, l)| (a, l.as_str())), limit)
+            .await
+            .map_err(status_for)?;
+
+        let next_after = if rows.len() == limit as usize {
+            rows.last()
+                .map(|last| format!("{}|{}", model::address_key(&last.address), last.list_name))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(Response::new(crate::pb::ListSanctionsReply {
+            entries: rows
+                .into_iter()
+                .map(|row| crate::pb::SanctionsListEntry {
+                    address: model::address_key(&row.address),
+                    list: row.list_name,
+                    entry: row.entry,
+                })
+                .collect(),
+            next_after,
+            watermark,
+        }))
     }
 
     async fn get_builder_leaderboard(
@@ -1561,6 +1629,79 @@ mod tests {
     #[test]
     fn invalid_address_is_rejected() {
         assert!(parse_address("not-an-address").is_err());
+    }
+
+    // ── ListSanctions (§8.5, screening sanctions view) ───────────────
+
+    #[tokio::test]
+    async fn list_sanctions_pages_the_whole_list_and_reports_a_watermark() {
+        use crate::model::SanctionEntry;
+        use crate::store::SanctionsStore;
+
+        let (service, store, _cache) = service();
+        let entry = |byte: u8, list: &str| SanctionEntry {
+            address: alloy_primitives::Address::repeat_byte(byte),
+            list_name: list.into(),
+            entry: format!("entry-{byte}"),
+            listed_at: None,
+        };
+        store
+            .seed_sanctions(&[
+                entry(0x02, "ofac_sdn"),
+                entry(0x01, "ofac_sdn"),
+                entry(0x01, "eu"),
+            ])
+            .await
+            .unwrap();
+
+        let head = service
+            .list_sanctions(Request::new(crate::pb::ListSanctionsRequest {
+                after: String::new(),
+                limit: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(head.entries.is_empty(), "limit 0 is the watermark alone");
+        assert_eq!(head.watermark.unwrap().rows, 3);
+
+        let mut seen = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = service
+                .list_sanctions(Request::new(crate::pb::ListSanctionsRequest {
+                    after: after.clone(),
+                    limit: 2,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            seen.extend(page.entries.into_iter().map(|e| (e.address, e.list)));
+            if page.next_after.is_empty() {
+                break;
+            }
+            after = page.next_after;
+        }
+        let a1 = crate::model::address_key(&alloy_primitives::Address::repeat_byte(0x01));
+        let a2 = crate::model::address_key(&alloy_primitives::Address::repeat_byte(0x02));
+        assert_eq!(
+            seen,
+            vec![
+                (a1.clone(), "eu".to_owned()),
+                (a1, "ofac_sdn".to_owned()),
+                (a2, "ofac_sdn".to_owned())
+            ],
+            "every row exactly once, in (address, list) order, across a split address"
+        );
+
+        let bad = service
+            .list_sanctions(Request::new(crate::pb::ListSanctionsRequest {
+                after: "not-a-cursor".into(),
+                limit: 2,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
     }
 
     // ── GetScreeningFacts (§11, Sprint 14 t1) ────────────────────────

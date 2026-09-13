@@ -48,6 +48,17 @@ pub const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Counter: facts `POST /v1/address/{addr}/screen` rendered a decision over, by
+/// `freshness` (`fresh` | `stale`). Exported by `server::degrade`, read by
+/// `loadtest`'s degraded-mode gate — defined here, in the leaf both depend on,
+/// because the load test may not depend on a service crate and a copied string
+/// would drift silently.
+pub const SCREENING_FACTS_SERVED_TOTAL: &str = "screening_facts_served_total";
+/// Counter: screening requests that left the fresh path, by `reason` and
+/// `outcome` (`served_stale` | `served_fresh_late` | `failed_closed`). Same
+/// sharing rationale as [`SCREENING_FACTS_SERVED_TOTAL`].
+pub const SCREENING_DEGRADED_TOTAL: &str = "screening_degraded_total";
+
 /// Histogram buckets (seconds) for durations that are **not** request
 /// latencies: scheduled sweeps, batch jobs, model calls, and the gap between a
 /// forecast and the event it predicted. ~1s to 1 day.

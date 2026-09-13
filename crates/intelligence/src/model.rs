@@ -339,6 +339,15 @@ pub struct SanctionEntry {
     pub listed_at: Option<DateTime<Utc>>,
 }
 
+/// A point-in-time identity of the sanctions table: it moves on every import,
+/// which is what lets a full-list reader skip a re-walk when nothing changed and
+/// notice an import that landed while it was walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SanctionsWatermark {
+    pub rows: u64,
+    pub last_imported_at: Option<DateTime<Utc>>,
+}
+
 /// The clustering signal an adjacency edge records (§8.2). These are the §8.2
 /// heuristics as *graph facts*: A funded B, A deployed B, A received B's
 /// profit, A and B share deployed bytecode, A interacted with B.

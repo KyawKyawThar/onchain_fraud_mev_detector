@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api_error::ApiError;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -29,7 +29,7 @@ use event_bus::EventSink;
 use event_bus::Transience;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
-use events::system::{ScreeningDecisionRecorded, UsageEventType};
+use events::system::{FactsStaleness, ScreeningDecisionRecorded, UsageEventType};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::model::address_key;
 use intelligence::pb::ScreeningFactsReply;
@@ -47,6 +47,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::audit::AuditRecorder;
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
+use crate::degrade::{self, ScreeningFallback};
 use crate::intelligence_client::{self, IntelligenceClient};
 use crate::policy_store::{self, PolicyStore};
 use crate::rate_limit::{self, ScreeningRateLimiter};
@@ -55,6 +56,13 @@ use crate::upstream;
 use crate::usage::{self, UsageRecorder};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `POST /v1/address/{addr}/screen`'s payload cap (§11, readiness Epic D). The
+/// only body the endpoint accepts is `{"policy": "<name, at most 64 chars>"}`,
+/// so a kilobyte is already generous; refusing a larger body before it is
+/// buffered keeps a big-payload flood off the p50-critical path, which axum's
+/// router-wide 2 MiB default would not.
+const SCREEN_BODY_LIMIT_BYTES: usize = 1024;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -66,7 +74,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, SimilarAddressesResponse, SimilarAddressResponse, SimilarityFactorResponse, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, events::system::FactsStaleness, events::system::ScreeningStaleReason, crate::screen::StalePolicy, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, SimilarAddressesResponse, SimilarAddressResponse, SimilarityFactorResponse, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -123,6 +131,19 @@ pub struct AppState {
     /// in production, keyed by the JWT's `CustomerId` the same way `policies`/
     /// `rules` are.
     pub screening_rate_limit: Arc<dyn ScreeningRateLimiter>,
+    /// `POST /v1/address/{addr}/screen`'s graceful degradation (§11, readiness
+    /// Epic D, [`crate::degrade`]): a last-known-good snapshot answers, flagged,
+    /// when intelligence is slow or unavailable. `None` is disarmed — fresh or
+    /// fail closed.
+    pub screening_fallback: Option<ScreeningFallback>,
+    /// The pod-local sanctions list (§8.5, [`crate::sanctions_view`]) every
+    /// screening decision is checked against — fresh or stale — and whose
+    /// currency decides whether a stale `allow` may stand.
+    pub sanctions: Arc<crate::sanctions_view::SanctionsView>,
+    /// The decorated screening read (`crate::facts_source`: bulkhead → breaker
+    /// → latency tracking → hedging over `intelligence`). `None` reads through
+    /// `intelligence` undecorated — the handler tests' setting.
+    pub screening_source: Option<Arc<dyn degrade::FactsSource>>,
 }
 
 fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi) {
@@ -147,6 +168,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     // policy-store round-trip.
     let screening = OpenApiRouter::new()
         .routes(routes!(screen_address))
+        .route_layer(DefaultBodyLimit::max(SCREEN_BODY_LIMIT_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.screening_rate_limit.clone(),
             rate_limit::enforce_screening_rate_limit,
@@ -416,6 +438,14 @@ struct ScreenResponse {
     /// factors for every decision regardless, see `crate::audit`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     factors: Vec<FactorResponse>,
+    /// `true` when this decision was rendered over a last-known-good snapshot
+    /// because intelligence was slow or unavailable (§11 graceful degradation).
+    /// Always present, so a caller branches on one boolean: a customer that
+    /// cannot accept stale facts on a withdrawal holds it on `stale: true`.
+    stale: bool,
+    /// Why the facts were stale and how old they were — omitted when fresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staleness: Option<FactsStaleness>,
 }
 
 /// `POST /v1/address/{address}/screen` — the **synchronous** counterparty
@@ -431,7 +461,15 @@ struct ScreenResponse {
 /// — every call is recorded onto the backbone as `ScreeningDecisionRecorded`
 /// (§11, Sprint 14 t3, `crate::audit`) and will meter a `ScreeningCall` (t4)
 /// — not a cacheable read. The body is optional — an absent or empty body,
-/// or one naming no `policy`, uses `default`.
+/// or one naming no `policy`, uses `default`, and it is capped at 1 KiB.
+///
+/// **Graceful degradation** (readiness Epic D, [`crate::degrade`]): the call
+/// sits inline on a customer's withdrawal, so when intelligence is slow past
+/// its fresh budget, or transiently unavailable, the decision is rendered over
+/// the address's last-known-good facts — through the caller's *current* policy,
+/// sanctions hard-block intact — and flagged `stale: true` with its age and
+/// reason, on the response and in the audit record. With no usable snapshot the
+/// endpoint still fails closed with a 502; it never allows by default.
 #[utoipa::path(
     post,
     path = "/v1/address/{address}/screen",
@@ -440,11 +478,12 @@ struct ScreenResponse {
     request_body(content = ScreenRequest, description = "Optional. Selects the named policy; omit (or an empty body) uses `default`."),
     security(("bearer_token" = [])),
     responses(
-        (status = 200, description = "The screening decision with its driving facts", body = ScreenResponse),
+        (status = 200, description = "The screening decision with its driving facts — `stale: true` when rendered over last-known-good facts because intelligence was slow or unavailable", body = ScreenResponse),
         (status = 400, description = "Address is not valid hex, the body isn't valid JSON, or `policy` names nothing this customer can see"),
         (status = 401, description = "Missing or invalid bearer token"),
+        (status = 413, description = "The request body exceeds the endpoint's 1 KiB cap"),
         (status = 429, description = "This endpoint's dedicated rate limit was exceeded (§19)"),
-        (status = 502, description = "intelligence or the policy store is unreachable"),
+        (status = 502, description = "intelligence is unreachable with no usable last-known-good snapshot, or the policy store is unreachable"),
     ),
 )]
 async fn screen_address(
@@ -472,18 +511,43 @@ async fn screen_address(
         .map_err(policy_store::to_api_error)?
         .ok_or_else(|| ApiError::bad_request(format!("no such policy: {policy_name:?}")))?;
 
-    let facts = state
-        .intelligence
-        .screening_facts(address)
-        .await
-        .map_err(intelligence_client::to_api_error)?;
+    // Fresh facts — or, when intelligence is slow or unavailable and degradation
+    // is armed, a flagged last-known-good snapshot (`crate::degrade`). Either way
+    // the decision below runs the caller's current policy.
+    let degrade::ResolvedFacts {
+        mut facts,
+        staleness,
+    } = degrade::resolve_facts(
+        match &state.screening_source {
+            Some(source) => source.as_ref(),
+            None => &state.intelligence,
+        },
+        state.screening_fallback.as_ref(),
+        address,
+    )
+    .await
+    .map_err(intelligence_client::to_api_error)?;
+
+    // §8.5 on every decision: the pod-local sanctions view can only *add*
+    // designations to what intelligence reported — a snapshot taken before a
+    // designation, or an intelligence cache racing an import, still blocks.
+    if let Some(listed) = state.sanctions.lookup(&address) {
+        merge_sanctions(&mut facts.sanctions, listed);
+    }
+    let freshness = match staleness {
+        None => crate::screen::Freshness::Fresh,
+        Some(staleness) => crate::screen::Freshness::Stale {
+            staleness,
+            sanctions_verified: state.sanctions.vouches(),
+        },
+    };
 
     // Wire → domain → policy: the prost reply is distilled once at the
     // transport edge's `From` impl; the decision layer only ever sees the
     // typed input.
     let input = crate::screen::ScreeningInput::from(&facts);
     let sanctioned = input.sanctioned;
-    let verdict = crate::screen::decide(input, &policy);
+    let verdict = crate::screen::decide(input, &policy, freshness);
 
     // §13 per-call metering: only on the success path — a call that 502'd
     // before a verdict was ever rendered isn't a billable screening call,
@@ -493,90 +557,123 @@ async fn screen_address(
     // events, never gated here (see `crate::rate_limit`'s module docs).
     state.usage.record(customer, UsageEventType::ScreeningCall);
 
+    let outcome = ScreeningOutcome {
+        customer,
+        address,
+        facts,
+        verdict,
+        sanctioned,
+        freshness,
+        decided_at: Utc::now(),
+    };
+
     // The access-audit trail (§11 Sprint 14 t3): recorded for *every* decision,
     // not just a block/review — a borderline `allow` is just as much a fact a
     // compliance reviewer may need to reconstruct later. Non-blocking (see
-    // `crate::audit`), so it can never add to the response's latency. The
-    // record's shape is a pure mapping (`screening_audit_record`), so what the
-    // legal trail captures is unit-testable without a broker.
-    state.audit.record(screening_audit_record(
-        customer,
-        address,
-        &facts,
-        &verdict,
-        sanctioned,
-        Utc::now(),
-    ));
-
-    Ok(Json(screen_response(address, facts, verdict, sanctioned)))
+    // `crate::audit`), so it can never add to the response's latency.
+    state.audit.record(outcome.audit_record());
+    Ok(Json(outcome.into_response()))
 }
 
-/// Pure mapping (§1 — I/O shell / pure core): the §11 access-audit fact for one
-/// screening decision. Carries the full per-factor breakdown regardless of
-/// outcome, so a later compliance review can reconstruct *why* even a
-/// borderline `allow` landed where it did.
-fn screening_audit_record(
-    customer: CustomerId,
-    address: AccountAddress,
-    facts: &ScreeningFactsReply,
-    verdict: &crate::screen::Verdict,
-    sanctioned: bool,
-    at: DateTime<Utc>,
-) -> ScreeningDecisionRecorded {
-    ScreeningDecisionRecorded {
-        customer_id: customer,
-        address,
-        decision: verdict.decision,
-        decision_basis: verdict.basis,
-        policy_name: verdict.policy_name.clone(),
-        policy_version: verdict.policy_version,
-        score: facts.score,
-        confidence: facts.confidence,
-        sanctioned,
-        model_version: facts.model_version.clone(),
-        factors: verdict.factors.clone(),
-        timestamp: at,
+/// Add the view's designations to intelligence's, without duplicates.
+fn merge_sanctions(
+    reported: &mut Vec<intelligence::pb::SanctionMatch>,
+    listed: Vec<intelligence::pb::SanctionMatch>,
+) {
+    for designation in listed {
+        if !reported.contains(&designation) {
+            reported.push(designation);
+        }
     }
 }
 
-/// Pure mapping (§1): the `POST /v1/address/{addr}/screen` response body.
-/// Consumes `facts` and `verdict` (no defensive clones on the SLO path). The
-/// factor breakdown is scoped to `review`/`block` — an `allow` stays lean on
-/// the wire while the audit record above always carries it.
-fn screen_response(
+/// One rendered screening decision — the single value both the API response and
+/// the access-audit record are derived from (§1 pure core).
+///
+/// One value rather than two mappers fed the same arguments, because the two
+/// artifacts must agree on what the customer was told. Above all on
+/// **freshness**: a decision rendered over a stale snapshot that disclosed
+/// staleness to the customer but not to the audit trail (or the reverse) is
+/// exactly the drift that threading the flag through two call sites invites.
+struct ScreeningOutcome {
+    customer: CustomerId,
     address: AccountAddress,
     facts: ScreeningFactsReply,
     verdict: crate::screen::Verdict,
     sanctioned: bool,
-) -> ScreenResponse {
-    let factors = if verdict.decision == crate::screen::Decision::Allow {
-        Vec::new()
-    } else {
-        verdict.factors.iter().map(FactorResponse::from).collect()
-    };
-    ScreenResponse {
-        address: address_key(&address),
-        decision: verdict.decision,
-        decision_basis: verdict.basis,
-        policy_name: verdict.policy_name,
-        policy_version: verdict.policy_version,
-        sanctioned,
-        sanctions: facts
-            .sanctions
-            .into_iter()
-            .map(|s| SanctionMatchResponse {
-                list: s.list,
-                entry: s.entry,
-            })
-            .collect(),
-        score: facts.score,
-        confidence: facts.confidence,
-        model_version: facts.model_version,
-        computed_at_unix_millis: facts.computed_at_unix_millis,
-        labels: facts.labels.into_iter().map(LabelResponse::from).collect(),
-        entity_id: facts.entity_id,
-        entity_size: facts.entity_size,
-        factors,
+    freshness: crate::screen::Freshness,
+    decided_at: DateTime<Utc>,
+}
+
+impl ScreeningOutcome {
+    /// The §11 access-audit fact. Carries the full per-factor breakdown whatever
+    /// the outcome, so a later review can reconstruct *why* even a borderline
+    /// `allow` landed where it did.
+    fn audit_record(&self) -> ScreeningDecisionRecorded {
+        ScreeningDecisionRecorded {
+            customer_id: self.customer,
+            address: self.address,
+            decision: self.verdict.decision,
+            decision_basis: self.verdict.basis,
+            policy_name: self.verdict.policy_name.clone(),
+            policy_version: self.verdict.policy_version,
+            score: self.facts.score,
+            confidence: self.facts.confidence,
+            sanctioned: self.sanctioned,
+            model_version: self.facts.model_version.clone(),
+            factors: self.verdict.factors.clone(),
+            timestamp: self.decided_at,
+            facts_staleness: self.freshness.staleness(),
+        }
+    }
+
+    /// The `POST /v1/address/{addr}/screen` body. Consumes the outcome (no
+    /// defensive clones on the SLO path); the factor breakdown is scoped to
+    /// `review`/`block` — an `allow` stays lean on the wire while the audit
+    /// record always carries it.
+    fn into_response(self) -> ScreenResponse {
+        let factors = if self.verdict.decision == crate::screen::Decision::Allow {
+            Vec::new()
+        } else {
+            self.verdict
+                .factors
+                .iter()
+                .map(FactorResponse::from)
+                .collect()
+        };
+        let staleness = self.freshness.staleness();
+        ScreenResponse {
+            address: address_key(&self.address),
+            decision: self.verdict.decision,
+            decision_basis: self.verdict.basis,
+            policy_name: self.verdict.policy_name,
+            policy_version: self.verdict.policy_version,
+            sanctioned: self.sanctioned,
+            sanctions: self
+                .facts
+                .sanctions
+                .into_iter()
+                .map(|s| SanctionMatchResponse {
+                    list: s.list,
+                    entry: s.entry,
+                })
+                .collect(),
+            score: self.facts.score,
+            confidence: self.facts.confidence,
+            model_version: self.facts.model_version,
+            computed_at_unix_millis: self.facts.computed_at_unix_millis,
+            labels: self
+                .facts
+                .labels
+                .into_iter()
+                .map(LabelResponse::from)
+                .collect(),
+            entity_id: self.facts.entity_id,
+            entity_size: self.facts.entity_size,
+            factors,
+            stale: staleness.is_some(),
+            staleness,
+        }
     }
 }
 
@@ -589,6 +686,8 @@ struct PolicyResponse {
     /// Score at/above which an otherwise-clean address blocks outright.
     /// Absent means monitor-only: score can never block, only review.
     block_at: Option<u8>,
+    /// `serve` | `review` — how a decision over stale facts is treated.
+    on_stale: crate::screen::StalePolicy,
 }
 
 impl From<crate::screen::Policy> for PolicyResponse {
@@ -598,6 +697,7 @@ impl From<crate::screen::Policy> for PolicyResponse {
             version: policy.version,
             review_at: policy.thresholds.review_at(),
             block_at: policy.thresholds.block_at(),
+            on_stale: policy.on_stale,
         }
     }
 }
@@ -655,6 +755,10 @@ struct UpsertPolicyRequest {
     /// only review — a sanctions match still hard-blocks regardless (§8.5).
     #[serde(default)]
     block_at: Option<u8>,
+    /// What to do with a decision over stale facts: `serve` (default) or
+    /// `review` — never auto-allow when intelligence could not confirm them.
+    #[serde(default)]
+    on_stale: crate::screen::StalePolicy,
 }
 
 /// `PUT /v1/policies/{name}` — create or retune one of this customer's named
@@ -685,7 +789,14 @@ async fn upsert_policy(
 ) -> Result<Json<PolicyResponse>, ApiError> {
     let policy = state
         .policies
-        .upsert_policy(customer, &name, body.review_at, body.block_at, Utc::now())
+        .upsert_policy(
+            customer,
+            &name,
+            body.review_at,
+            body.block_at,
+            body.on_stale,
+            Utc::now(),
+        )
         .await
         .map_err(policy_store::to_api_error)?;
 
@@ -1859,7 +1970,8 @@ mod tests {
     use crate::usage::UsageRecorder;
     use event_bus::test_util::RecordingSink;
     use events::system::{
-        ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, UsageRecorded,
+        ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded, ScreeningStaleReason,
+        UsageEventType, UsageRecorded,
     };
     use rule_engine::test_util::InMemoryRuleStore;
     use secrecy::SecretString;
@@ -1902,6 +2014,9 @@ mod tests {
             events: events.clone(),
             policies: policies.clone(),
             screening_rate_limit: Arc::new(InMemoryRateLimiter::unbounded()),
+            screening_fallback: None,
+            sanctions: Arc::new(crate::sanctions_view::SanctionsView::default()),
+            screening_source: None,
         };
         TestState {
             state,
@@ -1931,6 +2046,9 @@ mod tests {
             "SanctionMatchResponse",
             "ScreeningDecision",
             "ScreeningDecisionBasis",
+            "FactsStaleness",
+            "ScreeningStaleReason",
+            "StalePolicy",
             "CreateRuleRequest",
             "CreateRuleResponse",
             "BuildersResponse",
@@ -2451,6 +2569,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["decision"], "block");
         assert_eq!(json["decision_basis"], "sanctions_hard_block");
+        assert_eq!(json["stale"], false, "a live intelligence read is fresh");
+        assert!(
+            json.get("staleness").is_none(),
+            "no staleness on a fresh decision"
+        );
         let factors = json["factors"]
             .as_array()
             .expect("factors present on a block");
@@ -2473,6 +2596,332 @@ mod tests {
         );
         assert!(recorded.sanctioned);
         assert!(!recorded.factors.is_empty());
+        assert_eq!(recorded.facts_staleness, None);
+    }
+
+    /// An intelligence channel pointing at a port nothing listens on: every read
+    /// fails fast with a transient `Unavailable` — the "intelligence is down"
+    /// case, without depending on what happens to be bound to a fixed port.
+    fn unreachable_intelligence() -> IntelligenceClient {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        IntelligenceClient::connect_lazy(format!("http://{addr}")).unwrap()
+    }
+
+    fn armed_fallback(
+        store: Arc<crate::degrade::test_util::InMemorySnapshotStore>,
+    ) -> crate::degrade::ScreeningFallback {
+        let (recorder, _dropped) = crate::degrade::SnapshotRecorder::channel(16);
+        crate::degrade::ScreeningFallback::new(
+            crate::degrade::Degradation {
+                fresh_budget: std::time::Duration::from_millis(150),
+                max_stale_age: std::time::Duration::from_secs(900),
+            },
+            store,
+            recorder,
+        )
+    }
+
+    /// Readiness Epic D, end to end through the router: intelligence is down,
+    /// a last-known-good snapshot exists, and the withdrawal gets a decision
+    /// instead of a 502 — flagged on the response, recorded as stale in the
+    /// audit trail, and still billed (a verdict was rendered). The snapshot is
+    /// sanctioned and the policy is `monitor-only`: the §8.5 hard block
+    /// survives both the staleness and the softest policy.
+    #[tokio::test]
+    async fn screen_serves_a_flagged_stale_decision_when_intelligence_is_unavailable() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let address = alloy_primitives::Address::repeat_byte(0xEF);
+        let store = Arc::new(crate::degrade::test_util::InMemorySnapshotStore::new());
+        store.insert(
+            address,
+            crate::degrade::FactsSnapshot {
+                facts: intelligence::pb::ScreeningFactsReply {
+                    score: 12,
+                    model_version: "risk-v1".into(),
+                    sanctions: vec![intelligence::pb::SanctionMatch {
+                        list: "ofac_sdn".into(),
+                        entry: "Evil Corp".into(),
+                    }],
+                    ..Default::default()
+                },
+                observed_at: chrono::Utc::now() - chrono::Duration::seconds(30),
+            },
+        );
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(store));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/address/{address:#x}/screen"))
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"policy":"monitor-only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["decision_basis"], "sanctions_hard_block");
+        assert_eq!(json["stale"], true);
+        assert_eq!(json["staleness"]["reason"], "intelligence_unavailable");
+        assert!(json["staleness"]["age_ms"].as_u64().unwrap() >= 30_000);
+
+        let recorded = ts
+            .audit_rx
+            .try_recv()
+            .expect("the stale decision is audited");
+        let staleness = recorded
+            .facts_staleness
+            .expect("the audit trail records that the facts were stale");
+        assert_eq!(
+            staleness.reason,
+            ScreeningStaleReason::IntelligenceUnavailable
+        );
+
+        let metered: Vec<String> = std::iter::from_fn(|| ts.usage_rx.try_recv().ok())
+            .map(|usage| usage.event_type)
+            .collect();
+        assert!(
+            metered.contains(&UsageEventType::ScreeningCall.as_wire_str().to_owned()),
+            "a stale decision is still a rendered verdict, so it is billed: {metered:?}"
+        );
+    }
+
+    /// Armed but with nothing to fall back on, the endpoint behaves exactly as
+    /// before: fail closed, never a default allow.
+    #[tokio::test]
+    async fn screen_still_fails_closed_when_armed_with_no_snapshot() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(Arc::new(
+            crate::degrade::test_util::InMemorySnapshotStore::new(),
+        )));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        let response = router
+            .oneshot(
+                Request::post(format!(
+                    "/v1/address/{:#x}/screen",
+                    alloy_primitives::Address::ZERO
+                ))
+                .header(header::AUTHORIZATION, &bearer)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            ts.audit_rx.try_recv().is_err(),
+            "no verdict, no audit record"
+        );
+    }
+
+    fn clean_snapshot(score: u32) -> crate::degrade::FactsSnapshot {
+        crate::degrade::FactsSnapshot {
+            facts: intelligence::pb::ScreeningFactsReply {
+                score,
+                model_version: "risk-v1".into(),
+                ..Default::default()
+            },
+            observed_at: chrono::Utc::now() - chrono::Duration::seconds(30),
+        }
+    }
+
+    async fn screen_json(
+        router: axum::Router,
+        bearer: &str,
+        address: alloy_primitives::Address,
+        body: &'static str,
+    ) -> serde_json::Value {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/address/{address:#x}/screen"))
+                    .header(header::AUTHORIZATION, bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A stale answer cannot vouch for sanctions status on its own: with the
+    /// sanctions view never synced, a clean low-score snapshot is held for
+    /// review rather than allowed — under the default `serve` policy.
+    #[tokio::test]
+    async fn a_stale_allow_is_held_when_the_sanctions_view_cannot_vouch() {
+        let address = alloy_primitives::Address::repeat_byte(0xA1);
+        let store = Arc::new(crate::degrade::test_util::InMemorySnapshotStore::new());
+        store.insert(address, clean_snapshot(5));
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(store));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let json = screen_json(super::router(ts.state), &bearer, address, "").await;
+
+        assert_eq!(json["decision"], "review");
+        assert_eq!(json["decision_basis"], "stale_facts_review");
+        assert_eq!(json["stale"], true);
+    }
+
+    /// With a current sanctions view, a stale clean address is allowed under
+    /// `serve` — and an address the view lists is blocked even though its
+    /// snapshot, taken before the designation, says nothing about sanctions.
+    #[tokio::test]
+    async fn the_sanctions_view_decides_what_a_stale_snapshot_cannot_know() {
+        let clean = alloy_primitives::Address::repeat_byte(0xA2);
+        let designated_since = alloy_primitives::Address::repeat_byte(0xA3);
+        let store = Arc::new(crate::degrade::test_util::InMemorySnapshotStore::new());
+        store.insert(clean, clean_snapshot(5));
+        store.insert(designated_since, clean_snapshot(0));
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(store));
+        ts.state.sanctions = Arc::new(crate::sanctions_view::SanctionsView::seeded(
+            vec![(
+                designated_since,
+                vec![intelligence::pb::SanctionMatch {
+                    list: "ofac_sdn".into(),
+                    entry: "Designated Later".into(),
+                }],
+            )],
+            std::time::Duration::from_secs(180),
+        ));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        let json = screen_json(router.clone(), &bearer, clean, "").await;
+        assert_eq!(json["decision"], "allow");
+        assert_eq!(json["stale"], true, "still disclosed");
+
+        let json = screen_json(router, &bearer, designated_since, "").await;
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["decision_basis"], "sanctions_hard_block");
+        assert_eq!(json["sanctions"][0]["list"], "ofac_sdn");
+    }
+
+    /// `on_stale` is part of a policy's versioned identity: authoring it mints a
+    /// version, it round-trips through the API, and a `review` policy holds a
+    /// stale allow that `serve` would have let through.
+    #[tokio::test]
+    async fn a_customer_policy_can_hold_stale_allows_for_review() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let address = alloy_primitives::Address::repeat_byte(0xA4);
+        let store = Arc::new(crate::degrade::test_util::InMemorySnapshotStore::new());
+        store.insert(address, clean_snapshot(5));
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(store));
+        ts.state.sanctions = Arc::new(crate::sanctions_view::SanctionsView::seeded(
+            vec![],
+            std::time::Duration::from_secs(180),
+        ));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+
+        let put = |body: &'static str| {
+            Request::put("/v1/policies/careful")
+                .header(header::AUTHORIZATION, &bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(put(r#"{"review_at":40,"block_at":80}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(put(r#"{"review_at":40,"block_at":80,"on_stale":"review"}"#))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["version"], 2,
+            "a stale-behaviour change is a new version"
+        );
+        assert_eq!(body["on_stale"], "review");
+
+        let json = screen_json(router.clone(), &bearer, address, r#"{"policy":"default"}"#).await;
+        assert_eq!(json["decision"], "allow");
+        let json = screen_json(router, &bearer, address, r#"{"policy":"careful"}"#).await;
+        assert_eq!(json["decision"], "review");
+        assert_eq!(json["decision_basis"], "stale_facts_review");
+    }
+
+    /// The payload cap: the endpoint's only legitimate body is a policy name,
+    /// so an oversized one is refused before it is buffered or reaches any
+    /// dependency.
+    #[tokio::test]
+    async fn screen_rejects_a_body_over_its_cap() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state);
+        let oversized = format!(
+            r#"{{"policy":"{}"}}"#,
+            "x".repeat(super::SCREEN_BODY_LIMIT_BYTES)
+        );
+
+        let response = router
+            .oneshot(
+                Request::post(format!(
+                    "/v1/address/{:#x}/screen",
+                    alloy_primitives::Address::ZERO
+                ))
+                .header(header::AUTHORIZATION, &bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// The §11/Sprint 14 t2 policy surface end to end: `PUT /v1/policies/{name}`

@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 use events::primitives::CustomerId;
 use sqlx::PgPool;
 
-use crate::screen::{InvalidPolicy, Policy, Thresholds};
+use crate::screen::{InvalidPolicy, Policy, StalePolicy, Thresholds};
 
 /// A failure reading or writing the policy store. Carries the retry/skip
 /// *decision* (its [`event_bus::Transience`] impl) so every consumer handles
@@ -146,7 +146,8 @@ pub trait PolicyStore: Send + Sync {
     /// Create or retune one of `owner`'s custom policies.
     ///
     /// **Idempotent** (`PUT` semantics): if `name`'s current latest version
-    /// already carries these exact thresholds, no new version is written and
+    /// already carries these exact thresholds and stale behaviour, no new
+    /// version is written and
     /// the current one is returned unchanged — a retry or a double-submit
     /// isn't a "change", and the append-only history records only real
     /// changes. Otherwise a **new** version is written, one greater than the
@@ -161,6 +162,7 @@ pub trait PolicyStore: Send + Sync {
         name: &str,
         review_at: u8,
         block_at: Option<u8>,
+        on_stale: StalePolicy,
         at: DateTime<Utc>,
     ) -> Result<Policy, StoreError>;
 
@@ -202,6 +204,7 @@ struct PolicyRow {
     version: i32,
     review_at: i16,
     block_at: Option<i16>,
+    on_stale: String,
 }
 
 impl TryFrom<PolicyRow> for Policy {
@@ -216,7 +219,10 @@ impl TryFrom<PolicyRow> for Policy {
             .map(u8::try_from)
             .transpose()
             .map_err(|_| StoreError::malformed("block_at out of 0..=255 range"))?;
-        Policy::new(row.name, row.version, review_at, block_at).map_err(StoreError::from)
+        let on_stale = StalePolicy::from_wire(&row.on_stale).ok_or_else(|| {
+            StoreError::malformed(format!("on_stale {:?} is not a known value", row.on_stale))
+        })?;
+        Ok(Policy::new(row.name, row.version, review_at, block_at)?.with_on_stale(on_stale))
     }
 }
 
@@ -229,7 +235,7 @@ impl PolicyStore for PgPolicyStore {
     ) -> Result<Option<Policy>, StoreError> {
         let Some(row) = sqlx::query_as!(
             PolicyRow,
-            r#"SELECT name, version, review_at, block_at
+            r#"SELECT name, version, review_at, block_at, on_stale
                FROM screening_policies
                WHERE owner = $1 AND name = $2
                ORDER BY version DESC
@@ -251,6 +257,7 @@ impl PolicyStore for PgPolicyStore {
         name: &str,
         review_at: u8,
         block_at: Option<u8>,
+        on_stale: StalePolicy,
         at: DateTime<Utc>,
     ) -> Result<Policy, StoreError> {
         let thresholds = validate_custom_policy(name, review_at, block_at)?;
@@ -280,7 +287,7 @@ impl PolicyStore for PgPolicyStore {
 
         let latest = sqlx::query_as!(
             PolicyRow,
-            r#"SELECT name, version, review_at, block_at
+            r#"SELECT name, version, review_at, block_at, on_stale
                FROM screening_policies
                WHERE owner = $1 AND name = $2
                ORDER BY version DESC
@@ -296,7 +303,7 @@ impl PolicyStore for PgPolicyStore {
                 let current: Policy = row.try_into()?;
                 // Idempotent PUT: identical thresholds don't mint a new
                 // version (see the trait docs) — return the current one.
-                if current.thresholds == thresholds {
+                if current.thresholds == thresholds && current.on_stale == on_stale {
                     tx.commit().await?;
                     return Ok(current);
                 }
@@ -307,14 +314,15 @@ impl PolicyStore for PgPolicyStore {
 
         let row = sqlx::query_as!(
             PolicyRow,
-            r#"INSERT INTO screening_policies (owner, name, version, review_at, block_at, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6)
-               RETURNING name, version, review_at, block_at"#,
+            r#"INSERT INTO screening_policies (owner, name, version, review_at, block_at, on_stale, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING name, version, review_at, block_at, on_stale"#,
             owner.0,
             name,
             next_version,
             i16::from(thresholds.review_at()),
             thresholds.block_at().map(i16::from),
+            on_stale.as_wire(),
             at,
         )
         .fetch_one(&mut *tx)
@@ -329,7 +337,7 @@ impl PolicyStore for PgPolicyStore {
         // per name, the highest version.
         let rows = sqlx::query_as!(
             PolicyRow,
-            r#"SELECT DISTINCT ON (name) name, version, review_at, block_at
+            r#"SELECT DISTINCT ON (name) name, version, review_at, block_at, on_stale
                FROM screening_policies
                WHERE owner = $1
                ORDER BY name, version DESC"#,
@@ -385,6 +393,7 @@ pub mod test_util {
             name: &str,
             review_at: u8,
             block_at: Option<u8>,
+            on_stale: StalePolicy,
             _at: DateTime<Utc>,
         ) -> Result<Policy, StoreError> {
             let thresholds = validate_custom_policy(name, review_at, block_at)?;
@@ -398,12 +407,13 @@ pub mod test_util {
                 .map(|(_, p)| p.clone());
             if let Some(current) = &latest {
                 // Idempotent PUT: identical thresholds → no new version.
-                if current.thresholds == thresholds {
+                if current.thresholds == thresholds && current.on_stale == on_stale {
                     return Ok(current.clone());
                 }
             }
             let next_version = latest.map(|p| p.version).unwrap_or(0) + 1;
-            let policy = Policy::with_thresholds(name, next_version, thresholds)?;
+            let policy =
+                Policy::with_thresholds(name, next_version, thresholds)?.with_on_stale(on_stale);
             state.push((owner, policy.clone()));
             Ok(policy)
         }
@@ -452,7 +462,14 @@ mod tests {
     async fn resolve_falls_through_to_a_customers_own_policy() {
         let store = InMemoryPolicyStore::new();
         store
-            .upsert_policy(owner(1), "acme-strict", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme-strict",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
 
@@ -473,13 +490,27 @@ mod tests {
     async fn upsert_is_append_only_and_versions_climb() {
         let store = InMemoryPolicyStore::new();
         let v1 = store
-            .upsert_policy(owner(1), "acme", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(v1.version, 1);
 
         let v2 = store
-            .upsert_policy(owner(1), "acme", 15, Some(70), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                15,
+                Some(70),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(v2.version, 2);
@@ -497,14 +528,28 @@ mod tests {
     async fn upsert_with_unchanged_thresholds_does_not_mint_a_new_version() {
         let store = InMemoryPolicyStore::new();
         let v1 = store
-            .upsert_policy(owner(1), "acme", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(v1.version, 1);
 
         // Same thresholds again → still version 1, nothing appended.
         let again = store
-            .upsert_policy(owner(1), "acme", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(again.version, 1);
@@ -512,7 +557,14 @@ mod tests {
 
         // A real change climbs to version 2.
         let v2 = store
-            .upsert_policy(owner(1), "acme", 10, Some(55), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(55),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(v2.version, 2);
@@ -522,7 +574,14 @@ mod tests {
     async fn upsert_rejects_a_reserved_builtin_name() {
         let store = InMemoryPolicyStore::new();
         let err = store
-            .upsert_policy(owner(1), "default", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "default",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::ReservedName(name) if name == "default"));
@@ -532,7 +591,14 @@ mod tests {
     async fn upsert_rejects_an_invalid_threshold_pair() {
         let store = InMemoryPolicyStore::new();
         let err = store
-            .upsert_policy(owner(1), "acme", 80, Some(40), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                80,
+                Some(40),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)));
@@ -542,7 +608,14 @@ mod tests {
     async fn policies_are_isolated_per_owner() {
         let store = InMemoryPolicyStore::new();
         store
-            .upsert_policy(owner(1), "acme", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
 
@@ -555,15 +628,29 @@ mod tests {
     async fn policies_for_owner_lists_each_name_at_its_latest_version_only() {
         let store = InMemoryPolicyStore::new();
         store
-            .upsert_policy(owner(1), "acme", 10, Some(60), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                10,
+                Some(60),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         store
-            .upsert_policy(owner(1), "acme", 20, Some(70), Utc::now())
+            .upsert_policy(
+                owner(1),
+                "acme",
+                20,
+                Some(70),
+                StalePolicy::Serve,
+                Utc::now(),
+            )
             .await
             .unwrap();
         store
-            .upsert_policy(owner(1), "beta", 5, None, Utc::now())
+            .upsert_policy(owner(1), "beta", 5, None, StalePolicy::Serve, Utc::now())
             .await
             .unwrap();
 

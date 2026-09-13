@@ -29,7 +29,7 @@ use crate::profile::Profile;
 use crate::report::Gate;
 use crate::run::Drain;
 use crate::scrape::Histogram;
-use crate::slo::{Measured, Slo, Verdict};
+use crate::slo::{LatencyBudget, Measured, Slo, Verdict};
 use crate::source::{self, Offered};
 
 /// The share of samples a p99 budget requires. Named because it appears in
@@ -51,6 +51,8 @@ pub struct RunData<'a> {
     /// accounting check needs.
     pub window_share: f64,
     pub drain: &'a Drain,
+    /// The API service's screening counters over the window, when scraped.
+    pub screening: Option<&'a crate::run::ScreeningCounters>,
 }
 
 impl<'a> RunData<'a> {
@@ -107,6 +109,9 @@ pub const RULES: &[&dyn GateRule] = &[
     &ApiLoadAchieved,
     &ApiSuccessRatio,
     &ApiLatency,
+    &SCREEN_P50,
+    &SCREEN_P99,
+    &ScreenFailedClosed,
     &BlocksAccountedFor,
     &PipelineDrained,
     &FastPathLatency,
@@ -450,6 +455,150 @@ impl GateRule for ApiLatency {
     }
 }
 
+/// The route whose latency is contractual (§11): `/screen` sits inline on
+/// customer withdrawals. Matched against a profile's path *template*.
+pub const SCREEN_ROUTE: &str = "/v1/address/{address}/screen";
+
+/// §11/§19: the screening decision's p50 (< 100ms, contractual) and its bounded
+/// p99 (readiness Epic D), over that route's successful responses alone.
+///
+/// **Per route**, because the aggregate API histogram is a weighted mix and the
+/// cheapest route drags every quantile toward itself — a cached `/labels` read
+/// can hold the aggregate p50 under 100ms while every screening call misses it.
+/// **Successes only**, because a 429 or a fail-closed 502 answers in
+/// microseconds and is not a decision; counting them would let a throttled or
+/// broken endpoint report its best latency ever. `api_success_ratio` already
+/// says how many there were. A stale-but-flagged answer (`server::degrade`) is
+/// a 2xx decision and counts, as it should: it is what the customer waited for.
+struct ScreenLatency {
+    id: &'static str,
+    budget_fields: &'static [&'static str],
+    label: &'static str,
+    quantile: f64,
+    budget: fn(&Slo) -> LatencyBudget,
+}
+
+const SCREEN_P50: ScreenLatency = ScreenLatency {
+    id: "screen_p50",
+    budget_fields: &["screen_p50_seconds"],
+    label: "p50",
+    quantile: 0.5,
+    budget: screen_p50_budget,
+};
+
+const SCREEN_P99: ScreenLatency = ScreenLatency {
+    id: "screen_p99",
+    budget_fields: &["screen_p99_seconds"],
+    label: "p99",
+    quantile: P99,
+    budget: screen_p99_budget,
+};
+
+fn screen_p50_budget(slo: &Slo) -> LatencyBudget {
+    slo.screen_p50_seconds
+}
+
+fn screen_p99_budget(slo: &Slo) -> LatencyBudget {
+    slo.screen_p99_seconds
+}
+
+impl GateRule for ScreenLatency {
+    fn category(&self) -> Category {
+        Category::Claim
+    }
+
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn budgets(&self) -> &'static [&'static str] {
+        self.budget_fields
+    }
+
+    fn evaluate(&self, run: &RunData<'_>) -> Option<Gate> {
+        let api = applicable_api(run)?;
+        // A profile that never screens has no screening gate — not one that
+        // quietly holds.
+        let screens = run
+            .profile
+            .api_routes
+            .iter()
+            .any(|route| route.path == SCREEN_ROUTE && route.weight > 0);
+        if !screens {
+            return None;
+        }
+        let budget = (self.budget)(run.slo);
+        let share = api
+            .route_latency
+            .get(SCREEN_ROUTE)
+            .and_then(|h| h.share_at_most(budget.seconds()));
+        Some(Gate::new(
+            self.id,
+            format!(
+                "§11 screening {} < {budget}s (successful /screen responses, under load)",
+                self.label
+            ),
+            Verdict::share_at_least(
+                share,
+                self.quantile,
+                "no successful /screen responses to time — check api_success_ratio, and \
+                 SCREENING_RATE_LIMIT_PER_MINUTE on the subject (the default throttles any \
+                 single-identity load above ~2 qps)",
+            ),
+        ))
+    }
+}
+
+/// Readiness Epic D, under an injected intelligence fault: withdrawals got a
+/// decision — fresh, or stale and flagged — rather than a fail-closed 502.
+///
+/// Only applies to a profile that injects a fault. And it refuses to hold
+/// vacuously: if nothing left the fresh path, the fault never reached the
+/// screening read (the subject was not pointed at the proxy, or the injected
+/// latency sat under its fresh budget), and "no call failed closed" describes a
+/// healthy system, not a degraded one.
+struct ScreenFailedClosed;
+
+impl GateRule for ScreenFailedClosed {
+    fn category(&self) -> Category {
+        Category::Claim
+    }
+
+    fn id(&self) -> &'static str {
+        "screen_failed_closed"
+    }
+
+    fn budgets(&self) -> &'static [&'static str] {
+        &["max_screen_failed_closed_share"]
+    }
+
+    fn evaluate(&self, run: &RunData<'_>) -> Option<Gate> {
+        run.profile.fault?;
+        let description = format!(
+            "under the injected fault, ≥ {:.1}% of screening calls got a decision (fresh or \
+             stale-but-flagged) instead of failing closed",
+            (1.0 - run.slo.max_screen_failed_closed_share) * 100.0
+        );
+        let verdict = match run.screening {
+            None => Verdict::inconclusive(
+                "the profile injects a fault but the API service's screening counters were \
+                 not scraped — set LOADTEST_API_METRICS_URL",
+            ),
+            Some(counters) if counters.degraded() == 0.0 => Verdict::inconclusive(
+                "no screening call left the fresh path, so the fault never reached it — is the \
+                 subject's INTELLIGENCE_GRPC_ADDR the proxy, and is the injected latency above \
+                 its fresh budget?",
+            ),
+            Some(counters) => Verdict::share_at_least(
+                counters.decided_share(),
+                1.0 - run.slo.max_screen_failed_closed_share,
+                "the API service handled no screening calls",
+            ),
+        };
+        Some(Gate::new(self.id(), description, verdict))
+    }
+}
+
 /// Enough API responses succeeded that the latency above describes the API
 /// rather than its error path.
 struct ApiSuccessRatio;
@@ -532,6 +681,218 @@ mod tests {
              rule claims must exist. Left-only = a budget nobody enforces; right-only \
              = a rule reading a field that is gone"
         );
+    }
+
+    mod screening {
+        use std::time::Duration;
+
+        use super::super::*;
+        use crate::profile::{ApiRoute, Method};
+        use crate::run::FastPathWindow;
+        use crate::scrape::OrderedBound;
+
+        fn api_profile(paths: &[&str]) -> Profile {
+            Profile {
+                name: "t".into(),
+                rationale: "t".into(),
+                chain: 1,
+                blocks_per_second: 1.0,
+                txs_per_block: 1,
+                alerting_block_fraction: 1.0,
+                api_qps: 10.0,
+                api_routes: paths
+                    .iter()
+                    .map(|path| ApiRoute {
+                        path: (*path).into(),
+                        weight: 1,
+                        method: Method::Post,
+                        body: None,
+                    })
+                    .collect(),
+                warmup: Duration::from_secs(1),
+                duration: Duration::from_secs(1),
+                drain_timeout: Duration::from_secs(1),
+                address_pool: None,
+                fault: None,
+            }
+        }
+
+        /// A `/screen` histogram: `under_100ms` samples at or below 0.1s,
+        /// `under_250ms` (cumulative) at or below 0.25s, out of `total`.
+        fn screen_histogram(under_100ms: u64, under_250ms: u64, total: u64) -> Histogram {
+            Histogram {
+                buckets: [
+                    (OrderedBound(0.1), under_100ms),
+                    (OrderedBound(0.25), under_250ms),
+                ]
+                .into_iter()
+                .collect(),
+                count: total,
+                sum: 0.0,
+            }
+        }
+
+        fn api_offered(screen: Option<Histogram>) -> Offered {
+            Offered {
+                source: source::API,
+                unit: "qps",
+                scheduled: 1000,
+                delivered: 1000,
+                failed: 0,
+                target_rate: 10.0,
+                elapsed: Duration::from_secs(100),
+                max_lateness: Some(Duration::ZERO),
+                latency: None,
+                route_latency: screen
+                    .into_iter()
+                    .map(|h| (SCREEN_ROUTE.to_owned(), h))
+                    .collect(),
+                outcomes: None,
+            }
+        }
+
+        /// Judge against the committed budgets, so a retuned `slo.json` is what
+        /// these expectations are read against.
+        fn judge(rule: &dyn GateRule, profile: &Profile, offered: Offered) -> Option<Gate> {
+            judge_with(rule, profile, offered, None)
+        }
+
+        fn judge_with(
+            rule: &dyn GateRule,
+            profile: &Profile,
+            offered: Offered,
+            screening: Option<crate::run::ScreeningCounters>,
+        ) -> Option<Gate> {
+            let slo = Slo::load(&Slo::committed_path()).expect("slo.json must be valid");
+            let offered = [offered];
+            let window = FastPathWindow::default();
+            let drain = Drain::Settled {
+                waited: Duration::from_secs(1),
+            };
+            rule.evaluate(&RunData {
+                profile,
+                slo: &slo,
+                offered: &offered,
+                window: &window,
+                window_share: 1.0,
+                drain: &drain,
+                screening: screening.as_ref(),
+            })
+        }
+
+        fn faulted(mut profile: Profile) -> Profile {
+            profile.address_pool = Some(100);
+            profile.fault = Some(crate::profile::Fault {
+                intelligence_latency_ms: 300,
+            });
+            profile
+        }
+
+        fn counters(fresh: f64, stale: f64, failed_closed: f64) -> crate::run::ScreeningCounters {
+            crate::run::ScreeningCounters {
+                fresh,
+                stale,
+                failed_closed,
+            }
+        }
+
+        #[test]
+        fn the_failed_closed_gate_applies_only_to_a_faulted_profile() {
+            let healthy = api_profile(&[SCREEN_ROUTE]);
+            assert!(judge_with(
+                &ScreenFailedClosed,
+                &healthy,
+                api_offered(None),
+                Some(counters(10.0, 0.0, 0.0))
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn the_failed_closed_gate_holds_breaches_and_refuses_a_fault_that_never_landed() {
+            let profile = faulted(api_profile(&[SCREEN_ROUTE]));
+            let judge_counters =
+                |c| judge_with(&ScreenFailedClosed, &profile, api_offered(None), c).unwrap();
+
+            let served = judge_counters(Some(counters(100.0, 895.0, 5.0)));
+            assert!(
+                matches!(served.verdict, Verdict::Held { .. }),
+                "{:?}",
+                served.verdict
+            );
+
+            assert!(judge_counters(Some(counters(100.0, 700.0, 200.0)))
+                .verdict
+                .is_breach());
+
+            assert!(
+                judge_counters(Some(counters(1000.0, 0.0, 0.0)))
+                    .verdict
+                    .is_inconclusive(),
+                "a healthy run is not a degraded pass"
+            );
+            assert!(judge_counters(None).verdict.is_inconclusive());
+        }
+
+        #[test]
+        fn a_profile_that_never_screens_has_no_screening_gate() {
+            let profile = api_profile(&["/v1/incidents"]);
+            assert!(judge(&SCREEN_P50, &profile, api_offered(None)).is_none());
+            assert!(judge(&SCREEN_P99, &profile, api_offered(None)).is_none());
+        }
+
+        #[test]
+        fn p50_and_p99_are_judged_on_their_own_budgets() {
+            let profile = api_profile(&[SCREEN_ROUTE]);
+
+            let healthy = screen_histogram(600, 995, 1000);
+            let p50 = judge(&SCREEN_P50, &profile, api_offered(Some(healthy.clone()))).unwrap();
+            let p99 = judge(&SCREEN_P99, &profile, api_offered(Some(healthy))).unwrap();
+            assert!(
+                matches!(p50.verdict, Verdict::Held { .. }),
+                "{:?}",
+                p50.verdict
+            );
+            assert!(
+                matches!(p99.verdict, Verdict::Held { .. }),
+                "{:?}",
+                p99.verdict
+            );
+
+            // The contractual failure the aggregate cannot see: most screening
+            // calls over 100ms while the tail is still bounded.
+            let slow_median = screen_histogram(400, 995, 1000);
+            let p50 = judge(
+                &SCREEN_P50,
+                &profile,
+                api_offered(Some(slow_median.clone())),
+            )
+            .unwrap();
+            let p99 = judge(&SCREEN_P99, &profile, api_offered(Some(slow_median))).unwrap();
+            assert!(p50.verdict.is_breach());
+            assert!(matches!(p99.verdict, Verdict::Held { .. }));
+
+            // And the unbounded tail with a healthy median.
+            let long_tail = screen_histogram(900, 950, 1000);
+            let p99 = judge(&SCREEN_P99, &profile, api_offered(Some(long_tail))).unwrap();
+            assert!(p99.verdict.is_breach());
+        }
+
+        #[test]
+        fn a_screening_profile_with_nothing_to_time_is_inconclusive_not_green() {
+            let profile = api_profile(&[SCREEN_ROUTE]);
+            let gate = judge(&SCREEN_P50, &profile, api_offered(None))
+                .expect("the profile screens, so the gate applies");
+            assert!(gate.verdict.is_inconclusive());
+
+            let gate = judge(
+                &SCREEN_P99,
+                &profile,
+                api_offered(Some(screen_histogram(0, 0, 0))),
+            )
+            .unwrap();
+            assert!(gate.verdict.is_inconclusive());
+        }
     }
 
     #[test]

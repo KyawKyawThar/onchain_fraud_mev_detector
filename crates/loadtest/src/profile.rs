@@ -49,6 +49,21 @@ pub struct Profile {
     /// `{address}`, substituted per request so caches and rate limits see the
     /// spread of keys a real workload has.
     pub api_routes: Vec<ApiRoute>,
+    /// When set, the API driver cycles through this many distinct synthetic
+    /// addresses instead of a fresh one per request.
+    ///
+    /// Real counterparties repeat, and a degraded-mode run needs them to: the
+    /// screening fallback answers from snapshots of addresses screened before,
+    /// so a run where every address is new measures only the fail-closed path.
+    /// Absent (the default) keeps every request's address distinct, which is
+    /// what a cache-free latency measurement wants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_pool: Option<u64>,
+    /// A fault injected for the **measurement window only** — warmup runs
+    /// healthy, so the platform has built the state (snapshots, sanctions view,
+    /// latency history) it would have in production when the fault begins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<Fault>,
     /// Load offered before measurement starts. JIT, connection pools, Kafka
     /// partition leaders and page cache all settle here; samples from this
     /// window are excluded by the baseline scrape, not merely ignored.
@@ -63,6 +78,16 @@ pub struct Profile {
     /// is exactly the set with the worst latency.
     #[serde(with = "secs")]
     pub drain_timeout: Duration,
+}
+
+/// A fault the harness injects between the API service and intelligence
+/// (`crate::fault::LatencyProxy`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Fault {
+    /// Latency added to every intelligence response, in milliseconds. Pick it
+    /// above the subject's fresh budget ceiling and below its hard deadline to
+    /// exercise the stale path, or above the deadline to exercise fail-closed.
+    pub intelligence_latency_ms: u64,
 }
 
 /// One API route to drive, and how often relative to the others.
@@ -191,6 +216,26 @@ impl Profile {
             self.api_routes.iter().any(|r| r.weight > 0) || self.api_routes.is_empty(),
             "every API route has weight 0 — nothing would be requested"
         );
+        ensure!(
+            self.address_pool != Some(0),
+            "address_pool must be at least 1 (omit it for a distinct address per request)"
+        );
+        if self.fault.is_some() {
+            ensure!(
+                self.api_qps > 0.0
+                    && self
+                        .api_routes
+                        .iter()
+                        .any(|r| r.path == crate::gates::SCREEN_ROUTE && r.weight > 0),
+                "a fault is injected into the screening read path, so the profile must drive \
+                 /v1/address/{{address}}/screen — otherwise the fault is measured by nothing"
+            );
+            ensure!(
+                self.address_pool.is_some(),
+                "a fault profile needs an address_pool: with a new address per request no \
+                 snapshot ever exists, and the run can only measure fail-closed"
+            );
+        }
         Ok(())
     }
 }
@@ -263,6 +308,8 @@ mod tests {
             warmup: Duration::from_secs(10),
             duration: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(30),
+            address_pool: None,
+            fault: None,
         }
     }
 

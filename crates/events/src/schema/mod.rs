@@ -395,6 +395,21 @@ fn compare_fields(scope: &str, old: &[FieldSchema], new: &[FieldSchema], out: &m
 
     for (path, now) in &after {
         let Some(was) = before.get(path) else {
+            // A field that is required only *inside* an object that is itself new
+            // binds nothing already written: no archived event carries the
+            // object, so none can lack the field. The object's own line decides —
+            // it is reported Breaking if it was added as required.
+            if let Some(ancestor) = newly_added_ancestor(path, &before, &after) {
+                out.push(Change::new(
+                    Verdict::Compatible,
+                    format!(
+                        "{scope}.{path}: added inside the new `{ancestor}` ({}) — required \
+                         only where `{ancestor}` is present, which no archived event is",
+                        now.ty.label()
+                    ),
+                ));
+                continue;
+            }
             out.push(if now.required == Some(true) {
                 Change::new(
                     Verdict::Breaking,
@@ -441,6 +456,22 @@ fn compare_fields(scope: &str, old: &[FieldSchema], new: &[FieldSchema], out: &m
             _ => {}
         }
     }
+}
+
+/// The nearest enclosing path of `path` that exists in the new schema but not the
+/// old one, if any. Walks every dotted prefix (`a`, `a.b[]`, …), trying each both
+/// as written and with an array marker stripped (`a.b[]` → `a.b`), since an
+/// element's container is described under the bare name.
+fn newly_added_ancestor<'p>(
+    path: &'p str,
+    before: &BTreeMap<&str, &FieldSchema>,
+    after: &BTreeMap<&str, &FieldSchema>,
+) -> Option<&'p str> {
+    path.match_indices('.')
+        .map(|(i, _)| &path[..i])
+        .rev()
+        .flat_map(|prefix| [prefix, prefix.trim_end_matches("[]")])
+        .find(|prefix| after.contains_key(prefix) && !before.contains_key(prefix))
 }
 
 fn compare_type(scope: &str, path: &str, was: &FieldType, now: &FieldType, out: &mut Vec<Change>) {
@@ -636,6 +667,43 @@ mod tests {
             field("b", FieldType::String, Some(true)),
         ]);
         assert_eq!(verdicts(&before, &after), vec![Verdict::Breaking]);
+    }
+
+    /// An object that is new *and optional* may carry required fields without
+    /// breaking anything: no archived event has the object, so none can lack
+    /// what is inside it (`ScreeningDecisionRecorded.facts_staleness`).
+    #[test]
+    fn required_fields_inside_a_new_optional_object_are_compatible() {
+        let before = registry(vec![field("a", FieldType::Integer, Some(true))]);
+        let after = registry(vec![
+            field("a", FieldType::Integer, Some(true)),
+            field("o", FieldType::Object, Some(false)),
+            field("o.x", FieldType::Integer, Some(true)),
+            field("o.y", FieldType::String, Some(true)),
+        ]);
+        assert_eq!(verdicts(&before, &after), vec![Verdict::Compatible; 3]);
+    }
+
+    /// The exemption is for a *new* parent only, so it cannot hide a real break:
+    /// a required field added to an object that already existed breaks history
+    /// exactly as it would at the top level, and a new object that is itself
+    /// required still breaks on its own line.
+    #[test]
+    fn the_new_parent_exemption_does_not_hide_a_real_break() {
+        let with_object = registry(vec![field("o", FieldType::Object, Some(false))]);
+        let grown = registry(vec![
+            field("o", FieldType::Object, Some(false)),
+            field("o.x", FieldType::Integer, Some(true)),
+        ]);
+        assert_eq!(verdicts(&with_object, &grown), vec![Verdict::Breaking]);
+
+        let required_object = registry(vec![
+            field("o", FieldType::Object, Some(true)),
+            field("o.x", FieldType::Integer, Some(true)),
+        ]);
+        let mut found = verdicts(&registry(vec![]), &required_object);
+        found.sort();
+        assert_eq!(found, vec![Verdict::Compatible, Verdict::Breaking]);
     }
 
     #[test]

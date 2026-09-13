@@ -123,6 +123,69 @@ billable, audited event, not a cacheable read). A profile that names it without
 `"method": "POST"` collects 405s. The method is part of the committed profile
 for exactly this reason.
 
+**`/screen` has its own two gates, and they read only its successes.**
+`screen_p50` (§11's contractual < 100ms) and `screen_p99` (`slo.json`'s
+`screen_p99_seconds`) apply to any profile whose mix drives
+`/v1/address/{address}/screen`, and are judged over that route's **2xx responses
+alone** — not the aggregate `api_p99`, which the cheapest route in the mix drags
+toward itself, and not 429s or 502s, which answer in microseconds without being
+decisions. A profile that does not screen reports no screening gate at all; one
+that screens but gets no 2xx back reports them inconclusive.
+
+Two consequences for the subject. **Degradation changes what you measure**
+(`crates/server/src/degrade.rs`): with intelligence slow, an address that has a
+last-known-good snapshot is answered at `SCREENING_FRESH_BUDGET_MS` as a flagged
+`stale: true` 2xx, and counts — it is what the customer waited for. The driver
+screens *distinct synthetic addresses* on purpose, so most have no snapshot and
+ride the full `SCREENING_DEADLINE_MS`; a run that passes only because it re-screened
+warm addresses has measured the fallback, not the service. To measure the fresh
+path alone, run the subject with `SCREENING_STALE_MAX_AGE_SECS=0`. The share of stale decisions is reported as the `screen_stale_share` observation
+whenever `LOADTEST_API_METRICS_URL` points at the API service's `/metrics`.
+
+## Degraded mode: screening while intelligence is slow
+
+`profiles/screening-degraded.json` measures readiness Epic D's graceful-degradation
+claim instead of asserting it. `just load-test-degraded` runs it. Three things make
+it a measurement rather than a staged demo:
+
+- **The fault is on only for the measurement window.** Warmup runs against a
+  healthy intelligence so the subject builds what production has when an incident
+  starts: snapshots for the counterparties in play, a synced sanctions view, and
+  latency history for the adaptive budget and hedging. Then `LatencyProxy` adds
+  `fault.intelligence_latency_ms` (300ms) to every intelligence response. That is
+  above the fresh budget ceiling and below the hard deadline, so the stale path
+  and then the open breaker are what gets exercised.
+- **Counterparties repeat.** `address_pool: 500` cycles a bounded set of
+  addresses. With a fresh address per request no snapshot ever exists, and the run
+  would measure fail-closed and nothing else; the profile refuses to load without
+  a pool.
+- **The verdict reads the service's own counters.** `screen_failed_closed`
+  (budget `max_screen_failed_closed_share`, 1%) differences
+  `screening_facts_served_total` / `screening_degraded_total` over the window, so a
+  502 from an unrelated dependency is not mistaken for the degradation path. If
+  *nothing* left the fresh path the gate is inconclusive, not green: the fault
+  never reached the screening read.
+
+Wiring the subject (the proxy lives in the harness process):
+
+```sh
+# the API service under test reaches intelligence through the proxy
+INTELLIGENCE_GRPC_ADDR=http://127.0.0.1:50061 SCREENING_RATE_LIMIT_PER_MINUTE=100000 ./target/release/server
+
+# the harness: proxy 50061 -> real intelligence on 50051, scraping the API's metrics
+LOADTEST_API_BASE_URL=http://127.0.0.1:8080 LOADTEST_API_TOKEN=... \
+LOADTEST_API_METRICS_URL=http://127.0.0.1:9112/metrics \
+just load-test-degraded
+```
+
+Reading it: `screen_p50` during the fault is the breaker's number. Before it opens,
+calls wait the fresh budget; once it opens, snapshots answer in about one Redis
+read. A breach with a low `screen_stale_share` means the breaker never opened
+(`SCREENING_BREAKER_FAILURE_THRESHOLD`, or slow calls not reaching the slow-call
+threshold). A `screen_failed_closed` breach means snapshots were missing
+(`screening_snapshot_lookups_total{result}` on the subject says whether they were
+missing, too old, or unreadable).
+
 ## Reading a breach
 
 The report splits the fast path into its terms:

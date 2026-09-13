@@ -28,6 +28,7 @@
 //! cannot know" — an enum would force every gate to match on a source kind it
 //! does not care about.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -127,6 +128,14 @@ pub struct Offered {
     /// Client-observed latency, where the source can measure it.
     #[serde(skip)]
     pub latency: Option<Histogram>,
+    /// Client-observed latency of *successful* responses, per route template.
+    ///
+    /// A route that carries its own budget (`/screen`'s p50/p99) cannot be
+    /// judged from [`Self::latency`]: that histogram is a weighted mix, and the
+    /// cheapest route in the mix drags every quantile toward itself. Empty for a
+    /// source without routes.
+    #[serde(skip)]
+    pub route_latency: BTreeMap<String, Histogram>,
     /// Response outcomes, where the source has them.
     pub outcomes: Option<Outcomes>,
 }
@@ -155,6 +164,7 @@ impl Offered {
             elapsed: Duration::ZERO,
             max_lateness: None,
             latency: None,
+            route_latency: BTreeMap::new(),
             outcomes: None,
         }
     }

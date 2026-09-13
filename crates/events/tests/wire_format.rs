@@ -161,7 +161,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "ScreeningDecisionRecorded",
-        r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z"}}"#,
+        r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z","facts_staleness":{"reason":"intelligence_slow","observed_at":"2023-11-14T22:13:20Z","age_ms":1500}}}"#,
     ),
     (
         "ModelDriftDetected",
@@ -296,6 +296,24 @@ fn locked_wire_form_round_trips_back_to_value() {
 /// `missing field` error. Without the `#[serde(default …)]` attributes this
 /// test fails, which is the whole point: it is the guard the round-trip goldens
 /// (new shape only) can't provide.
+/// Backwards-compatibility lock for `ScreeningDecisionRecorded.facts_staleness`
+/// (SCHEMA.md's additive-field policy). A record written before graceful
+/// degradation existed — this exact pre-change byte string — must still decode,
+/// and must decode as *fresh*: that is not a default, it is what happened,
+/// because no stale path existed when it was written.
+#[test]
+fn legacy_screening_decision_reads_as_rendered_over_fresh_facts() {
+    let legacy = r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z"}}"#;
+
+    let event: DomainEvent = serde_json::from_str(legacy)
+        .expect("a pre-degradation screening record must still deserialize");
+    let DomainEvent::ScreeningDecisionRecorded(record) = event else {
+        panic!("expected ScreeningDecisionRecorded");
+    };
+
+    assert_eq!(record.facts_staleness, None);
+}
+
 #[test]
 fn legacy_preliminary_alert_reads_with_defaulted_scoring_fields() {
     let legacy = r#"{"type":"PreliminaryAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.8,"provisional":true}}"#;

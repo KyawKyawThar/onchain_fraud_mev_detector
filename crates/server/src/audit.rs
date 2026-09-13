@@ -136,6 +136,7 @@ mod tests {
             model_version: "risk-v1".into(),
             factors: vec![],
             timestamp: Utc::now(),
+            facts_staleness: None,
         }
     }
 

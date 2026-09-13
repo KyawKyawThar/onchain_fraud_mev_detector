@@ -113,8 +113,25 @@ async fn main() -> Result<()> {
     // Every replica of the subject, read as one: the SLO is stated over the
     // deployment (`sum by (le)`), and detection runs one instance per chain
     // (§20) with several replicas each under the HPA.
+    let screening = (!targets.api_metrics.is_empty())
+        .then(|| loadtest::run::PrometheusScreeningScrape::new(http.clone(), &targets.api_metrics));
+    let proxy = match targets.intelligence_proxy {
+        Some((listen, upstream)) => Some(
+            loadtest::fault::LatencyProxy::start(listen, upstream)
+                .await
+                .context("starting the intelligence fault proxy")?,
+        ),
+        None => None,
+    };
     let subject = CompositeSubject::new(http, &targets.detection_metrics)?;
-    let report = loadtest::run::run(&profile, &slo, &sources, &subject, shutdown).await?;
+    let extras = loadtest::run::RunExtras {
+        fault: proxy.as_ref(),
+        screening: screening
+            .as_ref()
+            .map(|s| s as &dyn loadtest::run::ScreeningMetrics),
+    };
+    let report =
+        loadtest::run::run_with(&profile, &slo, &sources, &subject, extras, shutdown).await?;
     print!("{report}");
     if let Some(path) = &cli.json_out {
         std::fs::write(path, loadtest::report::to_json(&report)?)
@@ -151,6 +168,12 @@ struct Targets {
     /// Bearer token for the API driver. Without one every request is a 401,
     /// which is fast and meaningless — the success-ratio gate catches it.
     api_token: Option<String>,
+    /// The API service's `/metrics` URLs (comma-separated), for the screening
+    /// counters a degraded-mode run is judged on. Empty means not scraped.
+    api_metrics: Vec<String>,
+    /// `(listen, upstream)` for the intelligence fault proxy. The subject's
+    /// `INTELLIGENCE_GRPC_ADDR` must point at `listen`.
+    intelligence_proxy: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
 }
 
 impl Targets {
@@ -167,6 +190,31 @@ impl Targets {
                 .collect(),
             api_base: std::env::var("LOADTEST_API_BASE_URL").ok(),
             api_token: std::env::var("LOADTEST_API_TOKEN").ok(),
+            api_metrics: std::env::var("LOADTEST_API_METRICS_URL")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            intelligence_proxy: match (
+                std::env::var("LOADTEST_INTELLIGENCE_PROXY_LISTEN").ok(),
+                std::env::var("LOADTEST_INTELLIGENCE_UPSTREAM").ok(),
+            ) {
+                (Some(listen), Some(upstream)) => Some((
+                    listen
+                        .parse()
+                        .context("LOADTEST_INTELLIGENCE_PROXY_LISTEN is not a socket address")?,
+                    upstream
+                        .parse()
+                        .context("LOADTEST_INTELLIGENCE_UPSTREAM is not a socket address")?,
+                )),
+                (None, None) => None,
+                _ => anyhow::bail!(
+                    "set both LOADTEST_INTELLIGENCE_PROXY_LISTEN and LOADTEST_INTELLIGENCE_UPSTREAM, \
+                     or neither — half a proxy injects no fault"
+                ),
+            },
         })
     }
 }

@@ -1666,7 +1666,8 @@
           "type": "enum",
           "values": [
             "sanctions_hard_block",
-            "score_thresholds"
+            "score_thresholds",
+            "stale_facts_review"
           ],
           "required": true
         },
@@ -1692,6 +1693,30 @@
         {
           "path": "factors[].name",
           "type": "string",
+          "required": true
+        },
+        {
+          "path": "facts_staleness",
+          "type": "object",
+          "required": false
+        },
+        {
+          "path": "facts_staleness.age_ms",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "facts_staleness.observed_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "facts_staleness.reason",
+          "type": "enum",
+          "values": [
+            "intelligence_slow",
+            "intelligence_unavailable"
+          ],
           "required": true
         },
         {
