@@ -65,6 +65,13 @@ pub enum JobError {
     #[error("rabbitmq publish failed: {0}")]
     Delivery(String),
 
+    /// The broker nacked the publish. With `x-overflow: reject-publish` on
+    /// `sim.jobs` that means the queue is at its length bound. Transient, but
+    /// never retried inline by [`publish_resilient`]: the dispatcher's consumer
+    /// retries the alert instead, so the wait happens on Kafka.
+    #[error("rabbitmq refused the publish (nack): sim.jobs is at its length bound")]
+    Rejected,
+
     /// The job could not be serialized — a bug in our own types, identical on
     /// every retry. Not retriable.
     #[error("encoding simulation job failed")]
@@ -75,7 +82,7 @@ impl event_bus::Transience for JobError {
     /// Whether re-publishing the *same* job could plausibly succeed later. A
     /// delivery failure is transient (broker recovers); an encode failure is not.
     fn is_transient(&self) -> bool {
-        matches!(self, JobError::Delivery(_))
+        matches!(self, JobError::Delivery(_) | JobError::Rejected)
     }
 }
 
@@ -155,16 +162,27 @@ impl JobSink for RabbitJobSink {
             .await
             .map_err(|err| JobError::Delivery(err.to_string()))?;
 
-        // A nack means the broker could not take responsibility for the message
-        // (e.g. it couldn't be persisted) — treat it as a transient delivery
-        // failure so `publish_resilient` retries rather than dropping the job.
+        // A nack means the broker did not take responsibility for the message.
+        // On a bounded `reject-publish` queue that is the length bound; it can also
+        // (rarely) be a persistence failure, which the same retry covers.
         if matches!(confirm, Confirmation::Nack(_)) {
-            return Err(JobError::Delivery(
-                "broker nacked the publish (message not confirmed)".into(),
-            ));
+            return Err(JobError::Rejected);
         }
         Ok(())
     }
+}
+
+/// Why a job did not reach `sim.jobs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JobUndelivered {
+    /// The queue is at its length bound. Returned immediately rather than retried
+    /// here: spinning inside the Kafka handler would stop the consumer polling and
+    /// get it evicted from its group. The caller retries through its consumer.
+    #[error("sim.jobs is at its length bound")]
+    Rejected,
+    /// Shutdown during a retry, or a job that can never be encoded.
+    #[error(transparent)]
+    Abandoned(#[from] event_bus::Undelivered),
 }
 
 /// Publish one command through `sink`, retrying a *transient* failure (broker blip)
@@ -172,19 +190,18 @@ impl JobSink for RabbitJobSink {
 /// outage doesn't drop a job whose alert has already streamed past on Kafka. A
 /// *permanent* failure (encode bug) is logged and skipped — it can never succeed.
 ///
-/// Mirrors `event_bus::publish_resilient`; the two brokers share one retry shape.
-/// Returns `true` if the job was queued, `false` if it was abandoned (shutdown or a
-/// permanent failure) — the dispatcher uses this to decide whether to advance its
-/// Kafka offset.
+/// Mirrors `event_bus::publish_resilient`; the two brokers share one retry shape,
+/// and one more outcome: [`JobUndelivered::Rejected`] when the bounded queue is full.
 pub async fn publish_resilient(
     sink: &dyn JobSink,
     job: &SimulationJob,
     backoff: Duration,
     shutdown: &CancellationToken,
-) -> bool {
+) -> Result<(), JobUndelivered> {
     loop {
         match sink.publish(job).await {
-            Ok(()) => return true,
+            Ok(()) => return Ok(()),
+            Err(JobError::Rejected) => return Err(JobUndelivered::Rejected),
             Err(err) if err.is_transient() => {
                 tracing::warn!(
                     error = %err,
@@ -198,7 +215,7 @@ pub async fn publish_resilient(
                             alert_id = %job.alert_id,
                             "shutdown during job publish retry; job not queued"
                         );
-                        return false;
+                        return Err(event_bus::Undelivered::Shutdown.into());
                     }
                     _ = tokio::time::sleep(backoff) => {}
                 }
@@ -209,7 +226,7 @@ pub async fn publish_resilient(
                     alert_id = %job.alert_id,
                     "permanent job publish failure; dropping job"
                 );
-                return false;
+                return Err(event_bus::Undelivered::Permanent.into());
             }
         }
     }
@@ -281,7 +298,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .await;
-        assert!(queued);
+        assert_eq!(queued, Ok(()));
         assert_eq!(*sink.delivered.lock().unwrap(), vec![job.alert_id]);
     }
 
@@ -294,7 +311,35 @@ mod tests {
         let shutdown = CancellationToken::new();
         shutdown.cancel(); // already cancelled → the retry select takes this arm
         let queued = publish_resilient(&sink, &a_job(), Duration::from_secs(3600), &shutdown).await;
-        assert!(!queued);
+        assert_eq!(
+            queued,
+            Err(JobUndelivered::Abandoned(event_bus::Undelivered::Shutdown))
+        );
         assert!(sink.delivered.lock().unwrap().is_empty());
+    }
+
+    /// A full queue is reported at once, not spun on: the retry belongs to the
+    /// dispatcher's consumer, which keeps polling Kafka while it waits.
+    #[tokio::test]
+    async fn a_full_queue_is_reported_immediately_not_retried_inline() {
+        struct Full(Mutex<u32>);
+        #[async_trait]
+        impl JobSink for Full {
+            async fn publish(&self, _job: &SimulationJob) -> Result<(), JobError> {
+                *self.0.lock().unwrap() += 1;
+                Err(JobError::Rejected)
+            }
+        }
+
+        let sink = Full(Mutex::new(0));
+        let outcome = publish_resilient(
+            &sink,
+            &a_job(),
+            Duration::from_secs(3600),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome, Err(JobUndelivered::Rejected));
+        assert_eq!(*sink.0.lock().unwrap(), 1, "one attempt, no inline retry");
     }
 }

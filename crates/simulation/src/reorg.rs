@@ -394,23 +394,21 @@ impl ReorgConsumer {
                 block = reverted.block.number,
                 "retracting incident from orphaned block"
             );
-            event_bus::publish_resilient(
+            // A retraction that did not land leaves the offset for redelivery, which
+            // re-retracts (idempotent), rather than committing past an un-retracted
+            // reorg. Decided on delivery, not on whether shutdown has fired.
+            if let Err(undelivered) = event_bus::publish_resilient(
                 self.event_sink.as_ref(),
                 EventEnvelope::new(chain, DomainEvent::IncidentRetracted(retracted)),
                 self.publish_backoff,
                 &self.shutdown,
             )
-            .await;
+            .await
+            {
+                return event_bus::handled_undelivered(undelivered, "simulation-reorg");
+            }
         }
-
-        // If shutdown fired during a publish retry, some retraction may not be on the
-        // wire — leave the offset so redelivery re-retracts (idempotent) rather than
-        // committing past an un-retracted reorg.
-        if self.shutdown.is_cancelled() {
-            Handled::Stop
-        } else {
-            Handled::Commit
-        }
+        Handled::Commit
     }
 
     /// Drive the consumer via the shared [`event_bus::run_consumer`] loop until shutdown

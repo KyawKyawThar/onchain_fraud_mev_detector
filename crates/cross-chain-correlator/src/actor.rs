@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
+use event_bus::AcceptLoss;
 use event_bus::{publish_resilient, EventSink};
 use events::{DomainEvent, EventEnvelope};
 use tokio::sync::mpsc;
@@ -245,7 +246,12 @@ impl CorrelationActor {
                     .await;
                 crate::metrics::record_pending_findings(finality.len());
                 let envelope = EventEnvelope::new(chain, event);
-                publish_resilient(sink.as_ref(), envelope, publish_backoff, &shutdown).await;
+                publish_resilient(sink.as_ref(), envelope, publish_backoff, &shutdown)
+                    .await
+                    .accept_loss(
+                        "the actor correlates in-memory legs with no upstream position to hold back; \
+                         an abandoned finding is counted by event_publish_abandoned_total",
+                    );
             }
         }
     }

@@ -183,7 +183,9 @@ metadata:
   labels:
     app.kubernetes.io/name: intelligence-grpc
 spec:
-  replicas: 2
+  # No `replicas`: the HPA owns the count. With a literal here every `kubectl
+  # apply` re-applies it and resets a scaled-out pool, most likely mid-incident,
+  # since that is when people deploy (crates/arch-conformance/tests/deploy_scaling.rs).
   selector:
     matchLabels:
       app.kubernetes.io/name: intelligence-grpc

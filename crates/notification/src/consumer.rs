@@ -71,6 +71,7 @@ use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
+use event_bus::AcceptLoss;
 use event_bus::{handled, EventHandler, EventSink, Handled, Transience};
 use events::primitives::{AlertId, Chain, CustomerId, IncidentId};
 use events::system::UsageEventType;
@@ -346,7 +347,8 @@ impl DeliveryEngine {
                         self.publish_backoff,
                         &self.shutdown,
                     )
-                    .await;
+                    .await
+.accept_loss("usage metering is approximate by design (§13); the delivery ledger, not metering, settles the notice");
             }
             Err(err) => {
                 tracing::warn!(

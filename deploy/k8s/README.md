@@ -12,6 +12,7 @@ base/                 # topology — no credentials, no environment specifics
   services/           # 16 workloads (Deployments, Services, HPAs, PDBs)
 overlays/dev/         # kind/laptop: generated dev secrets, :dev images, debug logs
 overlays/prod/        # pinned images, HPA floors raised, secrets EXPECTED (see below)
+cluster/              # once per cluster, not per environment: prometheus-adapter
 ```
 
 ## Quick start (kind)
@@ -56,24 +57,45 @@ lesson).
 | Workload | Replicas | Why |
 |---|---|---|
 | ingestion-eth / -base | 1 per chain, `Recreate` | the RPC failover pool is *in-process*; two pollers double-publish heads |
-| detection-eth / -base | 1 per chain, `Recreate` | chain is the Kafka partition key → one partition per chain; scale **up** (CPU/rayon), out by adding chains |
+| detection-eth / -base | 1 per chain, `Recreate`, **Guaranteed QoS** | chain is the Kafka partition key → one partition per chain; scale **up** (CPU/rayon), out by adding chains. **No HPA**: a second replica rebalances the partition (stalling the fast path under exactly the load that triggered it) and then idles. Contention is what the load test showed moving its latency, so requests == limits, and api-server prefers other nodes |
 | predictive | 1, `Recreate` | owns the mempool filter + in-process dedup ring |
 | copilot | 1, rolling with `maxSurge: 0` | interchangeable (leased `SKIP LOCKED` queue), but `replicas × COPILOT_WORKER_CONCURRENCY` hits an **org-wide** provider limit — a spend decision, never an HPA's |
 | event-store | 1 → partitions | consumer group; event-id-keyed inserts make overlap safe |
 | simulation-dispatcher | 1 | thin Kafka→RabbitMQ bridge |
-| **simulation-worker** | **HPA 2–8 (prod 4–16) on CPU** | revm is the bottleneck; competing consumers scale linearly (§20 "scale aggressively") |
+| **simulation-worker** | **HPA 2–8 (prod 4–16) on `sim.jobs` depth + CPU** | revm is the bottleneck; competing consumers scale linearly (§20 "scale aggressively"). Depth is §7's backpressure signal: (ready + unacked) ÷ `simulation_worker_job_capacity` (workers × prefetch), so the scaling point is each replica's own declared bound, not a number in the HPA. Scale-down one pod a minute; a draining pod finishes its in-flight job |
 | simulation-projection | 1 | read-model projector + internal `GET /v1/incidents` |
 | intelligence-attribute | 1, `Recreate` | MergeActor is single-writer and does not coordinate across processes |
 | **intelligence-grpc** | **HPA 2–6 on CPU** | stateless read path over Redis cache-aside (§20 "scale read path") |
 | intelligence-block-production | 1, `Recreate` | per-instance pending-writes flush queue; PBS/Ethereum-gated |
 | rule-engine | 1, `Recreate` | TemporalPool is single-writer-per-address per instance |
-| **api-server** | **HPA 2–6 (prod 3–10) on CPU** | stateless behind the Service; WS consumer group is **per-pod** (pod-name suffix) so every replica sees every alert |
+| **api-server** | **HPA 2–6 (prod 3–10) on CPU** | stateless behind the Service; WS consumer group is **per-pod** (pod-name suffix) so every replica sees every alert. Scale-down one pod every 2 minutes (each removal reconnects that pod's WS clients). No latency input (it would add load to a slow intelligence), and no qps input until the staging run measures per-pod throughput |
 | notification | 1 → partitions | Postgres dedup ledger absorbs redelivery, overlap-safe |
 | usage | 1 → partitions | customer-keyed partitioning; batched, dedup-on-read sink |
 
-HPAs need metrics-server (kind: `helm install metrics-server ...` or the
-components.yaml with `--kubelet-insecure-tls`); without it they just stay at
-minReplicas.
+### What the HPAs need
+
+- **metrics-server** for every CPU input (kind: the upstream `components.yaml`
+  with `--kubelet-insecure-tls`). Without it the CPU HPAs stay at minReplicas.
+- **prometheus-adapter** for the simulation worker's queue-depth input:
+  `just k8s-apply-cluster`, after the overlay (it lives in `mev` and reads the
+  in-cluster Prometheus). It is a separate tree because it registers the
+  cluster-wide `v1beta1.external.metrics.k8s.io` APIService, which a cluster
+  has exactly one of, and because it needs a RoleBinding in `kube-system` that
+  the overlays' `namespace: mev` would rewrite. Without it the worker HPA runs
+  on CPU alone and never scales down, and `kubectl describe hpa
+  simulation-worker` reports `FailedGetExternalMetric`.
+
+An HPA's target Deployment carries **no `replicas`**. With a literal, every
+`kubectl apply` resets a scaled-out pool to it, most likely mid-incident.
+`crates/arch-conformance/tests/deploy_scaling.rs` fails the build on that, on
+an HPA over a `Recreate` (single-writer) workload, and on a dangling
+`scaleTargetRef`. `deploy_users.rs` beside it checks that every pod can
+actually start under `runAsNonRoot`.
+
+The copilot is deliberately **not** autoscaled. What reaches the provider is
+`replicas × COPILOT_WORKER_CONCURRENCY` against an org-wide rate limit, so its
+replica count is a spend decision an operator makes. An HPA would base it on
+CPU, which is near zero for I/O-bound workers.
 
 ## Observability (§19, Sprint 13 t4)
 
@@ -139,7 +161,15 @@ real values**:
 CI (`ci.yml` docker matrix) publishes one image per binary to
 `ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/<bin>` on merge to `main`,
 tagged by branch, semver, and `sha-<commit>`; prod pins tags in its
-`images:` block. The detection image is built with
+`images:` block.
+
+Every pod sets `runAsNonRoot: true`, and the kubelet can only verify that
+against a **numeric** uid. An image whose user is a name (`appuser`, `nobody`)
+is refused at container start (`CreateContainerConfigError: image has
+non-numeric user`), which no render or schema check sees. So
+`deploy/Dockerfile` ends on `USER 10001:10001`, and every third-party image
+under `runAsNonRoot` states its `runAsUser` in the manifest. Both are enforced
+by `crates/arch-conformance/tests/deploy_users.rs`. The detection image is built with
 `FEATURES=detection/detectors,detection/anomaly` — without the first the binary
 links **zero** detectors and boots happily doing nothing — and on the `onnx`
 runtime flavour (`RUNTIME=onnx`), which adds the pinned, checksum-verified ONNX

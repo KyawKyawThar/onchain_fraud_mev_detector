@@ -114,7 +114,7 @@ impl UsageFact {
         chain: Chain,
         backoff: Duration,
         shutdown: &CancellationToken,
-    ) {
+    ) -> Result<(), crate::Undelivered> {
         let usage = UsageRecorded {
             customer_id: self.customer_id,
             event_type: self.event_type.as_wire_str().to_owned(),
@@ -129,7 +129,7 @@ impl UsageFact {
             backoff,
             shutdown,
         )
-        .await;
+        .await
     }
 }
 
@@ -148,7 +148,8 @@ mod tests {
         UsageFact::new(UsageEventType::DetectorRun, 5)
             .for_customer(CustomerId(Uuid::from_u128(1)))
             .record(&sink, Chain::ETHEREUM, Duration::from_millis(1), &shutdown)
-            .await;
+            .await
+            .expect("a healthy sink delivers the fact");
 
         let published = sink.envelopes();
         assert_eq!(published.len(), 1);
@@ -167,7 +168,8 @@ mod tests {
 
         UsageFact::new(UsageEventType::EventProcessed, 3)
             .record(&sink, Chain::ETHEREUM, Duration::from_millis(1), &shutdown)
-            .await;
+            .await
+            .expect("a healthy sink delivers the fact");
 
         let published = sink.envelopes();
         let DomainEvent::UsageRecorded(ref usage) = published[0].payload else {

@@ -127,8 +127,15 @@ spec:
         app.kubernetes.io/component: observability
     spec:
       serviceAccountName: prometheus
+      # The image's user is `nobody` by NAME, which the kubelet cannot check
+      # against runAsNonRoot; without a numeric uid it refuses to start the
+      # container, and Prometheus (now on the autoscaling path) never ran here.
+      # fsGroup keeps the data PVC writable for that uid.
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
         seccompProfile:
           type: RuntimeDefault
       containers:

@@ -141,6 +141,10 @@ pub async fn load_risk_inputs(
 /// wedge the stream.
 #[derive(Debug, thiserror::Error)]
 pub enum RiskScoreError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -156,6 +160,7 @@ impl Transience for RiskScoreError {
     /// Whether retrying the same event could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            RiskScoreError::Undelivered(err) => err.is_transient(),
             RiskScoreError::Store(err) => err.is_transient(),
             RiskScoreError::Cache(err) => err.is_transient(),
             RiskScoreError::Task(_) => false,
@@ -220,14 +225,18 @@ impl RiskScorer {
         .await
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Invalidate, recompute and publish one address's score, `as_of` the
@@ -259,7 +268,7 @@ impl RiskScorer {
             .await?;
 
         self.publish(chain, DomainEvent::RiskScoreUpdated(result))
-            .await;
+            .await?;
         Ok(())
     }
 

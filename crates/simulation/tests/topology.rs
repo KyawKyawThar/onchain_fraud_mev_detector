@@ -56,6 +56,7 @@ fn test_config(url: &str) -> RabbitConfig {
         dlx: "sim.jobs.dlx".into(),
         dead_letter_queue: "sim.jobs.dlq".into(),
         delivery_limit: 5,
+        max_length_bytes: simulation::config::DEFAULT_SIM_MAX_LENGTH_BYTES,
     }
 }
 
@@ -153,4 +154,38 @@ async fn quorum_queue_rejects_x_max_priority() {
         "RabbitMQ must reject x-max-priority on a quorum queue — this is the \
          constraint that forced the quorum/2-level-priority design (§7)"
     );
+}
+
+/// The queue bound, enforced by a real broker as a publisher nack. That nack is
+/// what the dispatcher turns into a Kafka-side retry (`Handled::Retry`), so this is
+/// the proof that a full `sim.jobs` refuses work rather than dropping queued jobs or
+/// accepting without limit.
+#[tokio::test]
+#[ignore = "requires Docker; run via `just test-integration`"]
+async fn a_full_work_queue_nacks_the_publisher() {
+    let (_node, url) = start_rabbit().await;
+    let cfg = RabbitConfig {
+        max_length_bytes: 2048,
+        ..test_config(&url)
+    };
+    declare_sim_topology(&url, &cfg)
+        .await
+        .expect("declaring the bounded topology");
+    let sink = RabbitJobSink::connect(&url, cfg.queue.clone())
+        .await
+        .expect("connecting the job sink");
+
+    let mut rejected_at = None;
+    for n in 0..500 {
+        match sink.publish(&a_job(5)).await {
+            Ok(()) => {}
+            Err(simulation::queue::JobError::Rejected) => {
+                rejected_at = Some(n);
+                break;
+            }
+            Err(other) => panic!("unexpected publish failure: {other}"),
+        }
+    }
+    let n = rejected_at.expect("a 2 KiB bound must refuse a publish within 500 jobs");
+    assert!(n > 0, "the first job fits under the bound");
 }

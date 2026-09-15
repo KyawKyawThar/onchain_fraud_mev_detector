@@ -96,11 +96,9 @@ impl Dispatcher {
     async fn process(&self, chain: Chain, alert: &PreliminaryAlertCreated) -> Handled {
         let (job, requested) = job_for_alert(chain, alert);
 
-        // The command is the critical step. `publish_resilient` returns `false` for
-        // two reasons we must treat *differently*: a shutdown mid-retry (leave the
-        // offset so redelivery re-dispatches), versus a permanent encode failure
-        // (poison — commit to skip it, or the same record redelivers forever).
-        if !queue::publish_resilient(
+        // The command is the critical step, and each way it can fail wants a
+        // different offset action.
+        match queue::publish_resilient(
             self.job_sink.as_ref(),
             &job,
             self.publish_backoff,
@@ -108,31 +106,39 @@ impl Dispatcher {
         )
         .await
         {
-            return if self.shutdown.is_cancelled() {
-                Handled::Stop
-            } else {
-                tracing::error!(alert_id = %alert.alert_id, "dropping un-queueable job (poison); skipping");
-                Handled::Commit
-            };
+            Ok(()) => {}
+            // `sim.jobs` is at its length bound: the worker pool is behind and cannot
+            // grow further. Leave the alert uncommitted and retry it. `run_consumer`
+            // re-fetches this record after the backoff and keeps polling meanwhile,
+            // so the backlog waits in Kafka (durable, replayable, alerting on lag)
+            // instead of in broker memory.
+            Err(queue::JobUndelivered::Rejected) => {
+                crate::metrics::record_dispatch_rejected();
+                tracing::warn!(
+                    alert_id = %alert.alert_id,
+                    "sim.jobs is at its length bound; retrying the alert from Kafka"
+                );
+                return Handled::Retry;
+            }
+            Err(queue::JobUndelivered::Abandoned(undelivered)) => {
+                return event_bus::handled_undelivered(undelivered, "dispatcher");
+            }
         }
 
         // The job is on the queue; record the request as an auditable fact (§7).
-        // The command itself never enters the event store — only this does.
-        event_bus::publish_resilient(
+        // The command itself never enters the event store — only this does. An
+        // audit event abandoned at shutdown leaves the offset for redelivery (the
+        // re-dispatch is idempotent); one that can never be encoded is skipped.
+        match event_bus::publish_resilient(
             self.event_sink.as_ref(),
             EventEnvelope::new(chain, DomainEvent::SimulationRequested(requested)),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
-
-        // If shutdown fired during the audit publish, the event may not be on the
-        // wire — leave the offset so redelivery re-dispatches (idempotent) and
-        // re-audits, rather than committing past an un-audited alert.
-        if self.shutdown.is_cancelled() {
-            Handled::Stop
-        } else {
-            Handled::Commit
+        .await
+        {
+            Ok(()) => Handled::Commit,
+            Err(undelivered) => event_bus::handled_undelivered(undelivered, "dispatcher"),
         }
     }
 

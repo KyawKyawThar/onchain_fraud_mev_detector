@@ -791,6 +791,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -2957,6 +2958,8 @@ dependencies = [
  "metrics",
  "rdkafka",
  "telemetry",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -7528,6 +7531,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "uuid",
+ "yaml-rust2",
 ]
 
 [[package]]

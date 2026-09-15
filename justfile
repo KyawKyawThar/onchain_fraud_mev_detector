@@ -934,6 +934,12 @@ k8s-diff overlay="dev":
 k8s-delete overlay="dev":
     {{k8s_kustomize}} deploy/k8s/overlays/{{overlay}} | kubectl delete -f -
 
+# Once-per-cluster add-ons (prometheus-adapter, which serves the queue-depth
+# metric the simulation-worker HPA scales on). Apply after the overlay: they
+# live in the `mev` namespace it creates. See deploy/k8s/cluster/kustomization.yaml.
+k8s-apply-cluster:
+    {{k8s_kustomize}} deploy/k8s/cluster | kubectl apply -f -
+
 # Watch the whole namespace converge
 k8s-status:
     kubectl -n mev get pods,statefulsets,deployments,hpa

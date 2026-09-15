@@ -197,6 +197,10 @@ impl Default for LinkSignalPolicy {
 /// touches and forwards their retry/skip classification unchanged.
 #[derive(Debug, thiserror::Error)]
 pub enum LinkSignalError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -208,6 +212,7 @@ pub enum LinkSignalError {
 impl Transience for LinkSignalError {
     fn is_transient(&self) -> bool {
         match self {
+            LinkSignalError::Undelivered(err) => err.is_transient(),
             LinkSignalError::Store(err) => err.is_transient(),
             LinkSignalError::Cache(err) => err.is_transient(),
             LinkSignalError::Similarity(err) => err.is_transient(),
@@ -523,7 +528,7 @@ impl LinkSignal {
                         "behavioral candidate link proposed (not a merge)",
                     );
                     self.publish(DomainEvent::EntityLinkProposed(link_proposed(proposal)))
-                        .await;
+                        .await?;
                     self.seams
                         .links
                         .mark_announced(proposal.candidate_id, at)
@@ -543,7 +548,7 @@ impl LinkSignal {
                             confidence: label.confidence,
                             source: <&str>::from(label.source).to_owned(),
                         }))
-                        .await;
+                        .await?;
                     }
                 }
             }
@@ -551,14 +556,14 @@ impl LinkSignal {
         Ok(())
     }
 
-    async fn publish(&self, payload: DomainEvent) {
+    async fn publish(&self, payload: DomainEvent) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.seams.sink.as_ref(),
             EventEnvelope::new(self.chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 }
 

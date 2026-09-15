@@ -343,7 +343,11 @@ fix for a production failure mode:
 - [ ] **A K8s manifest entry** in `deploy/k8s/base/services/` that states its
   scaling shape honestly (see the README table there): HPA only if replicas are
   truly interchangeable; `Recreate` + 1 if there's a single-writer anywhere in
-  the loop; reorg-rewindable if it holds cross-block state (§15).
+  the loop; reorg-rewindable if it holds cross-block state (§15). If it drains a
+  queue, the HPA scales on that queue divided by a per-replica capacity gauge
+  the binary exports, not on CPU alone and never against a literal target
+  (`simulation-worker` is the reference). If it holds a shared, rate-limited
+  budget (the copilot), it is not autoscaled at all.
 - [ ] **Nothing slow inside the handler.** `run_consumer` awaits the handler
   *before* committing, so the handler's worst case is the poll interval: a
   call that can take minutes (a model, a third-party API, a long simulation)
@@ -353,6 +357,29 @@ fix for a production failure mode:
   only trades that for a fleet that takes minutes to notice a dead pod. The
   fix is structural: the handler records a durable work item and commits, and
   a pool drains it on its own clock (§7's slow path; §20.4's copilot).
+
+- [ ] **A retry re-fetches its record.** `Handled::Retry` seeks the partition
+  back before re-polling. Without the seek, librdkafka hands the next record,
+  and the next `Commit` on that partition commits past the one being retried:
+  a retry that silently skips. Any hand-rolled consume loop must do the same.
+- [ ] **Settle on delivery, never on the shutdown token.** `publish_resilient`
+  returns `Result<(), Undelivered>`. A caller that advances an offset or acks a
+  job maps it (`handled`, `handled_undelivered`, or its own error's `#[from]`).
+  A caller with nothing upstream to hold back writes `.accept_loss(why)`, and
+  `why` is a claim a reviewer should check. `if shutdown.is_cancelled()` as a
+  stand-in for "was it published?" is the bug this replaced: it requeued work
+  whose results had already landed, and elsewhere committed past events that
+  had not.
+- [ ] **A work queue is bounded, and full means refuse.** `x-max-length-bytes`
+  with `x-overflow: reject-publish`, never `drop-head`. The producer turns the
+  nack into its *consumer's* `Retry`, so the backlog waits on Kafka (durable,
+  lag-alerted) instead of in broker memory, and the handler never spins long
+  enough to be evicted from its group.
+- [ ] **A slow-path worker has a job deadline, and its grace period is derived.**
+  `terminationGracePeriodSeconds ≥ deadline + overshoot allowance + result
+  publishes × send timeout`, checked by a test against the manifest
+  (`simulation/tests/grace_period.rs`). A guessed grace period turns every
+  scale-down into a SIGKILL of a job that was about to settle.
 
 **Reference.** [`usage`](../crates/usage/) is the smallest complete example;
 [`detection`'s scheduler](../crates/detection/src/scheduler.rs) shows the

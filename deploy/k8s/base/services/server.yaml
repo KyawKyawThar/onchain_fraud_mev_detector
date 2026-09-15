@@ -25,7 +25,9 @@ metadata:
   labels:
     app.kubernetes.io/name: api-server
 spec:
-  replicas: 2
+  # No `replicas`: the HPA owns the count. With a literal here every `kubectl
+  # apply` re-applies it and resets a scaled-out pool, most likely mid-incident,
+  # since that is when people deploy (crates/arch-conformance/tests/deploy_scaling.rs).
   selector:
     matchLabels:
       app.kubernetes.io/name: api-server
@@ -43,6 +45,21 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      # Keep API replicas off detection's nodes where the scheduler can. The
+      # 2026-09-07 load test measured the fast path at 250ms with the API idle
+      # and 1.000s — exactly the §6 budget — with API load co-resident, all of
+      # it queue wait. An HPA adding API pods is what creates that neighbour, so
+      # the pods it adds should land elsewhere. Preferred, not required: on a
+      # cluster too small to separate them, serving the API still wins.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: detection
       containers:
         - name: server
           image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/server:latest
@@ -110,6 +127,19 @@ spec:
               cpu: "1"
               memory: 512Mi
 ---
+# CPU is the scaling input, and deliberately the only one.
+#
+# What an API pod runs short of is its own compute: JWT verification, policy
+# evaluation, serialization. Its I/O waits on intelligence and event-store, and
+# more API replicas do not make those faster — they send them more concurrent
+# load. So there is no latency input: when intelligence is slow, a latency-driven
+# HPA would add pods that make it slower.
+#
+# No qps input yet, for lack of a number rather than a signal: a per-pod qps
+# target is a claim about how much one pod serves, and the only measurement
+# (2026-09-07, 100 qps, five services and the generator sharing one laptop) is
+# explicitly not a capacity claim. Add `http_requests_total` as a Pods metric
+# once the Epic D staging run has measured per-pod throughput.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -128,6 +158,17 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+  # Scale-down removes one pod every two minutes. Every WebSocket client on a
+  # removed pod reconnects at once to the survivors, so pacing removals caps
+  # that reconnect storm at one pod's share. Scale-up keeps the aggressive
+  # default: an API short of pods is failing requests now.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

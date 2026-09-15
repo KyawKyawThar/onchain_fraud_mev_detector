@@ -865,3 +865,120 @@ groups:
         annotations:
           summary: "Nothing is reporting on backups"
           description: "No `backup_artifact_age_seconds` series is being scraped at all. This is the failure mode a CronJob-based backup cannot report on itself and the reason the agent is a long-running Deployment: a job that was deleted, scaled to zero, or never deployed produces no metric, which looks identical on a dashboard to a healthy one. Until this clears, every other rule in this group is silent — there is no evidence either way about whether the platform can be recovered."
+
+  # ── Simulation autoscaling (Epic D; §7, §20) ──────────────────────────────
+  #
+  # The worker pool scales on the backpressure signal §7 designed for it, not
+  # on CPU alone. The HPA (deploy/k8s/base/services/simulation.yaml) reads the
+  # recording rule below through prometheus-adapter (deploy/k8s/cluster/).
+  #
+  # Nothing here is a literal. The unit is `simulation_worker_job_capacity` —
+  # workers x prefetch, the bound each replica already declares — so the
+  # scaling point is an EXPORTED GAUGE (category 2): retune the prefetch and
+  # the autoscaler follows. ready + unacked, not ready alone: RabbitMQ only
+  # holds a message ready once every consumer's prefetch window is full, so
+  # (ready + unacked) / capacity is the number of replicas needed to hold the
+  # whole queue inside declared bounds. Against an HPA AverageValue of 1 that
+  # exceeds the current count exactly when backpressure has engaged — ready
+  # alone would ask for fewer replicas than are already working the backlog.
+  #
+  # `min` capacity: mid-rollout of a prefetch change, err toward more replicas
+  # (the same direction the HPA fails when this series is missing — it holds
+  # and never scales down on a metric it cannot read).
+  - name: mevwatch-simulation-autoscaling
+    rules:
+      - record: simulation:sim_jobs_replicas_demanded
+        expr: |
+          (
+              sum(rabbitmq_queue_messages_ready{queue="sim.jobs"})
+            + sum(rabbitmq_queue_messages_unacked{queue="sim.jobs"})
+          ) / min(simulation_worker_job_capacity)
+
+      # STRUCTURAL: two series that contradict each other. Demand above the
+      # replicas actually reporting, by more than the HPA's own 10% tolerance,
+      # is a state the autoscaler exists to remove. It reacts within a sync
+      # period plus pod start (the worker's startup budget is 150s), so 15m of
+      # it is not lag — it is the autoscaler unable or not permitted to act.
+      - alert: SimulationBacklogOutgrowingWorkers
+        expr: |
+          simulation:sim_jobs_replicas_demanded
+            > 1.1 * count(simulation_worker_job_capacity)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sim.jobs needs more worker replicas than are running"
+          description: "simulation:sim_jobs_replicas_demanded ((ready + unacked) / per-replica job capacity) has exceeded the number of worker replicas reporting capacity for 15m. Incident confirmation is falling behind the fast path. `kubectl -n mev describe hpa simulation-worker` names which: ScalingLimited = at maxReplicas (raise it in the overlay — this is capacity, not a fault); FailedGetExternalMetric = the adapter or Prometheus cannot serve the signal; replicas desired but pods Pending = the cluster has no room for a 1-CPU worker. Nothing is lost while this fires — jobs wait in a durable quorum queue — but a backlog older than the reorg window simulates blocks the dispatcher may already have retracted."
+
+      - alert: SimulationQueueSignalDown
+        expr: up{job="rabbitmq"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ's metrics endpoint is not being scraped"
+          description: "The `rabbitmq` scrape target (:15692, /metrics/per-object) has been down for 5m. sim.jobs depth is the simulation worker autoscaler's input, so the HPA is running on CPU alone and will not scale down: it holds replicas rather than act on a metric it cannot read. The simulation dashboard's queue panels and SimulationBacklogOutgrowingWorkers are blind for the same reason. Check the broker pod and that the rabbitmq_prometheus plugin is still enabled."
+
+      # STRUCTURAL: a count that is zero while the pool can still grow. The
+      # dispatcher is refused only once sim.jobs holds its byte bound
+      # (RABBITMQ_SIM_MAX_LENGTH_BYTES), and the bound is hundreds of times the
+      # pool's in-flight capacity at maxReplicas, so a sustained rate means the
+      # autoscaler is already pinned. Nothing is lost: each refused alert stays
+      # uncommitted on Kafka and is retried.
+      - alert: SimulationQueueAtBound
+        expr: sum(increase(simulation_dispatch_rejected_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sim.jobs is full; the simulation backlog has moved to Kafka"
+          description: "The dispatcher's publishes are being nacked because sim.jobs is at its length bound (x-overflow=reject-publish). Each refused alert is left uncommitted and retried, so the backlog now shows as consumer lag on the dispatcher group rather than queue depth. No alert is lost, but incident confirmation is capped by the worker pool. Check SimulationBacklogOutgrowingWorkers and `kubectl -n mev describe hpa simulation-worker` (ScalingLimited = raise maxReplicas in the overlay). Raising the bound only delays this; it does not add capacity."
+
+      # STRUCTURAL: a count that should be zero. Each overrun is resolve or revm
+      # work thrown away and requeued, and x-delivery-limit dead-letters a job
+      # that overruns on every delivery.
+      - alert: SimulationJobsMissingDeadline
+        expr: sum by (stage) (increase(simulation_jobs_deadline_exceeded_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Simulation jobs are running past SIMULATION_JOB_DEADLINE_SECS ({{ $labels.stage }})"
+          description: "Jobs are being requeued because they exceeded the per-job deadline. stage=\"resolve\": the resolver (the RPC fork) is slow or hanging. stage=\"simulate\": revm is slow, either overloaded workers (check CPU against the HPA's 70% target) or bundles near the gas caps. Every overrun is wasted work, and a job that overruns on each of its x-delivery-limit deliveries lands in sim.jobs.dlq. Do not raise the deadline without raising terminationGracePeriodSeconds; crates/simulation/tests/grace_period.rs enforces the relationship."
+
+      # PUBLISHED CLAIM of the grace-period budget: it assumes a simulation stops
+      # at most worker::DEADLINE_OVERSHOOT_ALLOWANCE (5s) after its deadline. The
+      # deadline is checked between transactions, so the overshoot is one
+      # transaction's run time, and this is the measurement of that assumption.
+      # Above it, a draining worker can be SIGKILLed before its job settles.
+      # 5.0 is a latency-ladder boundary.
+      - alert: SimulationDeadlineOvershootAboveAllowance
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(simulation_job_deadline_overshoot_seconds_bucket[1h])) by (le)
+          ) > 5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "One transaction past the deadline takes longer than the grace budget allows"
+          description: "simulation_job_deadline_overshoot_seconds p99 is above the 5s DEADLINE_OVERSHOOT_ALLOWANCE that terminationGracePeriodSeconds is derived from. A single transaction is running for more than 5s after its job's deadline, so a worker drained during such a job can be killed before it settles, redelivering it into another full run. Lower SIMULATION_PER_TX_GAS (it bounds one transaction's run time), or raise the allowance and the grace period together; tests/grace_period.rs checks the sum."
+
+  # ── Event delivery (event-bus) ─────────────────────────────────────────────
+  - name: mevwatch-event-delivery
+    rules:
+      # STRUCTURAL: a count that should be zero. A permanent publish failure is
+      # an event the platform built and can never encode, a bug in our own
+      # types, and it fails identically on every retry. Consumers skip and
+      # dead-letter the record, and fire-and-forget producers drop the event, so
+      # this counter is the only place the loss is visible. Shutdown
+      # abandonments are the normal cost of drains and are deliberately not
+      # alerted on here.
+      - alert: EventPublishPermanentlyAbandoned
+        expr: sum by (event_type) (increase(event_publish_abandoned_total{reason="permanent"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.event_type }} events cannot be encoded and are being dropped"
+          description: "event_publish_abandoned_total{reason=\"permanent\"} is rising for {{ $labels.event_type }}: publish_resilient hit an encode failure, which retrying cannot fix. Consumer-side, the triggering record was skipped and parked on its DLQ (replay after the fix). Producer-side (ingestion, predictive, drain_to_backbone), the event is gone. Look for EventError in the service's logs; the usual cause is a schema_version the running build does not support."

@@ -60,8 +60,12 @@ spec:
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: observability
     spec:
+      # `nobody` by name in the image; the kubelet needs a numeric uid to honour
+      # runAsNonRoot (see infra/prometheus.yaml).
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
         seccompProfile:
           type: RuntimeDefault
       containers:

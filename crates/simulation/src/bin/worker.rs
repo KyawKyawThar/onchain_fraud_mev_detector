@@ -38,12 +38,14 @@ async fn run(cfg: Config) -> Result<()> {
         &[("chain", cfg.chain.metrics_label())],
     )
     .context("starting the metrics exporter")?;
+    simulation::metrics::record_job_capacity(cfg.worker.capacity);
 
     tracing::info!(
         chain = cfg.chain.id(),
         queue = %cfg.rabbitmq.queue,
-        workers = cfg.worker.workers,
-        prefetch = cfg.worker.prefetch,
+        workers = cfg.worker.capacity.workers(),
+        prefetch = cfg.worker.capacity.prefetch(),
+        job_deadline = ?cfg.worker.job_deadline,
         "starting simulation worker pool"
     );
 
@@ -112,16 +114,20 @@ async fn run(cfg: Config) -> Result<()> {
         event_sink,
         shutdown.clone(),
         cfg.worker.eth_usd_price,
-    );
+    )
+    .with_job_deadline(cfg.worker.job_deadline);
 
     // One competing consumer per worker slot: each opens its own consume channel
     // over the *same* queue, so the broker load-balances jobs across them.
-    let mut handles = Vec::with_capacity(cfg.worker.workers);
-    for slot in 0..cfg.worker.workers {
-        let source =
-            RabbitJobSource::connect(&cfg.rabbitmq.url, &cfg.rabbitmq.queue, cfg.worker.prefetch)
-                .await
-                .with_context(|| format!("connecting consumer slot {slot}"))?;
+    let mut handles = Vec::with_capacity(cfg.worker.capacity.workers());
+    for slot in 0..cfg.worker.capacity.workers() {
+        let source = RabbitJobSource::connect(
+            &cfg.rabbitmq.url,
+            &cfg.rabbitmq.queue,
+            cfg.worker.capacity.prefetch(),
+        )
+        .await
+        .with_context(|| format!("connecting consumer slot {slot}"))?;
         let worker = worker.clone();
         handles.push(tokio::spawn(async move { worker.run(source).await }));
     }

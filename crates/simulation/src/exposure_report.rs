@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use event_bus::usage::UsageFact;
+use event_bus::AcceptLoss;
 use event_bus::EventSink;
 use events::simulation::WalletExposureReportReady;
 use events::system::UsageEventType;
@@ -85,6 +86,9 @@ fn headline(summary: &MevExposureSummary) -> String {
 enum WalletOutcome {
     Published,
     ExposureFetchFailed,
+    /// The report was built but did not reach the broker (shutdown, or it can
+    /// never be encoded). Counted as failed for the cycle.
+    PublishAbandoned,
 }
 
 /// What one [`run_cycle`] call did — logged by the caller (`bin/projection.rs`)
@@ -136,18 +140,28 @@ async fn process_wallet(
         headline,
         summary: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
     };
-    event_bus::publish_resilient(
+    if let Err(undelivered) = event_bus::publish_resilient(
         sink,
         EventEnvelope::new(wallet.chain, DomainEvent::WalletExposureReportReady(event)),
         backoff,
         shutdown,
     )
-    .await;
+    .await
+    {
+        tracing::warn!(
+            %undelivered,
+            owner = %wallet.owner,
+            address = %wallet.address,
+            "exposure report not delivered; counting the wallet as failed this cycle"
+        );
+        return WalletOutcome::PublishAbandoned;
+    }
 
     UsageFact::new(UsageEventType::WalletMonitored, 1)
         .for_customer(wallet.owner)
         .record(sink, wallet.chain, backoff, shutdown)
-        .await;
+        .await
+        .accept_loss("usage metering is approximate by design (§13)");
 
     WalletOutcome::Published
 }
@@ -197,7 +211,9 @@ pub async fn run_cycle(
         for outcome in outcomes {
             match outcome {
                 WalletOutcome::Published => stats.wallets_published += 1,
-                WalletOutcome::ExposureFetchFailed => stats.wallets_failed += 1,
+                WalletOutcome::ExposureFetchFailed | WalletOutcome::PublishAbandoned => {
+                    stats.wallets_failed += 1
+                }
             }
         }
 

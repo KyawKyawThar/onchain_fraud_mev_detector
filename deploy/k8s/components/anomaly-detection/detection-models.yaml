@@ -31,10 +31,13 @@ spec:
           volumeMounts:
             - name: models
               mountPath: /mnt/models
+          # requests == limits: QoS is computed over init containers too, so a
+          # Burstable init container would demote the whole pod (see below).
+          # A pod reserves max(init, sum of app containers), so this adds nothing.
           resources:
             requests:
-              cpu: 50m
-              memory: 32Mi
+              cpu: 250m
+              memory: 128Mi
             limits:
               cpu: 250m
               memory: 128Mi
@@ -62,10 +65,15 @@ spec:
           # ONNX session pool (`sessions` in anomaly.json): sessions are small
           # for tree ensembles but not free, and the pool exists so inference
           # doesn't serialise the fan-out.
+          #
+          # requests == limits, preserving base detection's Guaranteed QoS
+          # (services/detection.yaml): a patch that raised only the limits would
+          # quietly demote the ML-enabled detector to Burstable, the class that
+          # loses CPU to autoscaled neighbours.
           resources:
             requests:
-              cpu: "1"
-              memory: 512Mi
+              cpu: "3"
+              memory: 2Gi
             limits:
               cpu: "3"
               memory: 2Gi
