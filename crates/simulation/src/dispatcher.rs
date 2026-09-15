@@ -305,8 +305,8 @@ mod tests {
     #[tokio::test]
     async fn process_skips_a_poison_job_that_can_never_be_queued() {
         /// A sink whose every publish is a *permanent* failure — the same outcome
-        /// an encode bug would have. It must be skipped (committed), not retried
-        /// forever, even though we are not shutting down.
+        /// an encode bug would have. It must be skipped (parked on the DLQ, then
+        /// committed), not retried forever, even though we are not shutting down.
         #[derive(Default)]
         struct PoisonSink;
         #[async_trait]
@@ -327,13 +327,48 @@ mod tests {
             CancellationToken::new(),
         );
 
-        assert_eq!(
-            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
-            Handled::Commit,
-            "a job that can never be queued is skipped, not retried forever"
+        assert!(
+            matches!(
+                dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+                Handled::Skip { .. }
+            ),
+            "a job that can never be queued is skipped (and dead-lettered), not retried forever"
         );
         // No audit fact for a job that was never queued.
         assert!(events.events.lock().unwrap().is_empty());
+    }
+
+    /// A full `sim.jobs` (the broker nacks under `x-overflow: reject-publish`) is a
+    /// `Retry`, attempted once. `run_consumer` re-fetches the record after the
+    /// backoff and keeps polling, so the backlog waits on Kafka. Spinning inside
+    /// the handler instead would stop the consumer polling and get it evicted
+    /// from its group.
+    #[tokio::test]
+    async fn a_full_work_queue_retries_the_alert_from_kafka() {
+        #[derive(Default)]
+        struct FullQueue(Mutex<u32>);
+        #[async_trait]
+        impl JobSink for FullQueue {
+            async fn publish(&self, _job: &SimulationJob) -> Result<(), JobError> {
+                *self.0.lock().unwrap() += 1;
+                Err(JobError::Rejected)
+            }
+        }
+
+        let jobs = Arc::new(FullQueue::default());
+        let events = Arc::new(RecordingEventSink::default());
+        let dispatcher = Dispatcher::new(jobs.clone(), events.clone(), CancellationToken::new());
+
+        assert_eq!(
+            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+            Handled::Retry,
+            "a full queue leaves the alert uncommitted for Kafka to redeliver"
+        );
+        assert_eq!(*jobs.0.lock().unwrap(), 1, "one attempt, no inline spin");
+        assert!(
+            events.events.lock().unwrap().is_empty(),
+            "no audit fact for a job that was not queued"
+        );
     }
 
     #[tokio::test]
