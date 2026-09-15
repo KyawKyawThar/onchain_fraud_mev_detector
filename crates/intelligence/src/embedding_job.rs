@@ -659,6 +659,9 @@ impl Embedder {
         }
 
         let mut to_write = Vec::with_capacity(vectors.len());
+        // Parallel to `to_write`: whether that write is a pure refresh, which
+        // announces the digest without re-publishing the unchanged vector.
+        let mut refresh_only = Vec::with_capacity(vectors.len());
         for vector in vectors {
             let decision = decide_write(
                 previous.get(&(vector.embedding_version(), vector.address)),
@@ -677,6 +680,7 @@ impl Embedder {
                 if vector.observations_truncated {
                     metrics::counter!(EMBEDDINGS_TRUNCATED_TOTAL).increment(1);
                 }
+                refresh_only.push(matches!(decision, WriteDecision::Refresh));
                 to_write.push(vector.clone());
             } else {
                 report.skipped += 1;
@@ -691,8 +695,17 @@ impl Embedder {
         self.embeddings.append(self.chain, &to_write).await?;
         report.written = to_write.len();
 
-        for vector in &to_write {
-            self.publish(DomainEvent::AddressEmbeddingUpdated(vector.to_event()))
+        for (vector, refresh) in to_write.iter().zip(&refresh_only) {
+            // The store row is written either way (it is what keeps
+            // `computed_at` honest); only the announcement slims. An unchanged
+            // vector's values are already in the event store under the same
+            // digest, so repeating them adds bytes and no fact.
+            let event = if *refresh {
+                vector.to_refresh_event()
+            } else {
+                vector.to_event()
+            };
+            self.publish(DomainEvent::AddressEmbeddingUpdated(event))
                 .await?;
         }
         Ok(report)

@@ -24,6 +24,9 @@ pub mod copilot;
 pub mod cross_chain;
 pub mod detection;
 pub mod intelligence;
+/// Where a keyed record lands on a topic — shared by the producer's partitioner
+/// and the capacity plan.
+pub mod partitioning;
 pub mod predictive;
 pub mod primitives;
 pub mod rule_engine;

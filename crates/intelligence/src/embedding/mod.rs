@@ -370,7 +370,8 @@ impl BehaviorVector {
             .collect()
     }
 
-    /// The wire form (§20.3) — the vector plus its bounded explanation.
+    /// The wire form (§20.3) — the vector plus its bounded explanation, and the
+    /// digest a later refresh of the same content will point back at.
     pub fn to_event(&self) -> AddressEmbeddingUpdated {
         AddressEmbeddingUpdated {
             address: self.address,
@@ -378,9 +379,41 @@ impl BehaviorVector {
             embedding_version: self.schema.version().to_owned(),
             schema_hash: self.schema.content_hash().to_owned(),
             vector: self.values.clone(),
+            content_digest: Some(self.content_digest_hex()),
             top_factors: self.top_factors(MAX_VISIBLE_FACTORS),
             observations_truncated: self.observations_truncated,
         }
+    }
+
+    /// The refresh form: the same identity and digest, **without the vector or
+    /// its factors**.
+    ///
+    /// Published when nothing moved and the stored vector merely aged past the
+    /// refresh floor. The values are identical to the ones the last full event
+    /// carried (equal digests are equal vectors), so repeating them wrote the
+    /// same ~1.3 KB into the event store for every active address, every day —
+    /// 60% of the store in the capacity plan. The digest is what keeps the
+    /// history complete: the earlier event with that digest holds the values.
+    pub fn to_refresh_event(&self) -> AddressEmbeddingUpdated {
+        AddressEmbeddingUpdated {
+            vector: Vec::new(),
+            top_factors: Vec::new(),
+            ..self.to_event()
+        }
+    }
+
+    /// [`content_digest`] of this vector, rendered as 16 hex digits.
+    pub fn content_digest_hex(&self) -> String {
+        format!(
+            "{:016x}",
+            content_digest(
+                &self.address,
+                self.schema.version(),
+                self.schema.content_hash(),
+                self.observations_truncated,
+                &self.values,
+            )
+        )
     }
 }
 

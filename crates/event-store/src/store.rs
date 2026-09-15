@@ -8,6 +8,7 @@ use events::primitives::{AccountAddress, Chain};
 use events::{DomainEvent, EventEnvelope};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::ClickhouseConfig;
@@ -79,31 +80,92 @@ impl EventStore {
     ///
     /// At-least-once by design — callers commit their source offset only *after*
     /// this returns, so a crash mid-append re-delivers rather than loses (§4).
-    #[tracing::instrument(skip_all, fields(rows = envelopes.len()))]
+    /// The encode step runs first and whole: an envelope that cannot be encoded
+    /// fails the call before any row is sent.
     pub async fn append_batch(&self, envelopes: &[EventEnvelope]) -> Result<(), StoreError> {
-        if envelopes.is_empty() {
+        let rows = match envelopes
+            .iter()
+            .map(EventRow::try_from)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                let err = StoreError::Encode(err);
+                crate::metrics::record_append_error(std::time::Duration::ZERO, &err);
+                return Err(err);
+            }
+        };
+        self.append_rows(&rows).await
+    }
+
+    /// Append already-encoded rows — **the one write path**. The HTTP API goes
+    /// through [`Self::append_batch`], and the Kafka ingest encodes per record
+    /// (so one bad envelope is dead-lettered alone) and flushes here.
+    ///
+    /// Idempotent under retry, in two layers. The insert carries an
+    /// `insert_deduplication_token` derived from the batch's event ids
+    /// ([`dedup_token`]), so an exact retry of a batch — the batch loop's
+    /// transient-failure path, a redelivery of the same batch — is refused at
+    /// insert time. A redelivery that forms a *different* batch still lands its
+    /// duplicates, and those collapse under the table's `ReplacingMergeTree`
+    /// key; reads dedupe by `event_id` meanwhile (`query`).
+    #[tracing::instrument(skip_all, fields(rows = rows.len()))]
+    pub async fn append_rows(&self, rows: &[EventRow]) -> Result<(), StoreError> {
+        if rows.is_empty() {
             return Ok(());
         }
-
         let started = std::time::Instant::now();
-        let result = self.append_batch_inner(envelopes).await;
+        let result = self.insert_rows(rows).await;
         match &result {
-            Ok(()) => crate::metrics::record_append_success(started.elapsed(), envelopes.len()),
+            Ok(()) => crate::metrics::record_append_success(started.elapsed(), rows),
             Err(err) => crate::metrics::record_append_error(started.elapsed(), err),
         }
         result
     }
 
-    async fn append_batch_inner(&self, envelopes: &[EventEnvelope]) -> Result<(), StoreError> {
-        let mut insert = self.client.insert::<EventRow>("events").await?;
-        for envelope in envelopes {
-            // Encode failures are permanent (`StoreError::Encode`); I/O failures
-            // from `write`/`end` are transient (`StoreError::Clickhouse`).
-            insert.write(&EventRow::try_from(envelope)?).await?;
+    async fn insert_rows(&self, rows: &[EventRow]) -> Result<(), StoreError> {
+        let mut insert = self
+            .client
+            .insert::<EventRow>(TABLE)
+            .await?
+            .with_setting(DEDUP_TOKEN_SETTING, dedup_token(rows));
+        for row in rows {
+            // I/O failures from `write`/`end` are transient (`StoreError::Clickhouse`).
+            insert.write(row).await?;
         }
         insert.end().await?;
         Ok(())
     }
+}
+
+/// The table every write lands in. Named once: the repartition, tiering and
+/// retention modules all address it.
+pub const TABLE: &str = "events";
+
+/// The ClickHouse setting that makes an insert idempotent within the table's
+/// `non_replicated_deduplication_window` (`replicated_deduplication_window` on a
+/// replicated table).
+const DEDUP_TOKEN_SETTING: &str = "insert_deduplication_token";
+
+/// The deduplication token for one insert: SHA-256 over the batch's event ids,
+/// **sorted**, so the same set of events is the same token however a retry or a
+/// redelivery happened to order it.
+///
+/// SHA-256 rather than a `std` hasher because the token must be identical
+/// across processes and builds — a retry after a deploy is exactly the case it
+/// exists for, and `DefaultHasher` makes no stability promise across versions.
+pub fn dedup_token(rows: &[EventRow]) -> String {
+    let mut ids: Vec<[u8; 16]> = rows.iter().map(|row| *row.event_id.as_bytes()).collect();
+    ids.sort_unstable();
+    let mut hasher = Sha256::new();
+    for id in &ids {
+        hasher.update(id);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Canonical stored form of an on-chain address: lowercase `0x`-hex. The write
@@ -247,6 +309,20 @@ mod tests {
                 trace_available: true,
             }),
         )
+    }
+
+    /// A retry that reorders the batch must still be recognised as the same
+    /// insert, and a batch with one different event must not be.
+    #[test]
+    fn the_dedup_token_is_order_independent_and_set_sensitive() {
+        let a = EventRow::try_from(&sample_envelope()).unwrap();
+        let b = EventRow::try_from(&sample_envelope()).unwrap();
+        let c = EventRow::try_from(&sample_envelope()).unwrap();
+        let forward = dedup_token(&[a.clone(), b.clone()]);
+        let backward = dedup_token(&[b.clone(), a.clone()]);
+        assert_eq!(forward, backward);
+        assert_ne!(forward, dedup_token(&[a, c]));
+        assert_eq!(forward.len(), 64, "hex SHA-256");
     }
 
     #[test]

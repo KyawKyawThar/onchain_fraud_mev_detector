@@ -26,6 +26,7 @@ resources:
   - services/ingestion.yaml
   - services/detection.yaml
   - services/event-store.yaml
+  - services/event-store-repartition.yaml
   - services/simulation.yaml
   - services/intelligence.yaml
   - services/rule-engine.yaml

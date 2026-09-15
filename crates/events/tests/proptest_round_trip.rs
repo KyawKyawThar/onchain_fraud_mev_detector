@@ -553,6 +553,9 @@ fn intelligence_event() -> impl Strategy<Value = DomainEvent> {
                         embedding_version,
                         schema_hash,
                         vector,
+                        // A refresh omits the vector and factors but keeps the
+                        // digest; an older event has neither. Both must round-trip.
+                        content_digest: None,
                         top_factors,
                         observations_truncated,
                     })

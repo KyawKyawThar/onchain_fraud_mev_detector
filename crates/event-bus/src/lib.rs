@@ -134,9 +134,33 @@ pub trait EventSink: Send + Sync {
     async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError>;
 }
 
+/// How long a topic's partition count is trusted before it is re-read. A
+/// partition increase is rare and deliberate; this is how long a producer may
+/// keep placing records by the old count afterwards.
+const PARTITION_COUNT_TTL: Duration = Duration::from_secs(300);
+/// Ceiling on one metadata round trip.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The production [`EventSink`]: a librdkafka [`FutureProducer`].
+///
+/// **The sink chooses the partition**, through
+/// [`events::partitioning::partition_for_key`], rather than leaving it to
+/// librdkafka's hash. Under the hash, Ethereum's and Base's chain keys shared
+/// one partition of three, so every chain-keyed topic ran on one partition —
+/// and which chains collide is an accident that changes with the count. Chains
+/// now occupy registered slots, and business keys keep exactly the CRC-32
+/// placement librdkafka gave them.
+///
+/// rdkafka 0.39's `FutureProducer` cannot carry a custom partitioner (its
+/// internal context does not forward one), so the choice is made here: the
+/// topic's partition count comes from broker metadata, cached per topic for
+/// [`PARTITION_COUNT_TTL`], and the record is sent to an explicit partition. A
+/// metadata failure is a transient delivery error — [`publish_resilient`]
+/// retries it — never a silent fallback to the hash.
 pub struct KafkaEventSink {
     producer: FutureProducer,
+    partition_counts:
+        std::sync::RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
 }
 
 impl KafkaEventSink {
@@ -153,7 +177,56 @@ impl KafkaEventSink {
             .set("message.timeout.ms", "30000")
             .create()
             .context("creating Kafka producer")?;
-        Ok(Self { producer })
+        Ok(Self {
+            producer,
+            partition_counts: std::sync::RwLock::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// `topic`'s partition count: cached, or read from broker metadata.
+    async fn partition_count(&self, topic: &str) -> Result<u32, PublishError> {
+        let cached = self
+            .partition_counts
+            .read()
+            .ok()
+            .and_then(|counts| counts.get(topic).copied());
+        if let Some((count, read_at)) = cached {
+            if read_at.elapsed() < PARTITION_COUNT_TTL {
+                return Ok(count);
+            }
+        }
+
+        // `fetch_metadata` blocks for up to its timeout, so it runs off the
+        // async workers. Rare: once per topic per TTL.
+        let producer = self.producer.clone();
+        let name = topic.to_owned();
+        let count = tokio::task::spawn_blocking(move || -> Result<u32, String> {
+            use rdkafka::producer::Producer;
+            let metadata = producer
+                .client()
+                .fetch_metadata(Some(&name), METADATA_TIMEOUT)
+                .map_err(|err| format!("reading metadata for {name}: {err}"))?;
+            let described = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == name)
+                .ok_or_else(|| format!("the broker returned no metadata for {name}"))?;
+            if let Some(err) = described.error() {
+                return Err(format!("{name}: {err:?}"));
+            }
+            match described.partitions().len() {
+                0 => Err(format!("{name} has no partitions yet")),
+                n => Ok(n as u32),
+            }
+        })
+        .await
+        .map_err(|err| PublishError::Delivery(err.to_string()))?
+        .map_err(PublishError::Delivery)?;
+
+        if let Ok(mut counts) = self.partition_counts.write() {
+            counts.insert(topic.to_owned(), (count, std::time::Instant::now()));
+        }
+        Ok(count)
     }
 }
 
@@ -170,8 +243,14 @@ impl EventSink for KafkaEventSink {
         let key = envelope.partition_key().to_string();
         let payload = envelope.to_json_vec()?; // EventError → PublishError::Encode
         let headers = trace_headers();
+        let partition = events::partitioning::partition_for_key(
+            key.as_bytes(),
+            self.partition_count(&topic).await?,
+        );
 
         let record = FutureRecord::to(&topic)
+            // `u32` from a count that came from a `usize`; always fits `i32`.
+            .partition(partition as i32)
             .key(&key)
             .payload(&payload)
             .headers(headers);

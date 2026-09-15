@@ -30,6 +30,14 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0003_events_retention.up.sql"),
         down: include_str!("../migrations/0003_events_retention.down.sql"),
     },
+    // The capacity plan's replacement definition (readiness Epic D). DDL only:
+    // `crate::repartition` puts it in place — at boot when that moves no data,
+    // through the `repartition run` Job when it does.
+    Migration {
+        version: "0004_create_events_next",
+        up: include_str!("../migrations/0004_create_events_next.up.sql"),
+        down: include_str!("../migrations/0004_create_events_next.down.sql"),
+    },
 ];
 
 /// The event store's migrator: applied on service boot via

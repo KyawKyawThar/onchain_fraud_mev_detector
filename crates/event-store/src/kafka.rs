@@ -2,19 +2,40 @@
 //! domain-event topic, deserializes each envelope, and appends it — continuing
 //! the producer's distributed trace across the broker boundary.
 //!
-//! Delivery is at-least-once: the source offset is committed only *after* a
-//! successful append, so a crash re-delivers rather than drops (the audit log
-//! must never lose an event). A malformed message is the one thing we commit
-//! *without* storing — logged loudly and skipped, so one poison record can't
-//! wedge the whole stream. A real dead-letter topic is a follow-up.
+//! **Batched.** Built on the shared micro-batching loop
+//! (`event_bus::batch`), not the per-record one. Every ClickHouse insert is an
+//! on-disk part, and the capacity plan puts day-one ingest at ~77 events/s and
+//! the horizon at well over a thousand: one insert per event is a part per
+//! event, which ClickHouse first throttles and then refuses. Records accumulate
+//! to [`crate::config`]'s bounds (rows or wait, whichever first), flush as one
+//! insert, and only then commit their offsets.
+//!
+//! **Delivery is at-least-once and the write is idempotent.** A crash between
+//! flush and commit redelivers the batch; the insert's deduplication token and
+//! the table's `ReplacingMergeTree` key make that a no-op (see
+//! [`EventStore::append_rows`]).
+//!
+//! **Evidence is never dropped by this loop.** Two different failures, two
+//! different answers:
+//!
+//! * An envelope that cannot be *encoded* can never be stored. It is rejected in
+//!   `accept`, parked alone on `mev.dlq.event-store` with its bytes intact, and
+//!   committed — one bad record cannot wedge the stream, and it is replayable.
+//! * A *flush* that fails is always retried ([`IngestFlushError`] is transient
+//!   whatever the cause). The shared loop drops a batch on a permanent flush
+//!   error so a sink cannot wedge, and for a usage rollup that is right. For the
+//!   system of record it would mean committing offsets past events that were
+//!   never stored. So a flush that can never succeed wedges ingest instead, and
+//!   the wedge pages: `EventStoreAppendErrorsHigh`, and consumer lag.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use event_bus::batch::{run_batch_consumer, Accepted, BatchConfig, BatchHandler};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
-use event_bus::{run_consumer, EventHandler, Handled, Transience};
+use event_bus::Transience;
 use events::{EventEnvelope, TOPIC_PREFIX};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::consumer::StreamConsumer;
@@ -23,11 +44,7 @@ use rdkafka::ClientConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::KafkaConfig;
-use crate::store::EventStore;
-
-/// Back-off before retrying after a transient storage failure, so a ClickHouse
-/// blip doesn't hot-loop the consumer.
-const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+use crate::store::{EventRow, EventStore, StoreError};
 
 /// How long to wait for the admin *request* round-trip during provisioning.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -72,14 +89,15 @@ pub fn desired_topics(cfg: &KafkaConfig) -> Vec<TopicSpec> {
 /// topology is explicit and version-controlled instead of being conjured lazily
 /// by broker auto-create — which is off in production and would otherwise mint
 /// topics with whatever partition count *and unbounded retention* the broker
-/// happens to default to. Chain is the message key (§20), so events for one
-/// chain keep their order on a single partition.
+/// happens to default to. Chain-keyed records land on their chain's registered
+/// slot (`events::partitioning`), so a chain's events keep their order on one
+/// partition.
 ///
 /// Idempotent and safe to run on every boot: a topic that already exists is
 /// reported and skipped. It is deliberately *not* a reconciler — it never grows
-/// or shrinks the partitions of an existing topic (that reshuffles key→partition
-/// assignment and breaks per-chain ordering), nor does it alter the retention of
-/// one already created; both must be separate, deliberate operations.
+/// or shrinks the partitions of an existing topic (growing re-maps every
+/// business key, and shrinking is impossible), nor does it alter the retention
+/// of one already created; both must be separate, deliberate operations.
 pub async fn ensure_topics(cfg: &KafkaConfig) -> Result<()> {
     let admin: AdminClient<_> = ClientConfig::new()
         .set("bootstrap.servers", &cfg.brokers)
@@ -152,15 +170,15 @@ pub async fn ensure_topics(cfg: &KafkaConfig) -> Result<()> {
 }
 
 /// Build the consumer through the shared lag-reporting constructor (§19) —
-/// manual offset commit ties the commit to a successful append; `earliest`
+/// manual offset commit ties the commit to a successful flush; `earliest`
 /// means a fresh group back-fills the store from the start of retained history.
 pub fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer<LagReporting>> {
     build_reporting_consumer(&cfg.brokers, &cfg.group_id, "event-store")
 }
 
 /// Subscribe to the per-event-type topics and append every event until
-/// `shutdown` is cancelled, via the shared [`event_bus::run_consumer`] loop — the
-/// store supplies only its per-event decision ([`Ingest`]).
+/// `shutdown` is cancelled, via the shared batching loop — the store supplies
+/// only its two decisions ([`Ingest`]).
 ///
 /// Subscribes to the *explicit* schema-derived topic list ([`events::all_topics`]),
 /// the same source [`ensure_topics`] provisions from — not a `mev.events.*`
@@ -171,6 +189,7 @@ pub fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer<LagReporting>>
 pub async fn run(
     consumer: StreamConsumer<LagReporting>,
     store: EventStore,
+    batch: BatchConfig,
     dlq: Option<&DeadLetterQueue>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -178,54 +197,67 @@ pub async fn run(
     let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
     tracing::info!(
         topics = topics.len(),
+        max_rows = batch.max_items,
+        max_wait_ms = batch.max_wait.as_millis() as u64,
         "event-store ingesting {TOPIC_PREFIX}.* topics"
     );
-    run_consumer(
+    run_batch_consumer(
         consumer,
         &topic_refs,
         "event-store",
-        RETRY_BACKOFF,
-        dlq,
+        batch,
         Ingest { store },
+        dlq,
         &shutdown,
     )
     .await
 }
 
-/// The store's per-record decision: append the event, mapping the typed store
-/// outcome onto the offset action. A successful append or a *permanent* fault
-/// (bad input the append will always reject) commits — one poison record can't
-/// wedge the stream (the audit log records what it can and moves on) — while a
-/// *transient* fault (storage unreachable) retries without committing. Decode
-/// poison is skipped by the driver before it reaches here.
+/// A failed flush of the event-store ingest. **Always transient** — see the
+/// module docs: the system of record retries a flush until it lands or the
+/// process stops, and never commits past events it did not store.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct IngestFlushError(#[from] StoreError);
+
+impl Transience for IngestFlushError {
+    fn is_transient(&self) -> bool {
+        true
+    }
+}
+
+/// The store's decisions for the batching loop: per record, encode the row (an
+/// unencodable envelope is a permanent skip → DLQ); per batch, one idempotent
+/// insert.
 struct Ingest {
     store: EventStore,
 }
 
 #[async_trait]
-impl EventHandler for Ingest {
-    async fn handle(&self, envelope: EventEnvelope) -> Handled {
-        match self
-            .store
-            .append_batch(std::slice::from_ref(&envelope))
-            .await
-        {
-            Ok(()) => {
-                tracing::debug!(
-                    event_type = envelope.event_type(),
-                    "appended event from Kafka"
-                );
-                Handled::Commit
-            }
-            Err(err) if err.is_transient() => {
-                tracing::error!(error = %err, "append failed; will retry on redelivery");
-                Handled::Retry
-            }
+impl BatchHandler for Ingest {
+    type Item = EventRow;
+    type FlushError = IngestFlushError;
+
+    fn accept(&self, envelope: EventEnvelope) -> Accepted<EventRow> {
+        match EventRow::try_from(&envelope) {
+            Ok(row) => Accepted::Item(row),
             Err(err) => {
-                tracing::error!(error = %err, "skipping unprocessable event (committed, not stored)");
-                Handled::Commit
+                crate::metrics::record_ingest_rejected(envelope.event_type());
+                Accepted::Skip {
+                    error: format!(
+                        "encoding {} {} for the event store: {err}",
+                        envelope.event_type(),
+                        envelope.event_id
+                    ),
+                }
             }
         }
+    }
+
+    async fn flush(&self, rows: &[EventRow]) -> Result<(), IngestFlushError> {
+        self.store.append_rows(rows).await?;
+        tracing::debug!(rows = rows.len(), "event-store batch flushed");
+        Ok(())
     }
 }
 
@@ -266,5 +298,15 @@ mod tests {
             assert_eq!(spec.replication, cfg.topic_replication);
             assert_eq!(spec.retention_ms, cfg.retention_ms);
         }
+    }
+
+    /// The property the whole ingest design rests on: the batch loop drops a
+    /// batch only on a *permanent* flush error, and this one never is — even
+    /// when the store's own classification would say so.
+    #[test]
+    fn a_flush_failure_is_never_permanent_so_no_batch_of_evidence_is_dropped() {
+        let encode = StoreError::Encode(serde_json::from_str::<()>("not json").unwrap_err());
+        assert!(!encode.is_transient(), "the store calls this permanent");
+        assert!(IngestFlushError::from(encode).is_transient());
     }
 }

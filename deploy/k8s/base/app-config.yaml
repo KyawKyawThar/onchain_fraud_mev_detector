@@ -26,12 +26,27 @@ data:
 
   # ── Event backbone (Kafka, §2/§4) ─────────────────────────────
   KAFKA_BROKERS: kafka:9092
-  # Topic topology event-store provisions on boot (§20). Partitions cap
-  # per-chain parallelism (chain is the message key); replication is 1 while
-  # the broker is a single-node KRaft StatefulSet.
-  KAFKA_TOPIC_PARTITIONS: "3"
+  # Topic topology event-store provisions on boot (§20). Sized for the capacity
+  # plan's horizon, not today: a topic's count only grows, growing it re-maps
+  # every business key, and chains occupy registered slots
+  # (events::Chain::partition_slot) that stay put while the count exceeds them.
+  # Pinned to crates/capacity/model.json by test. Replication is 1 while the
+  # broker is a single-node KRaft StatefulSet.
+  KAFKA_TOPIC_PARTITIONS: "12"
   KAFKA_TOPIC_REPLICATION: "1"
   KAFKA_RETENTION_MS: "604800000"
+
+  # ── Event store ingest + storage (readiness Epic D capacity plan) ──
+  # Rows per ClickHouse insert, and how long a record may wait for its batch.
+  # Every insert is an on-disk part, so these two decide the insert rate the
+  # capacity plan gates. Pinned to crates/capacity/model.json by test.
+  EVENT_STORE_BATCH_MAX_ROWS: "10000"
+  EVENT_STORE_BATCH_MAX_WAIT_MS: "1000"
+  # Hot/cold tiering for the `events` table: all three, or none. Needs a server
+  # storage policy with that volume (deploy/clickhouse/storage-tiered.xml).
+  # EVENT_STORE_STORAGE_POLICY: tiered
+  # EVENT_STORE_COLD_VOLUME: cold
+  # EVENT_STORE_COLD_AFTER_DAYS: "90"
 
   # ── ClickHouse (event store + analytics, §14) ─────────────────
   # Credential-free HTTP base for the `clickhouse` Rust client; user/password/

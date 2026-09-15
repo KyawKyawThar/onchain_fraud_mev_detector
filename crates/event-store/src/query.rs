@@ -297,9 +297,16 @@ impl EventStore {
     /// Execute a built query: select the canonical columns, order by the keyset,
     /// and fetch one row past `limit` so we can tell whether another page exists
     /// without a second round-trip.
+    ///
+    /// `LIMIT 1 BY event_id` because ingest is at-least-once: a redelivered
+    /// event can sit in the table twice until a background merge collapses it,
+    /// and an audit trail that lists one event twice is a wrong answer to "what
+    /// happened". The copies are identical (an event is immutable), so which one
+    /// survives is irrelevant; the keyset order makes the choice deterministic.
     async fn run_paged(&self, conditions: Conditions, limit: u64) -> Result<EventPage, StoreError> {
         let sql = format!(
-            "SELECT {STORED_EVENT_COLUMNS} FROM events{} ORDER BY occurred_at, event_id LIMIT ?",
+            "SELECT {STORED_EVENT_COLUMNS} FROM events{} ORDER BY occurred_at, event_id \
+             LIMIT 1 BY event_id LIMIT ?",
             conditions.where_clause()
         );
 

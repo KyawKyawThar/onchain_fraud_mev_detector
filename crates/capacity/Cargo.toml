@@ -1,0 +1,40 @@
+[package]
+name = "capacity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The event store's capacity plan (readiness Epic D): partition counts, shard
+# counts and storage growth for an append-only store, priced before they are a
+# surprise.
+#
+# A model, not a probe. Every input is a committed file — the capacity profile
+# (`model.json`), the event schema corpus (real payload sizes) and the event
+# store's own migrations (the partition key actually deployed) — so a plan is
+# reproducible from a commit, and changing any of them re-runs the gate in an
+# ordinary `cargo test`. There is deliberately no store or broker client here
+# (arch-conformance pins that): a number read from a live cluster is a
+# measurement, and measurements enter the model as a reviewed edit to
+# `model.json` with their provenance, not as a side channel.
+
+[[bin]]
+name = "capacity"
+path = "src/main.rs"
+
+[dependencies]
+# Real envelopes from the schema corpus, decoded through the same reader
+# production uses, so a payload size is the size of what the store writes.
+events = { workspace = true }
+# The evidence window is the retention decision's, never a second number here
+# (engineering conventions §18).
+retention = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+
+[lints]
+workspace = true

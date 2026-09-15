@@ -51,6 +51,9 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+# The insert deduplication token (store::dedup_token): a digest that must be
+# identical across processes and builds, which `std`'s hashers do not promise.
+sha2.workspace = true
 
 # OpenAPI spec generation + Swagger UI for the append API. `utoipa-axum` keeps the
 # routes and the spec in sync (one `#[utoipa::path]` feeds both).

@@ -8,9 +8,10 @@
 //! (Epic A, `production_readiness.md`), tracked separately from this
 //! observability wire-up.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::store::StoreError;
+use crate::store::{EventRow, StoreError};
 
 /// Histogram: one `append_batch` call's wall-clock latency.
 pub const APPEND_DURATION_SECONDS: &str = "event_store_append_duration_seconds";
@@ -36,10 +37,48 @@ pub fn set_evidence_retention_days(days: u32) {
     metrics::gauge!(EVIDENCE_RETENTION_DAYS).set(f64::from(days));
 }
 
-/// Record a successful append of `rows` envelopes, including its latency.
-pub fn record_append_success(elapsed: Duration, rows: usize) {
+/// Counter (labeled `event_type`): `payload` bytes appended, uncompressed.
+///
+/// The measured side of the capacity plan. `crates/capacity` projects payload
+/// bytes per day from `model.json`, and `EventStoreGrowthAboveCapacityPlan`
+/// compares this counter's daily rate against that projection — the threshold
+/// is pinned to the model by a test, so the alert and the plan cannot drift.
+/// Labeled by event type (a closed set of ~40) so the dashboard answers *which*
+/// type outgrew its rate, which is the question the alert raises.
+pub const PAYLOAD_BYTES_APPENDED_TOTAL: &str = "event_store_appended_payload_bytes_total";
+
+/// Counter (labeled `event_type`): envelopes the Kafka ingest could not encode
+/// and parked on the DLQ. Any non-zero rate is a bug in the event types.
+pub const INGEST_REJECTED_TOTAL: &str = "event_store_ingest_rejected_total";
+
+/// Gauge: rows in an `events` table still on the pre-capacity-plan partition
+/// key, waiting for `event-store repartition run`. Zero once the table is
+/// current. `EventStoreRepartitionPending` fires on it.
+pub const REPARTITION_PENDING_ROWS: &str = "event_store_repartition_pending_rows";
+
+/// Record a successful append of `rows`, including its latency and the payload
+/// bytes it added per event type.
+pub fn record_append_success(elapsed: Duration, rows: &[EventRow]) {
     metrics::histogram!(APPEND_DURATION_SECONDS).record(elapsed.as_secs_f64());
-    metrics::counter!(ROWS_APPENDED_TOTAL).increment(rows as u64);
+    metrics::counter!(ROWS_APPENDED_TOTAL).increment(rows.len() as u64);
+    let mut bytes: BTreeMap<&str, u64> = BTreeMap::new();
+    for row in rows {
+        *bytes.entry(row.event_type.as_str()).or_default() += row.payload.len() as u64;
+    }
+    for (event_type, n) in bytes {
+        metrics::counter!(PAYLOAD_BYTES_APPENDED_TOTAL, "event_type" => event_type.to_owned())
+            .increment(n);
+    }
+}
+
+/// Record one envelope the ingest rejected before it reached a batch.
+pub fn record_ingest_rejected(event_type: &str) {
+    metrics::counter!(INGEST_REJECTED_TOTAL, "event_type" => event_type.to_owned()).increment(1);
+}
+
+/// Publish how many rows still wait for the repartition Job.
+pub fn set_repartition_pending_rows(rows: u64) {
+    metrics::gauge!(REPARTITION_PENDING_ROWS).set(rows as f64);
 }
 
 /// Record a failed append attempt, classified transient/permanent via
@@ -84,9 +123,31 @@ mod tests {
             .map(|(_, _, _, v)| v)
     }
 
+    fn rows(n: usize) -> Vec<EventRow> {
+        use alloy_primitives::B256;
+        use events::chain::BlockAssembled;
+        use events::primitives::{BlockRef, Chain};
+        use events::{DomainEvent, EventEnvelope};
+        (0..n)
+            .map(|_| {
+                EventRow::try_from(&EventEnvelope::new(
+                    Chain::ETHEREUM,
+                    DomainEvent::BlockAssembled(BlockAssembled {
+                        block: BlockRef::new(1, B256::repeat_byte(0xab)),
+                        tx_count: 1,
+                        trace_available: true,
+                    }),
+                ))
+                .unwrap()
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_success_records_latency_and_row_count() {
-        let series = captured(|| record_append_success(Duration::from_millis(3), 5));
+    fn a_success_records_latency_row_count_and_payload_bytes_by_type() {
+        let batch = rows(5);
+        let expected_bytes: u64 = batch.iter().map(|r| r.payload.len() as u64).sum();
+        let series = captured(|| record_append_success(Duration::from_millis(3), &batch));
         match value(&series, APPEND_DURATION_SECONDS) {
             Some(DebugValue::Histogram(samples)) => assert_eq!(samples.len(), 1),
             other => panic!("expected a histogram, got {other:?}"),
@@ -95,6 +156,14 @@ mod tests {
             Some(DebugValue::Counter(n)) => assert_eq!(*n, 5),
             other => panic!("expected a counter, got {other:?}"),
         }
+        let bytes = series
+            .iter()
+            .find(|(ck, _, _, _)| {
+                ck.key().name() == PAYLOAD_BYTES_APPENDED_TOTAL
+                    && ck.key().labels().any(|l| l.value() == "BlockAssembled")
+            })
+            .map(|(_, _, _, v)| v);
+        assert_eq!(bytes, Some(&DebugValue::Counter(expected_bytes)));
     }
 
     #[test]

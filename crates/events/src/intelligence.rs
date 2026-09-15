@@ -158,11 +158,18 @@ pub struct BehaviorFactor {
 /// (`embedding_version` + `schema_hash` are part of the output, so a reweight
 /// is a new value under a new key, never a silent change under an old one).
 ///
-/// The full `vector` rides along rather than only a "recomputed" notification:
-/// a consumer that only needs to react (the §20.3 clustering signal) then
-/// needs no second read, and one that wants history has it in the event store.
-/// Its length is fixed by the named schema version, so the payload is bounded
-/// by construction.
+/// The full `vector` rides along when the vector's content moved (new, changed,
+/// or re-schema'd): a consumer that only needs to react (the §20.3 clustering
+/// signal) then needs no second read, and one that wants history has it in the
+/// event store. Its length is fixed by the named schema version, so the
+/// payload is bounded by construction.
+///
+/// **A refresh carries no vector.** The embedding job republishes an unchanged
+/// vector once per refresh interval so `computed_at` stays meaningful, and at
+/// production scale those refreshes were most of the event store (the capacity
+/// plan: 60% of all storage). A refresh now sets only `content_digest`, which
+/// names the earlier event that carried the identical vector — the store still
+/// holds every distinct vector exactly once, and the history stays complete.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AddressEmbeddingUpdated {
@@ -176,10 +183,20 @@ pub struct AddressEmbeddingUpdated {
     /// so an accidental edit under an unchanged version name is detectable
     /// downstream, not just in the producing build.
     pub schema_hash: String,
-    /// The scaled feature values, in schema order.
+    /// The scaled feature values, in schema order. **Empty on a refresh** —
+    /// see the type docs; `content_digest` identifies the vector then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector: Vec<f32>,
+    /// Hex digest of what the vector says (address, version, schema, values,
+    /// truncation — never when it was computed). Equal digests are equal
+    /// vectors, so a refresh event points at the last event that carried the
+    /// values. Absent on events written before digests were published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
     /// The largest-magnitude features behind `vector`, bounded — the
-    /// explainable view (§8.3), not a second copy of the vector.
+    /// explainable view (§8.3), not a second copy of the vector. Empty on a
+    /// refresh, for the same reason as `vector`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub top_factors: Vec<BehaviorFactor>,
     /// The address's observation history hit the read cap: `vector` describes
     /// its most *recent* activity window rather than all of it (§8.2's

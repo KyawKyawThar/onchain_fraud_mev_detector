@@ -290,8 +290,7 @@ async fn stack() -> Stack {
     let clickhouse = Client::default()
         .with_url(format!("http://127.0.0.1:{ch_port}"))
         .with_database("default");
-    simulation::ch_migrate::MIGRATOR
-        .run(&clickhouse)
+    simulation::ch_migrate::migrate(&clickhouse)
         .await
         .expect("apply ClickHouse migrations");
 

@@ -743,7 +743,10 @@ impl Stageable for SimulationReadModel {
                     .map_err(|err| {
                         ModelError::wrap("creating the ClickHouse staging database", err)
                     })?;
-                ch_migrate::MIGRATOR.run(&client).await.map_err(|err| {
+                // `migrate`, not the bare migrator: the staging database is
+                // empty, so the capacity plan's table swap completes here and
+                // the rebuild promotes the current definition.
+                ch_migrate::migrate(&client).await.map_err(|err| {
                     ModelError::wrap(
                         "creating the staged analytics schema",
                         std::io::Error::other(err.to_string()),

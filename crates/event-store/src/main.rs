@@ -23,12 +23,17 @@
 //!     (engineering conventions §18). The boot path reconciles too, but takes
 //!     no `DestructiveIntent` and therefore *cannot* narrow a window, bind an
 //!     existing archive, or overwrite a clause it could not parse.
+//!   - `repartition` / `repartition run` / `repartition finalize
+//!     --i-understand-this-drops-the-retired-table` — plan, move, or finish the
+//!     capacity plan's table replacement (docs/runbooks/capacity-plan.md §5).
+//!     Boot completes it only when that moves no data.
 
 use anyhow::{bail, Context, Result};
+use ch_migrate::swap::SwapOutcome;
 use chrono::Utc;
 use clickhouse::Client;
 use event_store::retention::Reconciliation;
-use event_store::{config, http, kafka, migrate, retention, store};
+use event_store::{config, http, kafka, migrate, repartition, retention, store, tiering};
 // The shared crate, not this binary's `event_store::retention` module — the
 // `use` above binds that name, so the witness is reached by absolute path.
 use ::retention::DestructiveIntent;
@@ -59,8 +64,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("retention") => retention_cli(&cfg, &client, args.collect()).await,
+        Some("repartition") => repartition_cli(&client, args.collect()).await,
         Some(other) => bail!(
-            "unknown argument {other:?}; expected `migrate up|down|info`, `provision-topics`, `retention [apply [--i-understand-this-deletes-evidence]]`, or no args to run the service"
+            "unknown argument {other:?}; expected `migrate up|down|info`, `provision-topics`, `retention [apply [--i-understand-this-deletes-evidence]]`, `repartition [run | finalize --i-understand-this-drops-the-retired-table]`, or no args to run the service"
         ),
     }
 }
@@ -80,12 +86,20 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
         "event-store schema ready"
     );
 
+    // The capacity plan's table replacement. Before retention, because
+    // retention reconciles whichever table is `events` once this settles.
+    reconcile_repartition(&client).await?;
+
     // The evidence half of the regulatory retention policy (engineering
     // conventions §18). After the migrations, because the migration is what
     // guarantees a floor and this is what raises it to whatever the deployment
     // decided; before accepting writes, because a store whose retention this
     // build cannot vouch for should not be taking evidence.
     reconcile_retention(&client, &cfg).await?;
+    // After retention: the move rule is written around the reconciled window.
+    if let Some(tiering) = &cfg.tiering {
+        reconcile_tiering(&client, tiering).await?;
+    }
 
     let store = store::EventStore::new(client);
     let shutdown = CancellationToken::new();
@@ -127,7 +141,14 @@ async fn serve(cfg: config::Config, client: Client) -> Result<()> {
         let store = store.clone();
         let shutdown = shutdown.clone();
         async move {
-            let result = kafka::run(consumer, store, Some(&dlq), shutdown.clone()).await;
+            let result = kafka::run(
+                consumer,
+                store,
+                cfg.ingest.clone(),
+                Some(&dlq),
+                shutdown.clone(),
+            )
+            .await;
             if let Err(ref err) = result {
                 tracing::error!(error = %err, "Kafka consumer failed; initiating shutdown");
                 shutdown.cancel();
@@ -246,6 +267,108 @@ async fn announce_policy_change(cfg: &config::Config, decision: &Reconciliation,
         Err(err) => tracing::error!(
             error = %err,
             "the retention window changed but no producer could be built to announce it"
+        ),
+    }
+}
+
+/// Complete the capacity plan's table replacement when that moves no data, and
+/// say plainly when it does not.
+///
+/// A pending replacement does **not** stop the service: the old table still
+/// works, and refusing to accept evidence because its layout will hit a limit
+/// in three years would be the worse failure today. It is a gauge
+/// (`EventStoreRepartitionPending` fires on it) and a warning naming the Job.
+async fn reconcile_repartition(client: &Client) -> Result<()> {
+    let outcome = repartition::reconcile_safe(client)
+        .await
+        .context("checking the events table's pending repartition")?;
+    match &outcome {
+        SwapOutcome::Pending {
+            live_rows,
+            staged_rows,
+        } => {
+            event_store::metrics::set_repartition_pending_rows(*live_rows);
+            tracing::warn!(
+                live_rows,
+                staged_rows,
+                "events is still on its pre-capacity-plan partition key and holds data; run \
+                 `event-store repartition run` (the event-store-repartition Job). Serving \
+                 on the current table meanwhile"
+            );
+        }
+        SwapOutcome::StagedLeftInPlace { staged_rows } => {
+            event_store::metrics::set_repartition_pending_rows(0);
+            tracing::warn!(
+                staged_rows,
+                "events is current but a staged replacement still holds rows; inspect it \
+                 before dropping"
+            );
+        }
+        other => {
+            event_store::metrics::set_repartition_pending_rows(0);
+            tracing::info!(outcome = ?other, "events table definition is current");
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile hot/cold tiering. Non-destructive, so boot applies it; a
+/// configuration the store cannot honour stops the service with the reason.
+async fn reconcile_tiering(client: &Client, cfg: &tiering::TieringConfig) -> Result<()> {
+    let plan = tiering::reconcile(client, cfg)
+        .await
+        .context("reconciling the events table's storage tiering")?;
+    match plan {
+        tiering::TieringPlan::Unchanged => tracing::info!(
+            policy = cfg.storage_policy(),
+            volume = cfg.cold_volume(),
+            after_days = cfg.move_after_days(),
+            "events storage tiering already matches"
+        ),
+        tiering::TieringPlan::Apply { set_policy, .. } => tracing::warn!(
+            policy = cfg.storage_policy(),
+            volume = cfg.cold_volume(),
+            after_days = cfg.move_after_days(),
+            policy_changed = set_policy.is_some(),
+            "applied events storage tiering; ClickHouse moves existing parts in the background"
+        ),
+    }
+    Ok(())
+}
+
+/// `event-store repartition [run | finalize --i-understand-this-drops-the-retired-table]`.
+///
+/// No argument is the plan. `run` moves data and swaps — non-destructive, safe
+/// to re-run, and what the `event-store-repartition` Job executes. `finalize`
+/// drops the retired table and demands a flag as unpleasant as retention's.
+async fn repartition_cli(client: &Client, args: Vec<String>) -> Result<()> {
+    const DROP_FLAG: &str = "--i-understand-this-drops-the-retired-table";
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        [] => {
+            print!("{}", repartition::plan(client).await?);
+            Ok(())
+        }
+        ["run"] => {
+            println!("{}", repartition::run(client).await?);
+            Ok(())
+        }
+        ["finalize", flag] if *flag == DROP_FLAG => {
+            let rows =
+                repartition::finalize(client, repartition::DropRetiredIntent::from_operator_flag())
+                    .await?;
+            println!(
+                "dropped {} ({rows} row(s), every one present in events)",
+                repartition::SWAP.retired()
+            );
+            Ok(())
+        }
+        ["finalize", ..] => bail!(
+            "finalize drops {} — pass {DROP_FLAG} once the plan says it is fully contained",
+            repartition::SWAP.retired()
+        ),
+        other => bail!(
+            "unknown arguments {other:?}; expected `repartition [run | finalize {DROP_FLAG}]`"
         ),
     }
 }

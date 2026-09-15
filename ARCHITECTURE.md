@@ -196,8 +196,15 @@ vs. commands:
 The immutable audit log. Every domain event from every service is appended
 here. This is the system of record.
 
-**Storage:** append-only log, partitioned by `(chain, event_type, date)`.
-ClickHouse with `MergeTree` — append-only semantics, no updates, no deletes.
+**Storage:** append-only log, ordered by `(chain, event_type, occurred_at,
+event_id)` and partitioned by month. ClickHouse with `ReplacingMergeTree` —
+append-only semantics, no updates, no deletes; the engine only collapses a
+redelivered copy of an event, which reads also dedupe by `event_id`. *(The original key was `(chain, event_type, date)`. Over the
+six-year evidence window that is ~180k partitions, past ClickHouse's
+`max_parts_in_total`, so the store would have refused inserts inside the window.
+The capacity plan, `crates/capacity` and
+[docs/runbooks/capacity-plan.md](docs/runbooks/capacity-plan.md), moved it; chain
+and type still prune through the primary key.)*
 
 **API:** append (internal only, write-authenticated), query by
 address/incident/time range, replay stream for a given event type and window.

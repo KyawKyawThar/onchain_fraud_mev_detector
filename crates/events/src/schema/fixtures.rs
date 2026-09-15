@@ -274,6 +274,7 @@ pub fn sample_events() -> Vec<DomainEvent> {
             // Exactly-representable f32s — a golden must not depend on the
             // shortest-repr float printer's rounding.
             vector: vec![0.5, 0.25, 0.0],
+            content_digest: Some("9f86d081884c7d65".into()),
             top_factors: vec![BehaviorFactor {
                 feature: "edge_count_log".into(),
                 value: 0.5,

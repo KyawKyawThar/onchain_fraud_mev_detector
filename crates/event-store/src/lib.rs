@@ -15,7 +15,12 @@ pub mod kafka;
 pub mod metrics;
 pub mod migrate;
 pub mod query;
+// Putting the capacity plan's table definition in place: at boot when that
+// moves no data, through the resumable `repartition run` Job when it does.
+pub mod repartition;
 // The regulatory evidence window (engineering conventions §18), enforced on
 // the `events` table's ClickHouse TTL.
 pub mod retention;
 pub mod store;
+// Hot/cold storage tiering — the move rule of the same TTL clause.
+pub mod tiering;
