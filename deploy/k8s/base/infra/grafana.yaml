@@ -37,6 +37,9 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        # The image's own uid, stated rather than inherited — see
+        # crates/arch-conformance/tests/deploy_users.rs.
+        runAsUser: 472
         fsGroup: 472 # the grafana image's own uid/gid — the PVC must be group-writable for it
         seccompProfile:
           type: RuntimeDefault

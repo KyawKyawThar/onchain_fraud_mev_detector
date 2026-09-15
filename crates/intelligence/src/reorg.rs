@@ -93,6 +93,10 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<La
 /// can't wedge the stream.
 #[derive(Debug, thiserror::Error)]
 pub enum ReorgError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -101,6 +105,7 @@ impl Transience for ReorgError {
     /// Whether retrying the same retraction could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            ReorgError::Undelivered(err) => err.is_transient(),
             ReorgError::Store(err) => err.is_transient(),
         }
     }
@@ -151,14 +156,18 @@ impl ReorgConsumer {
         .await
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Roll back one retracted incident: withdraw its attributions, then
@@ -186,7 +195,7 @@ impl ReorgConsumer {
                     entity_ids,
                 }),
             )
-            .await;
+            .await?;
         }
 
         let merges = self
@@ -226,7 +235,7 @@ impl ReorgConsumer {
                             ),
                         }),
                     )
-                    .await;
+                    .await?;
                 }
                 ReversalOutcome::AlreadyReverted => {
                     // A redelivered retraction — this merge was already

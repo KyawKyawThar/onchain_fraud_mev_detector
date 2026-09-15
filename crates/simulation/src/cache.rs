@@ -102,8 +102,28 @@ impl<S: Simulator> CachingSimulator<S> {
 
 impl<S: Simulator> Simulator for CachingSimulator<S> {
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
+        self.memoized(req, || self.inner.simulate(req))
+    }
+
+    /// A hit is returned whatever the deadline; only a miss runs the engine, and it
+    /// runs under the deadline.
+    fn simulate_by(
+        &self,
+        req: &SimulationRequest,
+        deadline: std::time::Instant,
+    ) -> Result<SimulationOutcome, SimError> {
+        self.memoized(req, || self.inner.simulate_by(req, deadline))
+    }
+}
+
+impl<S: Simulator> CachingSimulator<S> {
+    fn memoized(
+        &self,
+        req: &SimulationRequest,
+        run: impl FnOnce() -> Result<SimulationOutcome, SimError>,
+    ) -> Result<SimulationOutcome, SimError> {
         if self.capacity == 0 {
-            return self.inner.simulate(req);
+            return run();
         }
 
         let key = CacheKey::of(req);
@@ -117,7 +137,7 @@ impl<S: Simulator> Simulator for CachingSimulator<S> {
         // Miss: run the real engine. Only a *successful* outcome is cached — an error
         // (transient blip or poison) is never memoized, so a transient fault can still
         // succeed on redelivery rather than being pinned as a permanent failure.
-        let outcome = self.inner.simulate(req)?;
+        let outcome = run()?;
         self.insert(key, outcome.clone());
         Ok(outcome)
     }

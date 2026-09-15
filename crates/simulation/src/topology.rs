@@ -10,7 +10,9 @@
 //!   sim.jobs                         quorum, durable
 //!   ├─ x-queue-type: quorum          replicated across nodes for HA (§20)
 //!   ├─ x-dead-letter-exchange: sim.jobs.dlx
-//!   └─ x-delivery-limit: N           fail N times → DLX (§7)
+//!   ├─ x-delivery-limit: N           fail N times → DLX (§7)
+//!   ├─ x-max-length-bytes: B         bounded: the broker never holds an unbounded backlog
+//!   └─ x-overflow: reject-publish    at the bound, nack the publisher (never drop a job)
 //!        │  (after N failed redeliveries)
 //!        ▼
 //!   sim.jobs.dlx  (fanout) ──► sim.jobs.dlq   quorum, durable — the quarantine
@@ -149,8 +151,26 @@ pub(crate) fn sim_jobs_arguments(cfg: &RabbitConfig) -> FieldTable {
         "x-delivery-limit".into(),
         AMQPValue::LongLongInt(cfg.delivery_limit),
     );
+    // Bounded, and full means "refuse", not "evict". `drop-head` would silently
+    // discard the oldest jobs, and each is an alert that never gets confirmed.
+    // `reject-publish` nacks the dispatcher instead, which leaves the alert
+    // uncommitted on Kafka and retries it, moving the backlog to Kafka lag.
+    // Without a bound, the queue grows at maxReplicas until the broker's memory
+    // alarm blocks every publisher on the node.
+    args.insert(
+        "x-max-length-bytes".into(),
+        AMQPValue::LongLongInt(i64::try_from(cfg.max_length_bytes).unwrap_or(i64::MAX)),
+    );
+    args.insert(
+        "x-overflow".into(),
+        AMQPValue::LongString(OVERFLOW_REJECT_PUBLISH.into()),
+    );
     args
 }
+
+/// `x-overflow` value: at the length bound, nack new publishes rather than
+/// dropping queued jobs. Supported on quorum queues (unlike `reject-publish-dlx`).
+const OVERFLOW_REJECT_PUBLISH: &str = "reject-publish";
 
 /// Arguments for the dead-letter queue: just "make it a quorum queue" so the
 /// quarantine is as durable/HA as the work queue. It carries no DLX of its own —
@@ -172,6 +192,7 @@ mod tests {
             dlx: "sim.jobs.dlx".into(),
             dead_letter_queue: "sim.jobs.dlq".into(),
             delivery_limit: 5,
+            max_length_bytes: crate::config::DEFAULT_SIM_MAX_LENGTH_BYTES,
         }
     }
 
@@ -210,6 +231,22 @@ mod tests {
         assert_eq!(
             args.inner().get("x-delivery-limit"),
             Some(&AMQPValue::LongLongInt(20))
+        );
+    }
+
+    #[test]
+    fn work_queue_is_bounded_and_refuses_rather_than_drops_at_the_bound() {
+        let args = sim_jobs_arguments(&RabbitConfig {
+            max_length_bytes: 4096,
+            ..cfg()
+        });
+        assert_eq!(
+            args.inner().get("x-max-length-bytes"),
+            Some(&AMQPValue::LongLongInt(4096))
+        );
+        assert_eq!(
+            args.inner().get("x-overflow"),
+            Some(&AMQPValue::LongString("reject-publish".into()))
         );
     }
 

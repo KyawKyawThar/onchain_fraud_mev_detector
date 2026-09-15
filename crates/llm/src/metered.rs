@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use event_bus::usage::UsageFact;
-use event_bus::EventSink;
+use event_bus::{AcceptLoss, EventSink};
 use events::primitives::Chain;
 use events::system::UsageEventType;
 use tokio_util::sync::CancellationToken;
@@ -240,7 +240,15 @@ pub(crate) async fn publish_usage(
         if let Some(customer_id) = customer_id {
             fact = fact.for_customer(customer_id);
         }
-        fact.record(sink, chain, backoff, shutdown).await;
+        // The provider call has already happened and been paid for, so there is
+        // nothing upstream to hold back or retry. An abandoned fact undercounts
+        // spend (the budget alarms read these); it is counted by
+        // event_publish_abandoned_total{event_type} so the gap is visible.
+        fact.record(sink, chain, backoff, shutdown)
+            .await
+            .accept_loss(
+            "the metered provider call has already happened; an abandoned fact undercounts spend",
+        );
     }
 }
 

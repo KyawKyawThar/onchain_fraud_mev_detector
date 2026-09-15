@@ -4,6 +4,7 @@
 //! of the service stays pure and testable.
 
 use std::net::SocketAddr;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,12 +42,13 @@ pub struct Config {
 /// threshold.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Unacked jobs each consumer holds (`basic_qos` prefetch). Bounds in-flight
-    /// work per consumer — the backpressure knob (§17).
-    pub prefetch: u16,
-    /// In-process competing consumers (each its own consume channel). Horizontal
-    /// scale is more *replicas* (§20); this is per-replica concurrency.
-    pub workers: usize,
+    /// Competing consumers × their prefetch window: the replica's backpressure
+    /// bound, and the autoscaler's per-replica unit.
+    pub capacity: JobCapacity,
+    /// Wall-clock budget for one job's resolve + simulate. Past it the job is
+    /// requeued (a transient outcome: wall time depends on load). The pod's
+    /// termination grace period is derived from it (`tests/grace_period.rs`).
+    pub job_deadline: Duration,
     /// rayon pool threads revm runs on. `0` = rayon's default (one per core) — the
     /// usual choice, since revm CPU is the bottleneck §20 scales hardest.
     pub pool_threads: usize,
@@ -102,6 +104,13 @@ pub struct RabbitConfig {
     /// "fails N times → DLX" mechanism (§7) — a quorum-queue feature a classic
     /// queue lacks.
     pub delivery_limit: i64,
+    /// `x-max-length-bytes` on `sim.jobs`, with `x-overflow: reject-publish`. At
+    /// the bound the broker nacks the dispatcher's publish, the dispatcher leaves
+    /// the alert uncommitted on Kafka, and the backlog lands in Kafka lag (durable,
+    /// replayable, already alerting) instead of broker memory. Queue arguments are
+    /// immutable: changing this on a live broker fails the declaration at boot
+    /// (topology drift is refused loudly, see [`crate::topology`]).
+    pub max_length_bytes: u64,
 }
 
 /// Configuration for the `simulation-projection` binary (Sprint 6 t5) — the incident/
@@ -199,10 +208,20 @@ impl Config {
                 dlx: env_or("RABBITMQ_SIM_DLX", "sim.jobs.dlx"),
                 dead_letter_queue: env_or("RABBITMQ_SIM_DLQ", "sim.jobs.dlq"),
                 delivery_limit: env_parse("RABBITMQ_SIM_DELIVERY_LIMIT", 5i64)?,
+                max_length_bytes: max_length_bytes(env_parse(
+                    "RABBITMQ_SIM_MAX_LENGTH_BYTES",
+                    DEFAULT_SIM_MAX_LENGTH_BYTES,
+                )?)?,
             },
             worker: WorkerConfig {
-                prefetch: env_parse("RABBITMQ_PREFETCH", 16u16)?,
-                workers: env_parse("SIMULATION_WORKERS", 4usize)?,
+                capacity: JobCapacity::try_new(
+                    env_parse("SIMULATION_WORKERS", 4usize)?,
+                    env_parse("RABBITMQ_PREFETCH", 16u16)?,
+                )?,
+                job_deadline: job_deadline(env_parse(
+                    "SIMULATION_JOB_DEADLINE_SECS",
+                    crate::worker::DEFAULT_JOB_DEADLINE.as_secs(),
+                )?)?,
                 pool_threads: env_parse("SIMULATION_POOL_THREADS", 0usize)?,
                 min_profit: MinProfit::try_new(env_parse("SIMULATION_MIN_PROFIT_ETH", 0.05f64)?)
                     .context("SIMULATION_MIN_PROFIT_ETH")?,
@@ -235,6 +254,83 @@ impl Config {
     }
 }
 
+/// Jobs one worker replica holds at once: `workers` competing consumers, each
+/// with a `prefetch` window of unacked jobs.
+///
+/// One value for two readers by construction. The consumer's `basic_qos` reads
+/// [`prefetch`](Self::prefetch), and the autoscaler's unit
+/// (`simulation_worker_job_capacity`) reads [`jobs`](Self::jobs); neither can
+/// be retuned without the other following.
+///
+/// Zero in either factor is refused at boot, because both zeros fail silently
+/// somewhere else. A prefetch of 0 is AMQP for *unlimited*: a consumer that
+/// takes the whole queue into memory. A capacity of 0 makes the autoscaling rule
+/// divide by zero, +Inf demand, and the HPA jumps to maxReplicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCapacity {
+    workers: NonZeroUsize,
+    prefetch: NonZeroU16,
+}
+
+impl JobCapacity {
+    pub fn try_new(workers: usize, prefetch: u16) -> Result<Self> {
+        let workers = NonZeroUsize::new(workers).context(
+            "SIMULATION_WORKERS must be >= 1: a replica with no consumers holds nothing",
+        )?;
+        let prefetch = NonZeroU16::new(prefetch).context(
+            "RABBITMQ_PREFETCH must be >= 1: a prefetch of 0 is AMQP for unlimited, \
+             which lets one consumer take the whole queue",
+        )?;
+        workers
+            .get()
+            .checked_mul(usize::from(prefetch.get()))
+            .context("SIMULATION_WORKERS x RABBITMQ_PREFETCH overflows")?;
+        Ok(Self { workers, prefetch })
+    }
+
+    /// In-process competing consumers. Horizontal scale is more replicas (§20).
+    pub fn workers(self) -> usize {
+        self.workers.get()
+    }
+
+    /// Unacked jobs each consumer holds (`basic_qos`).
+    pub fn prefetch(self) -> u16 {
+        self.prefetch.get()
+    }
+
+    /// Jobs the replica holds in total. Never zero.
+    pub fn jobs(self) -> usize {
+        self.workers.get() * usize::from(self.prefetch.get())
+    }
+}
+
+/// `sim.jobs` byte bound when `RABBITMQ_SIM_MAX_LENGTH_BYTES` is unset: 100 MiB.
+///
+/// Sized so the work queue can never be what trips the broker's memory alarm,
+/// which blocks every publisher on the node, not just this one. The broker pod
+/// is limited to 1 GiB (`deploy/k8s/base/infra/rabbitmq.yaml`), and 100 MiB is a
+/// small fraction of that. A `SimulationJob` body is a few hundred bytes, so
+/// the bound is on the order of 250k jobs: hundreds of times the whole worker
+/// pool's in-flight capacity at maxReplicas, so it is reached only when the
+/// autoscaler is already pinned.
+pub const DEFAULT_SIM_MAX_LENGTH_BYTES: u64 = 100 * 1024 * 1024;
+
+fn max_length_bytes(bytes: u64) -> Result<u64> {
+    anyhow::ensure!(
+        bytes > 0,
+        "RABBITMQ_SIM_MAX_LENGTH_BYTES must be >= 1: 0 would reject every job"
+    );
+    Ok(bytes)
+}
+
+fn job_deadline(secs: u64) -> Result<Duration> {
+    anyhow::ensure!(
+        secs > 0,
+        "SIMULATION_JOB_DEADLINE_SECS must be >= 1: 0 would requeue every job"
+    );
+    Ok(Duration::from_secs(secs))
+}
+
 /// Read a required env var, with the variable name in the error.
 fn env(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| anyhow::anyhow!("missing required env var {key}"))
@@ -260,5 +356,34 @@ where
             )
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod job_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_is_workers_times_prefetch() {
+        let c = JobCapacity::try_new(4, 16).unwrap();
+        assert_eq!((c.workers(), c.prefetch(), c.jobs()), (4, 16, 64));
+    }
+
+    #[test]
+    fn a_zero_prefetch_is_refused_because_amqp_reads_it_as_unlimited() {
+        let err = JobCapacity::try_new(4, 0).unwrap_err().to_string();
+        assert!(err.contains("unlimited"), "{err}");
+    }
+
+    #[test]
+    fn zero_workers_is_refused() {
+        assert!(JobCapacity::try_new(0, 16).is_err());
+    }
+
+    #[test]
+    fn zero_bounds_are_refused() {
+        assert!(max_length_bytes(0).is_err());
+        assert!(job_deadline(0).is_err());
+        assert_eq!(job_deadline(45).unwrap(), Duration::from_secs(45));
     }
 }

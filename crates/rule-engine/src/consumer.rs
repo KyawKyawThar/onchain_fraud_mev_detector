@@ -71,6 +71,7 @@ use chrono::{DateTime, Utc};
 use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
+use event_bus::AcceptLoss;
 use event_bus::{
     handled, publish_resilient, run_consumer, EventHandler, EventSink, Handled, Transience,
 };
@@ -396,7 +397,7 @@ impl FireEmitter {
     /// can't correlate. Delivery failures are logged, not retried here:
     /// retry/receipts are the t5 adapter's policy, behind the [`ActionSink`]
     /// seam.
-    async fn emit(&self, chain: Chain, fire: Fire) {
+    async fn emit(&self, chain: Chain, fire: Fire) -> Result<(), EngineError> {
         let alert_id = fire.alert_id();
         let explanation = fire.explanation();
         metrics::counter!(RULE_FIRES_TOTAL, "kind" => fire.kind.metric_label()).increment(1);
@@ -413,7 +414,8 @@ impl FireEmitter {
                 self.publish_backoff,
                 &self.shutdown,
             )
-            .await;
+            .await
+            .accept_loss(USAGE_IS_APPROXIMATE);
 
         self.publish(
             chain,
@@ -428,7 +430,7 @@ impl FireEmitter {
                 }),
             }),
         )
-        .await;
+        .await?;
 
         self.publish(
             chain,
@@ -440,7 +442,7 @@ impl FireEmitter {
                 explanation: explanation.clone(),
             }),
         )
-        .await;
+        .await?;
 
         let alert = RuleAlert {
             alert_id,
@@ -465,7 +467,8 @@ impl FireEmitter {
                             self.publish_backoff,
                             &self.shutdown,
                         )
-                        .await;
+                        .await
+                        .accept_loss(USAGE_IS_APPROXIMATE);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -477,16 +480,21 @@ impl FireEmitter {
                 }
             }
         }
+        Ok(())
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 }
 
@@ -495,9 +503,19 @@ impl FireEmitter {
 /// `worker.rs`). Returns when the pool (all fire senders) is gone.
 pub async fn drain_fires(emitter: Arc<FireEmitter>, mut fires: mpsc::Receiver<TemporalFire>) {
     while let Some(fire) = fires.recv().await {
-        emitter
+        // No record offset rides on a temporal fire: it is drained after the pool
+        // has advanced its window state, so an undelivered fire cannot be held back
+        // or re-derived. Said loudly rather than dropped; the event itself is also
+        // counted by event_publish_abandoned_total.
+        if let Err(err) = emitter
             .emit(TEMPORAL_FIRE_CHAIN, Fire::temporal(fire))
-            .await;
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                "temporal fire not delivered; its window state has already advanced, so it is lost"
+            );
+        }
     }
 }
 
@@ -574,6 +592,10 @@ impl PendingState {
     }
 }
 
+/// Why usage facts may be lost here: metering is approximate by design (§13), and
+/// the rule's own events, not its metering, settle the record.
+const USAGE_IS_APPROXIMATE: &str = "usage metering is approximate by design (§13)";
+
 /// A failure evaluating one record. Every fallible seam funnels into this so
 /// the offset verdict is mapped in exactly one place
 /// ([`EngineConsumer::verdict`]) instead of each call site re-deciding
@@ -581,6 +603,10 @@ impl PendingState {
 /// `AttributionError`.
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Enrich(#[from] crate::enrich::EnrichError),
     #[error(transparent)]
@@ -604,6 +630,7 @@ impl Transience for EngineError {
     /// [`Handled::Stop`] first.
     fn is_transient(&self) -> bool {
         match self {
+            EngineError::Undelivered(err) => err.is_transient(),
             EngineError::Enrich(err) => err.is_transient(),
             EngineError::Store(err) => err.is_transient(),
             EngineError::Stopped => false,
@@ -705,6 +732,9 @@ impl EngineConsumer {
             Ok(()) if self.shutdown.is_cancelled() => Handled::Stop,
             Ok(()) => Handled::Commit,
             Err(EngineError::Stopped) => Handled::Stop,
+            Err(EngineError::Undelivered(undelivered)) => {
+                event_bus::handled_undelivered(undelivered, CONSUMER)
+            }
             Err(err) => handled(err, CONSUMER),
         }
     }
@@ -774,7 +804,7 @@ impl EngineConsumer {
             for rule in set.evaluate(ctx) {
                 self.emitter
                     .emit(chain, Fire::instant(rule, ctx, trigger, trigger_id))
-                    .await;
+                    .await?;
             }
         }
 

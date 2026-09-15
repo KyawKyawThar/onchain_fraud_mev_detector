@@ -3,7 +3,8 @@
 #   dispatcher   — Kafka consumer publishing SimulationJob commands; 1 is plenty
 #   worker       — revm CPU is THE bottleneck (§20 "scale aggressively"):
 #                  competing consumers on the sim.jobs quorum queue, so
-#                  replicas scale linearly → HPA on CPU
+#                  replicas scale linearly → HPA on queue depth (§7's own
+#                  backpressure signal) and CPU
 #   projection   — incidents read model (Postgres+ClickHouse) + internal
 #                  GET /v1/incidents the api-service fronts
 apiVersion: apps/v1
@@ -81,7 +82,9 @@ metadata:
   labels:
     app.kubernetes.io/name: simulation-worker
 spec:
-  replicas: 2
+  # No `replicas`: the HPA owns the count. With a literal here every `kubectl
+  # apply` re-applies it and resets a scaled-out pool, most likely mid-incident,
+  # since that is when people deploy (crates/arch-conformance/tests/deploy_scaling.rs).
   selector:
     matchLabels:
       app.kubernetes.io/name: simulation-worker
@@ -99,9 +102,13 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      # Long revm jobs get time to finish; an unacked job a killed worker held
-      # is redelivered anyway (per-message ack — crashes on hostile bytecode
-      # are an expected failure mode, §7).
+      # A job already taken runs to its settle on SIGTERM (Worker::run only
+      # observes shutdown between jobs), and one whose results land inside this
+      # window is acked, not re-run. Prefetched, unstarted jobs go straight back
+      # to the queue. Derived, not guessed: it must cover the job deadline
+      # (SIMULATION_JOB_DEADLINE_SECS, 45s) + one transaction of overshoot (5s)
+      # + two result publishes at the 30s Kafka send timeout = 110s.
+      # crates/simulation/tests/grace_period.rs fails the build if it does not.
       terminationGracePeriodSeconds: 120
       containers:
         - name: worker
@@ -121,6 +128,11 @@ spec:
                   name: rabbitmq-credentials
                   key: RABBITMQ_URL
             # Per-replica concurrency; horizontal scale is replicas (HPA below).
+            # SIMULATION_WORKERS x RABBITMQ_PREFETCH (default 16) is exported
+            # as simulation_worker_job_capacity, the HPA's per-replica unit —
+            # changing either moves the scaling point. Prefetch is therefore
+            # also the latency knob: it is how much queueing one replica
+            # absorbs before another is asked for.
             - name: SIMULATION_WORKERS
               value: "4"
             - name: SIMULATION_WORKER_METRICS_ADDR
@@ -150,7 +162,24 @@ spec:
               memory: 2Gi
 ---
 # The one true horizontal scaler in the system: workers are interchangeable
-# competing consumers, so CPU pressure → more replicas, linearly.
+# competing consumers, so replicas add throughput linearly.
+#
+# Two inputs; the HPA takes whichever asks for more:
+#   - sim.jobs depth, the signal §7 designed for this. External metric served by
+#     prometheus-adapter (deploy/k8s/cluster/) from the recording rule
+#     `simulation:sim_jobs_replicas_demanded` in deploy/prometheus-rules.yml:
+#     (ready + unacked) / simulation_worker_job_capacity, i.e. replicas needed
+#     to hold the queue inside each replica's declared bound. AverageValue 1
+#     means "no replica over its bound", so the target is the deployment's
+#     own prefetch, not a number chosen here.
+#   - CPU, kept for what depth cannot see: a few pathological jobs pinning
+#     every core while the queue looks short.
+# CPU alone lagged the backlog: a replica whose prefetch windows are full but
+# whose jobs are waiting on the resolver shows neither high CPU nor progress.
+#
+# If the external metric is unreadable (adapter or Prometheus down), the HPA
+# keeps scaling up on CPU and does not scale down — it holds capacity rather
+# than drain it. SimulationQueueSignalDown / SimulationBacklogOutgrowingWorkers.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -163,12 +192,35 @@ spec:
   minReplicas: 2
   maxReplicas: 8
   metrics:
+    - type: External
+      external:
+        metric:
+          name: simulation_sim_jobs_replicas_demanded
+        target:
+          type: AverageValue
+          averageValue: "1"
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
           averageUtilization: 70
+  # Scale-up keeps the Kubernetes default (no stabilization, up to double or +4
+  # pods every 15s): §20 says scale aggressively, and an idle extra worker costs
+  # only its request.
+  #
+  # Scale-down is paced to one pod a minute after the default 5m window. The
+  # removed pod drains its in-flight job first (up to the grace period), and a
+  # burst that has just drained usually arrives again within minutes; removing
+  # half the pool at once would mean restarting them — 150s of startup budget
+  # each — for the next one.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

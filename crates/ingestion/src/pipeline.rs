@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use event_bus::usage::UsageFact;
+use event_bus::AcceptLoss;
 use events::chain::{
     BlockAssembled, BlockCanonicalized, BlockFinalized, BlockReverted, RawBlockReceived,
 };
@@ -265,7 +266,8 @@ impl Pipeline {
                 self.publish_backoff,
                 &self.shutdown,
             )
-            .await;
+            .await
+            .accept_loss("usage metering is approximate by design (§13)");
 
         let finalized = match self.source.finalized_head().await {
             Ok(head) => head,
@@ -311,7 +313,8 @@ impl Pipeline {
                 self.publish_backoff,
                 &self.shutdown,
             )
-            .await;
+            .await
+            .accept_loss(INGESTION_LOSS);
         }
         if processed > 0 {
             UsageFact::new(UsageEventType::EventProcessed, processed)
@@ -321,10 +324,19 @@ impl Pipeline {
                     self.publish_backoff,
                     &self.shutdown,
                 )
-                .await;
+                .await
+                .accept_loss("usage metering is approximate by design (§13)");
         }
     }
 }
+
+/// Why ingestion accepts an abandoned publish: its source is an RPC head poller and
+/// its block tree lives in memory, so there is no upstream position to hold back.
+/// An event abandoned at shutdown cannot be re-derived from anything durable. It
+/// is counted by `event_publish_abandoned_total{event_type}`, which is where a
+/// hole in the audit stream shows up.
+const INGESTION_LOSS: &str =
+    "ingestion's tree is in-memory with no upstream position; abandonment is counted";
 
 /// Pure: the events a head produces when first observed — `RawBlockReceived`
 /// then `BlockAssembled` (the head of every block's lifecycle, §5).

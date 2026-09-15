@@ -128,6 +128,10 @@ impl Default for EmbeddingLimits {
 /// stream.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -144,6 +148,7 @@ impl Transience for EmbeddingError {
     /// Whether retrying the same work could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            EmbeddingError::Undelivered(err) => err.is_transient(),
             EmbeddingError::Store(err) => err.is_transient(),
             EmbeddingError::Graph(err) => err.is_transient(),
             EmbeddingError::EmbeddingStore(err) => err.is_transient(),
@@ -688,19 +693,19 @@ impl Embedder {
 
         for vector in &to_write {
             self.publish(DomainEvent::AddressEmbeddingUpdated(vector.to_event()))
-                .await;
+                .await?;
         }
         Ok(report)
     }
 
-    async fn publish(&self, payload: DomainEvent) {
+    async fn publish(&self, payload: DomainEvent) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(self.chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Every *current* member of `entity_ids`, in encounter order, duplicates

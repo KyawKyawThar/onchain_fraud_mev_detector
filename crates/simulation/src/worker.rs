@@ -39,10 +39,11 @@
 //! per-replica concurrency is more drain tasks feeding the one bounded pool.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use event_bus::usage::UsageFact;
-use event_bus::{EventSink, Transience};
+use event_bus::{AcceptLoss, EventSink, Transience, Undelivered};
+use events::primitives::Chain;
 use events::system::UsageEventType;
 use events::{DomainEvent, EventEnvelope};
 use tokio_util::sync::CancellationToken;
@@ -58,6 +59,41 @@ use crate::reorg::OrphanGuard;
 use crate::resolver::JobResolver;
 use crate::result::{events_for_outcome, EthUsdPrice};
 use crate::simulator::{SimError, SimulationOutcome, SimulationRequest, Simulator};
+
+/// Default for `SIMULATION_JOB_DEADLINE_SECS`: one job's resolve + simulate budget.
+///
+/// It is a term in the pod's shutdown budget, not a free choice. A job in flight
+/// at SIGTERM runs to its settle, so the grace period must cover this, plus
+/// [`DEADLINE_OVERSHOOT_ALLOWANCE`], plus [`MAX_RESULT_EVENTS`] × the Kafka send
+/// timeout. `tests/grace_period.rs` checks that sum against the manifest.
+pub const DEFAULT_JOB_DEADLINE: Duration = Duration::from_secs(45);
+
+/// How far past its deadline a simulation is assumed to run. The deadline is
+/// checked between transactions, so this is one transaction's worst case. The
+/// assumption is watched, not trusted: `simulation_job_deadline_overshoot_seconds`
+/// measures it, and `SimulationDeadlineOvershootAboveAllowance` fires above it.
+pub const DEADLINE_OVERSHOOT_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// The most result events one job publishes: `SimulationCompleted`, plus
+/// `IncidentCreated` when the alert is confirmed. Pinned by a test here.
+pub const MAX_RESULT_EVENTS: usize = 2;
+
+const USAGE_IS_APPROXIMATE: &str =
+    "usage metering is approximate by design (§13); results, not usage, settle the job";
+
+/// The ack decision, from what publishing the results did, and nothing else.
+///
+/// In particular not the shutdown token. A job whose results landed during a
+/// drain is done, and requeueing it would re-run revm for nothing. A result that
+/// can never be encoded fails identically on every re-run, so it is quarantined
+/// rather than cycled through `x-delivery-limit`.
+fn settle(results: Result<(), Undelivered>) -> Disposition {
+    match results {
+        Ok(()) => Disposition::Ack,
+        Err(Undelivered::Shutdown) => Disposition::Requeue,
+        Err(Undelivered::Permanent) => Disposition::DeadLetter,
+    }
+}
 
 /// Map a failure's transient/permanent classification onto the queue disposition:
 /// a transient fault is requeued for redelivery, a permanent ("poison") one is
@@ -93,6 +129,8 @@ pub struct Worker {
     shutdown: CancellationToken,
     /// Back-off between transient result-publish retries; a field so tests shrink it.
     publish_backoff: Duration,
+    /// Wall-clock budget for one job's resolve + simulate.
+    job_deadline: Duration,
     /// ETH→USD reference for restamping a confirmed incident's scoring triple
     /// from its (ETH) figures (§7 — see [`crate::result::events_for_outcome`]).
     eth_usd_price: EthUsdPrice,
@@ -119,8 +157,15 @@ impl Worker {
             event_sink,
             shutdown,
             publish_backoff: PUBLISH_BACKOFF,
+            job_deadline: DEFAULT_JOB_DEADLINE,
             eth_usd_price,
         }
+    }
+
+    /// Override the per-job deadline (`SIMULATION_JOB_DEADLINE_SECS`).
+    pub fn with_job_deadline(mut self, job_deadline: Duration) -> Self {
+        self.job_deadline = job_deadline;
+        self
     }
 
     /// Handle one job — resolve → simulate (on rayon) → publish the result(s) →
@@ -137,15 +182,29 @@ impl Worker {
     }
 
     /// The core, free of timing/the consume/ack loop. Resolve → simulate (on
-    /// rayon) → publish the result(s) → return the disposition.
+    /// rayon), both inside the job's deadline → publish the results → settle →
+    /// meter.
     async fn process_inner(&self, job: &SimulationJob) -> Disposition {
-        // 1. Resolve the alert to a runnable `(block, tx_set)` scenario.
-        let request = match self.resolver.resolve(job).await {
-            Ok(request) => request,
-            Err(err) => {
+        let deadline = Instant::now() + self.job_deadline;
+
+        // 1. Resolve the alert to a runnable `(block, tx_set)` scenario. The resolver
+        //    is async and cancellable, so the deadline simply times it out.
+        let resolved = tokio::time::timeout_at(deadline.into(), self.resolver.resolve(job)).await;
+        let request = match resolved {
+            Ok(Ok(request)) => request,
+            Ok(Err(err)) => {
                 let disposition = disposition_for(err.is_transient());
                 tracing::warn!(error = %err, alert_id = %job.alert_id, ?disposition, "resolve failed");
                 return disposition;
+            }
+            Err(_elapsed) => {
+                crate::metrics::record_deadline_exceeded("resolve", Duration::ZERO);
+                tracing::warn!(
+                    alert_id = %job.alert_id,
+                    job_deadline = ?self.job_deadline,
+                    "resolve passed the job deadline; requeueing"
+                );
+                return Disposition::Requeue;
             }
         };
 
@@ -165,8 +224,17 @@ impl Worker {
         }
 
         // 2. Run revm on the rayon pool — CPU never on the reactor (§17).
-        let outcome = match self.simulate(request).await {
+        let outcome = match self.simulate(request, deadline).await {
             Ok(outcome) => outcome,
+            Err(SimError::DeadlineExceeded { overshoot }) => {
+                crate::metrics::record_deadline_exceeded("simulate", overshoot);
+                tracing::warn!(
+                    alert_id = %job.alert_id,
+                    ?overshoot,
+                    "simulation passed the job deadline; requeueing"
+                );
+                return Disposition::Requeue;
+            }
             Err(err) => {
                 let disposition = disposition_for(err.is_transient());
                 tracing::warn!(error = %err, alert_id = %job.alert_id, ?disposition, "simulation failed");
@@ -181,69 +249,79 @@ impl Worker {
         );
         crate::metrics::record_job_outcome(outcome.confirmed);
 
-        // The revm run actually happened, regardless of whether it confirms the
-        // alert — one `SimulationRun` usage fact per job (§13). No customer is in
-        // scope (simulation is triggered off the detection pipeline, not by a
-        // customer), so it meters with `customer_id: None`.
-        UsageFact::new(UsageEventType::SimulationRun, 1)
-            .record(
-                self.event_sink.as_ref(),
-                job.chain,
-                self.publish_backoff,
-                &self.shutdown,
-            )
-            .await;
-
-        // 3. Publish the result(s) back onto Kafka (at-least-once). The command
-        //    never re-enters the event store — only its outcome does (§7).
+        // 3. Publish the results back onto Kafka (at-least-once), then settle on what
+        //    actually landed. The command never re-enters the event store — only its
+        //    outcome does (§7).
         let result_events = events_for_outcome(&outcome, self.eth_usd_price);
         let incidents_created = result_events
             .iter()
             .filter(|e| matches!(e, DomainEvent::IncidentCreated(_)))
             .count() as u64;
-        for event in result_events {
-            event_bus::publish_resilient(
-                self.event_sink.as_ref(),
-                EventEnvelope::new(job.chain, event),
-                self.publish_backoff,
-                &self.shutdown,
-            )
-            .await;
-        }
-        // A confirmed alert mints an incident — a second, distinct usage fact
-        // (§13): `IncidentGenerated` isn't attributable to a customer either, an
-        // incident only fans out to zero/one/many rule owners downstream in
-        // rule-engine (see `events::system::UsageRecorded`'s doc).
-        if incidents_created > 0 {
-            UsageFact::new(UsageEventType::IncidentGenerated, incidents_created)
+        let disposition = settle(self.publish_results(job.chain, result_events).await);
+
+        // 4. Meter a job once it is done: on `Ack` only, since a requeued job is
+        //    metered by the run that acks it. Skipped during a drain, because each
+        //    usage publish can take the Kafka send timeout and the grace-period
+        //    budget covers results, not metering. One `SimulationRun` per job; a
+        //    confirmed alert also mints `IncidentGenerated`. Neither is attributable
+        //    to a customer (§13).
+        if disposition == Disposition::Ack && !self.shutdown.is_cancelled() {
+            UsageFact::new(UsageEventType::SimulationRun, 1)
                 .record(
                     self.event_sink.as_ref(),
                     job.chain,
                     self.publish_backoff,
                     &self.shutdown,
                 )
-                .await;
+                .await
+                .accept_loss(USAGE_IS_APPROXIMATE);
+            if incidents_created > 0 {
+                UsageFact::new(UsageEventType::IncidentGenerated, incidents_created)
+                    .record(
+                        self.event_sink.as_ref(),
+                        job.chain,
+                        self.publish_backoff,
+                        &self.shutdown,
+                    )
+                    .await
+                    .accept_loss(USAGE_IS_APPROXIMATE);
+            }
         }
+        disposition
+    }
 
-        // 4. Ack only if the result truly made it out. If shutdown interrupted a
-        //    publish retry, some event may not be on the wire — requeue so
-        //    redelivery re-runs and re-publishes (idempotent), rather than acking
-        //    past an unpublished result.
-        if self.shutdown.is_cancelled() {
-            Disposition::Requeue
-        } else {
-            Disposition::Ack
+    /// Publish a job's results in order, stopping at the first that does not land.
+    /// Once one is undelivered the job will be requeued anyway, and during a drain
+    /// every further attempt could spend a whole send timeout of the grace period.
+    async fn publish_results(
+        &self,
+        chain: Chain,
+        events: Vec<DomainEvent>,
+    ) -> Result<(), Undelivered> {
+        for event in events {
+            event_bus::publish_resilient(
+                self.event_sink.as_ref(),
+                EventEnvelope::new(chain, event),
+                self.publish_backoff,
+                &self.shutdown,
+            )
+            .await?;
         }
+        Ok(())
     }
 
     /// Run one scenario on the shared rayon pool, bridging back to async via a
     /// oneshot. A dropped task (pool shut down) surfaces as a transient fault so the
     /// job redelivers rather than vanishing.
-    async fn simulate(&self, request: SimulationRequest) -> Result<SimulationOutcome, SimError> {
+    async fn simulate(
+        &self,
+        request: SimulationRequest,
+        deadline: Instant,
+    ) -> Result<SimulationOutcome, SimError> {
         let simulator = self.simulator.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pool.spawn(move || {
-            let outcome = simulator.simulate(&request);
+            let outcome = simulator.simulate_by(&request, deadline);
             // Receiver gone (worker dropped) → nothing to do; drop the result.
             let _ = tx.send(outcome);
         });
@@ -256,13 +334,17 @@ impl Worker {
 
     /// Drain `source` until shutdown or the source closes. For each delivery: run
     /// `process`, then settle the delivery per the returned disposition.
+    ///
+    /// Shutdown is only observed *between* jobs: a job already taken runs to its
+    /// settle, which is what the pod's termination grace period is sized for. Jobs
+    /// prefetched but not started return to the queue when the source drops.
     pub async fn run(self, mut source: impl JobSource) -> anyhow::Result<()> {
         tracing::info!("simulation worker draining sim.jobs");
         loop {
             let delivery = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => {
-                    tracing::info!("simulation worker stopping (in-flight unacked jobs redeliver)");
+                    tracing::info!("simulation worker stopping (prefetched, unstarted jobs return to the queue)");
                     return Ok(());
                 }
                 received = source.recv() => match received {
@@ -375,6 +457,10 @@ mod tests {
 
         let emitted = events.non_usage_events();
         assert_eq!(emitted.len(), 2, "SimulationCompleted + IncidentCreated");
+        assert!(
+            emitted.len() <= MAX_RESULT_EVENTS,
+            "the grace-period budget assumes at most MAX_RESULT_EVENTS results"
+        );
         assert!(matches!(emitted[0], DomainEvent::SimulationCompleted(_)));
         assert!(matches!(emitted[1], DomainEvent::IncidentCreated(_)));
     }
@@ -550,25 +636,180 @@ mod tests {
         );
     }
 
-    /// Shutdown interrupting the publish path requeues rather than acking past an
-    /// unpublished result — the at-least-once guard.
-    #[tokio::test]
-    async fn shutdown_during_processing_requeues() {
-        let events = Arc::new(RecordingEventSink::default());
+    /// A worker whose shutdown has already fired, publishing into `sink`.
+    fn draining_worker(sink: Arc<dyn EventSink>) -> Worker {
         let shutdown = CancellationToken::new();
         let mut w = Worker::new(
             Arc::new(CannedResolver(Ok(()))),
             Arc::new(NeverOrphaned),
             Arc::new(CannedSimulator(Ok(true))),
             test_pool(),
-            events.clone(),
+            sink,
             shutdown.clone(),
             EthUsdPrice::try_new(2_000.0).unwrap(),
         );
         w.publish_backoff = Duration::from_millis(1);
-        shutdown.cancel(); // already cancelled before processing
+        shutdown.cancel();
+        w
+    }
 
+    /// A worker over `sink`, not shutting down.
+    fn worker_over(sink: Arc<dyn EventSink>) -> Worker {
+        let mut w = Worker::new(
+            Arc::new(CannedResolver(Ok(()))),
+            Arc::new(NeverOrphaned),
+            Arc::new(CannedSimulator(Ok(true))),
+            test_pool(),
+            sink,
+            CancellationToken::new(),
+            EthUsdPrice::try_new(2_000.0).unwrap(),
+        );
+        w.publish_backoff = Duration::from_millis(1);
+        w
+    }
+
+    #[test]
+    fn settle_decides_on_delivery_alone() {
+        assert_eq!(settle(Ok(())), Disposition::Ack);
+        assert_eq!(settle(Err(Undelivered::Shutdown)), Disposition::Requeue);
+        assert_eq!(settle(Err(Undelivered::Permanent)), Disposition::DeadLetter);
+    }
+
+    /// A result that can never be encoded is quarantined, not cycled through
+    /// redeliveries that would each re-run revm to fail the same way.
+    #[tokio::test]
+    async fn an_unencodable_result_is_dead_lettered_and_not_metered() {
+        struct Unencodable;
+        #[async_trait]
+        impl EventSink for Unencodable {
+            async fn publish(
+                &self,
+                _envelope: EventEnvelope,
+            ) -> Result<(), event_bus::PublishError> {
+                Err(event_bus::PublishError::Encode(
+                    events::EventError::UnsupportedSchemaVersion {
+                        found: 999,
+                        supported: 1,
+                    },
+                ))
+            }
+        }
+
+        let w = worker_over(Arc::new(Unencodable));
+        assert_eq!(w.process(&sample_job()).await, Disposition::DeadLetter);
+    }
+
+    /// Results stop at the first that does not land: the job is requeued either
+    /// way, and during a drain each further attempt could cost a whole send timeout.
+    #[tokio::test]
+    async fn publishing_stops_at_the_first_undelivered_result() {
+        struct CountingDown(std::sync::Mutex<u32>);
+        #[async_trait]
+        impl EventSink for CountingDown {
+            async fn publish(
+                &self,
+                _envelope: EventEnvelope,
+            ) -> Result<(), event_bus::PublishError> {
+                *self.0.lock().unwrap() += 1;
+                Err(event_bus::PublishError::Delivery("broker down".into()))
+            }
+        }
+
+        let sink = Arc::new(CountingDown(std::sync::Mutex::new(0)));
+        let w = draining_worker(sink.clone());
         assert_eq!(w.process(&sample_job()).await, Disposition::Requeue);
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            1,
+            "a confirmed job has two results; only the first is attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolve_that_outlives_the_job_deadline_is_requeued() {
+        struct Hanging;
+        #[async_trait]
+        impl JobResolver for Hanging {
+            async fn resolve(
+                &self,
+                _job: &SimulationJob,
+            ) -> Result<SimulationRequest, ResolveError> {
+                std::future::pending().await
+            }
+        }
+
+        let events = Arc::new(RecordingEventSink::default());
+        let w = Worker::new(
+            Arc::new(Hanging),
+            Arc::new(NeverOrphaned),
+            Arc::new(CannedSimulator(Ok(true))),
+            test_pool(),
+            events.clone(),
+            CancellationToken::new(),
+            EthUsdPrice::try_new(2_000.0).unwrap(),
+        )
+        .with_job_deadline(Duration::from_millis(20));
+        assert_eq!(w.process(&sample_job()).await, Disposition::Requeue);
+        assert!(events.events().is_empty(), "nothing published or metered");
+    }
+
+    #[tokio::test]
+    async fn a_simulation_past_its_deadline_is_requeued_not_dead_lettered() {
+        struct Late;
+        impl Simulator for Late {
+            fn simulate(&self, _req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
+                unreachable!("the worker always calls simulate_by")
+            }
+            fn simulate_by(
+                &self,
+                _req: &SimulationRequest,
+                _deadline: Instant,
+            ) -> Result<SimulationOutcome, SimError> {
+                Err(SimError::DeadlineExceeded {
+                    overshoot: Duration::from_millis(3),
+                })
+            }
+        }
+
+        let events = Arc::new(RecordingEventSink::default());
+        let w = worker(
+            Arc::new(CannedResolver(Ok(()))),
+            Arc::new(Late),
+            events.clone(),
+        );
+        assert_eq!(w.process(&sample_job()).await, Disposition::Requeue);
+        assert!(events.events().is_empty());
+    }
+
+    /// Shutdown interrupting a failing publish requeues rather than acking past an
+    /// unpublished result — the at-least-once guard.
+    #[tokio::test]
+    async fn shutdown_interrupting_an_undelivered_result_requeues() {
+        struct BrokerDown;
+        #[async_trait]
+        impl EventSink for BrokerDown {
+            async fn publish(
+                &self,
+                _envelope: EventEnvelope,
+            ) -> Result<(), event_bus::PublishError> {
+                Err(event_bus::PublishError::Delivery("broker down".into()))
+            }
+        }
+
+        let w = draining_worker(Arc::new(BrokerDown));
+        assert_eq!(w.process(&sample_job()).await, Disposition::Requeue);
+    }
+
+    /// A job that finishes and publishes while the pod drains is done. Requeueing it
+    /// — the old rule, keyed on the shutdown token — re-ran revm and re-metered
+    /// `SimulationRun` on every scale-down.
+    #[tokio::test]
+    async fn a_result_delivered_during_shutdown_is_acked_not_rerun() {
+        let events = Arc::new(RecordingEventSink::default());
+        let w = draining_worker(events.clone());
+
+        assert_eq!(w.process(&sample_job()).await, Disposition::Ack);
+        assert_eq!(events.non_usage_events().len(), 2, "both results landed");
     }
 
     /// End-to-end through the drain loop: one job on an in-memory source is processed

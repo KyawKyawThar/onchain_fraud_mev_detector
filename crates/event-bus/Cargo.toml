@@ -42,6 +42,10 @@ rdkafka = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }
+# Docker-gated (`#[ignore]`) proof against a real broker that `run_consumer`'s
+# `Retry` re-fetches the record instead of skipping it (tests/retry_refetch.rs).
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["kafka"] }
 
 [lints]
 workspace = true

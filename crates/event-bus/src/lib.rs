@@ -68,7 +68,12 @@ use tracing::Instrument;
 /// How long a single produce may take before it's reported as failed. The record
 /// is also bounded by librdkafka's own `message.timeout.ms` (set below); this is
 /// the await ceiling on top of it.
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Public because it is a term in a shutdown budget: during a drain every
+/// publish still gets its first attempt, so a pod's termination grace period
+/// must cover this many seconds per event it may still publish (see
+/// `simulation`'s grace-period test).
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default back-off between retries of a transient publish failure, so a broker
 /// blip doesn't hot-loop the producer. Producers pass their own (tests shrink it).
@@ -179,6 +184,71 @@ impl EventSink for KafkaEventSink {
     }
 }
 
+/// Counter: events [`publish_resilient`] gave up on, labeled `event_type` and
+/// `reason` (`shutdown`/`permanent`). `reason="permanent"` is a count that should
+/// be zero: an event we built and can never encode. `reason="shutdown"` is the
+/// cost of drains, and is what a caller that settles on [`Undelivered`] turns into
+/// redelivery rather than loss.
+pub const PUBLISH_ABANDONED_TOTAL: &str = "event_publish_abandoned_total";
+
+/// Why [`publish_resilient`] gave up on an event without it reaching the broker.
+///
+/// Returned as the `Err` of a `Result`, which is `#[must_use]`: ignoring it is a
+/// compiler warning and a deny-warnings build error. So every caller either
+/// settles on it (a consumer's offset, a work queue's ack) or states, with
+/// [`AcceptLoss::accept_loss`], why losing the event is acceptable at that site.
+/// The alternative this replaced was a caller guessing delivery from whether
+/// `shutdown` had fired, which requeued work whose results had already landed.
+///
+/// For a consumer, [`Transience`] maps it onto the existing verdicts: `Shutdown`
+/// is transient (so [`handled`] yields `Retry`, which [`run_consumer`] turns into
+/// "stop without committing" once shutdown is in motion), and `Permanent` is not
+/// (so it is skipped and dead-lettered instead of wedging the stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Undelivered {
+    /// A transient failure was being retried when shutdown fired.
+    #[error("event not delivered: shutdown interrupted its publish retry")]
+    Shutdown,
+    /// The envelope can never be encoded; identical on every retry.
+    #[error("event not delivered: permanent publish failure")]
+    Permanent,
+}
+
+impl Undelivered {
+    /// The `reason` label on [`PUBLISH_ABANDONED_TOTAL`].
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Undelivered::Shutdown => "shutdown",
+            Undelivered::Permanent => "permanent",
+        }
+    }
+}
+
+impl Transience for Undelivered {
+    fn is_transient(&self) -> bool {
+        matches!(self, Undelivered::Shutdown)
+    }
+}
+
+/// The explicit form of "an undelivered event is acceptable here".
+///
+/// Only correct where nothing upstream is settled on the event: no offset or ack
+/// advances past it. Typical cases are metering (approximate by design, §13) or
+/// state that is re-derived anyway. `why` is the claim; every call is one a
+/// reviewer should be able to check. The loss is already counted by
+/// [`PUBLISH_ABANDONED_TOTAL`].
+pub trait AcceptLoss {
+    fn accept_loss(self, why: &'static str);
+}
+
+impl AcceptLoss for std::result::Result<(), Undelivered> {
+    fn accept_loss(self, why: &'static str) {
+        if let Err(reason) = self {
+            tracing::debug!(%reason, why, "undelivered event accepted as lost");
+        }
+    }
+}
+
 /// Publish one envelope through `sink`, retrying a *transient* failure (broker
 /// blip) over `backoff` until it succeeds or `shutdown` is cancelled — so a
 /// momentary outage can't leave a permanent hole in the audit stream (the events
@@ -190,15 +260,27 @@ impl EventSink for KafkaEventSink {
 /// detection's scheduler both call this so the retry/skip discipline lives once.
 /// The caller fixes the envelope's `event_id` across retries (by cloning one
 /// envelope) so a redelivery is deduped downstream (§7).
+///
+/// Shutdown aborts only a *retry*: the first attempt always runs, so a publish
+/// that lands during a drain returns `Ok` and must be treated as delivered.
 pub async fn publish_resilient(
     sink: &dyn EventSink,
     envelope: EventEnvelope,
     backoff: Duration,
     shutdown: &CancellationToken,
-) {
+) -> std::result::Result<(), Undelivered> {
+    let abandoned = |reason: Undelivered, envelope: &EventEnvelope| {
+        metrics::counter!(
+            PUBLISH_ABANDONED_TOTAL,
+            "event_type" => envelope.event_type().to_owned(),
+            "reason" => reason.as_label(),
+        )
+        .increment(1);
+        Err(reason)
+    };
     loop {
         match sink.publish(envelope.clone()).await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(err) if err.is_transient() => {
                 tracing::warn!(
                     error = %err,
@@ -212,7 +294,7 @@ pub async fn publish_resilient(
                             event_type = envelope.event_type(),
                             "shutdown during publish retry; event not delivered"
                         );
-                        return;
+                        return abandoned(Undelivered::Shutdown, &envelope);
                     }
                     _ = tokio::time::sleep(backoff) => {}
                 }
@@ -223,11 +305,17 @@ pub async fn publish_resilient(
                     event_type = envelope.event_type(),
                     "permanent publish failure; dropping event"
                 );
-                return;
+                return abandoned(Undelivered::Permanent, &envelope);
             }
         }
     }
 }
+
+/// Why [`drain_to_backbone`] may lose an item: it is a fire-and-forget producer
+/// (nothing upstream waits on the item), an item abandoned mid-retry at shutdown
+/// is counted by [`PUBLISH_ABANDONED_TOTAL`], and the rest of the backlog is bounded
+/// and reported through `on_dropped`.
+const DRAIN_ABANDON: &str = "drain_to_backbone is fire-and-forget; abandonment is counted";
 
 /// Default post-shutdown flush window for a [`drain_to_backbone`] producer —
 /// bounds how long a graceful shutdown keeps draining a backlog before
@@ -298,18 +386,20 @@ pub async fn drain_to_backbone<T, ToEnvelope, OnDropped>(
     // or the channel closes on its own (all senders gone).
     loop {
         tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            maybe = rx.recv() => match maybe {
-                Some(item) => {
-                    publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown).await
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    maybe = rx.recv() => match maybe {
+                        Some(item) => {
+                            publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown)
+        .await
+        .accept_loss(DRAIN_ABANDON);
+                        }
+                        None => {
+                            tracing::info!(producer = name, "backbone producer stopped; channel drained");
+                            return;
+                        }
+                    },
                 }
-                None => {
-                    tracing::info!(producer = name, "backbone producer stopped; channel drained");
-                    return;
-                }
-            },
-        }
     }
 
     // Phase 2 — shutdown signalled: keep flushing what's queued (the server may
@@ -317,7 +407,9 @@ pub async fn drain_to_backbone<T, ToEnvelope, OnDropped>(
     // `flush_grace` so a broker down at shutdown can't hang exit.
     let flushed = tokio::time::timeout(flush_grace, async {
         while let Some(item) = rx.recv().await {
-            publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown).await;
+            publish_resilient(sink.as_ref(), to_envelope(item), backoff, &shutdown)
+                .await
+                .accept_loss(DRAIN_ABANDON);
         }
     })
     .await;
@@ -387,6 +479,18 @@ pub fn handled(err: impl Transience + std::fmt::Display, consumer: &str) -> Hand
     handled_for(err.is_transient(), err, consumer)
 }
 
+/// The consumer verdict for a record whose handling could not publish an event:
+/// [`Undelivered::Shutdown`] leaves the offset for redelivery ([`Handled::Stop`]),
+/// and [`Undelivered::Permanent`] can never succeed, so the record is skipped
+/// (dead-lettered when a DLQ is wired). The direct form of [`handled`] for a
+/// handler whose only failure is the publish.
+pub fn handled_undelivered(err: Undelivered, consumer: &str) -> Handled {
+    match err {
+        Undelivered::Shutdown => Handled::Stop,
+        Undelivered::Permanent => handled_for(false, err, consumer),
+    }
+}
+
 /// Map an error's transient/permanent classification to the offset action every
 /// simple consumer on the backbone shares (§4): a transient fault (a downstream
 /// store/cache/broker blip) is logged and retried, leaving the offset for
@@ -431,8 +535,9 @@ pub fn handled_for(is_transient: bool, err: impl std::fmt::Display, consumer: &s
 /// undecodable bytes is committed-not-handled so it can't wedge the stream), and
 /// continues the producer's distributed trace by adopting the record headers as the
 /// handler span's parent (§19). The per-record [`Handled`] verdict then maps to the
-/// offset action: `Commit` advances it, `Retry` backs off `retry_backoff`
-/// (cancellably) and leaves it for redelivery, `Stop` returns without committing.
+/// offset action: `Commit` advances it, `Retry` seeks the partition back to
+/// the record and backs off `retry_backoff` (cancellably), so the same record is
+/// handled again next, `Stop` returns without committing.
 ///
 /// `name` labels the span + logs so multiple consumers in one process stay
 /// distinguishable. Manual commit (`enable.auto.commit=false`) on the passed
@@ -520,6 +625,27 @@ where
                     consumer = name,
                     "transient fault; leaving offset, backing off"
                 );
+                // Seek back so the next `recv` re-fetches THIS record. The
+                // consumer's fetch position is already past it, and librdkafka
+                // never redelivers an uncommitted record within a session: without
+                // the seek, the loop moves on to the next record, and the next
+                // `Commit` on this partition commits past the one being retried.
+                // A "retry" would silently become a skip.
+                if let Err(err) = consumer.seek(
+                    msg.topic(),
+                    msg.partition(),
+                    rdkafka::topic_partition_list::Offset::Offset(msg.offset()),
+                    RETRY_SEEK_TIMEOUT,
+                ) {
+                    tracing::error!(
+                        consumer = name,
+                        error = %err,
+                        topic = msg.topic(),
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        "seek back to a retried record failed; it is skipped until the next rebalance or restart"
+                    );
+                }
                 tokio::select! {
                     () = shutdown.cancelled() => return Ok(()),
                     () = tokio::time::sleep(retry_backoff) => {}
@@ -535,6 +661,11 @@ where
         }
     }
 }
+
+/// How long [`run_consumer`] waits for librdkafka to reposition a partition on
+/// [`Handled::Retry`]. A seek is a local fetch-queue reset, not a broker
+/// round-trip, so this is a ceiling, not an expected duration.
+const RETRY_SEEK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Decode one record into an [`EventEnvelope`], or `None` for poison (no payload or
 /// undecodable bytes — `from_json_slice` also rejects future schema versions, §2),
@@ -673,13 +804,32 @@ mod tests {
             remaining_failures: Mutex::new(2),
             delivered: Mutex::new(vec![]),
         };
-        publish_resilient(
+        let delivered = publish_resilient(
             &sink,
             an_envelope(),
             Duration::from_millis(1),
             &CancellationToken::new(),
         )
         .await;
+        assert_eq!(delivered, Ok(()));
+        assert_eq!(*sink.delivered.lock().unwrap(), vec!["BlockFinalized"]);
+    }
+
+    /// Shutdown only aborts a *retry*. A first attempt that lands during a drain
+    /// was delivered and must say so, or a caller settling on the result re-runs
+    /// work whose outcome is already on the broker.
+    #[tokio::test]
+    async fn resilient_publish_reports_a_first_attempt_delivered_during_shutdown() {
+        let sink = FlakySink {
+            remaining_failures: Mutex::new(0),
+            delivered: Mutex::new(vec![]),
+        };
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert_eq!(
+            publish_resilient(&sink, an_envelope(), Duration::from_secs(3600), &shutdown).await,
+            Ok(())
+        );
         assert_eq!(*sink.delivered.lock().unwrap(), vec!["BlockFinalized"]);
     }
 
@@ -691,8 +841,61 @@ mod tests {
         };
         let shutdown = CancellationToken::new();
         shutdown.cancel(); // already cancelled → the retry select takes this arm
-        publish_resilient(&sink, an_envelope(), Duration::from_secs(3600), &shutdown).await;
+        let delivered =
+            publish_resilient(&sink, an_envelope(), Duration::from_secs(3600), &shutdown).await;
+        assert_eq!(delivered, Err(Undelivered::Shutdown));
         assert!(sink.delivered.lock().unwrap().is_empty());
+    }
+
+    /// A sink whose envelope can never be encoded.
+    struct UnencodableSink;
+
+    #[async_trait]
+    impl EventSink for UnencodableSink {
+        async fn publish(&self, _envelope: EventEnvelope) -> Result<(), PublishError> {
+            Err(PublishError::Encode(EventError::UnsupportedSchemaVersion {
+                found: 999,
+                supported: 1,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn resilient_publish_reports_a_permanent_failure_without_retrying() {
+        let shutdown = CancellationToken::new();
+        assert_eq!(
+            publish_resilient(
+                &UnencodableSink,
+                an_envelope(),
+                Duration::from_secs(3600),
+                &shutdown
+            )
+            .await,
+            Err(Undelivered::Permanent)
+        );
+    }
+
+    #[test]
+    fn an_undelivered_publish_stops_or_skips_the_record() {
+        assert_eq!(
+            handled_undelivered(Undelivered::Shutdown, "t"),
+            Handled::Stop
+        );
+        assert!(matches!(
+            handled_undelivered(Undelivered::Permanent, "t"),
+            Handled::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn a_shutdown_abandonment_retries_and_a_permanent_one_skips() {
+        // Through the shared consumer verdict: Retry at shutdown stops without
+        // committing; a permanent one is skipped (and dead-lettered when wired).
+        assert_eq!(handled(Undelivered::Shutdown, "t"), Handled::Retry);
+        assert!(matches!(
+            handled(Undelivered::Permanent, "t"),
+            Handled::Skip { .. }
+        ));
     }
 
     // ── drain_to_backbone (the shared non-blocking producer discipline) ──────

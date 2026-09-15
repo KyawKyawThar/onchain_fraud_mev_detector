@@ -1,0 +1,25 @@
+# Cluster add-ons: things a cluster has ONE of, applied once per cluster and
+# after the `mev` namespace exists (`just k8s-apply-cluster`).
+#
+# Deliberately not part of ../base, for two reasons:
+#
+#   1. An APIService is cluster-scoped. `v1beta1.external.metrics.k8s.io` can be
+#      served by exactly one backend, so a second environment applied into the
+#      same cluster from base would silently re-point every HPA's external
+#      metrics at itself. Like metrics-server, this belongs to the cluster.
+#   2. The adapter's auth needs a RoleBinding in `kube-system`. base and the dev
+#      overlay set `namespace: mev`, and kustomize (5.x) rewrites an explicit
+#      namespace too — the binding would land in `mev`, the aggregator's
+#      front-proxy headers would go unverified, and every HPA read would come
+#      back 403. There is no field on this Kustomization that sets a namespace,
+#      so the one in each manifest is the one applied.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: mevwatch
+
+resources:
+  - prometheus-adapter.yaml

@@ -182,6 +182,10 @@ impl PendingState {
 /// stream.
 #[derive(Debug, thiserror::Error)]
 pub enum AttributionError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -194,6 +198,7 @@ impl Transience for AttributionError {
     /// Whether retrying the same incident could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            AttributionError::Undelivered(err) => err.is_transient(),
             AttributionError::Store(err) => err.is_transient(),
             AttributionError::Cluster(err) => err.is_transient(),
             AttributionError::Association(err) => err.is_transient(),
@@ -267,14 +272,18 @@ impl Attributor {
         .await
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Attribute one incident (see the module docs for the full pass). `at` is
@@ -340,7 +349,7 @@ impl Attributor {
                 labels: label_kinds.into_iter().map(str::to_owned).collect(),
             }),
         )
-        .await;
+        .await?;
 
         Ok(())
     }
@@ -371,7 +380,7 @@ impl Attributor {
                     entry: entry.entry,
                 }),
             )
-            .await;
+            .await?;
         }
 
         // The incident's own active labels feed the `AttributionUpdated`
@@ -419,7 +428,7 @@ impl Attributor {
                     seed_address: seed,
                 }),
             )
-            .await;
+            .await?;
         }
         for absorbed in &outcome.absorbed {
             self.publish(
@@ -430,7 +439,7 @@ impl Attributor {
                     evidence_ref: evidence.clone(),
                 }),
             )
-            .await;
+            .await?;
         }
 
         Ok(AddressOutcome {
@@ -485,7 +494,7 @@ impl Attributor {
                     source: <&str>::from(derived.source).to_owned(),
                 }),
             )
-            .await;
+            .await?;
         }
         Ok(())
     }

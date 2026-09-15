@@ -123,10 +123,15 @@ FROM debian:${DEBIAN_RELEASE}-slim AS runtime-base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 10001 appuser
+    && groupadd -r -g 10001 appuser \
+    && useradd -r -u 10001 -g 10001 appuser
 WORKDIR /app
 COPY --from=builder /app/service /usr/local/bin/service
-USER appuser
+# Numeric, not `appuser`: every K8s pod sets `runAsNonRoot: true`, and the
+# kubelet can only verify that against a numeric user. With a name it refuses to
+# start the container (CreateContainerConfigError: "image has non-numeric
+# user"), so no service pod could start. Found by the 2026-09-14 kind HPA demo.
+USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/service"]
 
 # The default flavour: nothing extra.
@@ -169,6 +174,6 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     pg_dump --version; \
     pg_restore --version
-USER appuser
+USER 10001:10001
 
 FROM runtime-${RUNTIME} AS runtime

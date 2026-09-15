@@ -131,6 +131,9 @@ api-error = { workspace = true }
 test-util = ["event-bus/test-util"]
 
 [dev-dependencies]
+# YAML, test-only: tests/grace_period.rs derives the worker's termination grace
+# period from the manifest and the worker's deadline constants.
+yaml-rust2 = { workspace = true }
 # `EnumIter` iteration in the wire-string drift tests (exhaustive over variants).
 strum = { workspace = true }
 # Self-dependency with `test-util` on, so the `tests/` integration crate sees

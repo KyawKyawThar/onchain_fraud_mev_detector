@@ -96,11 +96,9 @@ impl Dispatcher {
     async fn process(&self, chain: Chain, alert: &PreliminaryAlertCreated) -> Handled {
         let (job, requested) = job_for_alert(chain, alert);
 
-        // The command is the critical step. `publish_resilient` returns `false` for
-        // two reasons we must treat *differently*: a shutdown mid-retry (leave the
-        // offset so redelivery re-dispatches), versus a permanent encode failure
-        // (poison — commit to skip it, or the same record redelivers forever).
-        if !queue::publish_resilient(
+        // The command is the critical step, and each way it can fail wants a
+        // different offset action.
+        match queue::publish_resilient(
             self.job_sink.as_ref(),
             &job,
             self.publish_backoff,
@@ -108,31 +106,39 @@ impl Dispatcher {
         )
         .await
         {
-            return if self.shutdown.is_cancelled() {
-                Handled::Stop
-            } else {
-                tracing::error!(alert_id = %alert.alert_id, "dropping un-queueable job (poison); skipping");
-                Handled::Commit
-            };
+            Ok(()) => {}
+            // `sim.jobs` is at its length bound: the worker pool is behind and cannot
+            // grow further. Leave the alert uncommitted and retry it. `run_consumer`
+            // re-fetches this record after the backoff and keeps polling meanwhile,
+            // so the backlog waits in Kafka (durable, replayable, alerting on lag)
+            // instead of in broker memory.
+            Err(queue::JobUndelivered::Rejected) => {
+                crate::metrics::record_dispatch_rejected();
+                tracing::warn!(
+                    alert_id = %alert.alert_id,
+                    "sim.jobs is at its length bound; retrying the alert from Kafka"
+                );
+                return Handled::Retry;
+            }
+            Err(queue::JobUndelivered::Abandoned(undelivered)) => {
+                return event_bus::handled_undelivered(undelivered, "dispatcher");
+            }
         }
 
         // The job is on the queue; record the request as an auditable fact (§7).
-        // The command itself never enters the event store — only this does.
-        event_bus::publish_resilient(
+        // The command itself never enters the event store — only this does. An
+        // audit event abandoned at shutdown leaves the offset for redelivery (the
+        // re-dispatch is idempotent); one that can never be encoded is skipped.
+        match event_bus::publish_resilient(
             self.event_sink.as_ref(),
             EventEnvelope::new(chain, DomainEvent::SimulationRequested(requested)),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
-
-        // If shutdown fired during the audit publish, the event may not be on the
-        // wire — leave the offset so redelivery re-dispatches (idempotent) and
-        // re-audits, rather than committing past an un-audited alert.
-        if self.shutdown.is_cancelled() {
-            Handled::Stop
-        } else {
-            Handled::Commit
+        .await
+        {
+            Ok(()) => Handled::Commit,
+            Err(undelivered) => event_bus::handled_undelivered(undelivered, "dispatcher"),
         }
     }
 
@@ -299,8 +305,8 @@ mod tests {
     #[tokio::test]
     async fn process_skips_a_poison_job_that_can_never_be_queued() {
         /// A sink whose every publish is a *permanent* failure — the same outcome
-        /// an encode bug would have. It must be skipped (committed), not retried
-        /// forever, even though we are not shutting down.
+        /// an encode bug would have. It must be skipped (parked on the DLQ, then
+        /// committed), not retried forever, even though we are not shutting down.
         #[derive(Default)]
         struct PoisonSink;
         #[async_trait]
@@ -321,13 +327,48 @@ mod tests {
             CancellationToken::new(),
         );
 
-        assert_eq!(
-            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
-            Handled::Commit,
-            "a job that can never be queued is skipped, not retried forever"
+        assert!(
+            matches!(
+                dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+                Handled::Skip { .. }
+            ),
+            "a job that can never be queued is skipped (and dead-lettered), not retried forever"
         );
         // No audit fact for a job that was never queued.
         assert!(events.events.lock().unwrap().is_empty());
+    }
+
+    /// A full `sim.jobs` (the broker nacks under `x-overflow: reject-publish`) is a
+    /// `Retry`, attempted once. `run_consumer` re-fetches the record after the
+    /// backoff and keeps polling, so the backlog waits on Kafka. Spinning inside
+    /// the handler instead would stop the consumer polling and get it evicted
+    /// from its group.
+    #[tokio::test]
+    async fn a_full_work_queue_retries_the_alert_from_kafka() {
+        #[derive(Default)]
+        struct FullQueue(Mutex<u32>);
+        #[async_trait]
+        impl JobSink for FullQueue {
+            async fn publish(&self, _job: &SimulationJob) -> Result<(), JobError> {
+                *self.0.lock().unwrap() += 1;
+                Err(JobError::Rejected)
+            }
+        }
+
+        let jobs = Arc::new(FullQueue::default());
+        let events = Arc::new(RecordingEventSink::default());
+        let dispatcher = Dispatcher::new(jobs.clone(), events.clone(), CancellationToken::new());
+
+        assert_eq!(
+            dispatcher.process(Chain::ETHEREUM, &an_alert()).await,
+            Handled::Retry,
+            "a full queue leaves the alert uncommitted for Kafka to redeliver"
+        );
+        assert_eq!(*jobs.0.lock().unwrap(), 1, "one attempt, no inline spin");
+        assert!(
+            events.events.lock().unwrap().is_empty(),
+            "no audit fact for a job that was not queued"
+        );
     }
 
     #[tokio::test]

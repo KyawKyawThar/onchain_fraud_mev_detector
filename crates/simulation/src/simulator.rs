@@ -75,6 +75,7 @@
 //! [`crate::cache`] decorator, kept separate so the engine stays a pure function.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use events::primitives::{AlertId, AlertKind, BlockRef};
 use revm::bytecode::Bytecode;
@@ -306,12 +307,22 @@ pub enum SimError {
     /// caught by the sandbox. The worker **dead-letters** it rather than looping.
     #[error("unsimulatable job (poison): {0}")]
     Poison(String),
+
+    /// The job ran past its wall-clock deadline ([`Simulator::simulate_by`]).
+    /// Transient: wall time depends on the node's load, so the same job may
+    /// finish on a quieter worker, and `x-delivery-limit` still dead-letters one
+    /// that never does.
+    #[error("simulation passed its job deadline by {overshoot:?}")]
+    DeadlineExceeded { overshoot: Duration },
 }
 
 impl event_bus::Transience for SimError {
     /// Whether re-running the *same* job could plausibly succeed later.
     fn is_transient(&self) -> bool {
-        matches!(self, SimError::Transient(_))
+        matches!(
+            self,
+            SimError::Transient(_) | SimError::DeadlineExceeded { .. }
+        )
     }
 }
 
@@ -321,6 +332,19 @@ pub trait Simulator: Send + Sync {
     /// Run one scenario to an outcome. CPU-bound — the worker calls this on the
     /// rayon pool, never on the async reactor (§17).
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError>;
+
+    /// [`simulate`](Self::simulate), giving up once `deadline` has passed. The
+    /// worker always calls this form. The default ignores the deadline, which
+    /// is right for an engine that cannot stop early, such as a deterministic
+    /// test double.
+    fn simulate_by(
+        &self,
+        req: &SimulationRequest,
+        deadline: Instant,
+    ) -> Result<SimulationOutcome, SimError> {
+        let _ = deadline;
+        self.simulate(req)
+    }
 }
 
 /// Forward through an `Arc`, so both `Arc<dyn Simulator>` (the worker's erased
@@ -329,6 +353,14 @@ pub trait Simulator: Send + Sync {
 impl<S: Simulator + ?Sized> Simulator for Arc<S> {
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
         (**self).simulate(req)
+    }
+
+    fn simulate_by(
+        &self,
+        req: &SimulationRequest,
+        deadline: Instant,
+    ) -> Result<SimulationOutcome, SimError> {
+        (**self).simulate_by(req, deadline)
     }
 }
 
@@ -369,6 +401,8 @@ pub struct RevmSimulator {
     min_profit: MinProfit,
     /// Gas/step bounds on hostile bytecode (§7 hardening).
     limits: SimLimits,
+    /// Set only for the duration of one [`Simulator::simulate_by`] call.
+    deadline: Option<Instant>,
 }
 
 impl RevmSimulator {
@@ -381,7 +415,11 @@ impl RevmSimulator {
     /// Build an engine with explicit gas/step [`SimLimits`] — the worker binary wires
     /// the operator-tuned caps here; tests pin tight caps to exercise the bounds.
     pub fn with_limits(min_profit: MinProfit, limits: SimLimits) -> Self {
-        Self { min_profit, limits }
+        Self {
+            min_profit,
+            limits,
+            deadline: None,
+        }
     }
 }
 
@@ -390,6 +428,23 @@ impl Simulator for RevmSimulator {
     /// revm into a panic becomes poison rather than unwinding the rayon worker.
     fn simulate(&self, req: &SimulationRequest) -> Result<SimulationOutcome, SimError> {
         run_sandboxed(|| self.simulate_inner(req))
+    }
+
+    /// The deadline is checked before each transaction, so a job stops within
+    /// one transaction of it. revm cannot be interrupted mid-transaction without
+    /// a tracing inspector, which is deliberately not linked (see the module
+    /// docs). The per-tx gas cap bounds how long that last transaction runs, and
+    /// `simulation_job_deadline_overshoot_seconds` measures it.
+    fn simulate_by(
+        &self,
+        req: &SimulationRequest,
+        deadline: Instant,
+    ) -> Result<SimulationOutcome, SimError> {
+        let bounded = Self {
+            deadline: Some(deadline),
+            ..self.clone()
+        };
+        run_sandboxed(|| bounded.simulate_inner(req))
     }
 }
 
@@ -636,6 +691,14 @@ impl RevmSimulator {
         let mut tx_success = Vec::with_capacity(bundle.len());
         let mut bundle_gas: u64 = 0;
         for tx in bundle {
+            if let Some(deadline) = self.deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SimError::DeadlineExceeded {
+                        overshoot: now - deadline,
+                    });
+                }
+            }
             // Match the tx nonce to the caller's current nonce so the bundle isn't
             // rejected for replay protection; reads the committed state each step.
             let nonce = balance_and_nonce(evm.db_ref(), tx.caller)?.1;
@@ -827,6 +890,33 @@ mod tests {
         assert!(out.confirmed, "5 ETH clears the 1 ETH threshold");
         assert_eq!(out.txs, req.txs);
         assert_eq!(out.alert_id, req.alert_id);
+    }
+
+    /// A job whose deadline has passed stops before its next transaction, and the
+    /// same request with no deadline runs to an outcome.
+    #[test]
+    fn a_job_past_its_deadline_stops_before_the_next_transaction() {
+        let sim = RevmSimulator::new(MinProfit::try_new(1.0).unwrap());
+        let req = request(
+            vec![SeededAccount {
+                address: victim(),
+                balance: eth(10),
+                code: None,
+            }],
+            vec![SimTx {
+                caller: victim(),
+                to: Some(attacker()),
+                value: eth(1),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            }],
+        );
+
+        match sim.simulate_by(&req, Instant::now()) {
+            Err(SimError::DeadlineExceeded { .. }) => {}
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+        assert!(sim.simulate(&req).is_ok());
     }
 
     /// Below the threshold the alert is *retracted*, not confirmed — the heuristic

@@ -73,6 +73,7 @@ fn test_config(url: &str) -> RabbitConfig {
         dead_letter_queue: "sim.jobs.dlq".into(),
         // Low limit so the redelivery-loop backstop is cheap to reason about.
         delivery_limit: 3,
+        max_length_bytes: simulation::config::DEFAULT_SIM_MAX_LENGTH_BYTES,
     }
 }
 

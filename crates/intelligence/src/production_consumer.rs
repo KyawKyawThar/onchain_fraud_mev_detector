@@ -146,6 +146,10 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<La
 /// so a transient retry converges.
 #[derive(Debug, thiserror::Error)]
 pub enum ProductionError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Labels(#[from] StoreError),
     #[error(transparent)]
@@ -164,6 +168,7 @@ impl Transience for ProductionError {
     /// Whether retrying the same event could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            ProductionError::Undelivered(err) => err.is_transient(),
             ProductionError::Labels(err) => err.is_transient(),
             ProductionError::Cache(err) => err.is_transient(),
             ProductionError::Facts(SourceFault::Rpc(_)) => true,
@@ -403,19 +408,23 @@ impl ProductionConsumer {
                     source: <&str>::from(minted.source).to_owned(),
                 }),
             )
-            .await;
+            .await?;
         }
         Ok(Some(value))
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Run one pure fold under the state lock, then flush its snapshots.

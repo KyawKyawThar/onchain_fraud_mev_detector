@@ -133,6 +133,10 @@ pub fn build_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer<La
 /// stream.
 #[derive(Debug, thiserror::Error)]
 pub enum CrossChainAttributionError {
+    /// An event this pass derived did not reach the broker. Shutdown is
+    /// transient (the offset stays for redelivery); a permanent failure skips.
+    #[error(transparent)]
+    Undelivered(#[from] event_bus::Undelivered),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -145,6 +149,7 @@ impl Transience for CrossChainAttributionError {
     /// Whether retrying the same finding could plausibly succeed.
     fn is_transient(&self) -> bool {
         match self {
+            CrossChainAttributionError::Undelivered(err) => err.is_transient(),
             CrossChainAttributionError::Store(err) => err.is_transient(),
             CrossChainAttributionError::Cluster(err) => err.is_transient(),
             CrossChainAttributionError::Association(err) => err.is_transient(),
@@ -216,14 +221,18 @@ impl CrossChainAttributor {
         .await
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Attribute one cross-chain finding (see the module docs for the full
@@ -251,7 +260,7 @@ impl CrossChainAttributor {
                     entry: entry.entry,
                 }),
             )
-            .await;
+            .await?;
         }
 
         let evidence = format!("cross_chain_finding:{finding_id}");
@@ -288,7 +297,7 @@ impl CrossChainAttributor {
                         seed_address: seed,
                     }),
                 )
-                .await;
+                .await?;
             }
             for absorbed in &outcome.absorbed {
                 self.publish(
@@ -299,7 +308,7 @@ impl CrossChainAttributor {
                         evidence_ref: evidence.clone(),
                     }),
                 )
-                .await;
+                .await?;
             }
             resolved_entity = Some(outcome.entity_id);
         }
@@ -320,7 +329,7 @@ impl CrossChainAttributor {
                     source: <&str>::from(derived.source).to_owned(),
                 }),
             )
-            .await;
+            .await?;
         }
         Ok(())
     }

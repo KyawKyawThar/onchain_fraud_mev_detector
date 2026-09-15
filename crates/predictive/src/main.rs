@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{Address, B256};
 use anyhow::{Context, Result};
 use detector_api::TokenMeta;
+use event_bus::AcceptLoss;
 use event_bus::{publish_resilient, EventSink, KafkaEventSink, PUBLISH_BACKOFF};
 use events::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use events::primitives::{Confidence, PredictionId};
@@ -291,9 +292,17 @@ async fn run_consumer(
         };
         let envelope = EventEnvelope::new(chain, DomainEvent::PredictedAlert(alert));
         predictive_metrics::record_prediction(envelope.event_type());
-        publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+        publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown)
+            .await
+            .accept_loss(PREDICTION_LOSS);
     }
 }
+
+/// Why a prediction may be lost: predictions are provisional and come from a live
+/// mempool feed, so there is no upstream position to hold back and nothing to
+/// redeliver. An abandoned one is counted by `event_publish_abandoned_total`.
+const PREDICTION_LOSS: &str =
+    "provisional prediction from a live feed with no position to hold back";
 
 /// [`run_cascade`]'s fixed (non-channel, non-shared-state) configuration,
 /// grouped into one struct so the function stays under clippy's argument-count
@@ -401,7 +410,9 @@ async fn run_cascade(
                 .lock()
                 .unwrap()
                 .record_prediction(key, envelope.occurred_at);
-            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown)
+                .await
+                .accept_loss(PREDICTION_LOSS);
         }
 
         let reflexivity::CascadeOutcome {
@@ -422,7 +433,9 @@ async fn run_cascade(
             };
             let envelope = EventEnvelope::new(chain, DomainEvent::LiquidationCascadeWarned(alert));
             predictive_metrics::record_prediction(envelope.event_type());
-            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown).await;
+            publish_resilient(sink.as_ref(), envelope, PUBLISH_BACKOFF, &shutdown)
+                .await
+                .accept_loss(PREDICTION_LOSS);
         }
     }
 }

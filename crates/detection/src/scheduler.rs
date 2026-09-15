@@ -58,6 +58,7 @@ use event_bus::dlq::DeadLetterQueue;
 use event_bus::lag::{build_reporting_consumer, LagReporting};
 use event_bus::usage::UsageFact;
 use event_bus::{header_carrier, publish_resilient, EventSink};
+use event_bus::{AcceptLoss, Undelivered};
 use events::chain::BlockReverted;
 use events::primitives::Chain;
 use events::system::UsageEventType;
@@ -337,7 +338,23 @@ impl Scheduler {
                         }
                     }
                     Some((Some(event), token)) => {
-                        self.handle_one(event).await;
+                        match self.handle_one(event).await {
+                            // Published, or can never be: an event we cannot encode
+                            // fails identically forever, so advancing is
+                            // skip-don't-wedge (counted by
+                            // event_publish_abandoned_total{reason="permanent"}).
+                            Ok(()) | Err(Undelivered::Permanent) => {}
+                            // Shutdown interrupted a publish: this block's alerts may
+                            // not be on the wire, so its offset must NOT advance.
+                            // Returning also leaves every later block uncommitted, so
+                            // the committer can never overtake it.
+                            Err(Undelivered::Shutdown) => {
+                                tracing::info!(
+                                    "shutdown interrupted a block's publish; leaving its offset for redelivery"
+                                );
+                                return;
+                            }
+                        }
                         // Block is durably published — safe to advance its offset.
                         // A closed `done` (committer gone) means we're shutting down.
                         if done.send(token).await.is_err() {
@@ -367,7 +384,7 @@ impl Scheduler {
     /// wait is time it spent waiting to be handed to this function at all), so
     /// the clock arrives on the work item and the wrapper reads it rather than
     /// starting it. Same discipline, one rung weaker, and worth saying so.
-    async fn handle_one(&mut self, event: BlockEvent) {
+    async fn handle_one(&mut self, event: BlockEvent) -> Result<(), Undelivered> {
         // Split the fast path at pickup: everything before this moment was
         // queueing (the term that grows when detection is the bottleneck),
         // everything after is the work itself.
@@ -377,11 +394,13 @@ impl Scheduler {
             BlockEvent::Reverted(_) => None,
         };
 
-        let alerted = self.handle_one_inner(event).await;
+        let (alerted, delivered) = self.handle_one_inner(event).await;
 
         // The fast path ends when the work does — at the alert's durable
         // publication, not at the offset commit the caller performs next (§6).
-        if let Some((clock, queue_wait)) = timing {
+        // A block whose publish was abandoned was not delivered, so it is not a
+        // sample of the claim.
+        if let (Some((clock, queue_wait)), Ok(())) = (timing, delivered) {
             crate::metrics::record_fast_path(crate::metrics::FastPathSample {
                 queue_wait,
                 processing: clock.in_process().saturating_sub(queue_wait),
@@ -389,12 +408,14 @@ impl Scheduler {
                 alerted,
             });
         }
+        delivered
     }
 
     /// Run the roster, publish what it produced, and meter it. Returns whether
-    /// this block produced at least one `PreliminaryAlertCreated` — the one bit
-    /// [`Self::handle_one`] needs and the only thing it learns about the work.
-    async fn handle_one_inner(&mut self, event: BlockEvent) -> bool {
+    /// this block produced at least one `PreliminaryAlertCreated`, and whether
+    /// its events all reached the broker. Publishing stops at the first that does
+    /// not: the block's offset will not advance either way.
+    async fn handle_one_inner(&mut self, event: BlockEvent) -> (bool, Result<(), Undelivered>) {
         let outcome = self.process(event).await;
         let alerted = outcome
             .events
@@ -405,19 +426,26 @@ impl Scheduler {
         // never a shared `&self`, which would force the whole `Scheduler` (and
         // so every cross-block slot) to be `Sync`; the slots run serially and
         // needn't be.
+        let mut delivered = Ok(());
         for payload in outcome.events {
-            publish_resilient(
+            if let Err(undelivered) = publish_resilient(
                 self.sink.as_ref(),
                 EventEnvelope::new(self.chain, payload),
                 self.publish_backoff,
                 &self.shutdown,
             )
-            .await;
+            .await
+            {
+                delivered = Err(undelivered);
+                break;
+            }
         }
 
         // One `DetectorRun` usage fact per block, batched to the exact count run
-        // — no customer in scope (detection is chain-wide, §13).
-        if outcome.detector_runs > 0 {
+        // — no customer in scope (detection is chain-wide, §13). Only for a block
+        // that was delivered: an undelivered one is re-run, and metered, on
+        // redelivery.
+        if delivered.is_ok() && outcome.detector_runs > 0 {
             UsageFact::new(UsageEventType::DetectorRun, outcome.detector_runs)
                 .record(
                     self.sink.as_ref(),
@@ -425,10 +453,11 @@ impl Scheduler {
                     self.publish_backoff,
                     &self.shutdown,
                 )
-                .await;
+                .await
+                .accept_loss("usage metering is approximate by design (§13)");
         }
 
-        alerted
+        (alerted, delivered)
     }
 }
 

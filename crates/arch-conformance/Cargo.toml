@@ -17,5 +17,8 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
+# YAML, test-only: `tests/deploy_users.rs` walks deploy/k8s for pods that the
+# kubelet would refuse to start. Same crate and reasoning as alert-conformance.
+yaml-rust2 = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

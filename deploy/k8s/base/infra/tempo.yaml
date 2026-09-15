@@ -69,8 +69,13 @@ spec:
         app.kubernetes.io/part-of: mevwatch
         app.kubernetes.io/component: observability
     spec:
+      # Numeric and explicit: the image's own user (10001:10001). A kubelet can
+      # only honour runAsNonRoot against a numeric uid, so the manifest states it
+      # (crates/arch-conformance/tests/deploy_users.rs).
       securityContext:
         runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:

@@ -74,6 +74,7 @@ use alloy_primitives::B256;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
+use event_bus::AcceptLoss;
 use event_bus::{publish_resilient, run_consumer, EventHandler, EventSink, Handled};
 use events::chain::{BlockFinalized, BlockReverted};
 use events::cross_chain::CrossChainFindingRetracted;
@@ -514,7 +515,15 @@ impl FinalityConsumer {
                                 reason: reason.clone(),
                             }),
                         )
-                        .await;
+                        .await
+                        // A known gap, stated rather than hidden: the tracker has
+                        // already released this finding, so neither a held offset nor
+                        // redelivery would re-retract it. The loss is counted by
+                        // event_publish_abandoned_total{event_type="CrossChainFindingRetracted"}.
+                        .accept_loss(
+                            "the finality tracker has already released the finding; \
+                             redelivery cannot re-retract it",
+                        );
                     }
                 }
                 crate::metrics::record_pending_findings(self.tracker.len());
@@ -558,14 +567,18 @@ impl FinalityConsumer {
         }
     }
 
-    async fn publish(&self, chain: Chain, payload: DomainEvent) {
+    async fn publish(
+        &self,
+        chain: Chain,
+        payload: DomainEvent,
+    ) -> Result<(), event_bus::Undelivered> {
         publish_resilient(
             self.sink.as_ref(),
             EventEnvelope::new(chain, payload),
             self.publish_backoff,
             &self.shutdown,
         )
-        .await;
+        .await
     }
 
     /// Drive the consumer off Kafka until shutdown or a fatal subscribe
