@@ -26,6 +26,8 @@ path = "src/main.rs"
 detection = { workspace = true, features = ["detectors"] }
 detector-api = { workspace = true, features = ["test-util"] }
 events = { workspace = true }
+# The replay-window format `dataset window` writes (Epic E).
+corpus = { workspace = true }
 alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -54,6 +56,16 @@ insta = { workspace = true }
 # anywhere near the test binary (see that file's docs for why that matters).
 anomaly-detector = { workspace = true }
 inference = { workspace = true, features = ["test-util"] }
+# tests/adversarial_boundaries.rs: each threshold near miss is shown to fire
+# once *that one* threshold is loosened, so it provably sits on the edge it
+# claims to probe. That needs the detectors' own config types.
+sandwich-detector = { workspace = true }
+arb-detector = { workspace = true }
+flashloan-detector = { workspace = true }
+liquidation-detector = { workspace = true }
+rugpull-detector = { workspace = true }
+washtrading-detector = { workspace = true }
+poisoning-detector = { workspace = true }
 ml-features = { workspace = true }
 
 [lints]

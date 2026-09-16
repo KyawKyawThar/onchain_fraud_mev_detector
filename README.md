@@ -13,8 +13,8 @@ MEVWatch follows Ethereum and Base block by block. It flags MEV and fraud patter
 | | |
 |---|---|
 | **Measured** | The fast path (block → preliminary alert) held its < 1s p99 budget at 4 blocks/s: 250ms with the API idle, and 1.000s, on the boundary, with API load on the same laptop. That is a floor, not a capacity figure ([load test](docs/runbooks/load-test.md)). On kind, the simulation workers autoscaled on queue depth: 2 → 5 replicas in 37s and back to 2 in exact 60s steps. |
-| **Enforced in CI** | A detector precision/recall gate, alert rules that cannot fire, dependency seams, and pods that cannot start under `runAsNonRoot` all fail the build. |
-| **Not yet shown** | End to end on real mainnet transactions: the live source is header-only, and simulation's fork-from-chain is stubbed. The detector corpus is 8 hand-built scenarios, too small to support any false-positive rate. No production traffic. |
+| **Enforced in CI** | A detector precision/recall gate over known incidents and near misses, a README that cannot state the false-positive target as a result, alert rules that cannot fire, dependency seams, and pods that cannot start under `runAsNonRoot` all fail the build. |
+| **Not yet shown** | End to end on real mainnet transactions: the live source is header-only, and simulation's fork-from-chain is stubbed. A false-positive rate: the < 4% of simulation-refuted alerts is a target, not a result. The corpus is 8 hand-built scenarios plus 22 adversarial near misses (all quiet), and it has 0 of the 3+ replayed mainnet windows and 65+ adjudicated alerts the backtest requires before stating it. No production traffic. |
 
 ## Architecture
 

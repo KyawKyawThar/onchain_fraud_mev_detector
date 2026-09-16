@@ -17,6 +17,16 @@
 //! falling under the promotion bar, and one can sit *at* its baseline forever
 //! while never having been good enough to ship.
 //!
+//! The run also prints the **false-positive-rate claim** ([`claim`]): whether
+//! the committed mainnet windows are enough to state the README's target as a
+//! result. It informs rather than gates. "Not enough evidence yet" is the
+//! honest current state, not a broken build. What *is* gated, by
+//! `tests/readme_claim.rs`, is the README saying more than this verdict allows.
+//!
+//! The replayed corpus is [`backtest::load_corpus`]: the hand-written fixtures
+//! (known incidents and adversarial near misses) plus every window in
+//! `crates/backtest/corpus/mainnet/`.
+//!
 //! `--update-baseline` overwrites the baseline with this run's numbers — the
 //! deliberate step a change that intentionally moves a detector's measured
 //! performance takes before it can merge. `--update-model-cards` overwrites
@@ -41,7 +51,7 @@
 //! weights for, not a failure.
 
 use anyhow::Context;
-use backtest::{baseline, fixtures, gate, performance};
+use backtest::{baseline, claim, fixtures, gate, performance};
 use clap::Parser;
 use detection::RolloutPolicy;
 
@@ -74,14 +84,18 @@ fn main() -> anyhow::Result<()> {
     let roster =
         backtest::boot_with(ml).context("linking the detector roster to its model cards")?;
 
-    let mut fixtures = fixtures::all();
+    let mut fixtures = backtest::load_corpus(&roster).context("loading the committed corpus")?;
     if scoring_ml {
         fixtures.extend(fixtures::ml());
     }
     let report = backtest::run_backtest(&fixtures, &roster);
     print!("{report}");
+    print!(
+        "\n{}",
+        claim::evaluate(&report, &claim::ClaimPolicy::COMMITTED)
+    );
 
-    // The committed artifacts are derived from `fixtures::all()` alone. A run
+    // The committed artifacts are derived from `load_corpus` alone. A run
     // that replayed more blocks than they were measured over would rewrite
     // every detector's hit rate against a different denominator — silently
     // making the golden files unreproducible on a machine with no model

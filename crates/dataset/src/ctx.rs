@@ -13,9 +13,10 @@
 //! reason: the decode/fork path is not wired yet.
 //!
 //! So this is a trait, not a function. The export pipeline is written against
-//! it, [`ReplayCtxSource`] backs it with what the event store *does* carry
-//! today, and an archive-backed implementation drops in behind it later
-//! without the join, the label rule, the sinks or the manifest changing.
+//! it; [`ReplayCtxSource`] backs it with what the event store *does* carry, and
+//! [`crate::archive::ArchiveCtxSource`] backs it with full blocks read from an
+//! archive node (the only `Enriched` source), with the join, the label rule,
+//! the sinks and the manifest unchanged.
 //!
 //! # Fidelity is stamped, never assumed
 //!

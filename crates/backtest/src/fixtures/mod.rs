@@ -1,6 +1,11 @@
 //! Ground-truth fixtures for the backtest harness (§18, Sprint 10 t2): one
-//! known-incident scenario per built-in detector, plus one clean block with no
-//! incident at all.
+//! known-incident scenario per built-in detector, one clean block with no
+//! incident at all, and the [`adversarial`] near misses (Epic E).
+//!
+//! All of these are **author-written**. They prove each detector's contract,
+//! meaning its signature fires and its edges hold. They are not a sample of
+//! real traffic, so no false-positive rate can be read off them (see
+//! [`crate::claim`]). Real traffic enters through [`crate::windows`].
 //!
 //! Built with [`CtxBuilder`] — the same helper the detectors' own regression
 //! tests use — so each incident here is the identical realistic, mainnet-shaped
@@ -18,6 +23,8 @@ use detector_api::DetectorId;
 use events::primitives::{AlertKind, BlockRef, Chain};
 
 use crate::fixture::{ExpectedIncident, Fixture};
+
+pub mod adversarial;
 
 const ETH: u128 = 1_000_000_000_000_000_000; // 1e18 wei
 const USDC_UNIT: u128 = 1_000_000; // 1 USDC (6 decimals)
@@ -401,8 +408,9 @@ pub fn anomalous_bundle() -> Fixture {
     )
 }
 
-/// Every fixture the backtest replays: one known incident per built-in
-/// detector, plus the clean block.
+/// Every hand-written fixture the backtest replays: one known incident per
+/// built-in detector, the clean block, and every [`adversarial`] near miss.
+/// The committed mainnet windows are added on top by [`crate::load_corpus`].
 ///
 /// Deliberately excludes [`anomalous_bundle`]: the ML detector is only in the
 /// roster when a deployment mounts a model bundle, and ground-truthing an
@@ -420,6 +428,9 @@ pub fn all() -> Vec<Fixture> {
         poisoning(),
         clean_block(),
     ]
+    .into_iter()
+    .chain(adversarial::all())
+    .collect()
 }
 
 /// The fixtures that only mean something with an ML detector in the roster.

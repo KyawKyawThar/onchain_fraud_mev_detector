@@ -4,6 +4,9 @@
 //! ```text
 //!   dataset export --from 2026-08-01T00:00:00Z --to 2026-08-02T00:00:00Z \
 //!                  --parquet out/sandwich-aug01.parquet --clickhouse
+//!   dataset window --from 2026-10-01T00:00:00Z --to 2026-10-01T01:00:00Z \
+//!                  --name "eth mainnet 2026-10-01 00:00 UTC, 1h" \
+//!                  --out crates/backtest/corpus/mainnet/eth-2026-10-01T00.json.gz
 //!   dataset migrate up|down|info
 //! ```
 //!
@@ -13,6 +16,12 @@
 //! `content_hash` produced it byte for byte. Flags that only change *where the
 //! rows go* (`--parquet`, `--clickhouse`) are deliberately outside both.
 //!
+//! Block contexts come from `--context-source`: `archive` reads every block
+//! from the archive node in `DATASET_ARCHIVE_RPC_URL` and yields enriched
+//! contexts (`chain-enrich`); `replay` rebuilds them from the replayed events
+//! and never exceeds `full_bundle`. `export` defaults to `replay`, `window` to
+//! `archive` (a window refuses anything less).
+//!
 //! With no sink flag the run is a dry run: it replays, joins, extracts and
 //! prints the manifest without writing anywhere — the cheap way to see what a
 //! window would yield before committing a table to it.
@@ -21,13 +30,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use dataset::config::Config;
-use dataset::ctx::{Fidelity, ReplayCtxFactory};
+use dataset::config::ARCHIVE_RPC_URL_ENV;
+use dataset::ctx::{CtxSourceFactory, Fidelity, ReplayCtxFactory, StaticCtxFactory};
 use dataset::sink::clickhouse::{build_client, ClickHouseSink};
 use dataset::sink::parquet::ParquetSink;
 use dataset::sink::{CollectingSink, FanOutSink};
 use dataset::source::HttpEventSource;
 use dataset::spec::DatasetSpec;
-use dataset::{run_export, ExportOptions};
+use dataset::ArchiveCtxSource;
+use dataset::{capture_window, run_export, CaptureOptions, ExportOptions, WindowSpec};
 use events::primitives::Chain;
 use ml_features::{FeatureVersion, Granularity};
 
@@ -45,6 +56,10 @@ struct Cli {
 enum Command {
     /// Materialise a dataset from a replay window.
     Export(ExportArgs),
+    /// Capture a replay window for the backtest corpus (Epic E): every
+    /// canonical block in the range as its enriched context, plus simulation's
+    /// verdicts on the findings raised there. Refuses anything less.
+    Window(WindowArgs),
     /// Apply, revert or inspect this binary's ClickHouse migrations.
     Migrate {
         /// `up`, `down`, or `info`.
@@ -121,6 +136,100 @@ struct ExportArgs {
     /// (§19). Unset means the `metrics` call sites stay no-ops.
     #[arg(long)]
     metrics_addr: Option<std::net::SocketAddr>,
+    #[command(flatten)]
+    context: ContextArgs,
+}
+
+/// Where block contexts come from (shared by `export` and `window`).
+#[derive(clap::Args)]
+struct ContextArgs {
+    /// `archive`: full blocks and receipts from the archive node in
+    /// DATASET_ARCHIVE_RPC_URL, decoded and enriched. `replay`: rebuilt from
+    /// the replayed events, never better than full_bundle.
+    #[arg(long, value_parser = ["archive", "replay"])]
+    context_source: Option<String>,
+    /// Venues and price feeds to enrich with. Defaults to the committed
+    /// config for the chain (crates/chain-enrich/config/).
+    #[arg(long)]
+    enrich_config: Option<std::path::PathBuf>,
+    /// Per-call timeout for archive reads, in seconds.
+    #[arg(long, default_value_t = 30)]
+    archive_timeout_secs: u64,
+}
+
+impl ContextArgs {
+    /// Build the factory `kind` names (`default` when the flag is unset).
+    async fn factory(
+        &self,
+        default: &str,
+        chain: Chain,
+        config: &Config,
+    ) -> Result<Box<dyn CtxSourceFactory>> {
+        match self.context_source.as_deref().unwrap_or(default) {
+            "replay" => Ok(Box::new(ReplayCtxFactory)),
+            _ => {
+                use secrecy::ExposeSecret;
+                let url = config.archive_rpc_url.as_ref().with_context(|| {
+                    format!("--context-source archive needs {ARCHIVE_RPC_URL_ENV}")
+                })?;
+                // Never echo the URL: hosted endpoints carry the key in it.
+                let url: url::Url = url
+                    .expose_secret()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("{ARCHIVE_RPC_URL_ENV} is not a valid URL"))?;
+                let enrich = match &self.enrich_config {
+                    Some(path) => chain_enrich::EnrichConfig::from_file(path)?,
+                    None => chain_enrich::EnrichConfig::builtin(chain)?,
+                };
+                anyhow::ensure!(
+                    enrich.chain == chain,
+                    "the enrichment config is for {}, the replay is {chain}",
+                    enrich.chain
+                );
+                let rpc = chain_enrich::AlloyArchiveRpc::new(
+                    url,
+                    std::time::Duration::from_secs(self.archive_timeout_secs),
+                );
+                let source = ArchiveCtxSource::connect(rpc, enrich)
+                    .await
+                    .context("connecting to the archive node")?;
+                Ok(Box::new(StaticCtxFactory::new(std::sync::Arc::new(source))))
+            }
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct WindowArgs {
+    /// Chain id to replay (1 = Ethereum).
+    #[arg(long, default_value_t = 1)]
+    chain: u64,
+    /// Inclusive start: blocks assembled at or after this instant (RFC 3339).
+    #[arg(long)]
+    from: DateTime<Utc>,
+    /// Exclusive end.
+    #[arg(long)]
+    to: DateTime<Utc>,
+    /// Seconds past `--to` to keep reading simulation outcomes.
+    #[arg(long, default_value_t = dataset::DEFAULT_LOOKAHEAD_SECS)]
+    lookahead_secs: u64,
+    /// The window's name, printed in every backtest report.
+    #[arg(long)]
+    name: String,
+    /// Where to write the window, normally
+    /// `crates/backtest/corpus/mainnet/<name>.json`. Refuses to overwrite: a
+    /// committed window is evidence, and replacing it is a deliberate delete.
+    #[arg(long)]
+    out: std::path::PathBuf,
+    /// Ceiling on events held in memory for the replay.
+    #[arg(long, default_value_t = dataset::export::DEFAULT_MAX_EVENTS)]
+    max_events: usize,
+    /// Block contexts resolved at once. Changes wall time and source load,
+    /// never the window written.
+    #[arg(long, default_value_t = 16)]
+    ctx_concurrency: usize,
+    #[command(flatten)]
+    context: ContextArgs,
 }
 
 impl ExportArgs {
@@ -168,7 +277,60 @@ async fn main() -> Result<()> {
             dataset::migrate::MIGRATOR.cli(&client, Some(&action)).await
         }
         Command::Export(args) => export(args, config).await,
+        Command::Window(args) => window(args, config).await,
     }
+}
+
+async fn window(args: WindowArgs, config: Config) -> Result<()> {
+    if args.out.exists() {
+        anyhow::bail!(
+            "{} already exists — a committed window is evidence; delete it deliberately first",
+            args.out.display()
+        );
+    }
+    let spec = WindowSpec {
+        chain: Chain(args.chain),
+        from: args.from,
+        to: args.to,
+        lookahead_secs: args.lookahead_secs,
+        name: args.name,
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(dataset::source::DEFAULT_REQUEST_TIMEOUT)
+        .build()
+        .context("building the event-store HTTP client")?;
+    let events = HttpEventSource::new(http, &config.event_store_url);
+
+    // A window needs enriched contexts, so it reads the archive by default;
+    // `--context-source replay` is only useful to see the refusal.
+    let factory = args.context.factory("archive", spec.chain, &config).await?;
+    let options = CaptureOptions {
+        max_events: args.max_events,
+        ctx_concurrency: args.ctx_concurrency,
+    };
+    let window = capture_window(&spec, &events, factory.as_ref(), options)
+        .await
+        .context("capturing the replay window")?;
+    corpus::save(&window, &args.out).with_context(|| format!("writing {}", args.out.display()))?;
+
+    let mut verdicts = std::collections::BTreeMap::<&str, u64>::new();
+    for adj in &window.adjudications {
+        *verdicts.entry(adj.verdict.as_str()).or_default() += 1;
+    }
+    println!(
+        "window {:?}: {} blocks, verdicts {:?}, unadjudicated {:?}\n  written to {}",
+        window.name,
+        window.blocks.len(),
+        verdicts,
+        window.unadjudicated_findings,
+        args.out.display()
+    );
+    println!(
+        "  next: just backtest, then update the baseline, model cards and snapshot together \
+         (crates/backtest/corpus/mainnet/README.md)"
+    );
+    Ok(())
 }
 
 async fn export(args: ExportArgs, config: Config) -> Result<()> {
@@ -231,15 +393,19 @@ async fn export(args: ExportArgs, config: Config) -> Result<()> {
         .context("building the event-store HTTP client")?;
     let events = HttpEventSource::new(http, &config.event_store_url);
 
-    // Today's context source is reconstructed from each shard's own window, so
-    // the factory rebuilds it per shard. When an archive-backed `CtxSource`
-    // lands it becomes a `StaticCtxFactory` built from config, and nothing else
-    // here changes.
-    let ctx_factory = ReplayCtxFactory;
+    // `replay` by default, so an export with no archive node configured
+    // behaves as it always has; `archive` gives enriched rows.
+    let ctx_factory = args.context.factory("replay", spec.chain, &config).await?;
 
-    let manifest = run_export(&spec, &events, &ctx_factory, &mut sinks, args.options())
-        .await
-        .context("exporting the dataset")?;
+    let manifest = run_export(
+        &spec,
+        &events,
+        ctx_factory.as_ref(),
+        &mut sinks,
+        args.options(),
+    )
+    .await
+    .context("exporting the dataset")?;
 
     dataset::metrics::record_export(&manifest);
 

@@ -1,0 +1,35 @@
+[package]
+name = "corpus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The replay-window format (§18, §20.1; Epic E) — a run of consecutive mainnet
+# blocks, each as the full `DetectionCtx` a detector saw, plus the findings
+# simulation adjudicated on them. Written by `dataset window` (the flywheel
+# side) and read by `backtest` (the scoring side), which is why it is its own
+# leaf: `dataset` must never link `detection`, and `backtest` has no business
+# linking ClickHouse, Parquet or an HTTP client. Both sides depend on this
+# small crate instead of on each other.
+#
+# Deliberately as blind as the context it serialises: no stores, no brokers,
+# no `intelligence` (arch-conformance holds this). An adjudication is
+# simulation's verdict on a *behaviour*, never an attribution.
+
+[dependencies]
+events = { workspace = true }
+detector-api = { workspace = true }
+alloy-primitives = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `.json.gz` windows (see the crate docs, "Storage"). Pure Rust backend.
+flate2 = { workspace = true }
+
+[dev-dependencies]
+detector-api = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -38,6 +38,18 @@ telemetry = { workspace = true }
 # This binary owns the `ml_dataset_*` tables outright (§14: no shared tables),
 # so it carries its own migration set bound to its own bookkeeping table.
 ch-migrate = { workspace = true }
+# The replay-window format `dataset window` writes for the backtest corpus
+# (Epic E) — the leaf both sides share, so this crate never links `backtest`
+# or `detection`.
+corpus = { workspace = true }
+# The archive-backed context source (`archive.rs`): full blocks and receipts,
+# decoded and enriched — the only `Fidelity::Enriched` producer.
+chain-enrich = { workspace = true }
+url = { workspace = true }
+# `dataset window` resolves block contexts with bounded, order-preserving
+# concurrency (`buffered`), so an archive-backed source is not one round trip
+# per block in series.
+futures-util = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -87,6 +99,8 @@ proptest = { workspace = true }
 # contexts with, so an end-to-end export test can supply a *fully enriched*
 # context through the `CtxSource` seam and assert on real feature values.
 detector-api = { workspace = true, features = ["test-util"] }
+# `FakeChain`, to test the archive source against real decoding.
+chain-enrich = { workspace = true, features = ["test-util"] }
 # Real ClickHouse in a throwaway container for the `#[ignore]`d sink test.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

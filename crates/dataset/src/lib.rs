@@ -54,9 +54,9 @@
 //!   holds events, not blocks, so a faithful context needs an archive node and
 //!   the decode path that is not wired yet. [`ctx::CtxSource`] is therefore a
 //!   seam: [`ctx::ReplayCtxSource`] backs it with what the window itself
-//!   reveals, every context declares a [`ctx::Fidelity`], and `--min-fidelity`
-//!   decides what is good enough to train on. When the archive-backed source
-//!   lands, nothing else in this crate changes.
+//!   reveals, [`archive::ArchiveCtxSource`] with full blocks from an archive
+//!   node, every context declares a [`ctx::Fidelity`], and `--min-fidelity`
+//!   decides what is good enough to train on.
 //!
 //! # Attribution-blindness carries through
 //!
@@ -68,6 +68,7 @@
 //! reading its own answer. The arch-conformance rule keeps `intelligence` off
 //! this crate's dependency edge so the property stays structural.
 
+pub mod archive;
 pub mod config;
 pub mod ctx;
 pub mod export;
@@ -80,7 +81,9 @@ pub mod row;
 pub mod sink;
 pub mod source;
 pub mod spec;
+pub mod window;
 
+pub use archive::ArchiveCtxSource;
 pub use ctx::{
     CtxSource, CtxSourceFactory, Fidelity, MapCtxSource, ReplayCtxFactory, ReplayCtxSource,
     StaticCtxFactory,
@@ -93,3 +96,4 @@ pub use row::{DatasetRow, RowDigest};
 pub use sink::{DatasetSink, FanOutSink, SinkError};
 pub use source::{EventSource, HttpEventSource, RetryPolicy, VecEventSource};
 pub use spec::{DatasetSpec, SpecError, DEFAULT_LOOKAHEAD_SECS};
+pub use window::{capture_window, CaptureOptions, WindowError, WindowSpec};

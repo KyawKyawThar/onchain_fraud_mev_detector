@@ -190,9 +190,10 @@ fn the_ml_fixtures_are_not_part_of_the_committed_corpus() {
     // machine with no model bundle would score a false negative for `anomaly`
     // — turning "not deployed here" into "broken".
     assert!(
-        fixtures::all()
+        fixtures::all().iter().all(|f| f
+            .expected()
             .iter()
-            .all(|f| f.expected.iter().all(|e| e.detector.as_str() != "anomaly")),
+            .all(|e| e.detector.as_str() != "anomaly")),
         "no ML ground truth may appear in the default fixture set"
     );
     assert!(!fixtures::ml().is_empty());

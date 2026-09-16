@@ -72,6 +72,7 @@ mod tests {
             false_positives: 1,
             false_negatives: 0,
             blocks_hit: 3,
+            unadjudicated: 0,
         }
     }
 
@@ -100,6 +101,7 @@ mod tests {
                     false_positives: 2,
                     false_negatives: 0,
                     blocks_hit: 2,
+                    unadjudicated: 0,
                 },
             )],
         );
