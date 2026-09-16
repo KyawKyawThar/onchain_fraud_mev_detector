@@ -1,0 +1,75 @@
+# ── event-store repartition (readiness Epic D capacity plan) ───────
+# Moves an `events` table that already holds data onto the capacity plan's
+# definition (monthly partitions, ReplacingMergeTree): month by month into
+# `events__next`, exchange, then catch up any row that reached the old table
+# late. docs/runbooks/capacity-plan.md §5.
+#
+# Why a Job and not the boot path. Boot swaps the table in only when that moves
+# no data. A copy of a production table inside a boot migration would hold the
+# pod under its liveness probe for as long as the copy takes and restart from
+# nothing each time the probe killed it — with regulatory evidence in flight.
+# Here the copy runs unhurried, and every step is keyed on what the target
+# already holds, so a killed or retried Job resumes where it stopped.
+#
+# Suspended. Nothing moves until an operator unsuspends it:
+#   kubectl -n mev patch job event-store-repartition -p '{"spec":{"suspend":false}}'
+# The Job never drops anything. Dropping `events__retired` is
+# `event-store repartition finalize --i-understand-this-drops-the-retired-table`,
+# typed by a human after `event-store repartition` reports it fully contained.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: event-store-repartition
+  labels:
+    app.kubernetes.io/name: event-store-repartition
+    app.kubernetes.io/part-of: mevwatch
+    app.kubernetes.io/component: event-store
+spec:
+  suspend: true
+  # Retries are safe: a run resumes from the data, never from the beginning.
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: event-store-repartition
+        app.kubernetes.io/part-of: mevwatch
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: event-store-repartition
+          image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/event-store:latest
+          args: ["repartition", "run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # The binary resolves its whole config at boot (§9), so the Job
+          # carries the service's environment even though it serves nothing.
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: clickhouse-credentials # CLICKHOUSE_USER/PASSWORD/DB
+          env:
+            - name: EVENT_STORE_HOST
+              value: 0.0.0.0
+            - name: EVENT_STORE_PORT
+              value: "8081"
+            - name: EVENT_STORE_WRITE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: EVENT_STORE_WRITE_TOKEN
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

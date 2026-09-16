@@ -128,6 +128,11 @@ pub enum Skipped {
     /// A different `embedding_version`, or the same name over a different
     /// schema hash — not comparable to this node's population.
     ForeignSchema,
+    /// A refresh: the vector did not move since the event that last carried
+    /// it, and that event was already evaluated. Re-searching an identical
+    /// subject finds the same candidates; a link that appears because a
+    /// *neighbor* moved is found when the neighbor's own changed vector arrives.
+    Unchanged,
     /// An all-zero vector: nothing to match on.
     NoSignal,
     /// The graph already placed this address and the scope is
@@ -335,6 +340,11 @@ impl LinkSignal {
             || event.schema_hash != self.schema.content_hash()
         {
             return Some(Skipped::ForeignSchema);
+        }
+        // Before the zero check: an empty vector is a refresh, not a flat one,
+        // and the two mean different things on the dashboard.
+        if event.vector.is_empty() {
+            return Some(Skipped::Unchanged);
         }
         if event.vector.iter().all(|value| *value == 0.0) {
             return Some(Skipped::NoSignal);
@@ -781,6 +791,7 @@ mod tests {
             embedding_version: h.schema.version().to_owned(),
             schema_hash: h.schema.content_hash().to_owned(),
             vector: vector(h.schema, 1.0),
+            content_digest: None,
             top_factors: Vec::new(),
             observations_truncated: false,
         };
@@ -801,6 +812,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.skipped, Some(Skipped::ForeignSchema));
+
+        let mut refresh = event.clone();
+        refresh.vector.clear();
+        refresh.content_digest = Some("00000000000000ab".into());
+        let out = h.signal.evaluate(Chain(1), &refresh, at()).await.unwrap();
+        assert_eq!(
+            out.skipped,
+            Some(Skipped::Unchanged),
+            "a refresh carries no vector and is not a flat one"
+        );
 
         let mut flat = event;
         flat.vector = vec![0.0; h.schema.features().len()];
@@ -824,6 +845,7 @@ mod tests {
             embedding_version: h.schema.version().to_owned(),
             schema_hash: h.schema.content_hash().to_owned(),
             vector: vector(h.schema, 1.0),
+            content_digest: None,
             top_factors: Vec::new(),
             observations_truncated: false,
         };
@@ -1073,6 +1095,7 @@ mod tests {
                 embedding_version: self.schema.version().to_owned(),
                 schema_hash: self.schema.content_hash().to_owned(),
                 vector: values.to_vec(),
+                content_digest: None,
                 top_factors: Vec::new(),
                 observations_truncated: false,
             }

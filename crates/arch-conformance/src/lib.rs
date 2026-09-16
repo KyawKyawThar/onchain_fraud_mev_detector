@@ -368,6 +368,36 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── The capacity plan is a model, not a probe (readiness Epic D) ─
+        // `capacity` prices the event store from committed inputs only: the
+        // profile, the schema corpus and the store's migrations. That is what
+        // makes its gate reproducible from a commit and runnable in a plain
+        // `cargo test`. A store or broker client would let a plan quietly read
+        // "today's size" from whatever cluster the runner could reach, so the
+        // same commit would pass on a laptop and fail in CI. A measurement
+        // enters the model as a reviewed edit to `model.json`, with its
+        // provenance, never through a side channel.
+        if krate == "capacity" {
+            for forbidden in [
+                "clickhouse",
+                "rdkafka",
+                "sqlx",
+                "redis",
+                "reqwest",
+                "db",
+                "event-bus",
+                "event-store",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — the capacity plan is \
+                         computed from committed inputs so its gate is reproducible from \
+                         a commit; a measurement enters model.json as a reviewed edit"
+                    ));
+                }
+            }
+        }
+
         // ── The rebuild seam reads the log through its published API ─────
         // `rebuild` re-derives a read model from the event store. Its whole
         // correctness argument is that it replays through the *published*

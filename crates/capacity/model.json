@@ -1,0 +1,147 @@
+{
+  "name": "ga-projection",
+  "rationale": "The load the platform must hold from GA across a growth horizon longer than the evidence window, so the plan shows the event store at steady state rather than still filling. Chain rates are each chain's own cadence and typical block size (not the load test's burst rates: storage integrates the daily mean, bursts are the load test's business). API load is a daily mean sized so that mainnet-peak's 100 qps is roughly a 3x peak over it. The active-address population is the embedding sweep's. Growth of 1.4x a year for eight years is an assumption, not a forecast; the low and high scenarios bracket it, and the plan is re-run with --headroom rather than by editing it, so the projection and the margin stay separate claims. Every rate below has its own rationale; parameters that are neither projection nor measured from this repository are tagged assumed and listed by every report until measured (docs/runbooks/capacity-plan.md section 4).",
+  "horizon_years": 8,
+  "annual_growth": 1.4,
+  "scenarios": [
+    {
+      "name": "low",
+      "annual_growth": 1.15,
+      "rationale": "Customer growth without a new chain: volume follows existing chains' organic transaction growth."
+    },
+    {
+      "name": "high",
+      "annual_growth": 2.0,
+      "rationale": "A new chain roughly every year (Sprint 17's multi-chain roadmap) on top of customer growth."
+    }
+  ],
+  "chains": [
+    {
+      "chain": 1,
+      "blocks_per_second": 0.08333,
+      "txs_per_block": 170,
+      "alerting_block_fraction": 0.35,
+      "rationale": "Ethereum L1: 12s slots; ~1.2M transactions a day is ~170 per block. MEV (sandwiches, arbitrage, liquidations) is present in a large share of mainnet blocks, and the detection roster fires on it; 35% of blocks producing at least one alert is assumed and should be replaced by the measured detector_triggered rate once mainnet runs."
+    },
+    {
+      "chain": 8453,
+      "blocks_per_second": 0.5,
+      "txs_per_block": 230,
+      "alerting_block_fraction": 0.15,
+      "rationale": "Base: 2s blocks; ~10M transactions a day is ~230 per block. A lower alerting fraction than L1 because sequencer ordering leaves less public-mempool MEV to detect; assumed."
+    }
+  ],
+  "api": {
+    "mean_requests_per_second": 30,
+    "screen_share": 0.6,
+    "rationale": "Daily mean. The load test offers 100 qps as peak (profiles/mainnet-peak.json); a 3x peak-to-mean puts the mean near 30. The screening share matches the load test's route weights (6 of 10), the surface customers call inline on withdrawals."
+  },
+  "active_addresses_per_day": 2000000,
+  "customers": 200,
+  "events": {
+    "RawBlockReceived": { "terms": [{ "driver": "block", "per": 1 }], "rationale": "One per block ingested, per chain." },
+    "BlockAssembled": { "terms": [{ "driver": "block", "per": 1 }], "rationale": "One per block, once transactions and traces are available." },
+    "BlockCanonicalized": { "terms": [{ "driver": "block", "per": 1 }], "rationale": "One per block entering the canonical chain." },
+    "BlockReverted": { "terms": [{ "driver": "block", "per": 0.002 }], "rationale": "Reorgs are rare post-merge and rarer on Base's sequencer; one block in 500 is deliberately pessimistic, since a reorg storm is when this is written." },
+    "BlockFinalized": { "terms": [{ "driver": "block", "per": 1 }], "rationale": "Every canonical block is eventually finalized." },
+    "DetectorTriggered": {
+      "terms": [{ "driver": "alerting_block", "per": 2, "payload_bytes": 800 }],
+      "rationale": "Two detector hits per alerting block (a sandwich block usually also carries an arbitrage). Size overridden: the corpus fixture lists one transaction and a two-field evidence map, where a sandwich carries three transactions and pool/profit evidence."
+    },
+    "PreliminaryAlertCreated": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "Hits collapse to fewer alerts than triggers after correlation." },
+    "SimulationRequested": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "One simulation per preliminary alert (§7)." },
+    "SimulationCompleted": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "One result per simulation." },
+    "IncidentCreated": { "terms": [{ "driver": "alerting_block", "per": 1.2 }], "rationale": "Confirmed share of simulated alerts." },
+    "IncidentRetracted": { "terms": [{ "driver": "alerting_block", "per": 0.3 }], "rationale": "The unconfirmed share, plus reorg retractions." },
+    "IncidentFinalized": { "terms": [{ "driver": "alerting_block", "per": 1.2 }], "rationale": "Every confirmed incident finalizes with its block." },
+    "WalletExposureReportReady": { "terms": [{ "driver": "customer", "per": 0.5 }], "rationale": "A report every other day per customer." },
+    "LabelAdded": { "terms": [{ "driver": "alerting_block", "per": 1 }], "rationale": "Attribution and block-production labels minted from confirmed incidents." },
+    "LabelUpdated": { "terms": [{ "driver": "alerting_block", "per": 0.2 }], "rationale": "Confidence changes on existing labels." },
+    "LabelRevoked": { "terms": [{ "driver": "day", "per": 50 }], "rationale": "Operational: disputes and feed corrections." },
+    "EntityCreated": { "terms": [{ "driver": "alerting_block", "per": 0.5 }], "rationale": "New actors behind incidents." },
+    "EntityMerged": { "terms": [{ "driver": "day", "per": 200 }], "rationale": "Clustering merges, bounded by the link-signal job's cadence." },
+    "EntitySplit": { "terms": [{ "driver": "day", "per": 20 }], "rationale": "Rare corrections of merges." },
+    "AttributionUpdated": { "terms": [{ "driver": "alerting_block", "per": 1.2 }], "rationale": "One per confirmed incident." },
+    "AttributionRetracted": { "terms": [{ "driver": "alerting_block", "per": 0.3 }], "rationale": "Follows incident retractions." },
+    "RiskScoreUpdated": { "terms": [{ "driver": "alerting_block", "per": 6 }], "rationale": "Each label or attribution invalidates the addresses it names (attacker, victim, pool: about three), recomputed and republished (intelligence::risk_scorer)." },
+    "SanctionHit": { "terms": [{ "driver": "screen", "per": 0.001 }, { "driver": "day", "per": 20 }], "rationale": "A screening that matches a list, plus list-refresh hits on already-known addresses." },
+    "AddressEmbeddingUpdated": {
+      "terms": [
+        { "driver": "active_address", "per": 0.3, "payload_bytes": 1300 },
+        { "driver": "active_address", "per": 0.7, "payload_bytes": 330 }
+      ],
+      "rationale": "The sweep refreshes each active address once per 24h refresh interval (intelligence::embedding_job). Two shapes since the refresh slimming: a vector whose content moved carries the full 33 features, up to MAX_VISIBLE_FACTORS = 8 factors and a digest (about 1.3 KB of JSON; the corpus fixture carries 3 floats); a refresh of an unchanged vector carries identity and digest only (about 330 B). A 30% changed share is assumed; measure it as the ratio of embeddings_written_total{reason=\"changed\"} (plus new and schema_changed) to all writes."
+    },
+    "EntityLinkProposed": { "terms": [{ "driver": "active_address", "per": 0.001 }], "rationale": "The clustering signal proposes links for a small share of the population." },
+    "RuleCreated": { "terms": [{ "driver": "customer", "per": 0.05 }], "rationale": "A new rule every few weeks per customer." },
+    "RuleTriggered": { "terms": [{ "driver": "alerting_block", "per": 2 }], "rationale": "Customer rules matching alerts across the tenant base." },
+    "RuleAlertCreated": { "terms": [{ "driver": "alerting_block", "per": 1 }], "rationale": "Triggers that clear their rule's full condition." },
+    "UsageRecorded": {
+      "terms": [
+        { "driver": "api_request", "per": 1 },
+        { "driver": "block", "per": 1 },
+        { "driver": "alerting_block", "per": 3.5 }
+      ],
+      "rationale": "One per metered API request (server::usage), one DetectorRun fact per block (detection::scheduler), and per alert a SimulationRun (1.5) and notification deliveries (2)."
+    },
+    "ScreeningDecisionRecorded": { "terms": [{ "driver": "screen", "per": 1 }], "rationale": "Every screening decision is audited (server::audit)." },
+    "ModelDriftDetected": { "terms": [{ "driver": "day", "per": 2 }], "rationale": "Drift windows closing across the served models." },
+    "RetentionPolicyChanged": { "terms": [{ "driver": "day", "per": 0.01 }], "rationale": "A policy change a few times a year." },
+    "RetentionPurgeCompleted": { "terms": [{ "driver": "day", "per": 1 }], "rationale": "The daily purge run." },
+    "PredictedAlert": { "terms": [{ "driver": "block", "per": 0.2 }], "rationale": "Mempool predictions that clear the predictive threshold." },
+    "LiquidationRiskPredicted": { "terms": [{ "driver": "block", "per": 0.5 }], "rationale": "Positions crossing a risk band as prices move." },
+    "LiquidationCascadeWarned": { "terms": [{ "driver": "day", "per": 5 }], "rationale": "Cascade warnings are rare by design." },
+    "IncidentNarrativeDrafted": { "terms": [{ "driver": "alerting_block", "per": 0.05 }], "rationale": "The copilot drafts only for high-severity incidents." },
+    "RuleDraftProposed": { "terms": [{ "driver": "customer", "per": 0.1 }], "rationale": "Natural-language rule drafts." },
+    "BridgeMevDetected": { "terms": [{ "driver": "day", "per": 50 }], "rationale": "Cross-chain findings are bounded by bridge activity, not block rate." },
+    "CrossChainMevDetected": { "terms": [{ "driver": "day", "per": 50 }], "rationale": "As above." },
+    "CrossChainFindingRetracted": { "terms": [{ "driver": "day", "per": 10 }], "rationale": "A share of cross-chain findings withdrawn at finality." }
+  },
+  "ingest": {
+    "batch_max_rows": 10000,
+    "batch_max_wait_ms": 1000,
+    "consumers": 3,
+    "max_inserts_per_second": 10
+  },
+  "clickhouse": {
+    "compression_ratio": {
+      "value": 3.0,
+      "basis": { "kind": "assumed", "why": "JSON payloads compress well under ZSTD(3), but hashes, addresses and float vectors are high-entropy digits; 3x is conservative for that mix. Replace with the measured ratio from the runbook's system.columns query." }
+    },
+    "index_overhead_fraction": 0.05,
+    "replicas": 2,
+    "node_disk_gib": 2000,
+    "max_disk_fill": 0.75,
+    "partition_budget": 1000,
+    "max_parts_in_total": 100000,
+    "max_partitions_per_insert_block": 100,
+    "deployed_pvc_gib": 20,
+    "shard_key": "cityHash64(event_id)",
+    "cold_after_days": 90
+  },
+  "kafka": {
+    "deployed_partitions": 12,
+    "replication": 3,
+    "brokers": 3,
+    "broker_disk_gib": 1000,
+    "max_disk_fill": 0.8,
+    "retention_days": 7,
+    "partition_throughput_bytes_per_second": {
+      "value": 10485760,
+      "basis": { "kind": "assumed", "why": "10 MiB/s sustained ingress per partition is a conservative planning figure for a replicated topic on commodity disks. Replace with a measured producer-perf-test result on the production brokers." }
+    },
+    "max_partition_replicas_per_broker": 4000,
+    "peak_to_mean": 4,
+    "deployed_pvc_gib": 10
+  },
+  "cost": {
+    "block_storage_usd_per_gib_month": {
+      "value": 0.1,
+      "basis": { "kind": "assumed", "why": "Provisioned SSD block storage list price, before snapshots and egress. Replace with the contracted rate." }
+    },
+    "cold_storage_usd_per_gib_month": {
+      "value": 0.025,
+      "basis": { "kind": "assumed", "why": "Object storage list price plus request overhead for a cold ClickHouse volume that is read rarely. Replace with the contracted rate." }
+    }
+  }
+}

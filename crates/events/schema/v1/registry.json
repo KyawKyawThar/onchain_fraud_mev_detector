@@ -39,6 +39,11 @@
           "required": true
         },
         {
+          "path": "content_digest",
+          "type": "string",
+          "required": false
+        },
+        {
           "path": "embedding_version",
           "type": "string",
           "required": true
@@ -61,7 +66,7 @@
         {
           "path": "top_factors",
           "type": "array",
-          "required": true
+          "required": false
         },
         {
           "path": "top_factors[]",
@@ -85,7 +90,7 @@
         {
           "path": "vector",
           "type": "array",
-          "required": true
+          "required": false
         },
         {
           "path": "vector[]",

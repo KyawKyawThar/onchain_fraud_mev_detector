@@ -91,7 +91,7 @@ _Full notes: [readiness log](docs/history/production-readiness-log.md#hardening-
 - [x] **Load testing** at target throughput (2026-09-07): chain tps, peak alert volume, API qps — and, first, **an instrument capable of failing.** The < 1s claim had no series behind it: the only latency detection exported was `detector_detect_duration_seconds`, one `detect` call…
 - [x] **Autoscaling:** simulation worker pool on `sim.jobs` queue depth (the designed backpressure signal, §7, §20); HPA on detection/api by CPU/qps.
 - [ ] **Intelligence write-path sharding** by address range (§20); read-path gRPC scaling; cache hit-rate targets + stampede protection on the Redis hot path (§8).
-- [ ] **Capacity plan:** partition counts, shard counts, storage growth for the append-only event store (it grows forever — model the cost).
+- [x] **Capacity plan** (2026-09-15): partition counts, shard counts, storage growth for the append-only event store (it grows forever — model the cost). `crates/capacity` gates every ClickHouse table and the Kafka topology at 1.5× in CI. It found the daily events key refusing inserts on day 1258, and a hardening pass fixed the write path under it: idempotent batched ingest (dedup token + `ReplacingMergeTree` + deduped reads), no dropped evidence, a resumable repartition Job instead of a boot-time copy, registered Kafka partition slots, slim embedding refreshes, and storage tiering. Surfaced: eleven ClickHouse tables with no TTL, five of which pass the restore limit around year 8.3…
 
 **Exit gate:** SLOs met at 1.5× projected peak load in staging; autoscaling demonstrated; load test is a recurring CI/nightly job.
 

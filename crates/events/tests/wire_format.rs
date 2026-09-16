@@ -137,7 +137,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "AddressEmbeddingUpdated",
-        r#"{"type":"AddressEmbeddingUpdated","payload":{"address":"0x3333333333333333333333333333333333333333","entity_id":"00000000-0000-0000-0000-0000000000e1","embedding_version":"behavior-v1","schema_hash":"a1b2c3","vector":[0.5,0.25,0.0],"top_factors":[{"feature":"edge_count_log","value":0.5,"share":0.75}],"observations_truncated":false}}"#,
+        r#"{"type":"AddressEmbeddingUpdated","payload":{"address":"0x3333333333333333333333333333333333333333","entity_id":"00000000-0000-0000-0000-0000000000e1","embedding_version":"behavior-v1","schema_hash":"a1b2c3","vector":[0.5,0.25,0.0],"content_digest":"9f86d081884c7d65","top_factors":[{"feature":"edge_count_log","value":0.5,"share":0.75}],"observations_truncated":false}}"#,
     ),
     (
         "EntityLinkProposed",

@@ -278,23 +278,180 @@ pub fn ttl_expression(days: u32) -> String {
 /// fails to parse: an unrecognised clause is [`TtlState::Unreadable`], which the
 /// planner refuses rather than overwrites.
 pub fn read_ttl(engine_full: &str) -> TtlState {
+    read_ttl_rules(engine_full).delete
+}
+
+/// A table's whole `TTL` clause, split into the rule this module owns — the
+/// `DELETE` window — and the rules it must carry across untouched.
+///
+/// **Why the split exists.** `ALTER TABLE … MODIFY TTL` replaces the *entire*
+/// clause. Storage tiering adds a second rule (`… TO VOLUME 'cold'`), and the
+/// earlier reader stopped at the first `TO VOLUME`, so it read the 90-day move
+/// as the retention window: boot then saw a "shortening" and refused to start.
+/// Safe, but it made tiering impossible, and a writer that only knew about the
+/// delete rule would have silently dropped the move rule on every extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtlRules {
+    /// The retention window.
+    pub delete: TtlState,
+    /// Tiering rules, in clause order. They move parts and delete nothing.
+    pub moves: Vec<MoveRule>,
+}
+
+/// A `TTL <expr> TO VOLUME '…'` or `TO DISK '…'` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveRule {
+    /// Days from occurrence before a part moves.
+    pub days: u32,
+    /// The destination as written back into DDL: `TO VOLUME 'cold'`.
+    pub target: String,
+}
+
+impl MoveRule {
+    fn render(&self) -> String {
+        format!("{} {}", ttl_expression(self.days), self.target)
+    }
+}
+
+/// The whole clause this store writes: move rules first, the delete rule last.
+pub fn render_ttl(delete_days: u32, moves: &[MoveRule]) -> String {
+    moves
+        .iter()
+        .map(MoveRule::render)
+        .chain(std::iter::once(format!(
+            "{} DELETE",
+            ttl_expression(delete_days)
+        )))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse every rule of the `TTL` clause in `engine_full`.
+///
+/// **All or nothing.** A rule this build cannot read makes the whole clause
+/// [`TtlState::Unreadable`] with no moves, because any write replaces every
+/// rule: reproducing a clause with one rule missing is how a table loses a rule
+/// nobody asked to remove. The same holds for two delete rules.
+pub fn read_ttl_rules(engine_full: &str) -> TtlRules {
     let Some(start) = engine_full.find(" TTL ") else {
-        return TtlState::Absent;
+        return TtlRules {
+            delete: TtlState::Absent,
+            moves: Vec::new(),
+        };
     };
     let tail = &engine_full[start + " TTL ".len()..];
-
-    // Bound the clause: everything a MergeTree can put *after* TTL.
-    let end = ["SETTINGS", " TO DISK", " TO VOLUME", " GROUP BY", " WHERE"]
-        .iter()
-        .filter_map(|marker| tail.find(marker))
-        .min()
-        .unwrap_or(tail.len());
+    let end = top_level_find(tail, "SETTINGS").unwrap_or(tail.len());
     let clause = tail[..end].trim();
+    let unreadable = || TtlRules {
+        delete: TtlState::Unreadable(clause.to_owned()),
+        moves: Vec::new(),
+    };
 
-    match parse_days(clause) {
-        Some(days) => TtlState::Days(days),
-        None => TtlState::Unreadable(clause.to_owned()),
+    let mut deletes = Vec::new();
+    let mut moves = Vec::new();
+    for rule in top_level_split(clause) {
+        match classify_rule(rule.trim()) {
+            Some(TtlRule::Delete(days)) => deletes.push(days),
+            Some(TtlRule::Move(rule)) => moves.push(rule),
+            None => return unreadable(),
+        }
     }
+    match deletes.as_slice() {
+        [] => TtlRules {
+            delete: TtlState::Absent,
+            moves,
+        },
+        [days] => TtlRules {
+            delete: TtlState::Days(*days),
+            moves,
+        },
+        _ => unreadable(),
+    }
+}
+
+enum TtlRule {
+    Delete(u32),
+    Move(MoveRule),
+}
+
+/// One rule, or `None` for a form this build does not write and so must not
+/// rewrite (`GROUP BY`, `WHERE`, `RECOMPRESS`, a non-day interval).
+fn classify_rule(rule: &str) -> Option<TtlRule> {
+    if rule.is_empty() {
+        return None;
+    }
+    for marker in [" GROUP BY", " WHERE ", " RECOMPRESS", " SET "] {
+        if top_level_find(rule, marker).is_some() {
+            return None;
+        }
+    }
+    for marker in [" TO VOLUME ", " TO DISK "] {
+        if let Some(at) = top_level_find(rule, marker) {
+            let days = parse_days(rule[..at].trim())?;
+            // `engine_full` escapes the quotes (`TO DISK \'cold\'`); DDL wants
+            // them bare.
+            let target = rule[at + 1..].trim().replace("\\'", "'");
+            return Some(TtlRule::Move(MoveRule { days, target }));
+        }
+    }
+    let expression = rule.strip_suffix("DELETE").map_or(rule, str::trim_end);
+    parse_days(expression).map(TtlRule::Delete)
+}
+
+/// The byte offset of `pattern` in `s` outside parentheses and quotes.
+fn top_level_find(s: &str, pattern: &str) -> Option<usize> {
+    top_level_positions(s).find(|&at| s[at..].starts_with(pattern))
+}
+
+/// `s` split at commas outside parentheses and quotes.
+fn top_level_split(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for at in top_level_positions(s) {
+        if s.as_bytes()[at] == b',' {
+            parts.push(&s[from..at]);
+            from = at + 1;
+        }
+    }
+    parts.push(&s[from..]);
+    parts
+}
+
+/// Every byte offset in `s` that sits at nesting depth zero, outside a quoted
+/// string. A backslash escapes the next byte, as in `engine_full`'s `\'`.
+fn top_level_positions(s: &str) -> impl Iterator<Item = usize> + '_ {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut escaped = false;
+    (0..bytes.len()).filter(move |&at| {
+        let byte = bytes[at];
+        if escaped {
+            escaped = false;
+            return false;
+        }
+        match byte {
+            b'\\' => {
+                escaped = true;
+                return false;
+            }
+            b'\'' => {
+                quoted = !quoted;
+                return false;
+            }
+            _ if quoted => return false,
+            b'(' => {
+                depth += 1;
+                return false;
+            }
+            b')' => {
+                depth -= 1;
+                return false;
+            }
+            _ => {}
+        }
+        depth == 0 && s.is_char_boundary(at)
+    })
 }
 
 /// `toIntervalDay(n)` or `INTERVAL n DAY`, and nothing else.
@@ -571,19 +728,125 @@ pub const APPLIED_BY_BOOT: &str = "boot";
 /// A human typed the flag.
 pub const APPLIED_BY_OPERATOR: &str = "operator";
 
-/// The one write this module makes.
+/// The one retention write this module makes: set the delete window, carrying
+/// every tiering rule the table already has across the rewrite.
 async fn write_ttl(client: &Client, days: u32) -> Result<(), RetentionError> {
+    let moves = observe_rules_current(client).await?.moves;
+    modify_ttl(client, days, &moves).await
+}
+
+/// Replace the table's TTL clause with `delete_days` and `moves`.
+///
+/// Shared with `crate::tiering`, which owns the move rules the way this module
+/// owns the delete rule — one renderer, so the two cannot write clauses the
+/// other then fails to read.
+pub async fn modify_ttl(
+    client: &Client,
+    delete_days: u32,
+    moves: &[MoveRule],
+) -> Result<(), RetentionError> {
     // Not a bound parameter: `MODIFY TTL` takes an *expression*, and a bind
-    // would arrive as a literal argument rather than as part of it. The value
-    // is a `u32` this crate computed, so there is nothing to inject.
+    // would arrive as a literal argument rather than as part of it. Days are
+    // `u32`s this crate computed; move targets are validated identifiers.
     client
         .query(&format!(
-            "ALTER TABLE {TABLE} MODIFY TTL {} DELETE",
-            ttl_expression(days)
+            "ALTER TABLE {TABLE} MODIFY TTL {}",
+            render_ttl(delete_days, moves)
         ))
         .execute()
         .await
         .map_err(RetentionError::Apply)
+}
+
+/// Every TTL rule of the table in the client's own database.
+pub async fn observe_rules_current(client: &Client) -> Result<TtlRules, RetentionError> {
+    let engine_full: Vec<String> = client
+        .query(
+            "SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = ?",
+        )
+        .bind(TABLE)
+        .fetch_all()
+        .await
+        .map_err(RetentionError::Read)?;
+    let described = engine_full
+        .first()
+        .ok_or_else(|| RetentionError::TableMissing {
+            database: "current database".to_owned(),
+        })?;
+    Ok(read_ttl_rules(described))
+}
+
+#[cfg(test)]
+mod ttl_rule_tests {
+    use super::*;
+
+    /// Verbatim from ClickHouse 26.5 for a table with a move and a delete rule:
+    /// the delete keyword is dropped and the quotes are escaped.
+    const TIERED: &str = "ReplacingMergeTree PARTITION BY toYYYYMM(occurred_at) \
+         ORDER BY (chain, event_type, occurred_at, event_id) \
+         TTL toDateTime(occurred_at) + toIntervalDay(90) TO VOLUME \\'cold\\', \
+         toDateTime(occurred_at) + toIntervalDay(2192) \
+         SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192";
+
+    /// The trap: the old reader took the 90-day move as the retention window.
+    #[test]
+    fn a_move_rule_is_not_the_retention_window() {
+        let rules = read_ttl_rules(TIERED);
+        assert_eq!(rules.delete, TtlState::Days(2192));
+        assert_eq!(
+            rules.moves,
+            vec![MoveRule {
+                days: 90,
+                target: "TO VOLUME 'cold'".into()
+            }]
+        );
+        assert_eq!(read_ttl(TIERED), TtlState::Days(2192));
+    }
+
+    /// What this module writes reads back as what it meant.
+    #[test]
+    fn a_rendered_clause_round_trips() {
+        let moves = vec![MoveRule {
+            days: 30,
+            target: "TO DISK 'cold'".into(),
+        }];
+        let engine_full = format!(
+            "MergeTree ORDER BY x TTL {} SETTINGS index_granularity = 8192",
+            render_ttl(2192, &moves)
+        );
+        let rules = read_ttl_rules(&engine_full);
+        assert_eq!(rules.delete, TtlState::Days(2192));
+        assert_eq!(rules.moves, moves);
+    }
+
+    /// Any rule this build cannot reproduce makes the whole clause unreadable,
+    /// because a rewrite replaces every rule.
+    #[test]
+    fn one_unreadable_rule_makes_the_clause_unreadable() {
+        for clause in [
+            "toDateTime(occurred_at) + toIntervalDay(90) RECOMPRESS CODEC(ZSTD(9)), \
+             toDateTime(occurred_at) + toIntervalDay(2192)",
+            "toDateTime(occurred_at) + toIntervalMonth(3) TO VOLUME 'cold', \
+             toDateTime(occurred_at) + toIntervalDay(2192)",
+            "toDateTime(occurred_at) + toIntervalDay(10), toDateTime(occurred_at) + toIntervalDay(20)",
+        ] {
+            let rules = read_ttl_rules(&format!("MergeTree ORDER BY x TTL {clause}"));
+            assert!(
+                matches!(rules.delete, TtlState::Unreadable(_)),
+                "{clause} -> {rules:?}"
+            );
+            assert!(rules.moves.is_empty());
+        }
+    }
+
+    /// Moves without a delete rule are still an unbounded table.
+    #[test]
+    fn moves_alone_leave_the_window_absent() {
+        let rules =
+            read_ttl_rules("MergeTree ORDER BY x TTL toDateTime(d) + toIntervalDay(7) TO DISK 'x'");
+        assert_eq!(rules.delete, TtlState::Absent);
+        assert_eq!(rules.moves.len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -591,10 +854,13 @@ mod tests {
     use super::*;
 
     /// What ClickHouse actually hands back for the migrated table.
-    const ENGINE_FULL: &str = "MergeTree PARTITION BY (chain, event_type, toDate(occurred_at)) \
+    /// Since the capacity plan's repartition (0004) the table carries a second
+    /// setting, so this also pins that the clause ends at `SETTINGS` rather
+    /// than swallowing `ttl_only_drop_parts`.
+    const ENGINE_FULL: &str = "MergeTree PARTITION BY toYYYYMM(occurred_at) \
          ORDER BY (chain, event_type, occurred_at, event_id) \
          TTL toDateTime(occurred_at) + toIntervalDay(2192) \
-         SETTINGS index_granularity = 8192";
+         SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192";
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

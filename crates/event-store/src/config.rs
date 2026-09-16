@@ -51,6 +51,15 @@ pub struct Config {
     /// a platform-wide fact has no natural one. Same stance as the copilot's
     /// `COPILOT_CHAIN`. Read from the deployment-wide `CHAIN_ID`.
     pub chain: events::primitives::Chain,
+    /// How the Kafka ingest batches its appends (`EVENT_STORE_BATCH_MAX_ROWS`,
+    /// `EVENT_STORE_BATCH_MAX_WAIT_MS`). The capacity plan's insert-rate gate
+    /// reads the same two values from the deployed config map.
+    pub ingest: event_bus::batch::BatchConfig,
+    /// Hot/cold storage tiering for the `events` table, when the deployment
+    /// has a tiered storage policy (`EVENT_STORE_STORAGE_POLICY`,
+    /// `EVENT_STORE_COLD_VOLUME`, `EVENT_STORE_COLD_AFTER_DAYS` — all three or
+    /// none). `None` leaves the table on the server's default policy.
+    pub tiering: Option<crate::tiering::TieringConfig>,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base
@@ -116,9 +125,75 @@ impl Config {
                 "CHAIN_ID",
                 events::primitives::Chain::ETHEREUM.0,
             )?),
+            ingest: ingest_config(
+                env_parse("EVENT_STORE_BATCH_MAX_ROWS", DEFAULT_BATCH_MAX_ROWS)?,
+                env_parse("EVENT_STORE_BATCH_MAX_WAIT_MS", DEFAULT_BATCH_MAX_WAIT_MS)?,
+            )?,
+            tiering: tiering_from_env()?,
         })
     }
 }
+
+/// Default rows per ingest insert.
+pub const DEFAULT_BATCH_MAX_ROWS: usize = 10_000;
+/// Default ceiling on how long a record waits for its batch, in milliseconds.
+pub const DEFAULT_BATCH_MAX_WAIT_MS: u64 = 1_000;
+
+/// Validate the ingest batch bounds.
+///
+/// The wait is what bounds inserts per second on a quiet stream (one flush per
+/// wait per consumer at most), so it has a floor; the row count bounds memory
+/// per batch, so it has a ceiling. Both ends are ones the capacity plan's
+/// insert-rate gate assumes.
+pub fn ingest_config(max_rows: usize, max_wait_ms: u64) -> Result<event_bus::batch::BatchConfig> {
+    if !(1..=100_000).contains(&max_rows) {
+        bail!("EVENT_STORE_BATCH_MAX_ROWS must be 1..=100000, got {max_rows}");
+    }
+    if !(100..=60_000).contains(&max_wait_ms) {
+        bail!(
+            "EVENT_STORE_BATCH_MAX_WAIT_MS must be 100..=60000 — below 100ms a quiet stream \
+             inserts faster than ClickHouse merges parts; got {max_wait_ms}"
+        );
+    }
+    Ok(event_bus::batch::BatchConfig {
+        max_items: max_rows,
+        max_wait: std::time::Duration::from_millis(max_wait_ms),
+        retry_backoff: std::time::Duration::from_secs(1),
+        shutdown_flush_grace: std::time::Duration::from_secs(10),
+    })
+}
+
+/// Resolve the optional tiering triple: all three variables, or none.
+fn tiering_from_env() -> Result<Option<crate::tiering::TieringConfig>> {
+    let optional = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    match (
+        optional("EVENT_STORE_STORAGE_POLICY"),
+        optional("EVENT_STORE_COLD_VOLUME"),
+        optional("EVENT_STORE_COLD_AFTER_DAYS"),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(policy), Some(volume), Some(days)) => {
+            let days: u32 = days
+                .parse()
+                .context("EVENT_STORE_COLD_AFTER_DAYS must be a whole number of days")?;
+            Ok(Some(crate::tiering::TieringConfig::new(
+                policy, volume, days,
+            )?))
+        }
+        _ => bail!(
+            "storage tiering needs EVENT_STORE_STORAGE_POLICY, EVENT_STORE_COLD_VOLUME and \
+             EVENT_STORE_COLD_AFTER_DAYS together — a partial set would leave the table half \
+             configured"
+        ),
+    }
+}
+
+/// Partitions per topic when none is configured. Sized for the capacity plan's
+/// horizon, not today: a topic's count can only grow, growing it re-maps every
+/// business key, and chain keys occupy registered slots
+/// (`events::partitioning`) that stay put only while the count exceeds them.
+/// Twelve leaves room for ten more chains and a consumer group of twelve.
+pub const DEFAULT_TOPIC_PARTITIONS: i32 = 12;
 
 /// Number of milliseconds in 7 days — the default Kafka topic retention.
 const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
@@ -128,7 +203,7 @@ const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 /// librdkafka error; catching it here keeps the "fail fast with a clear message
 /// at boot" contract the rest of this module holds.
 fn kafka_from_env() -> Result<KafkaConfig> {
-    let topic_partitions = env_parse("KAFKA_TOPIC_PARTITIONS", 3)?;
+    let topic_partitions = env_parse("KAFKA_TOPIC_PARTITIONS", DEFAULT_TOPIC_PARTITIONS)?;
     let topic_replication = env_parse("KAFKA_TOPIC_REPLICATION", 1)?;
     let retention_ms = env_parse("KAFKA_RETENTION_MS", DEFAULT_RETENTION_MS)?;
 

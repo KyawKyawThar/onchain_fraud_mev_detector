@@ -1909,6 +1909,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "capacity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "events",
+ "retention",
+ "serde",
+ "serde_json",
+ "strum",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3015,6 +3028,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "telemetry",
  "testcontainers",

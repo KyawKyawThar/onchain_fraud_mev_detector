@@ -184,8 +184,7 @@ async fn analytics_rows_append_and_aggregate_by_kind() {
         .with_database("default");
 
     // Apply the analytics migration, then append a few immutable rows.
-    simulation::ch_migrate::MIGRATOR
-        .run(&client)
+    simulation::ch_migrate::migrate(&client)
         .await
         .expect("apply ClickHouse migrations");
     let analytics = ClickhouseAnalytics::new(client.clone());
@@ -400,8 +399,7 @@ async fn mev_exposure_excludes_retracted_incidents_and_totals_by_kind() {
         .with_url(format!("http://127.0.0.1:{http_port}"))
         .with_user("default")
         .with_database("default");
-    simulation::ch_migrate::MIGRATOR
-        .run(&client)
+    simulation::ch_migrate::migrate(&client)
         .await
         .expect("apply ClickHouse migrations");
     let analytics = ClickhouseAnalytics::new(client);

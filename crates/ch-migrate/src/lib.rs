@@ -23,6 +23,10 @@
 //!   stray marker is a build error, but a migration is `include_str!`'d into a
 //!   `const`, so it compiles and is first refused by ClickHouse itself.
 
+/// Replacing a table ClickHouse cannot `ALTER` (partition key, engine) without
+/// a data copy inside a boot migration — see the module docs.
+pub mod swap;
+
 use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};

@@ -351,7 +351,34 @@ groups:
           severity: page
         annotations:
           summary: "The event store is failing to append"
-          description: "event_store_append_errors_total has been increasing for 5m — the audit trail's write path is degraded. A `permanent`-labeled error is a bug (encode failure); `transient` points at ClickHouse."
+          description: "event_store_append_errors_total has been increasing for 5m — the audit trail's write path is degraded. A `permanent`-labeled error is a bug (encode failure); `transient` points at ClickHouse. The Kafka ingest retries a failed flush indefinitely rather than commit past evidence it did not store, so while this fires ingest is wedged on purpose: kafka_consumer_lag{consumer=\"event-store\"} climbs, and nothing is lost."
+
+      # Threshold provenance (§19b): derived from the committed capacity model,
+      # not typed. 4609880285 = 1.25 × the model's 1× projection of `payload`
+      # bytes per day at the end of year one (`just capacity-plan` prints it as
+      # the drift ceiling). crates/capacity/tests/committed.rs fails the build
+      # if this number and the model disagree, so neither can move alone.
+      - alert: EventStoreGrowthAboveCapacityPlan
+        expr: sum(increase(event_store_appended_payload_bytes_total[1d])) > 4609880285
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The event store is growing faster than the capacity plan projects"
+          description: "Payload bytes appended over the last day exceed 1.25x the capacity plan's year-one projection. Storage, shard and cost figures in docs/runbooks/capacity-plan.md are now under-estimates. Break the rate down by `event_type` to find which type outgrew its rate in crates/capacity/model.json, correct that rate (or its payload size) from the measurement, re-run `just capacity-plan`, and re-pin this threshold to the new drift ceiling. A duplicate-heavy redelivery storm also inflates this counter; check kafka_consumer_lag first."
+
+      # Structural (§19b): the gauge is a row count the service publishes at
+      # boot; any non-zero value is the condition. `for: 7d` because a pending
+      # repartition is safe to serve on for weeks — the capacity plan puts the
+      # old key's limit years away — but it must not become permanent.
+      - alert: EventStoreRepartitionPending
+        expr: max(event_store_repartition_pending_rows) > 0
+        for: 7d
+        labels:
+          severity: warning
+        annotations:
+          summary: "The events table is still on its pre-capacity-plan partition key"
+          description: "event_store_repartition_pending_rows has been non-zero for a week: `events` holds data under the daily (chain, event_type, date) key, which the capacity plan shows passing ClickHouse's max_parts_in_total inside the evidence window. Boot will not move data. Run `event-store repartition` for the plan, unsuspend the event-store-repartition Job to move it, then finalize by hand (docs/runbooks/capacity-plan.md §5)."
 
       - alert: ServiceDown
         expr: up == 0

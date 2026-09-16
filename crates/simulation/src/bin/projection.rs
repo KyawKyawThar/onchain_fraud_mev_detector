@@ -141,10 +141,7 @@ async fn connect_postgres(cfg: &ProjectionConfig) -> Result<PostgresStore> {
 /// The schema must exist before the analytics tables can be scanned or
 /// truncated — the same `up` the consumer boot path runs.
 async fn migrated_clickhouse(client: Client) -> Result<Client> {
-    ch_migrate::MIGRATOR
-        .run(&client)
-        .await
-        .context("running ClickHouse analytics migrations")?;
+    ch_migrate::migrate(&client).await?;
     Ok(client)
 }
 
@@ -270,10 +267,7 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     // Bring the analytics schema up to date before writing (Postgres schema is applied by
     // sqlx-cli via `just migrate-*` / the migrate.yml workflow — the same split as the
     // event store: schema is an operational step, distinct from running the service).
-    ch_migrate::MIGRATOR
-        .run(&client)
-        .await
-        .context("running ClickHouse analytics migrations")?;
+    ch_migrate::migrate(&client).await?;
 
     // Connect the two stores; a bad URL / unreachable database fails fast here at boot.
     let pool = db::connect(cfg.postgres_url.expose_secret())

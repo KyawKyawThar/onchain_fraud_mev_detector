@@ -782,6 +782,19 @@ prometheus-rules-check:
 alerts-check: prometheus-rules-check
     cargo test -p alert-conformance --locked
 
+# The event store's capacity plan (readiness Epic D): partitions, shards,
+# storage growth and monthly cost from the committed model, the schema corpus
+# and the event store's own migrations. No stack needed. Exit 1 on a breach.
+#   just capacity-plan                       # the plan at projected load
+#   just capacity-plan --evidence-days 3653  # what a ten-year policy costs
+# Full runbook: docs/runbooks/capacity-plan.md
+capacity-plan *args:
+    cargo run -p capacity --locked -- {{args}}
+
+# The gate CI holds (crates/capacity/tests/committed.rs): 1.5× projected load.
+capacity-check:
+    cargo run -p capacity --locked -- --headroom 1.5
+
 load-test-smoke:
     cargo run -p loadtest --locked -- --profile crates/loadtest/profiles/smoke.json
 

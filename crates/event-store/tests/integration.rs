@@ -11,10 +11,14 @@
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
+use ch_migrate::swap::SwapOutcome;
 use chrono::{DateTime, Utc};
 use event_store::config::{ClickhouseConfig, KafkaConfig};
 use event_store::query::Filters;
-use event_store::store::{build_client, EventStore, StoredEvent, STORED_EVENT_COLUMNS};
+use event_store::repartition::{self, RunOutcome};
+use event_store::retention::{self as store_retention, Reconciliation, TtlState};
+use event_store::store::{build_client, EventRow, EventStore, StoredEvent, STORED_EVENT_COLUMNS};
+use event_store::tiering::{self, TieringConfig, TieringPlan};
 use event_store::{kafka, migrate};
 use events::chain::{BlockAssembled, BlockFinalized};
 use events::intelligence::{AttributionUpdated, SanctionHit};
@@ -36,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// A handful of events spanning two chains and two event types, so a successful
-/// insert also exercises the `(chain, event_type, date)` partitioning. Built
+/// insert also exercises the ordering key's leading columns. Built
 /// with millisecond-precise timestamps because the `DateTime64(3)` column stores
 /// only milliseconds (an arbitrary `now()` wouldn't survive the round trip).
 fn sample_events() -> Vec<EventEnvelope> {
@@ -99,6 +103,35 @@ fn every_fixture_is_inside_the_retention_window() {
     }
 }
 
+/// The schema the service boots into: migrations, then the table swap that
+/// completes when it moves no data (a fresh container always qualifies).
+async fn migrate_like_boot(store: &EventStore) {
+    migrate::MIGRATOR
+        .run(store.client())
+        .await
+        .expect("migrate");
+    let outcome = repartition::reconcile_safe(store.client())
+        .await
+        .expect("boot swap");
+    assert_eq!(outcome, SwapOutcome::Swapped, "a fresh store swaps at boot");
+}
+
+async fn engine_full(store: &EventStore, table: &str) -> String {
+    store
+        .client()
+        .query(
+            "SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = ?",
+        )
+        .bind(table)
+        .fetch_one()
+        .await
+        .expect("engine_full")
+}
+
+async fn count(store: &EventStore, sql: &str) -> u64 {
+    store.client().query(sql).fetch_one().await.expect(sql)
+}
+
 /// Connect an [`EventStore`] to a testcontainer ClickHouse (default user, no
 /// password, `default` database).
 fn store_for(http_port: u16) -> EventStore {
@@ -154,10 +187,7 @@ async fn append_persists_and_round_trips_every_event() {
         .expect("clickhouse port");
 
     let store = store_for(port);
-    migrate::MIGRATOR
-        .run(store.client())
-        .await
-        .expect("migrate");
+    migrate_like_boot(&store).await;
 
     let mut want = sample_events();
     store.append_batch(&want).await.expect("append");
@@ -175,6 +205,321 @@ async fn append_persists_and_round_trips_every_event() {
     assert_eq!(got, want, "stored events must reconstruct byte-for-byte");
 }
 
+/// The capacity plan's table replacement, the way a deployed store meets it: a
+/// daily-partitioned `events` with history, a new build that migrates, and the
+/// repartition Job.
+///
+/// Proves each claim the design makes. Boot moves no data. The Job carries
+/// every row across byte-for-byte and keeps the old table. A bulk insert that
+/// **throws** under the daily key (one block over
+/// `max_partitions_per_insert_block`, as a backup restore produces) lands under
+/// the monthly one — checked against the daily table first, so the test fails
+/// if the hazard stops being real. A row a writer lands in the old table late is
+/// carried across by a re-run. And finalize refuses until the old table is
+/// provably contained.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn the_repartition_job_upgrades_a_daily_store_in_place() {
+    let node = ClickHouse::default()
+        .start()
+        .await
+        .expect("start clickhouse");
+    let port = node
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("clickhouse port");
+    let store = store_for(port);
+    let client = store.client();
+
+    // The new build's migrations ran; its boot swap has not, because the store
+    // it meets already holds history.
+    migrate::MIGRATOR.run(client).await.expect("migrate");
+
+    // 150 days x 2 chains x 2 event types = 600 daily partitions of history,
+    // dated inside the retention window so the TTL cannot race the assertions.
+    let epoch = Utc::now().timestamp_millis() - 200 * 86_400_000;
+    let history = spread_events(epoch, 150, 0);
+    // The daily key caps one insert at 100 partitions: 2 days x 4 pairs = 8.
+    for chunk in history.chunks(4 * 2) {
+        store.append_batch(chunk).await.expect("append history");
+    }
+
+    // The hazard is real on the daily table: 30 days x 4 pairs = 120 partitions.
+    let bulk = spread_events(epoch, 30, 1_000_000);
+    assert!(
+        store.append_batch(&bulk).await.is_err(),
+        "the daily key must refuse a bulk insert over max_partitions_per_insert_block — \
+         if it stops, this test no longer proves the repartition is needed"
+    );
+
+    // Boot with data: reports, moves nothing.
+    let boot = repartition::reconcile_safe(client).await.expect("boot");
+    assert_eq!(
+        boot,
+        SwapOutcome::Pending {
+            live_rows: history.len() as u64,
+            staged_rows: 0
+        }
+    );
+    let plan = repartition::plan(client).await.expect("plan");
+    let to_move: u64 = plan.gaps.iter().map(|g| g.missing).sum();
+    assert_eq!(to_move, history.len() as u64, "{plan}");
+
+    // The Job.
+    let outcome = repartition::run(client).await.expect("run");
+    assert!(
+        matches!(outcome, RunOutcome::Repartitioned { .. }),
+        "{outcome}"
+    );
+
+    let live = engine_full(&store, "events").await;
+    assert!(live.starts_with("ReplacingMergeTree"), "{live}");
+    assert!(
+        live.contains("PARTITION BY toYYYYMM(occurred_at)"),
+        "{live}"
+    );
+    assert_eq!(store_retention::read_ttl(&live), TtlState::Days(2192));
+    assert_eq!(
+        count(&store, "SELECT count() FROM events__retired").await,
+        history.len() as u64,
+        "the daily table is kept, retired"
+    );
+
+    let mut want = history.clone();
+    want.sort_by_key(|e| e.event_id);
+    assert_eq!(
+        fetch_all_envelopes(&store).await,
+        want,
+        "every historical row must survive the move byte-for-byte"
+    );
+
+    // The same bulk insert now lands.
+    store
+        .append_batch(&bulk)
+        .await
+        .expect("a bulk insert spanning a month must land under the monthly key");
+
+    // A writer still on the old table lands one more event there.
+    let late = spread_events(epoch, 1, 5_000_000).remove(0);
+    let mut insert = client
+        .insert::<EventRow>("events__retired")
+        .await
+        .expect("insert into retired");
+    insert
+        .write(&EventRow::try_from(&late).unwrap())
+        .await
+        .unwrap();
+    insert.end().await.unwrap();
+
+    // Finalize refuses while the retired table holds an event the live one lacks…
+    let refused =
+        repartition::finalize(client, repartition::DropRetiredIntent::from_operator_flag()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(repartition::RepartitionError::RetiredNotSubsumed { missing: 1, .. })
+        ),
+        "{refused:?}"
+    );
+
+    // …a re-run carries it across, and then finalize drops the old table.
+    let rerun = repartition::run(client).await.expect("rerun");
+    assert!(matches!(rerun, RunOutcome::CaughtUp { .. }), "{rerun}");
+    let dropped =
+        repartition::finalize(client, repartition::DropRetiredIntent::from_operator_flag())
+            .await
+            .expect("finalize");
+    assert_eq!(dropped, history.len() as u64 + 1);
+    assert!(
+        !ch_migrate::swap::TableSwap::exists(client, "events__retired")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        count(&store, "SELECT uniqExact(event_id) FROM events").await,
+        (history.len() + bulk.len() + 1) as u64
+    );
+}
+
+/// At-least-once ingest, made idempotent by the store: an exact batch retry is
+/// refused at insert time, a redelivery that forms a *different* batch is
+/// collapsed by the engine, and a read never shows a duplicate in between.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn a_retried_or_redelivered_batch_is_stored_and_read_once() {
+    let node = ClickHouse::default()
+        .start()
+        .await
+        .expect("start clickhouse");
+    let port = node
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("clickhouse port");
+    let store = store_for(port);
+    migrate_like_boot(&store).await;
+
+    let epoch = Utc::now().timestamp_millis() - 86_400_000;
+    let events = spread_events(epoch, 3, 0);
+
+    // The batch loop's transient-failure path re-sends the identical batch.
+    store.append_batch(&events).await.expect("first");
+    store.append_batch(&events).await.expect("retry");
+    assert_eq!(
+        count(&store, "SELECT count() FROM events").await,
+        events.len() as u64,
+        "an identical batch is deduplicated at insert time"
+    );
+
+    // A redelivery after a restart forms a different batch around the same events.
+    let mut overlapping = events[..4].to_vec();
+    overlapping.extend(spread_events(epoch, 1, 9_000_000));
+    store.append_batch(&overlapping).await.expect("redelivery");
+
+    let unique = (events.len() + 4) as u64;
+    let replay = store
+        .replay(&Filters {
+            from: Some(DateTime::<Utc>::from_timestamp_millis(epoch - 1).unwrap()),
+            limit: Some(10_000),
+            ..Filters::default()
+        })
+        .await
+        .expect("replay");
+    assert_eq!(
+        replay.events.len() as u64,
+        unique,
+        "reads dedupe before merges run"
+    );
+    assert_eq!(
+        count(&store, "SELECT count() FROM events FINAL").await,
+        unique,
+        "the engine collapses the redelivered copies"
+    );
+}
+
+/// Storage tiering on a server with a hot/cold policy. The trap it closes: the
+/// old TTL reader took a move rule for the retention window, so a tiered table
+/// made boot refuse to start.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn tiering_adds_a_move_rule_and_retention_still_reads_its_window() {
+    use testcontainers::ImageExt;
+    const STORAGE: &str = r#"<clickhouse>
+  <storage_configuration>
+    <disks>
+      <cold><path>/var/lib/clickhouse/cold/</path></cold>
+    </disks>
+    <policies>
+      <tiered>
+        <volumes>
+          <default><disk>default</disk></default>
+          <cold><disk>cold</disk></cold>
+        </volumes>
+      </tiered>
+    </policies>
+  </storage_configuration>
+</clickhouse>"#;
+    let node = ClickHouse::default()
+        .with_copy_to(
+            "/etc/clickhouse-server/config.d/storage.xml",
+            STORAGE.as_bytes().to_vec(),
+        )
+        .start()
+        .await
+        .expect("start clickhouse");
+    let port = node
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("clickhouse port");
+    let store = store_for(port);
+    let client = store.client();
+    migrate_like_boot(&store).await;
+
+    let cfg = TieringConfig::new("tiered".into(), "cold".into(), 90).unwrap();
+    let applied = tiering::reconcile(client, &cfg).await.expect("tier");
+    assert!(
+        matches!(
+            applied,
+            TieringPlan::Apply {
+                set_policy: Some(_),
+                ..
+            }
+        ),
+        "{applied:?}"
+    );
+    let tiered = engine_full(&store, "events").await;
+    assert!(tiered.contains("TO VOLUME"), "{tiered}");
+    assert_eq!(
+        tiering::reconcile(client, &cfg).await.expect("again"),
+        TieringPlan::Unchanged,
+        "reconciliation is idempotent"
+    );
+
+    // Boot's retention reconcile on a tiered table: in line, not a refusal.
+    let policies = ::retention::PolicySet::default();
+    let decision = store_retention::reconcile_safe(client, "default", &policies, Utc::now())
+        .await
+        .expect("retention on a tiered table");
+    assert!(
+        matches!(decision, Reconciliation::Unchanged { .. }),
+        "{decision}"
+    );
+
+    // Widening the window keeps the move rule.
+    let wider = ::retention::PolicySet::uniform(
+        ::retention::Policy::new(
+            ::retention::STATUTORY_ARTIFACT_DAYS,
+            ::retention::EVIDENCE_MARGIN_DAYS + 30,
+        )
+        .unwrap(),
+    );
+    let widened = store_retention::reconcile_safe(client, "default", &wider, Utc::now())
+        .await
+        .expect("widen");
+    assert!(matches!(widened, Reconciliation::Extend(_)), "{widened}");
+    let rules = store_retention::observe_rules_current(client)
+        .await
+        .unwrap();
+    assert_eq!(rules.delete, TtlState::Days(2222));
+    assert_eq!(rules.moves, vec![cfg.move_rule()]);
+
+    // And evidence still lands.
+    store
+        .append_batch(&sample_events())
+        .await
+        .expect("append under the tiered policy");
+}
+
+/// One event per day for `days` days, for each of two chains and two event
+/// types, starting at `epoch_ms`. `id_base` keeps two calls' ids disjoint.
+fn spread_events(epoch_ms: i64, days: i64, id_base: u128) -> Vec<EventEnvelope> {
+    let mut out = Vec::new();
+    for day in 0..days {
+        let at = DateTime::<Utc>::from_timestamp_millis(epoch_ms + day * 86_400_000).unwrap();
+        for (c, chain) in [Chain::ETHEREUM, Chain::BASE].into_iter().enumerate() {
+            let id =
+                |kind: u128| Uuid::from_u128(id_base + (day as u128) * 4 + (c as u128) * 2 + kind);
+            let block = BlockRef::new(day as u64, B256::repeat_byte(0xab));
+            out.push(EventEnvelope::with_metadata(
+                id(0),
+                at,
+                chain,
+                DomainEvent::BlockAssembled(BlockAssembled {
+                    block,
+                    tx_count: 1,
+                    trace_available: false,
+                }),
+            ));
+            out.push(EventEnvelope::with_metadata(
+                id(1),
+                at,
+                chain,
+                DomainEvent::BlockFinalized(BlockFinalized { block }),
+            ));
+        }
+    }
+    out
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers ClickHouse)"]
 async fn query_api_finds_events_by_incident_address_and_window() {
@@ -188,19 +533,16 @@ async fn query_api_finds_events_by_incident_address_and_window() {
         .expect("clickhouse port");
 
     let store = store_for(port);
-    migrate::MIGRATOR
-        .run(store.client())
-        .await
-        .expect("migrate");
+    migrate_like_boot(&store).await;
 
     // Fixture timestamps are offsets from a *recent* epoch, deliberately not
     // from 1970. The events table now carries a retention TTL (migration
     // `0003_events_retention`: occurred_at + 2192 days), so a bare
     // `from_timestamp_millis(1_000)` dates these rows 1970-01-01 — expired by
     // half a century. ClickHouse then deletes them in the background *while the
-    // test is running*, and because the table partitions by
-    // `(chain, event_type, toDate(occurred_at))` it drops them one event type
-    // at a time. The symptom is an arbitrary-looking subset of a query result
+    // test is running*, and (under the original daily `(chain, event_type,
+    // date)` partitioning, before the 0004 repartition) it dropped them one
+    // event type at a time. The symptom is an arbitrary-looking subset of a query result
     // going missing, at a *different assertion on each run* (the trail on a
     // slow run, the replay window on a fast one) — which reads like a
     // write-path bug rather than like retention.
@@ -450,10 +792,7 @@ async fn event_published_to_kafka_lands_in_store() {
     );
 
     let store = store_for(ch_port);
-    migrate::MIGRATOR
-        .run(store.client())
-        .await
-        .expect("migrate");
+    migrate_like_boot(&store).await;
 
     // Mirror production boot order: provision the topology first, so the topics
     // exist before either the producer sends or the consumer's explicit
@@ -493,7 +832,12 @@ async fn event_published_to_kafka_lands_in_store() {
     let shutdown = CancellationToken::new();
     let consumer_task = tokio::spawn({
         let shutdown = shutdown.clone();
-        async move { kafka::run(consumer, consumer_store, None, shutdown).await }
+        async move {
+            // Small batches with a short wait: the production defaults would
+            // hold one record for a full second before the poll below sees it.
+            let batch = event_store::config::ingest_config(100, 100).expect("batch config");
+            kafka::run(consumer, consumer_store, batch, None, shutdown).await
+        }
     });
 
     // Poll until it lands (or time out).

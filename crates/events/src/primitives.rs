@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Which chain an event pertains to. Kafka topics are partitioned by chain
-/// (§20), and the event store partitions by `(chain, event_type, date)` (§4),
-/// so this is the primary routing key carried on the [`crate::EventEnvelope`].
+/// (§20, through [`Chain::partition_slot`]), and the event store orders by
+/// `(chain, event_type, occurred_at)` (§4), so this is the primary routing key
+/// carried on the [`crate::EventEnvelope`].
 ///
 /// Modelled as a chain id so adding an L2 (Phase 10) needs no new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -23,8 +24,34 @@ impl Chain {
     /// (Phase 10, Sprint 13 t2).
     pub const BASE: Chain = Chain(8453);
 
+    /// Every chain this build knows by name. `partitioning`'s tests hold the
+    /// slot assignment against it, so a chain added here without a slot fails.
+    pub const KNOWN: &'static [Chain] = &[Chain::ETHEREUM, Chain::BASE];
+
     pub fn id(self) -> u64 {
         self.0
+    }
+
+    /// The Kafka partition this chain's chain-keyed records occupy, modulo the
+    /// topic's partition count ([`crate::partitioning::partition_for_key`]).
+    ///
+    /// An explicit registry rather than a hash of the id. With librdkafka's
+    /// default CRC-32 partitioner, `"1"` and `"8453"` both land on partition 2
+    /// of 3, so every chain-keyed topic used one partition of three — and which
+    /// chains collide is an accident of the hash that changes with the count.
+    /// A slot is a reviewed decision instead: two chains cannot share one
+    /// unless the partition count is smaller than the slot range, and growing
+    /// the count never moves a chain whose slot was already below it.
+    ///
+    /// Assign the next free slot when adding a chain; never renumber one — a
+    /// renumbered slot moves that chain's in-flight records to another
+    /// partition and breaks its ordering across the deploy.
+    pub fn partition_slot(self) -> Option<u32> {
+        match self {
+            Chain::ETHEREUM => Some(0),
+            Chain::BASE => Some(1),
+            _ => None,
+        }
     }
 
     /// Human-readable name for the chains this deployment knows, for logs and

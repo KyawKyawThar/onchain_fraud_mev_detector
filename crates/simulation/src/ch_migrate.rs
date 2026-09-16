@@ -10,7 +10,10 @@
 //! `migrations/` (one statement per file, **no literal `?` anywhere** — the
 //! runner validates both) and appending one entry to [`MIGRATIONS`].
 
+use anyhow::{Context, Result};
+use ch_migrate::swap::{SwapOutcome, TableSwap};
 use ch_migrate::{Migration, Migrator};
+use clickhouse::Client;
 
 /// The ordered migration set. Versions sort lexically, so zero-pad the numeric
 /// prefix.
@@ -35,14 +38,52 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0004_create_incident_timing_rollup_mv.up.sql"),
         down: include_str!("../migrations/0004_create_incident_timing_rollup_mv.down.sql"),
     },
+    // The capacity plan's replacement for incident_analytics (monthly key).
+    // DDL only; `migrate` swaps it in when that moves no data.
+    Migration {
+        version: "0005_create_incident_analytics_next",
+        up: include_str!("../migrations/0005_create_incident_analytics_next.up.sql"),
+        down: include_str!("../migrations/0005_create_incident_analytics_next.down.sql"),
+    },
 ];
 
-/// The simulation service's migrator: applied on the projection consumer's
-/// boot via [`run`](Migrator::run), or driven explicitly through the
+/// The simulation service's migrator, driven explicitly through the
 /// `simulation-projection migrate up|down|info` subcommand
-/// ([`cli`](Migrator::cli)).
+/// ([`cli`](Migrator::cli)). Every other path goes through [`migrate`], so the
+/// table swap cannot be forgotten at one of them.
 pub const MIGRATOR: Migrator =
     Migrator::new("simulation analytics", "sim_schema_migrations", MIGRATIONS);
+
+/// The analytics table's capacity-plan replacement.
+pub const ANALYTICS_SWAP: TableSwap = TableSwap::new("incident_analytics");
+
+/// Apply the migrations, then complete the analytics table's replacement when
+/// that moves no data.
+///
+/// The one schema entry point for the consumer's boot, the rebuild's live
+/// connection and the rebuild's **staging database** — the last one matters
+/// most: a staging database is always empty, so it always swaps, and a rebuild
+/// therefore stages and promotes the monthly definition. That is how a live
+/// table with data moves: `rebuild --model dashboards --yes`, not a copy.
+pub async fn migrate(client: &Client) -> Result<SwapOutcome> {
+    MIGRATOR
+        .run(client)
+        .await
+        .context("running ClickHouse analytics migrations")?;
+    let outcome = ANALYTICS_SWAP
+        .swap_if_safe(client)
+        .await
+        .context("completing the incident_analytics replacement")?;
+    match &outcome {
+        SwapOutcome::Pending { live_rows, .. } => tracing::warn!(
+            live_rows,
+            "incident_analytics is still on its daily partition key and holds data; move it with \
+             `simulation-projection rebuild --model dashboards --yes` (docs/runbooks/capacity-plan.md)"
+        ),
+        other => tracing::debug!(outcome = ?other, "incident_analytics definition is current"),
+    }
+    Ok(outcome)
+}
 
 #[cfg(test)]
 mod tests {
