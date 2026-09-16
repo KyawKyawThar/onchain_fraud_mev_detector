@@ -105,14 +105,18 @@ async fn the_sink_places_chain_keys_on_their_slots_and_business_keys_by_hash() {
     for chain in [Chain::ETHEREUM, Chain::BASE] {
         for _ in 0..3 {
             n += 1;
-            sink.publish(finalized(n, chain)).await.expect("publish block");
+            sink.publish(finalized(n, chain))
+                .await
+                .expect("publish block");
         }
         let slot = chain.partition_slot().expect("known chain") as i32;
         expected.insert(chain.id().to_string(), slot);
     }
     for customer in &customers {
         n += 1;
-        sink.publish(usage(n, *customer)).await.expect("publish usage");
+        sink.publish(usage(n, *customer))
+            .await
+            .expect("publish usage");
         let key = customer.to_string();
         expected.insert(
             key.clone(),
@@ -137,7 +141,9 @@ async fn the_sink_places_chain_keys_on_their_slots_and_business_keys_by_hash() {
     while received < published {
         let message = tokio::time::timeout_at(deadline, consumer.recv())
             .await
-            .unwrap_or_else(|_| panic!("only {received} of {published} records arrived: {landed:?}"))
+            .unwrap_or_else(|_| {
+                panic!("only {received} of {published} records arrived: {landed:?}")
+            })
             .expect("receive");
         let key = String::from_utf8(message.key().expect("keyed").to_vec()).expect("utf-8 key");
         landed.entry(key).or_default().push(message.partition());
