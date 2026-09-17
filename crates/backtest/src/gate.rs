@@ -497,6 +497,7 @@ mod tests {
             false_positives: 0,
             false_negatives: 0,
             blocks_hit: 2,
+            unadjudicated: 0,
         }
     }
 
@@ -548,6 +549,7 @@ mod tests {
                 false_positives: 4,
                 false_negatives: 0,
                 blocks_hit: 5,
+                unadjudicated: 0,
             },
         )]);
         let outcome = only(evaluate(&report, &gate(), &rollout), "anomaly");
@@ -569,6 +571,7 @@ mod tests {
                 false_positives: 4,
                 false_negatives: 0,
                 blocks_hit: 5,
+                unadjudicated: 0,
             },
         )]);
         let outcome = only(
@@ -590,6 +593,7 @@ mod tests {
                 false_positives: 0,
                 false_negatives: 0,
                 blocks_hit: 0,
+                unadjudicated: 0,
             },
         )]);
         let outcome = only(
@@ -680,6 +684,7 @@ mod tests {
                 false_positives: 0,
                 false_negatives: 3,
                 blocks_hit: 0,
+                unadjudicated: 0,
             },
         )]);
         let outcome = only(evaluate(&report, &gate(), &rollout), "rugpull");

@@ -1,31 +1,52 @@
 ---
 source: crates/backtest/tests/baseline_snapshot.rs
-assertion_line: 19
 expression: report.to_string()
 ---
-backtest: 8 fixtures replayed
+backtest: 30 fixtures replayed
 
-sandwich: frontrun-victim-backrun bracket on a WETH/TKN pool
+[hand-built] sandwich: frontrun-victim-backrun bracket on a WETH/TKN pool
   caught      block 100 sandwich Sandwich
-arb: two-hop closed-cycle WETH -> USDC -> WETH
+[hand-built] arb: two-hop closed-cycle WETH -> USDC -> WETH
   caught      block 200 arb Arbitrage
-flashloan: 100 WETH borrowed and repaid with a fee in one tx
+[hand-built] flashloan: 100 WETH borrowed and repaid with a fee in one tx
   caught      block 300 flashloan Flashloan
-liquidation: 8% bonus seizure of WETH collateral for USDC debt
+[hand-built] liquidation: 8% bonus seizure of WETH collateral for USDC debt
   caught      block 400 liquidation Liquidation
-rugpull: 90% of a pool's TKN reserve drained in one tx
+[hand-built] rugpull: 90% of a pool's TKN reserve drained in one tx
   caught      block 500 rugpull Rugpull
-wash-trading: buy/sell/buy/sell round trip on one pool over 4 blocks
+[hand-built] wash-trading: buy/sell/buy/sell round trip on one pool over 4 blocks
   caught      block 603 wash-trading WashTrading
-address-poisoning: zero-value bait from an 8-nibble lookalike
+[hand-built] address-poisoning: zero-value bait from an 8-nibble lookalike
   caught      block 700 address-poisoning AddressPoisoning
-clean: one ordinary swap and one plain transfer, no incident
+[hand-built] clean: one ordinary swap and one plain transfer, no incident
+[adversarial] sandwich near-miss: a round trip around an opposite-direction trade (no victim)
+[adversarial] sandwich near-miss: the bracket shape, closed at a loss
+[adversarial] sandwich near-miss: frontrun and victim on one pool, backrun on another
+[adversarial] sandwich near-miss: a bracket netting $2, under the $10 floor
+[adversarial] arb near-miss: a closed cycle that loses 5%
+[adversarial] arb near-miss: a two-hop router trade that never returns to its input
+[adversarial] arb near-miss: a closed cycle netting $0.20, under the $10 floor
+[adversarial] flashloan near-miss: 100 WETH out, 99 WETH back in one tx
+[adversarial] flashloan near-miss: a $200 round trip, under the $1,000 floor
+[adversarial] flashloan/liquidation/rugpull near-miss: a fair USDC→WETH swap read from transfers
+[adversarial] liquidation near-miss: a 1% edge, under the 3% bonus floor
+[adversarial] liquidation near-miss: an 8% seizure against $50 of debt, under the $100 floor
+[adversarial] rugpull near-miss: 30% of the reserve withdrawn, under the 50% floor
+[adversarial] rugpull near-miss: 90% of a $5,000 pool, under the $10,000 gate
+[adversarial] wash-trading near-miss: four same-direction buys on one pool over 4 blocks
+[adversarial] wash-trading near-miss: buy/sell/buy/sell that nets 67% long
+[adversarial] wash-trading near-miss: a flat round trip that stops at three swaps
+[adversarial] address-poisoning near-miss: zero-value transfer from a 2+2-nibble match
+[adversarial] address-poisoning near-miss: a lookalike paying the victim real value
+[adversarial] address-poisoning near-miss: a zero-value transfer with no counterparty to mimic
+[adversarial] noise: twelve distinct traders both ways on one pool, plus payments
+[adversarial] noise: a 20-tx block with no decoded actions (header-only source)
 
 per-detector precision / recall / hit_rate:
-  address-poisoning    precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  arb                  precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  flashloan            precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  liquidation          precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  rugpull              precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  sandwich             precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
-  wash-trading         precision 1.000  recall 1.000  hit_rate 0.091  (tp=1 fp=0 fn=0 blocks_hit=1/11)
+  address-poisoning    precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  arb                  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  flashloan            precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  liquidation          precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  rugpull              precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  sandwich             precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  wash-trading         precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)

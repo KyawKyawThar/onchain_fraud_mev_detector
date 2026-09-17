@@ -143,6 +143,66 @@ pub fn violations(graph: &DepGraph) -> Vec<String> {
             }
         }
 
+        // ── The replay corpus is as blind as the ctx it stores (Epic E) ──
+        // `corpus` is the file format both `dataset` (writer) and `backtest`
+        // (reader) share. It serialises `DetectionCtx`s beside simulation's
+        // verdicts, so an edge to a store or to `intelligence` could only exist
+        // to put an attribution next to a context. And an edge to `detection`
+        // would let `dataset` reach the service through it, which is the
+        // coupling the leaf exists to avoid.
+        if krate == "corpus" {
+            for forbidden in [
+                "detection",
+                "intelligence",
+                "event-bus",
+                "rdkafka",
+                "sqlx",
+                "redis",
+                "clickhouse",
+                "reqwest",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — the replay-window format \
+                         is a leaf shared by `dataset` and `backtest`, and carries contexts \
+                         and verdicts only, never attributions"
+                    ));
+                }
+            }
+        }
+
+        // ── Archive enrichment reads the chain, nothing else (Epic E) ────
+        // `chain-enrich` builds the `DetectionCtx` detectors read, from an
+        // archive node. It must implement against `detector-api` (the ctx is
+        // its output) and stay off the composing service, labels, brokers and
+        // stores: what it decodes is what the chain did, never who did it, and
+        // a store edge would let enrichment start caching attributions.
+        if krate == "chain-enrich" {
+            if !has("detector-api") {
+                out.push(format!(
+                    "{krate}: must build contexts through the detector-api seam (it has no \
+                     detector-api dependency)"
+                ));
+            }
+            for forbidden in [
+                "detection",
+                "intelligence",
+                "event-bus",
+                "rdkafka",
+                "lapin",
+                "sqlx",
+                "redis",
+                "clickhouse",
+            ] {
+                if has(forbidden) {
+                    out.push(format!(
+                        "{krate}: must not depend on {forbidden} — archive enrichment is a pure \
+                         read of chain state into a DetectionCtx"
+                    ));
+                }
+            }
+        }
+
         // ── Model serving is held to the same purity (§20.2) ─────────────
         // `inference` is the seam a model is executed behind. It scores a
         // `FeatureVector` and nothing else, which is what keeps the *serving*
@@ -629,7 +689,12 @@ mod tests {
             ("ml-features", &["detector-api", "serde", "sha2"]),
             ("event-bus", &["events", "rdkafka", "metrics"]),
             ("detection", &["detector-api", "event-bus", "rdkafka"]),
-            ("backtest", &["detection", "detector-api"]),
+            ("backtest", &["detection", "detector-api", "corpus"]),
+            ("corpus", &["events", "detector-api", "serde"]),
+            (
+                "chain-enrich",
+                &["detector-api", "events", "alloy-provider", "bounded-map"],
+            ),
             (
                 "dataset",
                 &[
@@ -638,6 +703,8 @@ mod tests {
                     "events",
                     "clickhouse",
                     "ch-migrate",
+                    "corpus",
+                    "chain-enrich",
                 ],
             ),
             (
@@ -817,6 +884,26 @@ mod tests {
                 "dataset",
                 &["events", "clickhouse", "ch-migrate"],
                 "no ml-features dependency",
+            ),
+            (
+                "corpus",
+                &["events", "detector-api", "intelligence"],
+                "replay-window format is a leaf",
+            ),
+            (
+                "chain-enrich",
+                &["detector-api", "alloy-provider", "clickhouse"],
+                "pure read of chain state",
+            ),
+            (
+                "chain-enrich",
+                &["events", "alloy-provider"],
+                "no detector-api dependency",
+            ),
+            (
+                "corpus",
+                &["events", "detector-api", "detection"],
+                "replay-window format is a leaf",
             ),
             (
                 "inference",

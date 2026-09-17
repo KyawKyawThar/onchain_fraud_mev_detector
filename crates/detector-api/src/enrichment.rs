@@ -377,6 +377,23 @@ impl Enrichment {
         self.txs.values()
     }
 
+    /// Every token's metadata. Iteration order is unspecified (a `HashMap`) —
+    /// sort before anything order-sensitive, e.g. writing a replay window
+    /// (`corpus::BlockRecord`), which is the reason this accessor exists.
+    pub fn tokens(&self) -> impl ExactSizeIterator<Item = &TokenMeta> {
+        self.tokens.values()
+    }
+
+    /// Every pool's reserve state. Unspecified order, as [`tokens`](Self::tokens).
+    pub fn pools(&self) -> impl ExactSizeIterator<Item = &PoolState> {
+        self.pools.values()
+    }
+
+    /// Every `(token, price)` pair. Unspecified order, as [`tokens`](Self::tokens).
+    pub fn prices(&self) -> impl ExactSizeIterator<Item = (Address, UsdPrice)> + '_ {
+        self.prices.iter().map(|(token, price)| (*token, *price))
+    }
+
     /// Value a raw base-unit `amount` of `token` in USD, combining the token's
     /// [`decimals`](TokenMeta::decimals) and reference [`price`](Self::price).
     ///

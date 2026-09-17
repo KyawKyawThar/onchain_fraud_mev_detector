@@ -14,7 +14,7 @@
 #[test]
 fn full_report_matches_its_committed_snapshot() {
     let roster = backtest::boot().expect("the built-in roster links cleanly");
-    let fixtures = backtest::fixtures::all();
+    let fixtures = backtest::load_corpus(&roster).expect("the committed corpus loads");
     let report = backtest::run_backtest(&fixtures, &roster);
     insta::assert_snapshot!(report.to_string());
 }

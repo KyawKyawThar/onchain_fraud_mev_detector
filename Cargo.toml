@@ -154,6 +154,20 @@ inference = { path = "crates/inference" }
 # binary, not a library other crates link: it is listed here only so the
 # workspace's crate inventory stays in one place.
 dataset = { path = "crates/dataset" }
+# Replay-window format (§18, §20.1; Epic E) — consecutive mainnet blocks as the
+# `DetectionCtx`s a detector saw, plus simulation's verdicts on them. A leaf so
+# `dataset` (writer) and `backtest` (reader) share it without linking each
+# other: `dataset` must not reach `detection`, and `backtest` has no use for
+# ClickHouse or HTTP.
+corpus = { path = "crates/corpus" }
+# Archive-backed block enrichment (Epic E): blocks + receipts from an archive
+# node → the full `DetectionCtx` (verified V2 swaps, transfers, reserves,
+# Chainlink prices, gas). The workspace's first `Fidelity::Enriched` producer
+# and the shared archive-read seam fork-from-chain is meant to build on.
+chain-enrich = { path = "crates/chain-enrich" }
+# gzip for committed replay windows (`corpus`). The default backend is the
+# pure-Rust `miniz_oxide`: no C toolchain, same self-contained-image stance.
+flate2 = "1"
 # LLM seam (§20.4, Sprint 20 t1) — the `LlmClient` trait the investigation
 # copilot programs against, its thin `reqwest` client over the Claude Messages
 # API (there is no official Anthropic Rust SDK), the metering decorator that

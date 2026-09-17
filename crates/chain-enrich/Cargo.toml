@@ -1,0 +1,68 @@
+[package]
+name = "chain-enrich"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Archive-backed block enrichment (§5, §6; Epic E) — turns a block and its
+# receipts, read from an archive node, into the full `DetectionCtx` a detector
+# runs on: decoded ERC-20 transfers, venue-verified Uniswap-V2-style swaps,
+# pool reserves before the block, token metadata, and Chainlink prices as of
+# the block, with receipt gas facts.
+#
+# The first producer of `Fidelity::Enriched` contexts in the workspace, and the
+# shared archive-read layer: `dataset` uses it for replay windows and training
+# rows, and simulation's fork-from-chain (Sprint 25 t6) is meant to read state
+# through the same `ArchiveRpc` seam rather than revm's `alloydb`, whose alloy
+# 2.0 pin is what blocked it.
+#
+# Two halves, one crate: `decode`/`venue`/`abi`/`config` are pure (no I/O, no
+# runtime), and `rpc`/`alloy`/`enricher` do the reads. Arch-conformance keeps
+# the crate off `detection`, `intelligence`, brokers and stores: it describes
+# what the chain did, never who did it.
+
+[dependencies]
+detector-api = { workspace = true }
+events = { workspace = true }
+bounded-map = { workspace = true }
+resilience = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-transport = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-network-primitives = { workspace = true }
+url = { workspace = true }
+
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Counters through the shared facade (§19); no-ops until an exporter exists.
+metrics = { workspace = true }
+
+[features]
+default = []
+# `chain_enrich::test_util` — the in-memory `FakeChain` archive double, for
+# downstream crates (dataset) to test their `CtxSource` against real decoding.
+test-util = []
+
+[dev-dependencies]
+# The wire test serves canned JSON-RPC over real HTTP, so the alloy adapter's
+# request shapes and response decoding are exercised end to end.
+axum = { workspace = true }
+tokio = { workspace = true }
+# The decoded shape must be the one detectors were written against: an
+# enriched block is run through the real sandwich detector.
+sandwich-detector = { workspace = true }
+serde_json = { workspace = true }
+resilience = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[lints]
+workspace = true

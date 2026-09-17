@@ -57,7 +57,7 @@
 
 use std::collections::BTreeMap;
 
-use detector_api::{CrossBlockDetector, DetectionCtx};
+use detector_api::{CrossBlockDetector, DetectionCtx, DetectorId};
 use events::chain::BlockReverted;
 use events::primitives::{BlockRef, DetectorRef};
 use events::DomainEvent;
@@ -322,6 +322,12 @@ impl CrossBlockStates {
 
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
+    }
+
+    /// The id of every registered cross-block detector, in key order — the
+    /// counterpart of [`DetectionPlan::ids`](crate::emit::DetectionPlan::ids).
+    pub fn ids(&self) -> impl Iterator<Item = DetectorId> + '_ {
+        self.by_key.keys().map(|(id, _)| *id)
     }
 
     /// Whether a slot is registered for `key`.

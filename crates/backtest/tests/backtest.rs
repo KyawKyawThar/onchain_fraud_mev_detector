@@ -7,7 +7,7 @@
 #[test]
 fn seven_detectors_score_perfect_precision_and_recall_with_no_cross_triggers() {
     let roster = backtest::boot().expect("the built-in roster links cleanly");
-    let fixtures = backtest::fixtures::all();
+    let fixtures = backtest::load_corpus(&roster).expect("the committed corpus loads");
     let report = backtest::run_backtest(&fixtures, &roster);
 
     assert_eq!(

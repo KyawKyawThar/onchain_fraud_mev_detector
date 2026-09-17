@@ -209,6 +209,7 @@ mod tests {
             false_positives: 0,
             false_negatives: 0,
             blocks_hit: 0,
+            unadjudicated: 0,
         }
     }
 
@@ -236,6 +237,7 @@ mod tests {
                 false_positives: 1,
                 false_negatives: 0,
                 blocks_hit: 0,
+                unadjudicated: 0,
             },
         )]);
         let regressions = check(&report, &baseline);
@@ -279,6 +281,7 @@ mod tests {
                 false_positives: 0,
                 false_negatives: 1,
                 blocks_hit: 0,
+                unadjudicated: 0,
             },
         )]);
         let regressions = check(&report, &baseline);
@@ -297,6 +300,7 @@ mod tests {
                 false_positives: 5,
                 false_negatives: 3,
                 blocks_hit: 0,
+                unadjudicated: 0,
             },
         )]);
         assert!(check(&report, &baseline).is_empty());

@@ -29,23 +29,35 @@
 //! [`detection::PerformanceStore`] from a [`Report`] — the artifact
 //! `detection`'s boot reads to fill `ModelCard::Performance` (§18, Sprint 10 t4).
 //!
+//! Epic E added the evidence side. [`windows`] loads committed mainnet replay
+//! windows as *open-world* fixtures, labelled by simulation (see
+//! [`fixture`] for why an unlabelled alert there is not a false positive).
+//! [`fixtures::adversarial`] adds near misses every detector must stay quiet
+//! on. [`claim`] decides whether the mainnet part is large enough to state
+//! the README's false-positive target as a result.
+//!
 //! [`CtxBuilder`]: detector_api::test_util::CtxBuilder
 
 pub mod baseline;
+pub mod bootstrap;
+pub mod claim;
 pub mod fixture;
 pub mod fixtures;
 pub mod gate;
 pub mod performance;
 pub mod scoring;
+pub mod windows;
 
-pub use fixture::{ExpectedIncident, Fixture};
+pub use fixture::{ExpectedIncident, Fixture, GroundTruth, Provenance};
 pub use scoring::{run_backtest, run_fixture, DetectorStats, Finding, FixtureResult, Report};
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
 use detection::{
-    link_roster, register_builtins_with, DetectionPlan, DetectorId, DetectorPlugin, FeatureFlags,
-    PerformanceStore, RolloutPolicy,
+    link_roster, register_builtins_with, register_cross_block_builtins, DetectionPlan, DetectorId,
+    DetectorPlugin, FeatureFlags, PerformanceStore, RolloutPolicy,
 };
 
 /// The linked `Block` roster plus the flags it was built from — bundled
@@ -58,6 +70,37 @@ use detection::{
 pub struct Roster {
     pub plan: DetectionPlan,
     pub flags: FeatureFlags,
+    /// Every linked detector id, `Block` and cross-block, by its wire name.
+    known: BTreeMap<&'static str, DetectorId>,
+}
+
+impl Roster {
+    fn new(plan: DetectionPlan, flags: FeatureFlags) -> Self {
+        let cross_block = register_cross_block_builtins(
+            &flags,
+            &RolloutPolicy::default(),
+            &PerformanceStore::new(),
+        );
+        let known = plan
+            .ids()
+            .chain(cross_block.ids())
+            .map(|id| (id.as_str(), id))
+            .collect();
+        Self { plan, flags, known }
+    }
+
+    /// The linked detector a wire id names, or `None` when this build does not
+    /// link it.
+    ///
+    /// Replayed labels resolve through this rather than minting a `'static`
+    /// id of their own. A label for an unlinked detector is then *orphaned*,
+    /// not scored: an ML model with no bundle mounted, or a retired detector,
+    /// has not missed anything here. Scoring it would turn "not in this build"
+    /// into a false negative and fail the gate for a detector the gate cannot
+    /// see — the same reason [`fixtures::ml`] stays out of [`fixtures::all`].
+    pub fn resolve(&self, id: &str) -> Option<DetectorId> {
+        self.known.get(id).copied()
+    }
 }
 
 /// Build the full built-in `Block` roster the same way the live service's
@@ -99,5 +142,17 @@ pub fn boot_with(extra: Vec<Arc<dyn DetectorPlugin>>) -> anyhow::Result<Roster> 
         &RolloutPolicy::default(),
         &PerformanceStore::new(),
     )?;
-    Ok(Roster { plan, flags })
+    Ok(Roster::new(plan, flags))
+}
+
+/// The whole committed corpus: every hand-written fixture ([`fixtures::all`])
+/// followed by every mainnet window in [`windows::default_dir`].
+///
+/// This is the set the committed baseline and model cards are measured over,
+/// so the CLI and the tests that check those files must both use it. Window
+/// labels resolve against `roster` (see [`Roster::resolve`]).
+pub fn load_corpus(roster: &Roster) -> Result<Vec<Fixture>, windows::WindowError> {
+    let mut corpus = fixtures::all();
+    corpus.extend(windows::load_dir(&windows::default_dir(), roster)?);
+    Ok(corpus)
 }

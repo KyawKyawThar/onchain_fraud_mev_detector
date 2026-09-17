@@ -1547,17 +1547,25 @@ dependencies = [
  "alloy-primitives",
  "anomaly-detector",
  "anyhow",
+ "arb-detector",
  "chrono",
  "clap",
+ "corpus",
  "detection",
  "detector-api",
  "events",
+ "flashloan-detector",
  "inference",
  "insta",
+ "liquidation-detector",
  "ml-features",
+ "poisoning-detector",
+ "rugpull-detector",
+ "sandwich-detector",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "washtrading-detector",
 ]
 
 [[package]]
@@ -1976,6 +1984,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-enrich"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network-primitives",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-transport",
+ "async-trait",
+ "axum",
+ "bounded-map",
+ "detector-api",
+ "events",
+ "futures-util",
+ "metrics",
+ "resilience",
+ "sandwich-detector",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2307,6 +2342,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corpus"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "chrono",
+ "detector-api",
+ "events",
+ "flate2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2536,12 +2585,15 @@ dependencies = [
  "async-trait",
  "axum",
  "ch-migrate",
+ "chain-enrich",
  "chrono",
  "clap",
  "clickhouse",
+ "corpus",
  "detector-api",
  "event-store",
  "events",
+ "futures-util",
  "metrics",
  "metrics-util",
  "ml-features",
@@ -2559,6 +2611,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -3196,6 +3249,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
+ "crc32fast",
  "miniz_oxide",
  "zlib-rs",
 ]

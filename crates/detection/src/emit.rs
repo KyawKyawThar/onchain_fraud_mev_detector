@@ -340,6 +340,13 @@ impl DetectionPlan {
             .map(|linked| &linked.detector_ref)
     }
 
+    /// The id of every linked detector, in roster order. The `'static` ids a
+    /// caller holding only a wire `String` (a replayed label, say) resolves
+    /// against, instead of minting its own.
+    pub fn ids(&self) -> impl Iterator<Item = DetectorId> + '_ {
+        self.detectors.iter().map(|linked| linked.plugin.id())
+    }
+
     /// How many detectors the plan will fan out over.
     pub fn len(&self) -> usize {
         self.detectors.len()

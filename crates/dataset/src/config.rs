@@ -42,13 +42,19 @@ impl ClickhouseConfig {
     }
 }
 
-/// Everything the binary needs to reach its two dependencies.
+/// The archive node `--context-source archive` reads from. A secret: hosted
+/// endpoints carry the API key in the URL.
+pub const ARCHIVE_RPC_URL_ENV: &str = "DATASET_ARCHIVE_RPC_URL";
+
+/// Everything the binary needs to reach its dependencies.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Event-store service root, e.g. `http://event-store:8081`. The `/v1/replay`
     /// path is appended by the source.
     pub event_store_url: String,
     pub clickhouse: ClickhouseConfig,
+    /// Unset unless an archive node is configured.
+    pub archive_rpc_url: Option<SecretString>,
 }
 
 impl Config {
@@ -56,6 +62,10 @@ impl Config {
         Ok(Self {
             event_store_url: parse_or(EVENT_STORE_URL_ENV, DEFAULT_EVENT_STORE_URL.to_owned())?,
             clickhouse: ClickhouseConfig::from_env()?,
+            archive_rpc_url: std::env::var(ARCHIVE_RPC_URL_ENV)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(SecretString::from),
         })
     }
 }
@@ -73,6 +83,18 @@ mod tests {
         assert!(cfg.event_store_url.starts_with("http://"));
         assert!(cfg.clickhouse.url.starts_with("http://"));
         assert!(!cfg.clickhouse.database.is_empty());
+    }
+
+    #[test]
+    fn the_archive_url_stays_out_of_debug_output() {
+        let cfg = Config {
+            event_store_url: "http://es:8081".into(),
+            clickhouse: ClickhouseConfig::from_env().unwrap(),
+            archive_rpc_url: Some(SecretString::from(
+                "https://eth.example/v2/SECRET-KEY".to_owned(),
+            )),
+        };
+        assert!(!format!("{cfg:?}").contains("SECRET-KEY"));
     }
 
     #[test]
