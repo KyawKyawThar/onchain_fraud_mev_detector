@@ -268,6 +268,21 @@ pub trait DetectorPlugin: Send + Sync {
     /// path, so it must stay cheap.
     fn detect(&self, ctx: &DetectionCtx) -> Vec<Evidence>;
 
+    /// The tunable configuration this build runs with, as plain JSON — the
+    /// thresholds that decide what [`detect`](Self::detect) reports.
+    ///
+    /// The composing service hashes this into the `config_hash` of the
+    /// `(id, version, config_hash)` triple
+    /// (`detection::model::ConfigHash::for_build`). Required, not defaulted: a
+    /// detector that forgot to report its config would hash every threshold
+    /// change to the same identity, and the backtest gate could then no longer
+    /// tell "we changed it" from "it broke" (§18). A detector with nothing
+    /// tunable returns [`serde_json::Value::Null`] and says so.
+    ///
+    /// Constants that are *code* (confidence formulas, say) are not config:
+    /// changing one is a new [`version`](Self::version).
+    fn config_value(&self) -> serde_json::Value;
+
     /// A digest of the *learned* configuration this build serves — weights, and
     /// the feature contract they were trained against (§20.2). `None`, the
     /// default, for a detector whose behaviour is fixed by code and thresholds.

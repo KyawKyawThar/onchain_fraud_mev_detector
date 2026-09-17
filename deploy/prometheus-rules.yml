@@ -468,6 +468,23 @@ groups:
           summary: "{{ $labels.detector }} p99 detect latency is eating the fast-path budget"
           description: "One detector's p99 detect call has been above 50ms for 10m, against a measured healthy whole-path p99 of 250ms. Every detector in the roster runs on the §6 block → alert path, so one outlier at 50ms is the early warning that FastPathLatencyHigh is coming. For the ML detector this is the §20.2 inference budget — cross-check model_inference_duration_seconds. Note this series is deliberately NOT the fast-path SLO: it is one `detect` call and is unmoved by a queue building up in front of it (docs/runbooks/load-test.md), so a quiet value here does not mean the fast path is healthy."
 
+      # STRUCTURAL (a gauge that should be zero). `detector_performance_stale`
+      # is 1 when a linked detector build has a stored measurement for a
+      # *different* build: its version or config changed and the compiled-in
+      # model_performance.json was not regenerated, so its model card says
+      # "unmeasured" for a detector that was measured. Published for every
+      # linked detector at boot, 0 included (§15b), so a quiet series is a
+      # reading, not an absence. It cannot clear without a new image, hence
+      # warning rather than page, and a short `for`.
+      - alert: DetectorPerformanceCardStale
+        expr: max by (detector, version) (detector_performance_stale) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.detector }} v{{ $labels.version }} is running with a stale model card"
+          description: "The deployed detection image links a {{ $labels.detector }} build whose (version, config_hash) differs from the one its committed performance record was measured on, so the card shows the detector as unmeasured and §18's measured precision/recall is not attached to its findings. The detector itself runs normally. Fix: run `just backtest-update-baseline` for this build, review the baseline and model-card diff, and ship a new image. The boot log names both builds (look for 'model card unmeasured'). If DETECTION_PERFORMANCE_STORE points at an override file, that file is the stale one."
+
       - alert: ModelServingSkew
         expr: sum(rate(model_drift_rejected_total[15m])) by (model) > 0
         for: 15m

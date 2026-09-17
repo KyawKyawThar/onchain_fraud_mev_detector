@@ -749,7 +749,9 @@ schema-bless:
 
 # Replay the ground-truth fixtures and fail on either committed gate — the CI
 # merge gate. Two distinct checks (see crates/backtest/src/gate.rs):
-#   regression — nothing dropped below crates/backtest/baseline.json
+#   regression — nothing dropped below crates/backtest/baseline.json on the
+#                same (id, version, config_hash) [REGRESSION], and every
+#                baselined detector is still the build it measured [REBUILT]
 #   promotion  — nothing Active sits below crates/backtest/promotion_gate.json,
 #                and shadowed detectors clearing it are reported as promotable
 backtest:
@@ -823,11 +825,21 @@ load-test-degraded proxy_listen="127.0.0.1:50061" upstream="127.0.0.1:50051":
 backtest-ml config:
     cargo run -p backtest --all-features --locked -- --anomaly-config {{config}}
 
-# Overwrite the committed baseline with this run's numbers — the deliberate
-# step a detector/config change that intentionally moves precision/recall
-# takes before it can merge.
+# Overwrite the committed baseline AND model cards with this run's numbers and
+# builds — the deliberate step a detector version/config change takes before
+# it can merge (`just backtest` prints REBUILT until it does). Both files key
+# on (id, version, config_hash), so both move together;
+# tests/committed_builds.rs fails if only one did.
 backtest-update-baseline:
-    cargo run -p backtest --all-features --locked -- --update-baseline
+    cargo run -p backtest --all-features --locked -- --update-baseline --update-model-cards
+
+# Check the archive node in DATASET_ARCHIVE_RPC_URL and the committed
+# enrichment config against the live chain before capturing a replay window
+# (Epic E). Exit 0 pass, 1 fail (node or config wrong), 2 inconclusive (the
+# node did not answer). Nightly in CI: .github/workflows/archive-probe.yml.
+#   just archive-probe --concurrency 1     # on a rate-limited endpoint
+archive-probe *args:
+    cargo run -p dataset --locked -- probe-archive {{args}}
 
 # Accept a changed full-report snapshot (tests/baseline_snapshot.rs) after
 # reviewing the diff `cargo test` printed — the dev-review counterpart to

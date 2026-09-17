@@ -6,8 +6,11 @@
 //! report, then fail with a non-zero exit if either gate says so —
 //!
 //! - the **regression** gate ([`baseline`]): a baselined detector's precision
-//!   or recall dropped below `crates/backtest/baseline.json`. Answers "did this
-//!   change make something worse?"
+//!   or recall dropped below `crates/backtest/baseline.json` on the same
+//!   `(id, version, config_hash)` (`REGRESSION`: it broke), or the detector now
+//!   runs as a different build than the baseline measured (`REBUILT`: we
+//!   changed it, so re-baseline after review). Answers "did this change make
+//!   something worse, and was it the detector that changed?"
 //! - the **promotion** gate ([`gate`]): a `LifecycleStatus::Active` detector is
 //!   below `crates/backtest/promotion_gate.json`, or has no measurement at all.
 //!   Answers "is what we ship still good enough?" — and, for the shadowed
@@ -134,26 +137,29 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "{regressions} regression(s) and {promotion} promotion-gate failure(s) — fix the \
-         detector/config change, or run `cargo run -p backtest -- --update-baseline` if a \
-         measured drop is intended"
+        "{regressions} baseline finding(s) and {promotion} promotion-gate failure(s). \
+         REGRESSION means an unchanged detector got worse: fix what changed under it. \
+         REBUILT means a detector's version or config changed: review the movement, then run \
+         `cargo run -p backtest -- --update-baseline --update-model-cards` so both files name \
+         the new build"
     )
 }
 
-/// The regression gate: nothing may drop below the committed baseline.
+/// The regression gate: nothing may drop below the committed baseline, and
+/// every baselined detector must still be the build its baseline measured.
 fn check_regressions(report: &backtest::Report) -> anyhow::Result<usize> {
     let base = baseline::load(&baseline::default_path())
         .context("loading the committed precision/recall baseline")?;
-    let regressions = baseline::check(report, &base);
+    let findings = baseline::check(report, &base);
 
     println!();
-    if regressions.is_empty() {
-        println!("no regressions against baseline (§18)");
+    if findings.is_empty() {
+        println!("no regressions against baseline, every baselined build unchanged (§18)");
     }
-    for r in &regressions {
-        println!("REGRESSION  {r}");
+    for finding in &findings {
+        println!("{finding}");
     }
-    Ok(regressions.len())
+    Ok(findings.len())
 }
 
 /// The promotion gate: nothing `Active` may sit below the committed floor, and

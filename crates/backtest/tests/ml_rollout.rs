@@ -50,7 +50,7 @@ fn ml_detector(score: f64) -> Arc<dyn DetectorPlugin> {
 }
 
 fn stats(report: &backtest::Report, id: &str) -> DetectorStats {
-    report.detectors.get(id).copied().unwrap_or_default()
+    report.stats(id)
 }
 
 /// A gate whose only difference from the committed one is that a single

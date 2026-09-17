@@ -297,6 +297,7 @@ pub fn register_cross_block_builtins(
             detector_api::Scope::CrossBlock {
                 window_blocks: detector.window_blocks(),
             },
+            &detector.config_value(),
             // No cross-block detector serves a learned model today; the
             // `CrossBlockDetector` trait has no `model_digest` because
             // nothing needs one yet (§20.1's cross-block feature family is

@@ -166,6 +166,25 @@ impl ArchiveRpc for FakeChain {
         Ok(self.chain_id)
     }
 
+    async fn head_number(&self) -> Result<u64, RpcError> {
+        self.check()?;
+        Ok(self
+            .blocks
+            .values()
+            .map(|(b, _)| b.number)
+            .max()
+            .unwrap_or(0))
+    }
+
+    async fn block_hash(&self, number: u64) -> Result<Option<B256>, RpcError> {
+        self.check()?;
+        Ok(self
+            .blocks
+            .values()
+            .find(|(b, _)| b.number == number)
+            .map(|(b, _)| b.hash))
+    }
+
     async fn block(&self, hash: B256) -> Result<Option<RawBlock>, RpcError> {
         self.check()?;
         Ok(self.blocks.get(&hash).map(|(b, _)| b.clone()))

@@ -17,7 +17,7 @@ use alloy_consensus::Transaction as _;
 use alloy_network_primitives::TransactionResponse;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types_eth::{BlockId, TransactionInput, TransactionRequest};
+use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, TransactionInput, TransactionRequest};
 use alloy_transport::{TransportError, TransportErrorKind};
 use async_trait::async_trait;
 use resilience::{Backoff, RetryDecision};
@@ -172,6 +172,25 @@ impl ArchiveRpc for AlloyArchiveRpc {
         self.read("eth_chainId", || self.provider.get_chain_id())
             .await?
             .ok_or_else(|| not_a_call("eth_chainId"))
+    }
+
+    async fn head_number(&self) -> Result<u64, RpcError> {
+        self.read("eth_blockNumber", || self.provider.get_block_number())
+            .await?
+            .ok_or_else(|| not_a_call("eth_blockNumber"))
+    }
+
+    async fn block_hash(&self, number: u64) -> Result<Option<B256>, RpcError> {
+        const OP: &str = "eth_getBlockByNumber";
+        let block = self
+            .read(OP, || {
+                self.provider
+                    .get_block_by_number(BlockNumberOrTag::Number(number))
+                    .into_future()
+            })
+            .await?
+            .ok_or_else(|| not_a_call(OP))?;
+        Ok(block.map(|b| b.header.hash))
     }
 
     async fn block(&self, hash: B256) -> Result<Option<RawBlock>, RpcError> {

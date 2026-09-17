@@ -188,6 +188,12 @@ impl<R: ArchiveRpc> Enricher<R> {
         self.config.chain
     }
 
+    /// The node this enricher reads from — for callers that need to *find*
+    /// blocks (head, hash by number) on the same verified connection.
+    pub fn rpc(&self) -> &R {
+        &self.rpc
+    }
+
     /// Enrich the block `block` names, or `None` if the node does not know
     /// that hash.
     pub async fn enrich(&self, block: BlockRef) -> Result<Option<EnrichedBlock>, EnrichError> {

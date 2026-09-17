@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::B256;
+use detection::Build;
 use detection::{register_cross_block_builtins, PerformanceStore, RolloutPolicy};
 use events::primitives::AlertKind;
 use events::DomainEvent;
@@ -252,28 +253,85 @@ impl DetectorStats {
     }
 }
 
+/// One detector's line in a [`Report`]: the build it ran as and what it
+/// scored.
+///
+/// One map of these rather than a stats map beside a builds map: the two are
+/// keyed identically and read together, and two parallel maps are two
+/// answers to "which detectors did this run see", free to disagree.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DetectorEntry {
+    /// `None` when ground truth names a detector this run did not link.
+    pub build: Option<Build>,
+    pub stats: DetectorStats,
+}
+
 /// The whole fixture set's replay: per-fixture detail plus the per-detector
-/// precision/recall roll-up (§18) — the reference stats a future CI gate
-/// (Sprint 10 t3) and `ModelCard::Performance` (t4) build on.
+/// precision/recall roll-up (§18) — what the baseline, the promotion gate and
+/// `ModelCard::Performance` are built from.
 #[derive(Debug)]
 pub struct Report {
     pub fixtures: Vec<FixtureResult>,
-    /// Keyed by `DetectorId` string, deterministic order for a stable report.
-    pub detectors: BTreeMap<String, DetectorStats>,
+    /// Every detector the run linked or scored, by `DetectorId` string, in a
+    /// deterministic order for a stable report. The numbers describe the
+    /// entry's build and no other, so everything persisted from a report is
+    /// keyed on the triple, not the id (§18).
+    pub detectors: BTreeMap<String, DetectorEntry>,
     /// Total blocks replayed across every fixture — the same denominator for
     /// every detector's hit rate, since every detector runs over every block.
     pub total_blocks: u64,
 }
 
 impl Report {
+    /// Assemble a report from per-fixture results and the builds the run
+    /// linked. A linked detector that scored nothing still gets an entry
+    /// (default stats), so "linked and unmeasured" is visible rather than
+    /// absent.
+    pub fn assemble(fixtures: Vec<FixtureResult>, builds: &BTreeMap<String, Build>) -> Self {
+        let mut detectors: BTreeMap<String, DetectorEntry> = aggregate(&fixtures)
+            .into_iter()
+            .map(|(id, stats)| {
+                let build = builds.get(&id).cloned();
+                (id, DetectorEntry { build, stats })
+            })
+            .collect();
+        for (id, build) in builds {
+            detectors
+                .entry(id.clone())
+                .or_insert_with(|| DetectorEntry {
+                    build: Some(build.clone()),
+                    stats: DetectorStats::default(),
+                });
+        }
+        Self {
+            total_blocks: fixtures.iter().map(|r| r.blocks_replayed).sum(),
+            fixtures,
+            detectors,
+        }
+    }
+
+    /// `id`'s stats, zero if the run never saw it.
+    pub fn stats(&self, id: &str) -> DetectorStats {
+        self.detectors.get(id).map(|e| e.stats).unwrap_or_default()
+    }
+
+    /// The build `id` ran as, when this run linked it.
+    pub fn build(&self, id: &str) -> Option<&Build> {
+        self.detectors.get(id)?.build.as_ref()
+    }
+
+    /// Every linked detector with its build and stats, in id order.
+    pub fn linked(&self) -> impl Iterator<Item = (&str, &Build, &DetectorStats)> {
+        self.detectors
+            .iter()
+            .filter_map(|(id, e)| Some((id.as_str(), e.build.as_ref()?, &e.stats)))
+    }
+
     /// Fraction of replayed blocks `id` fired on at least once — the
     /// volume/noise signal `Performance::Measured::hit_rate` carries. `None`
     /// when no blocks were replayed (an empty fixture set).
     pub fn hit_rate(&self, id: &str) -> Option<f64> {
-        (self.total_blocks > 0).then(|| {
-            let hits = self.detectors.get(id).map_or(0, |s| s.blocks_hit);
-            hits as f64 / self.total_blocks as f64
-        })
+        (self.total_blocks > 0).then(|| self.stats(id).blocks_hit as f64 / self.total_blocks as f64)
     }
 }
 
@@ -283,11 +341,7 @@ impl Report {
 /// across every fixture; each fixture still gets its own fresh cross-block state.
 pub fn run_backtest(fixtures: &[Fixture], roster: &Roster) -> Report {
     let results: Vec<FixtureResult> = fixtures.iter().map(|f| run_fixture(f, roster)).collect();
-    Report {
-        detectors: aggregate(&results),
-        total_blocks: results.iter().map(|r| r.blocks_replayed).sum(),
-        fixtures: results,
-    }
+    Report::assemble(results, roster.builds())
 }
 
 /// Roll per-fixture outcomes up into per-detector stats.
@@ -374,10 +428,15 @@ impl std::fmt::Display for Report {
         }
 
         writeln!(f, "\nper-detector precision / recall / hit_rate:")?;
-        for (id, stats) in &self.detectors {
+        for (id, entry) in &self.detectors {
+            let stats = &entry.stats;
             writeln!(
                 f,
-                "  {id:<20} precision {}  recall {}  hit_rate {}  (tp={} fp={} fn={} blocks_hit={}/{})",
+                "  {id:<20} {:<24} precision {}  recall {}  hit_rate {}  (tp={} fp={} fn={} blocks_hit={}/{})",
+                entry
+                    .build
+                    .as_ref()
+                    .map_or_else(|| "not linked".to_owned(), ToString::to_string),
                 fmt_rate(stats.precision()),
                 fmt_rate(stats.recall()),
                 fmt_rate(self.hit_rate(id)),
@@ -388,7 +447,11 @@ impl std::fmt::Display for Report {
                 self.total_blocks,
             )?;
             if stats.unadjudicated > 0 {
-                writeln!(f, "  {:<20} unadjudicated={}", "", stats.unadjudicated)?;
+                writeln!(
+                    f,
+                    "  {:<20} {:<24} unadjudicated={}",
+                    "", "", stats.unadjudicated
+                )?;
             }
         }
         Ok(())
@@ -425,16 +488,7 @@ mod tests {
         assert_eq!(stats.recall(), Some(0.75));
     }
 
-    fn report_of(total_blocks: u64, entries: &[(&str, DetectorStats)]) -> Report {
-        Report {
-            fixtures: Vec::new(),
-            detectors: entries
-                .iter()
-                .map(|(id, stats)| (id.to_string(), *stats))
-                .collect(),
-            total_blocks,
-        }
-    }
+    use crate::test_report as report_of;
 
     #[test]
     fn hit_rate_divides_blocks_hit_by_total_blocks() {
@@ -455,6 +509,23 @@ mod tests {
     fn hit_rate_is_zero_not_none_for_a_detector_with_no_hits() {
         let report = report_of(10, &[]);
         assert_eq!(report.hit_rate("sandwich"), Some(0.0));
+    }
+
+    #[test]
+    fn assemble_lists_a_linked_detector_that_scored_nothing() {
+        let builds = BTreeMap::from([(
+            "sandwich".to_owned(),
+            crate::test_build("sandwich", "1.0.0", "cfg"),
+        )]);
+        let report = Report::assemble(Vec::new(), &builds);
+        assert_eq!(
+            report.detectors["sandwich"],
+            DetectorEntry {
+                build: Some(builds["sandwich"].clone()),
+                stats: DetectorStats::default(),
+            }
+        );
+        assert_eq!(report.linked().count(), 1);
     }
 
     #[test]

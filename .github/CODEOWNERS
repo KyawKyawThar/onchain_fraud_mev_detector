@@ -19,3 +19,16 @@
 /crates/copilot/src/grounding.rs        @KyawKyawThar
 /crates/copilot/src/grounding_audit.rs  @KyawKyawThar
 /crates/copilot/src/capability.rs       @KyawKyawThar
+
+# ── Detection quality governance (§18, §20.2, Epic E) ───────────
+# A detector's measured standing. Each file is keyed on the
+# (id, version, config_hash) triple, and regenerating it is how a detector
+# config change is *accepted*; the promotion floor is policy with no --update
+# flag. The golden hash table pins what a triple means. None of these should
+# move on one person's say-so.
+/crates/backtest/baseline.json          @KyawKyawThar
+/crates/backtest/promotion_gate.json    @KyawKyawThar
+/crates/detection/model_performance.json @KyawKyawThar
+/crates/detection/src/measured.rs       @KyawKyawThar
+/crates/backtest/corpus/                @KyawKyawThar
+/crates/chain-enrich/config/            @KyawKyawThar

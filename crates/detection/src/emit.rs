@@ -347,6 +347,12 @@ impl DetectionPlan {
         self.detectors.iter().map(|linked| linked.plugin.id())
     }
 
+    /// Every linked `(id, version, config_hash)` triple, in roster order —
+    /// what the backtest harness keys its committed measurements on (§18).
+    pub fn detector_refs(&self) -> impl Iterator<Item = &DetectorRef> + '_ {
+        self.detectors.iter().map(|linked| &linked.detector_ref)
+    }
+
     /// How many detectors the plan will fan out over.
     pub fn len(&self) -> usize {
         self.detectors.len()

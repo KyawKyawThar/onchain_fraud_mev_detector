@@ -24,6 +24,7 @@ use events::primitives::{Confidence, ConfidenceOutOfRange, DetectorRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::measured::{canonical_json, Build, BuildKeyed, Lookup};
 use crate::registry::DetectorKey;
 use detector_api::{DetectorId, DetectorPlugin, ModelKind, Scope, SemVer};
 
@@ -38,10 +39,11 @@ use detector_api::{DetectorId, DetectorPlugin, ModelKind, Scope, SemVer};
 /// `Display`, serde). Storing the digest, not a `String`, keeps a `ConfigHash`
 /// *always* a valid 32-byte hash — it can't be constructed from arbitrary text.
 ///
-/// Hashing is **deterministic by construction**: [`of`](Self::of) routes through
-/// [`serde_json::Value`], whose maps are sorted, so a config with a `HashMap`
-/// can't hash two different ways from one logical value — the caller doesn't
-/// have to remember to use ordered containers.
+/// Hashing is **deterministic by construction**: [`of`](Self::of) and
+/// [`for_build`](Self::for_build) hash [`canonical_json`], which sorts object
+/// keys itself, so a config with a `HashMap` can't hash two different ways from
+/// one logical value, and no cargo feature elsewhere in the build can change
+/// the bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConfigHash([u8; 32]);
 
@@ -59,11 +61,8 @@ impl ConfigHash {
         // Round-trip through `Value` so map keys are canonically ordered before
         // hashing — robust by construction, not by caller discipline. The cost
         // (one allocation) is on the cold deploy path, never the detect hot path.
-        let canonical =
-            serde_json::to_value(config).map_err(|source| ConfigHashError { source })?;
-        let bytes = serde_json::to_vec(&canonical)
-            .expect("re-serializing an in-memory serde_json::Value is infallible");
-        Ok(Self::of_bytes(&bytes))
+        let value = serde_json::to_value(config).map_err(|source| ConfigHashError { source })?;
+        Ok(Self::of_bytes(&canonical_json(&value)))
     }
 
     /// Hash raw bytes directly — for a detector that already has a canonical
@@ -72,18 +71,31 @@ impl ConfigHash {
         Self(Sha256::digest(bytes).into())
     }
 
-    /// The **boot-placeholder** config hash for a detector, derived from its
-    /// `(id, version)` identity alone.
+    /// The config hash of one detector build: its `(id, version)` plus the
+    /// configuration it reports through
+    /// [`DetectorPlugin::config_value`](detector_api::DetectorPlugin::config_value).
     ///
-    /// Detectors don't yet expose their serialised config for a real
-    /// [`of`](Self::of), so until per-detector config hashing lands (Sprint 10 t4)
-    /// the boot path stamps this stable, identity-seeded stand-in. Both the `Block`
-    /// catalogue (`main::catalogue`) and the cross-block roster
-    /// ([`register_cross_block_builtins`](crate::registry::register_cross_block_builtins))
-    /// route through *this one function* so the placeholder can't drift between the
-    /// two paths — a detector's emitted triple is the same however it was linked.
-    pub fn boot_placeholder(id: DetectorId, version: SemVer) -> Self {
-        Self::of_bytes(format!("{id}-{version}").as_bytes())
+    /// This is what makes the triple mean something to the backtest gate
+    /// (§18): a threshold change moves the hash while the version stays put,
+    /// so a committed measurement can say which build it was taken from, and a
+    /// precision drop under a *new* hash reads as "we changed it" rather than
+    /// "it broke". The `Block` catalogue, the cross-block roster and the ML
+    /// bundle check all route through this one function, so a detector's
+    /// triple is the same however it was linked.
+    ///
+    /// Canonical by construction ([`canonical_json`] sorts keys itself), and
+    /// domain-separated so it can never collide with [`of`](Self::of) over
+    /// bytes that happen to spell the same thing.
+    pub fn for_build(id: DetectorId, version: SemVer, config: &serde_json::Value) -> Self {
+        let config = canonical_json(config);
+        let mut hasher = Sha256::new();
+        hasher.update(b"config-hash/detector-build/v1\n");
+        hasher.update(id.as_str().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(version.to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(&config);
+        Self(hasher.finalize().into())
     }
 
     /// The raw 32-byte digest.
@@ -106,7 +118,7 @@ impl ConfigHash {
     /// Taken as raw bytes rather than a typed descriptor deliberately: the
     /// serving seam (`inference`) stays off this crate's dependency edge, and
     /// this stays the *one* fold, so a detector's hash can't be composed two
-    /// different ways (the same reason [`boot_placeholder`](Self::boot_placeholder)
+    /// different ways (the same reason [`for_build`](Self::for_build)
     /// is a single function).
     ///
     /// Domain-separated, so folding a model into a config hash can never
@@ -138,18 +150,39 @@ impl Serialize for ConfigHash {
     }
 }
 
+/// A [`ConfigHash`] could not be read back from its hex rendering.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("config hash must be 64 hex chars (32 bytes): {reason}")]
+pub struct ConfigHashParseError {
+    reason: String,
+}
+
+impl std::str::FromStr for ConfigHash {
+    type Err = ConfigHashParseError;
+
+    /// Parse the lowercase-hex form [`to_hex`](Self::to_hex) writes — the
+    /// inverse the backtest harness needs to turn a wire [`DetectorRef`] back
+    /// into a typed build.
+    fn from_str(hex: &str) -> Result<Self, Self::Err> {
+        let bytes = alloy_primitives::hex::decode(hex).map_err(|e| ConfigHashParseError {
+            reason: e.to_string(),
+        })?;
+        let digest: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ConfigHashParseError {
+                reason: format!("got {} bytes", bytes.len()),
+            })?;
+        Ok(Self(digest))
+    }
+}
+
 impl<'de> Deserialize<'de> for ConfigHash {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let hex = String::deserialize(deserializer)?;
-        let bytes = alloy_primitives::hex::decode(&hex).map_err(D::Error::custom)?;
-        let digest: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            D::Error::custom(format!(
-                "config hash must be 32 bytes (64 hex chars), got {}",
-                bytes.len()
-            ))
-        })?;
-        Ok(Self(digest))
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
     }
 }
 
@@ -382,45 +415,105 @@ impl Performance {
     }
 }
 
-/// The wire form of one detector's measured performance (§18, Sprint 10 t4) — the
-/// bridge between the backtest harness's offline scoring
+/// One detector's measured performance, as the backtest harness writes it
 /// ([`backtest::performance::from_report`](../../backtest/performance/index.html))
-/// and a live boot's [`ModelCard`].
+/// and a boot shows it on a [`ModelCard`] (§18, Sprint 10 t4).
 ///
-/// Rates are plain `f64`, not [`Confidence`], on purpose: `Confidence`'s derived
-/// `Deserialize` doesn't range-check (it's `#[serde(transparent)]` over a bare
-/// `f64`), so validating a value from outside the process — this is read from a
-/// checked-in JSON file — has to happen explicitly, in [`into_performance`]
-/// (Self::into_performance), not silently inside serde.
+/// **Validated inside `Deserialize`** (`try_from` a raw record), so an
+/// out-of-range rate cannot be parsed at all — the invariant is the type's,
+/// not a `validate()` call a reader must remember. The same family as
+/// `UsdAmount` and `loadtest::slo::LatencyBudget`.
+///
+/// It carries no build: the [`PerformanceStore`] around it does, and only
+/// hands a record out for the exact build it was measured on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawPerformanceRecord")]
 pub struct PerformanceRecord {
-    pub precision: f64,
-    pub recall: f64,
-    pub hit_rate: f64,
-    pub sample_size: NonZeroU64,
-    pub measured_at: DateTime<Utc>,
+    precision: Confidence,
+    recall: Confidence,
+    hit_rate: Confidence,
+    sample_size: NonZeroU64,
+    measured_at: DateTime<Utc>,
 }
 
-impl PerformanceRecord {
-    /// Validate the rates into a [`Performance::Measured`], or the first
-    /// out-of-range field's error.
-    pub fn into_performance(self) -> Result<Performance, ConfidenceOutOfRange> {
-        Ok(Performance::Measured {
-            precision: Confidence::try_new(self.precision)?,
-            recall: Confidence::try_new(self.recall)?,
-            hit_rate: Confidence::try_new(self.hit_rate)?,
-            sample_size: self.sample_size,
-            measured_at: self.measured_at,
-        })
+/// The unvalidated wire shape of a [`PerformanceRecord`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPerformanceRecord {
+    precision: f64,
+    recall: f64,
+    hit_rate: f64,
+    sample_size: NonZeroU64,
+    measured_at: DateTime<Utc>,
+}
+
+impl TryFrom<RawPerformanceRecord> for PerformanceRecord {
+    type Error = ConfidenceOutOfRange;
+
+    fn try_from(raw: RawPerformanceRecord) -> Result<Self, Self::Error> {
+        Self::try_new(
+            raw.precision,
+            raw.recall,
+            raw.hit_rate,
+            raw.sample_size,
+            raw.measured_at,
+        )
     }
 }
 
-/// Every detector's persisted measured performance, keyed by [`DetectorId`]
-/// string — the same keying convention as
-/// [`backtest::baseline::Baseline`](../../backtest/baseline/type.Baseline.html).
-pub type PerformanceStore = BTreeMap<String, PerformanceRecord>;
+impl PerformanceRecord {
+    /// A record, or the first out-of-range rate's error.
+    pub fn try_new(
+        precision: f64,
+        recall: f64,
+        hit_rate: f64,
+        sample_size: NonZeroU64,
+        measured_at: DateTime<Utc>,
+    ) -> Result<Self, ConfidenceOutOfRange> {
+        Ok(Self {
+            precision: Confidence::try_new(precision)?,
+            recall: Confidence::try_new(recall)?,
+            hit_rate: Confidence::try_new(hit_rate)?,
+            sample_size,
+            measured_at,
+        })
+    }
 
-/// Something went wrong loading the committed performance store.
+    /// The card's view of this record. Infallible: the rates were checked
+    /// when the record was built.
+    pub fn performance(&self) -> Performance {
+        Performance::Measured {
+            precision: self.precision,
+            recall: self.recall,
+            hit_rate: self.hit_rate,
+            sample_size: self.sample_size,
+            measured_at: self.measured_at,
+        }
+    }
+
+    pub fn precision(&self) -> f64 {
+        self.precision.get()
+    }
+
+    pub fn recall(&self) -> f64 {
+        self.recall.get()
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        self.hit_rate.get()
+    }
+
+    pub fn sample_size(&self) -> NonZeroU64 {
+        self.sample_size
+    }
+}
+
+/// Every detector's measured performance, each entry naming the build it was
+/// measured on (see [`crate::measured`]). A card shows a record only through
+/// [`BuildKeyed::lookup`] → `Current`.
+pub type PerformanceStore = BuildKeyed<PerformanceRecord>;
+
+/// Something went wrong loading or writing a performance store.
 #[derive(Debug, thiserror::Error)]
 pub enum PerformanceStoreError {
     #[error("reading performance store at {path}")]
@@ -429,18 +522,12 @@ pub enum PerformanceStoreError {
         #[source]
         source: std::io::Error,
     },
+    /// Includes an out-of-range rate: records validate while parsing.
     #[error("parsing performance store at {path}")]
     Parse {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
-    },
-    #[error("performance store at {path} has an out-of-range rate for {id}")]
-    InvalidRecord {
-        path: PathBuf,
-        id: String,
-        #[source]
-        source: ConfidenceOutOfRange,
     },
     #[error("serializing performance store")]
     Serialize(#[source] serde_json::Error),
@@ -452,52 +539,85 @@ pub enum PerformanceStoreError {
     },
 }
 
-/// `crates/detection/model_performance.json`, resolved at compile time (so it's
-/// correct regardless of which crate/cwd calls it — `backtest` writes here via
-/// this same function, `detection`'s boot reads it) — the committed bridge from
-/// the backtest harness's measured precision/recall/hit_rate into every
-/// [`ModelCard::performance`] at boot.
+/// `crates/detection/model_performance.json` in the source tree — where
+/// `backtest --update-model-cards` **writes**. Never a runtime read path: a
+/// deployed image has no source tree (see [`committed_performance_store`]).
 pub fn default_performance_store_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("model_performance.json")
 }
 
-/// Load the committed performance store. A missing file is `Ok`-empty — a
-/// legitimate state before the backtest harness has ever run
-/// (`--update-model-cards`) or for a brand-new detector with no history yet;
-/// every card just stays [`Performance::Unmeasured`]. Malformed JSON or an
-/// out-of-range rate is a typed error: a checked-in artifact drifting from its
-/// schema is a wiring bug, not a runtime condition to paper over.
-pub fn load_performance_store(path: &Path) -> Result<PerformanceStore, PerformanceStoreError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PerformanceStore::new())
-        }
-        Err(source) => {
-            return Err(PerformanceStoreError::Read {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    };
-    let raw: BTreeMap<String, PerformanceRecord> =
-        serde_json::from_str(&text).map_err(|source| PerformanceStoreError::Parse {
-            path: path.to_path_buf(),
+/// The committed store, compiled into the binary.
+///
+/// Embedded rather than read from [`default_performance_store_path`]: that is
+/// a path on the *build* machine, so a container image (which ships only the
+/// binary) would find nothing, and a missing file used to mean "every card
+/// unmeasured", silently. It also belongs with the binary for a better
+/// reason: every record is keyed on a build triple, and the triple is fixed
+/// when the binary is compiled, so the measurement ships with the build it
+/// describes. `tests/committed_builds.rs` in the backtest crate keeps the two
+/// in step.
+pub const COMMITTED_PERFORMANCE_STORE: &str = include_str!("../model_performance.json");
+
+/// Environment variable naming a performance store file to use **instead of**
+/// the embedded one — an operator override, e.g. numbers from a larger
+/// corpus. A missing or malformed file then fails boot.
+pub const PERFORMANCE_STORE_ENV: &str = "DETECTION_PERFORMANCE_STORE";
+
+/// Parse the store compiled into this binary.
+pub fn committed_performance_store() -> Result<PerformanceStore, PerformanceStoreError> {
+    serde_json::from_str(COMMITTED_PERFORMANCE_STORE).map_err(|source| {
+        PerformanceStoreError::Parse {
+            path: PathBuf::from("<embedded model_performance.json>"),
             source,
-        })?;
-    // Validate every record eagerly (rather than lazily on first read) so a bad
-    // artifact fails at boot, not on whichever detector happens to be looked up
-    // first.
-    for (id, record) in &raw {
-        record.clone().into_performance().map_err(|source| {
-            PerformanceStoreError::InvalidRecord {
-                path: path.to_path_buf(),
-                id: id.clone(),
-                source,
-            }
-        })?;
+        }
+    })
+}
+
+/// Where a boot's performance store came from — logged, so an operator
+/// override is never invisible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PerformanceSource {
+    Embedded,
+    File(PathBuf),
+}
+
+impl std::fmt::Display for PerformanceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embedded => f.write_str("embedded"),
+            Self::File(path) => write!(f, "{}", path.display()),
+        }
     }
-    Ok(raw)
+}
+
+/// The store a service boot should use: the file [`PERFORMANCE_STORE_ENV`]
+/// names, or else the embedded one. Read once at boot; fail-fast either way.
+pub fn performance_store_from_env(
+) -> Result<(PerformanceStore, PerformanceSource), PerformanceStoreError> {
+    match std::env::var_os(PERFORMANCE_STORE_ENV) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            Ok((
+                load_performance_store(&path)?,
+                PerformanceSource::File(path),
+            ))
+        }
+        None => Ok((committed_performance_store()?, PerformanceSource::Embedded)),
+    }
+}
+
+/// Load a store from `path`. A missing file is an error: the embedded store
+/// is always available, so a path someone named and that is not there is a
+/// deployment mistake, not an empty store.
+pub fn load_performance_store(path: &Path) -> Result<PerformanceStore, PerformanceStoreError> {
+    let text = std::fs::read_to_string(path).map_err(|source| PerformanceStoreError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|source| PerformanceStoreError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Write `store` back to `path` as pretty JSON — the artifact
@@ -593,14 +713,15 @@ impl ModelCard {
         (self.id, self.version)
     }
 
+    /// This card's typed `(id, version, config_hash)` build.
+    pub fn build(&self) -> Build {
+        Build::new(self.id.as_str(), self.version, self.config_hash.clone())
+    }
+
     /// The wire [`DetectorRef`] — the exact `(id, version, config_hash)` triple
     /// stamped onto every `DetectorTriggered` this build produces (§6, task 5).
     pub fn detector_ref(&self) -> DetectorRef {
-        DetectorRef {
-            id: self.id.as_str().to_owned(),
-            version: self.version.to_string(),
-            config_hash: self.config_hash.to_hex(),
-        }
+        self.build().to_ref()
     }
 }
 
@@ -706,37 +827,46 @@ impl ModelRegistryBuilder {
 
 /// Build one detector's [`ModelCard`], layering the rollout status, any
 /// measured performance from `performance`, and any served model's identity
-/// on top of a fresh boot-placeholder card (§18, Sprint 10 t4; §20.2). Shared by the `Block` catalogue
-/// ([`crate::boot`]) and cross-block registration
-/// ([`crate::registry::register_cross_block_builtins`]) so both stamp a
-/// detector's card the same way regardless of which roster it lives in.
+/// on top of the build's own [`ConfigHash::for_build`] (§18, Sprint 10 t4;
+/// §20.2). Shared by the `Block` catalogue ([`crate::boot`]) and cross-block
+/// registration ([`crate::registry::register_cross_block_builtins`]) so both
+/// stamp a detector's card the same way regardless of which roster it lives in.
+///
+/// A stored measurement is applied only when it names this exact
+/// `(id, version, config_hash)`. One taken from another build leaves the card
+/// [`Performance::Unmeasured`]: the card must not advertise a precision the
+/// running configuration was never scored at.
+// One argument per identity component plus the two policy inputs; bundling
+// them would just rename the list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn card_for(
     id: DetectorId,
     version: SemVer,
     kind: ModelKind,
     scope: Scope,
+    config: &serde_json::Value,
     model_digest: Option<[u8; 32]>,
     rollout: &RolloutPolicy,
     performance: &PerformanceStore,
 ) -> ModelCard {
     // Weights are config (§20.2): a detector serving a learned model folds its
     // model identity — artifact SHA-256 + trained `feature_version` + schema
-    // digest — into the same hash a threshold change would move, so a retrain
-    // is a new `(id, version, config_hash)` triple and rollback stays
+    // digest — into the same hash a threshold change moves, so a retrain is a
+    // new `(id, version, config_hash)` triple and rollback stays
     // `deprecated_at`. A rule detector returns `None` and is unaffected.
+    let build = ConfigHash::for_build(id, version, config);
     let config_hash = match model_digest {
-        Some(digest) => ConfigHash::boot_placeholder(id, version).with_model_artifact(&digest),
-        None => ConfigHash::boot_placeholder(id, version),
+        Some(digest) => build.with_model_artifact(&digest),
+        None => build,
     };
     let mut card = ModelCard::new(id, version, kind, scope, config_hash, Utc::now())
         .with_status(rollout.status_of(id));
 
-    if let Some(record) = performance.get(id.as_str()) {
-        let perf = record
-            .clone()
-            .into_performance()
-            .expect("load_performance_store already validated every record");
-        card = card.with_performance(perf);
+    // Only a measurement of exactly this build reaches the card. A stale one
+    // is reported by the caller's shell (`PerformanceStore::stale_against`),
+    // which keeps this function pure.
+    if let Lookup::Current(record) = performance.lookup(&card.build()) {
+        card = card.with_performance(record.performance());
     }
 
     card
@@ -1025,20 +1155,28 @@ mod tests {
     // ── PerformanceRecord ─────────────────────────────────────────────
 
     fn valid_record() -> PerformanceRecord {
-        PerformanceRecord {
-            precision: 0.9,
-            recall: 0.8,
-            hit_rate: 0.05,
-            sample_size: NonZeroU64::new(1_000).unwrap(),
-            measured_at: Utc::now(),
-        }
+        PerformanceRecord::try_new(0.9, 0.8, 0.05, NonZeroU64::new(1_000).unwrap(), Utc::now())
+            .unwrap()
+    }
+
+    fn flashloan_build(config: &serde_json::Value) -> Build {
+        let (id, version) = (DetectorId::new("flashloan"), SemVer::new(2, 1, 0));
+        Build::new(
+            id.as_str(),
+            version,
+            ConfigHash::for_build(id, version, config),
+        )
+    }
+
+    fn flashloan_store() -> PerformanceStore {
+        [(flashloan_build(&serde_json::Value::Null), valid_record())]
+            .into_iter()
+            .collect()
     }
 
     #[test]
     fn performance_record_converts_into_measured() {
-        let perf = valid_record().into_performance().unwrap();
-        assert!(perf.is_measured());
-        match perf {
+        match valid_record().performance() {
             Performance::Measured {
                 precision, recall, ..
             } => {
@@ -1051,9 +1189,9 @@ mod tests {
 
     #[test]
     fn performance_record_rejects_an_out_of_range_rate() {
-        let mut record = valid_record();
-        record.precision = 1.7;
-        assert!(record.into_performance().is_err());
+        let n = NonZeroU64::new(1).unwrap();
+        assert!(PerformanceRecord::try_new(1.7, 0.5, 0.1, n, Utc::now()).is_err());
+        assert!(PerformanceRecord::try_new(0.5, f64::NAN, 0.1, n, Utc::now()).is_err());
     }
 
     #[test]
@@ -1064,13 +1202,32 @@ mod tests {
         assert_eq!(record, reloaded);
     }
 
+    #[test]
+    fn an_out_of_range_rate_does_not_parse() {
+        // Validation lives in `Deserialize`: there is no parsed-but-invalid
+        // record for a reader to forget to check.
+        let bad = r#"{"precision":1.7,"recall":0.5,"hit_rate":0.1,"sample_size":10,"measured_at":"2024-01-01T00:00:00Z"}"#;
+        assert!(serde_json::from_str::<PerformanceRecord>(bad).is_err());
+        let extra = r#"{"precision":0.7,"recall":0.5,"hit_rate":0.1,"sample_size":10,"measured_at":"2024-01-01T00:00:00Z","note":1}"#;
+        assert!(serde_json::from_str::<PerformanceRecord>(extra).is_err());
+    }
+
     // ── performance store I/O ────────────────────────────────────────
 
     #[test]
-    fn a_missing_performance_store_loads_as_empty() {
+    fn the_embedded_store_parses() {
+        // It is compiled in, so a malformed committed file must fail here
+        // rather than at a production boot.
+        committed_performance_store().expect("the committed model_performance.json parses");
+    }
+
+    #[test]
+    fn a_missing_named_store_is_an_error_not_an_empty_store() {
         let path = Path::new("/nonexistent/does-not-exist/model_performance.json");
-        let store = load_performance_store(path).unwrap();
-        assert!(store.is_empty());
+        assert!(matches!(
+            load_performance_store(path),
+            Err(PerformanceStoreError::Read { .. })
+        ));
     }
 
     #[test]
@@ -1083,25 +1240,25 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_range_record_is_a_typed_error_not_a_silent_clamp() {
+    fn an_out_of_range_record_in_a_file_fails_the_load() {
         let path = std::env::temp_dir().join(format!("model-perf-test-{}-oor", std::process::id()));
+        let hash = "00".repeat(32);
         std::fs::write(
             &path,
-            br#"{"sandwich":{"precision":1.7,"recall":0.5,"hit_rate":0.1,"sample_size":10,"measured_at":"2024-01-01T00:00:00Z"}}"#,
+            format!(
+                r#"{{"sandwich":{{"version":"1.2.0","config_hash":"{hash}","metrics":{{"precision":1.7,"recall":0.5,"hit_rate":0.1,"sample_size":10,"measured_at":"2024-01-01T00:00:00Z"}}}}}}"#
+            ),
         )
         .unwrap();
         let result = load_performance_store(&path);
         std::fs::remove_file(&path).unwrap();
-        assert!(matches!(
-            result,
-            Err(PerformanceStoreError::InvalidRecord { .. })
-        ));
+        assert!(matches!(result, Err(PerformanceStoreError::Parse { .. })));
     }
 
     #[test]
     fn performance_store_save_then_load_round_trips() {
         let path = std::env::temp_dir().join(format!("model-perf-test-{}-ok", std::process::id()));
-        let store = PerformanceStore::from([("sandwich".to_string(), valid_record())]);
+        let store = flashloan_store();
 
         save_performance_store(&store, &path).unwrap();
         let reloaded = load_performance_store(&path).unwrap();
@@ -1115,20 +1272,86 @@ mod tests {
     #[test]
     fn card_for_applies_rollout_status_and_measured_performance() {
         let rollout = RolloutPolicy::new().shadow(DetectorId::new("flashloan"));
-        let performance = PerformanceStore::from([("flashloan".to_string(), valid_record())]);
 
         let card = card_for(
             DetectorId::new("flashloan"),
             SemVer::new(2, 1, 0),
             ModelKind::Rule,
             Scope::Block,
+            &serde_json::Value::Null,
             None,
             &rollout,
-            &performance,
+            &flashloan_store(),
         );
 
         assert_eq!(card.status, LifecycleStatus::Shadow);
         assert!(card.performance.is_measured());
+    }
+
+    #[test]
+    fn card_for_ignores_a_measurement_taken_on_another_build() {
+        // The record was measured under `Null` config; the running build has a
+        // threshold. Same id, same version — still not the detector that was
+        // scored, so its numbers must not reach this card.
+        let performance = flashloan_store();
+        let rebuilt = card_for(
+            DetectorId::new("flashloan"),
+            SemVer::new(2, 1, 0),
+            ModelKind::Rule,
+            Scope::Block,
+            &serde_json::json!({ "min_loan_usd": 500.0 }),
+            None,
+            &RolloutPolicy::default(),
+            &performance,
+        );
+        assert!(!rebuilt.performance.is_measured());
+        assert_eq!(
+            performance.stale_against([&rebuilt.build()]).len(),
+            1,
+            "the shell can report it"
+        );
+
+        let bumped = card_for(
+            DetectorId::new("flashloan"),
+            SemVer::new(2, 2, 0),
+            ModelKind::Rule,
+            Scope::Block,
+            &serde_json::Value::Null,
+            None,
+            &RolloutPolicy::default(),
+            &performance,
+        );
+        assert!(!bumped.performance.is_measured());
+    }
+
+    #[test]
+    fn a_card_build_is_its_wire_ref() {
+        let card = a_card("sandwich", SemVer::new(1, 2, 0));
+        assert_eq!(Build::from_ref(&card.detector_ref()).unwrap(), card.build());
+    }
+
+    #[test]
+    fn for_build_moves_with_each_component_of_the_triple() {
+        let id = DetectorId::new("sandwich");
+        let v = SemVer::new(1, 2, 0);
+        let cfg = serde_json::json!({ "min_profit_usd": 10.0 });
+        let base = ConfigHash::for_build(id, v, &cfg);
+
+        assert_eq!(base, ConfigHash::for_build(id, v, &cfg), "deterministic");
+        assert_ne!(
+            base,
+            ConfigHash::for_build(id, v, &serde_json::json!({ "min_profit_usd": 5.0 })),
+            "a threshold change is a new identity at the same version"
+        );
+        assert_ne!(base, ConfigHash::for_build(id, SemVer::new(1, 3, 0), &cfg));
+        assert_ne!(base, ConfigHash::for_build(DetectorId::new("arb"), v, &cfg));
+        // Key order is not identity.
+        let ab: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
+        let ba: serde_json::Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        assert_eq!(
+            ConfigHash::for_build(id, v, &ab),
+            ConfigHash::for_build(id, v, &ba)
+        );
     }
 
     #[test]
@@ -1138,6 +1361,7 @@ mod tests {
             SemVer::new(1, 2, 0),
             ModelKind::Rule,
             Scope::Block,
+            &serde_json::Value::Null,
             None,
             &RolloutPolicy::default(),
             &PerformanceStore::new(),
@@ -1155,6 +1379,7 @@ mod tests {
                 SemVer::new(1, 0, 0),
                 ModelKind::Ml,
                 Scope::Block,
+                &serde_json::Value::Null,
                 digest,
                 &RolloutPolicy::default(),
                 &PerformanceStore::new(),
@@ -1166,8 +1391,12 @@ mod tests {
         // same inputs (§20.2: one fold, one way).
         assert_eq!(
             card(Some([0x11; 32])),
-            ConfigHash::boot_placeholder(DetectorId::new("anomaly"), SemVer::new(1, 0, 0))
-                .with_model_artifact(&[0x11; 32])
+            ConfigHash::for_build(
+                DetectorId::new("anomaly"),
+                SemVer::new(1, 0, 0),
+                &serde_json::Value::Null
+            )
+            .with_model_artifact(&[0x11; 32])
         );
         assert_ne!(card(Some([0x11; 32])), card(Some([0x22; 32])));
         assert_ne!(card(Some([0x11; 32])), card(None));

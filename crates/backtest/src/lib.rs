@@ -55,9 +55,10 @@ use std::sync::Arc;
 
 use std::collections::BTreeMap;
 
+use anyhow::Context as _;
 use detection::{
-    link_roster, register_builtins_with, register_cross_block_builtins, DetectionPlan, DetectorId,
-    DetectorPlugin, FeatureFlags, PerformanceStore, RolloutPolicy,
+    link_roster, register_builtins_with, register_cross_block_builtins, Build, DetectionPlan,
+    DetectorId, DetectorPlugin, FeatureFlags, PerformanceStore, RolloutPolicy,
 };
 
 /// The linked `Block` roster plus the flags it was built from — bundled
@@ -72,10 +73,12 @@ pub struct Roster {
     pub flags: FeatureFlags,
     /// Every linked detector id, `Block` and cross-block, by its wire name.
     known: BTreeMap<&'static str, DetectorId>,
+    /// Every linked detector's `(id, version, config_hash)`, by id.
+    builds: BTreeMap<String, Build>,
 }
 
 impl Roster {
-    fn new(plan: DetectionPlan, flags: FeatureFlags) -> Self {
+    fn new(plan: DetectionPlan, flags: FeatureFlags) -> anyhow::Result<Self> {
         let cross_block = register_cross_block_builtins(
             &flags,
             &RolloutPolicy::default(),
@@ -86,7 +89,27 @@ impl Roster {
             .chain(cross_block.ids())
             .map(|id| (id.as_str(), id))
             .collect();
-        Self { plan, flags, known }
+        let builds = detection::boot::linked_builds(&plan, &cross_block)
+            .context("reading back the linked detector triples")?
+            .into_iter()
+            .map(|build| (build.id.clone(), build))
+            .collect();
+        Ok(Self {
+            plan,
+            flags,
+            known,
+            builds,
+        })
+    }
+
+    /// The `(id, version, config_hash)` every linked detector runs as, keyed
+    /// by id — the identity [`run_backtest`] stamps on its [`Report`].
+    ///
+    /// Read from the linked plan and cross-block roster
+    /// ([`detection::boot::linked_builds`]), not recomputed, so these are
+    /// exactly the triples the live service emits for the same build.
+    pub fn builds(&self) -> &BTreeMap<String, Build> {
+        &self.builds
     }
 
     /// The linked detector a wire id names, or `None` when this build does not
@@ -142,7 +165,7 @@ pub fn boot_with(extra: Vec<Arc<dyn DetectorPlugin>>) -> anyhow::Result<Roster> 
         &RolloutPolicy::default(),
         &PerformanceStore::new(),
     )?;
-    Ok(Roster::new(plan, flags))
+    Roster::new(plan, flags)
 }
 
 /// The whole committed corpus: every hand-written fixture ([`fixtures::all`])
@@ -155,4 +178,37 @@ pub fn load_corpus(roster: &Roster) -> Result<Vec<Fixture>, windows::WindowError
     let mut corpus = fixtures::all();
     corpus.extend(windows::load_dir(&windows::default_dir(), roster)?);
     Ok(corpus)
+}
+
+/// A stand-in build for hand-made reports in unit tests: a real, parseable
+/// config hash derived from the id and `config`.
+#[cfg(test)]
+pub(crate) fn test_build(id: &str, version: &str, config: &str) -> Build {
+    Build::new(
+        id,
+        version.parse().expect("a test version is valid semver"),
+        detection::ConfigHash::of_bytes(format!("{id}-{config}").as_bytes()),
+    )
+}
+
+/// A hand-made report for unit tests: each detector linked as
+/// `test_build(id, "1.0.0", "cfg")`.
+#[cfg(test)]
+pub(crate) fn test_report(total_blocks: u64, entries: &[(&str, DetectorStats)]) -> Report {
+    Report {
+        fixtures: Vec::new(),
+        detectors: entries
+            .iter()
+            .map(|(id, stats)| {
+                (
+                    id.to_string(),
+                    scoring::DetectorEntry {
+                        build: Some(test_build(id, "1.0.0", "cfg")),
+                        stats: *stats,
+                    },
+                )
+            })
+            .collect(),
+        total_blocks,
+    }
 }

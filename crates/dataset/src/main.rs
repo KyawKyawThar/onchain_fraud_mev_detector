@@ -60,6 +60,11 @@ enum Command {
     /// canonical block in the range as its enriched context, plus simulation's
     /// verdicts on the findings raised there. Refuses anything less.
     Window(WindowArgs),
+    /// Check an archive node and the enrichment config before a capture:
+    /// connect (chain id + every feed), then enrich a sample of old blocks.
+    /// Exit 0 pass, 1 fail (config or node is wrong), 2 inconclusive (the
+    /// node did not answer — rate limit, timeout).
+    ProbeArchive(ProbeArgs),
     /// Apply, revert or inspect this binary's ClickHouse migrations.
     Migrate {
         /// `up`, `down`, or `info`.
@@ -158,6 +163,39 @@ struct ContextArgs {
 }
 
 impl ContextArgs {
+    /// The archive client and enrichment config `--context-source archive`
+    /// uses, checked against `chain`. No I/O yet.
+    fn archive(
+        &self,
+        chain: Chain,
+        config: &Config,
+    ) -> Result<(chain_enrich::AlloyArchiveRpc, chain_enrich::EnrichConfig)> {
+        use secrecy::ExposeSecret;
+        let url = config
+            .archive_rpc_url
+            .as_ref()
+            .with_context(|| format!("an archive node is required: set {ARCHIVE_RPC_URL_ENV}"))?;
+        // Never echo the URL: hosted endpoints carry the key in it.
+        let url: url::Url = url
+            .expose_secret()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{ARCHIVE_RPC_URL_ENV} is not a valid URL"))?;
+        let enrich = match &self.enrich_config {
+            Some(path) => chain_enrich::EnrichConfig::from_file(path)?,
+            None => chain_enrich::EnrichConfig::builtin(chain)?,
+        };
+        anyhow::ensure!(
+            enrich.chain == chain,
+            "the enrichment config is for {}, the requested chain is {chain}",
+            enrich.chain
+        );
+        let rpc = chain_enrich::AlloyArchiveRpc::new(
+            url,
+            std::time::Duration::from_secs(self.archive_timeout_secs),
+        );
+        Ok((rpc, enrich))
+    }
+
     /// Build the factory `kind` names (`default` when the flag is unset).
     async fn factory(
         &self,
@@ -168,28 +206,7 @@ impl ContextArgs {
         match self.context_source.as_deref().unwrap_or(default) {
             "replay" => Ok(Box::new(ReplayCtxFactory)),
             _ => {
-                use secrecy::ExposeSecret;
-                let url = config.archive_rpc_url.as_ref().with_context(|| {
-                    format!("--context-source archive needs {ARCHIVE_RPC_URL_ENV}")
-                })?;
-                // Never echo the URL: hosted endpoints carry the key in it.
-                let url: url::Url = url
-                    .expose_secret()
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("{ARCHIVE_RPC_URL_ENV} is not a valid URL"))?;
-                let enrich = match &self.enrich_config {
-                    Some(path) => chain_enrich::EnrichConfig::from_file(path)?,
-                    None => chain_enrich::EnrichConfig::builtin(chain)?,
-                };
-                anyhow::ensure!(
-                    enrich.chain == chain,
-                    "the enrichment config is for {}, the replay is {chain}",
-                    enrich.chain
-                );
-                let rpc = chain_enrich::AlloyArchiveRpc::new(
-                    url,
-                    std::time::Duration::from_secs(self.archive_timeout_secs),
-                );
+                let (rpc, enrich) = self.archive(chain, config)?;
                 let source = ArchiveCtxSource::connect(rpc, enrich)
                     .await
                     .context("connecting to the archive node")?;
@@ -197,6 +214,30 @@ impl ContextArgs {
             }
         }
     }
+}
+
+#[derive(clap::Args)]
+struct ProbeArgs {
+    /// Chain id to probe (1 = Ethereum).
+    #[arg(long, default_value_t = 1)]
+    chain: u64,
+    /// How far behind the node's head to sample. Deep enough that a pruned
+    /// node cannot answer.
+    #[arg(long, default_value_t = chain_enrich::ProbeOptions::default().depth)]
+    depth: u64,
+    /// Consecutive blocks to enrich.
+    #[arg(long, default_value_t = chain_enrich::ProbeOptions::default().blocks)]
+    blocks: u64,
+    /// Override the config's read fan-out. A keyless public endpoint
+    /// rate-limits the default; the verdict does not depend on it.
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// Venues and price feeds to check. Defaults to the committed config.
+    #[arg(long)]
+    enrich_config: Option<std::path::PathBuf>,
+    /// Per-call timeout for archive reads, in seconds.
+    #[arg(long, default_value_t = 30)]
+    archive_timeout_secs: u64,
 }
 
 #[derive(clap::Args)]
@@ -265,7 +306,7 @@ impl ExportArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
     // Hold the guard for the lifetime of `main` so spans flush on exit (§19).
     let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("dataset"))?;
     let cli = Cli::parse();
@@ -274,11 +315,39 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Migrate { action } => {
             let client = build_client(&config.clickhouse);
-            dataset::migrate::MIGRATOR.cli(&client, Some(&action)).await
+            dataset::migrate::MIGRATOR
+                .cli(&client, Some(&action))
+                .await?;
         }
-        Command::Export(args) => export(args, config).await,
-        Command::Window(args) => window(args, config).await,
+        Command::Export(args) => export(args, config).await?,
+        Command::Window(args) => window(args, config).await?,
+        Command::ProbeArchive(args) => return probe_archive(args, config).await,
     }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+async fn probe_archive(args: ProbeArgs, config: Config) -> Result<std::process::ExitCode> {
+    let context = ContextArgs {
+        context_source: None,
+        enrich_config: args.enrich_config,
+        archive_timeout_secs: args.archive_timeout_secs,
+    };
+    let (rpc, mut enrich) = context.archive(Chain(args.chain), &config)?;
+    if let Some(n) = args.concurrency {
+        anyhow::ensure!(n > 0, "--concurrency must be at least 1");
+        enrich.concurrency = n;
+    }
+    let report = chain_enrich::probe(
+        rpc,
+        enrich,
+        chain_enrich::ProbeOptions {
+            depth: args.depth,
+            blocks: args.blocks,
+        },
+    )
+    .await;
+    print!("{report}");
+    Ok(std::process::ExitCode::from(report.verdict.exit_code()))
 }
 
 async fn window(args: WindowArgs, config: Config) -> Result<()> {

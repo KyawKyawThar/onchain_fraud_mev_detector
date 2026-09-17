@@ -16,6 +16,7 @@ field evidence yet. Do not fill it with hand-built stand-ins.
 
 ```bash
 export DATASET_ARCHIVE_RPC_URL=https://…          # an archive node; the URL is a secret
+just archive-probe                                # must print PASS before a capture
 dataset window \
   --from 2026-10-01T00:00:00Z --to 2026-10-01T01:00:00Z \
   --name "eth mainnet 2026-10-01 00:00 UTC, 1h" \
@@ -44,8 +45,8 @@ After adding a window:
 
 1. Run `just backtest`. Expect the baseline to move: windows add blocks and
    verdicts.
-2. Run `just backtest-update-baseline` and
-   `cargo run -p backtest -- --update-model-cards`.
+2. Run `just backtest-update-baseline`. It rewrites the baseline and the
+   model cards together, both keyed on each detector's build.
 3. Run `just backtest-accept-snapshot`.
 4. Review all four diffs together.
 

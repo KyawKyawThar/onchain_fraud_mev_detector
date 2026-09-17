@@ -67,6 +67,11 @@ impl DetectorPlugin for DemoDetector {
         Self::VERSION
     }
 
+    fn config_value(&self) -> serde_json::Value {
+        // Nothing tunable: the firing rule is `fires_on`, which is code.
+        serde_json::Value::Null
+    }
+
     fn kind(&self) -> ModelKind {
         ModelKind::Rule
     }

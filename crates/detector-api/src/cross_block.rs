@@ -60,6 +60,11 @@ pub trait CrossBlockDetector: Send + Sync {
     /// Rule / ML / Hybrid — metadata for the model registry and reporting.
     fn kind(&self) -> ModelKind;
 
+    /// The tunable configuration this build runs with, as plain JSON — hashed
+    /// into the detector's `config_hash`. Required for the same reason as
+    /// [`DetectorPlugin::config_value`](crate::DetectorPlugin::config_value).
+    fn config_value(&self) -> serde_json::Value;
+
     /// How many trailing blocks of history the detector needs — the
     /// `Scope::CrossBlock { window_blocks }` the service sizes its snapshot store to.
     fn window_blocks(&self) -> u32;
