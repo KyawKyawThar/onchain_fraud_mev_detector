@@ -1,0 +1,99 @@
+name: Archive probe (enrichment config)
+
+# Epic E: the replay-window corpus is only as good as the enrichment that
+# builds it. `crates/chain-enrich/config/ethereum-mainnet.json` names price
+# feeds and DEX venues by address, and a wrong venue does not error — every
+# pair reads as unverified, swaps silently vanish, and a window captured that
+# way scores as perfect precision. `dataset probe-archive` checks the node and
+# the config against the live chain; this job runs it nightly and on any PR
+# that touches the config or the enrichment code.
+#
+# Deliberate choices:
+#
+#  * **Armed explicitly.** The probe needs a keyed archive node
+#    (`secrets.DATASET_ARCHIVE_RPC_URL`); keyless public endpoints rate-limit
+#    before one block is enriched. Until an operator sets the repository
+#    variable `ARCHIVE_PROBE_ENABLED=true`, the job reports "not armed" as a
+#    notice rather than silently passing or failing every night (conventions
+#    §15b: declare your arming state).
+#  * **Exit 2 (inconclusive) fails the job, after one retry.** A throttled or
+#    unreachable node learned nothing about the config, and a green check that
+#    learned nothing is the blind spot this job exists to close. One retry
+#    absorbs a transient blip; a second means the node is the problem.
+#  * **Never on PRs from forks.** The secret is not available there.
+
+on:
+  schedule:
+    - cron: "30 4 * * *" # nightly, after the load test
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/chain-enrich/**
+      - .github/workflows/archive-probe.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SQLX_OFFLINE: "true"
+
+jobs:
+  probe:
+    name: archive node + mainnet enrichment config
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Arming state
+        id: armed
+        run: |
+          if [ "${{ vars.ARCHIVE_PROBE_ENABLED }}" = "true" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Archive probe not armed::Set repository variable ARCHIVE_PROBE_ENABLED=true and secret DATASET_ARCHIVE_RPC_URL (a keyed archive node) to enable this check."
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.armed.outputs.armed == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.armed.outputs.armed == 'true'
+      - uses: rui314/setup-mold@v1
+        if: steps.armed.outputs.armed == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.armed.outputs.armed == 'true'
+
+      - name: Build
+        if: steps.armed.outputs.armed == 'true'
+        run: cargo build -p dataset --locked
+
+      - name: Probe
+        if: steps.armed.outputs.armed == 'true'
+        env:
+          DATASET_ARCHIVE_RPC_URL: ${{ secrets.DATASET_ARCHIVE_RPC_URL }}
+        run: |
+          if [ -z "$DATASET_ARCHIVE_RPC_URL" ]; then
+            echo "::error::ARCHIVE_PROBE_ENABLED is true but secret DATASET_ARCHIVE_RPC_URL is empty"
+            exit 1
+          fi
+          for attempt in 1 2; do
+            set +e
+            ./target/debug/dataset probe-archive
+            code=$?
+            set -e
+            case "$code" in
+              0) exit 0 ;;
+              1) echo "::error::archive probe FAILED: the node or crates/chain-enrich/config is wrong (see the report above)"; exit 1 ;;
+              2) echo "::warning::archive probe inconclusive (attempt $attempt): the node did not answer" ;;
+              *) echo "::error::archive probe exited $code"; exit "$code" ;;
+            esac
+            [ "$attempt" = 1 ] && sleep 300
+          done
+          echo "::error::archive probe inconclusive twice: the node is unreachable or throttled, so the config was not checked"
+          exit 2

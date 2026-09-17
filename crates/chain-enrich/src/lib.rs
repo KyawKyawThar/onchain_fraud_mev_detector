@@ -9,7 +9,9 @@
 //!   counts as an ERC-20 transfer, which `Swap` emitters are real pools
 //!   (CREATE2-verified against configured venues, since anyone can emit the
 //!   event), and which prices are fresh enough to use.
-//! - [`rpc::ArchiveRpc`] is the four-read seam; [`alloy::AlloyArchiveRpc`] is
+//! - [`probe`] checks a node and a config before a capture, with a
+//!   pass / fail / inconclusive verdict.
+//! - [`rpc::ArchiveRpc`] is the archive-read seam; [`alloy::AlloyArchiveRpc`] is
 //!   its HTTP implementation with timeouts, jittered retry and failure
 //!   classification (a pruned node is named as such).
 //! - [`Enricher`] orchestrates one block: bounded concurrent reads, caches
@@ -26,6 +28,7 @@ pub mod alloy;
 pub mod config;
 pub mod decode;
 pub mod enricher;
+pub mod probe;
 pub mod rpc;
 pub mod venue;
 
@@ -35,5 +38,6 @@ pub mod test_util;
 pub use alloy::AlloyArchiveRpc;
 pub use config::{ConfigError, EnrichConfig, PriceFeed};
 pub use enricher::{EnrichError, EnrichReport, EnrichedBlock, Enricher};
+pub use probe::{probe, ProbeOptions, ProbeReport, Verdict};
 pub use rpc::{ArchiveRpc, CallOutcome, RpcError, StateAt};
 pub use venue::V2Venue;

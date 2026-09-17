@@ -1,5 +1,5 @@
-//! The archive-read seam: the four reads enrichment needs, and how their
-//! failures are classified.
+//! The archive-read seam: the reads enrichment (and the pre-capture probe)
+//! needs, and how their failures are classified.
 //!
 //! Object-safe, so a caller holds `Arc<dyn ArchiveRpc>` and a test swaps in
 //! [`crate::test_util::FakeChain`]. The production implementation is
@@ -62,6 +62,15 @@ pub trait ArchiveRpc: Send + Sync {
     /// The chain the node serves (`eth_chainId`).
     async fn chain_id(&self) -> Result<u64, RpcError>;
 
+    /// The node's head block number (`eth_blockNumber`).
+    async fn head_number(&self) -> Result<u64, RpcError>;
+
+    /// The hash of the node's canonical block at `number`, or `None` if it has
+    /// none. Used to *find* a block; everything read about the block itself
+    /// goes by hash, so a reorg between the two reads is caught by
+    /// [`crate::Enricher::enrich`] rather than answered from the wrong block.
+    async fn block_hash(&self, number: u64) -> Result<Option<B256>, RpcError>;
+
     /// A block with its full transactions, or `None` if the node does not
     /// know the hash (it was never canonical there, or was reorged away).
     async fn block(&self, hash: B256) -> Result<Option<RawBlock>, RpcError>;
@@ -77,6 +86,12 @@ pub trait ArchiveRpc: Send + Sync {
 impl<T: ArchiveRpc + ?Sized> ArchiveRpc for std::sync::Arc<T> {
     async fn chain_id(&self) -> Result<u64, RpcError> {
         (**self).chain_id().await
+    }
+    async fn head_number(&self) -> Result<u64, RpcError> {
+        (**self).head_number().await
+    }
+    async fn block_hash(&self, number: u64) -> Result<Option<B256>, RpcError> {
+        (**self).block_hash(number).await
     }
     async fn block(&self, hash: B256) -> Result<Option<RawBlock>, RpcError> {
         (**self).block(hash).await

@@ -43,6 +43,8 @@ use std::time::Duration;
 
 use events::primitives::DetectorRef;
 
+use crate::measured::{Build, StaleMeasurement};
+
 /// Counter: every detector invocation. Hit-rate denominator (`hits / runs`).
 pub const RUNS_TOTAL: &str = "detector_runs_total";
 /// Counter: invocations that produced ≥1 finding. Hit-rate numerator.
@@ -128,6 +130,32 @@ pub const DRIFT_EVENTS_TOTAL: &str = "detection_drift_events_total";
 /// them ([`crate::drift::DriftPublisher`]).
 pub fn record_drift_event(model_id: &str) {
     metrics::counter!(DRIFT_EVENTS_TOTAL, "model" => model_id.to_owned()).increment(1);
+}
+
+/// Gauge: `1` when a linked detector build's model card is **unmeasured
+/// because its stored measurement names a different build** (a config or
+/// version changed and `model_performance.json` was not regenerated), `0`
+/// otherwise. Labeled `{detector, version}`.
+///
+/// Published for **every** linked detector at boot, `0` included (§15b): an
+/// absent series and a `0` mean opposite things, and "the cards are fine"
+/// must be a reading, not the absence of one. Only the boot shell records it,
+/// from [`crate::measured::BuildKeyed::stale_against`]; the registry code
+/// that decides what a card shows stays pure.
+pub const PERFORMANCE_STALE: &str = "detector_performance_stale";
+
+/// Record the performance-store state of every linked build: `1` for each
+/// build `stale` names, `0` for the rest.
+pub fn record_performance_state(running: &[Build], stale: &[StaleMeasurement]) {
+    for build in running {
+        let is_stale = stale.iter().any(|s| s.running == *build);
+        metrics::gauge!(
+            PERFORMANCE_STALE,
+            "detector" => build.id.clone(),
+            "version" => build.version.to_string(),
+        )
+        .set(if is_stale { 1.0 } else { 0.0 });
+    }
 }
 
 /// Record one detector invocation: its `detect` latency and how many findings it
@@ -218,6 +246,43 @@ mod tests {
             .filter(|l| l.key() == "outcome")
             .map(|l| l.value().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn performance_state_publishes_every_linked_build_including_the_healthy_ones() {
+        use crate::model::ConfigHash;
+        use detector_api::SemVer;
+
+        let build =
+            |id: &str, cfg: &[u8]| Build::new(id, SemVer::new(1, 0, 0), ConfigHash::of_bytes(cfg));
+        let running = [build("sandwich", b"new"), build("arb", b"a")];
+        let stale = [StaleMeasurement {
+            running: running[0].clone(),
+            measured: build("sandwich", b"old"),
+        }];
+
+        let series = captured(|| record_performance_state(&running, &stale));
+        let gauges: std::collections::BTreeMap<String, f64> = series
+            .iter()
+            .filter(|(ck, ..)| ck.key().name() == PERFORMANCE_STALE)
+            .map(|(ck, _, _, v)| {
+                let detector = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "detector")
+                    .unwrap()
+                    .value()
+                    .to_owned();
+                let DebugValue::Gauge(g) = v else {
+                    panic!("{PERFORMANCE_STALE} must be a gauge")
+                };
+                (detector, g.into_inner())
+            })
+            .collect();
+        assert_eq!(
+            gauges,
+            [("arb".to_owned(), 0.0), ("sandwich".to_owned(), 1.0)].into()
+        );
     }
 
     fn a_sample(total_ms: u64, alerted: bool) -> FastPathSample {

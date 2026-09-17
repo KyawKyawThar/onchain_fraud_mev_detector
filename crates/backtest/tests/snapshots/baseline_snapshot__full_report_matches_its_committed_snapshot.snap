@@ -43,10 +43,10 @@ backtest: 30 fixtures replayed
 [adversarial] noise: a 20-tx block with no decoded actions (header-only source)
 
 per-detector precision / recall / hit_rate:
-  address-poisoning    precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  arb                  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  flashloan            precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  liquidation          precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  rugpull              precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  sandwich             precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
-  wash-trading         precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  address-poisoning    v1.0.0 cfg 4138542f29a2  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  arb                  v1.0.0 cfg 59c146ba0689  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  flashloan            v2.1.0 cfg c31483efd3d1  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  liquidation          v1.0.0 cfg 3ba1bf8192a5  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  rugpull              v1.0.0 cfg 380fc479515c  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  sandwich             v1.2.0 cfg 410e44c54bb0  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)
+  wash-trading         v1.0.0 cfg 10ad57c57db6  precision 1.000  recall 1.000  hit_rate 0.024  (tp=1 fp=0 fn=0 blocks_hit=1/42)

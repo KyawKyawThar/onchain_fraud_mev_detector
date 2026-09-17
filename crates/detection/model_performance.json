@@ -1,51 +1,79 @@
 {
   "address-poisoning": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379852Z"
+    "version": "1.0.0",
+    "config_hash": "4138542f29a26b2ee2cf9b6d39f569af24c065c73a24bc69a817020d88b12ddb",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "arb": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379855Z"
+    "version": "1.0.0",
+    "config_hash": "59c146ba06899bd81551c32e91f0d77009013e09dd8ca75986c36493986bd045",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "flashloan": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379856Z"
+    "version": "2.1.0",
+    "config_hash": "c31483efd3d14b43ccedd6724598dde48b20e4d0284bf2a1fa88b66f6800b800",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "liquidation": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379857Z"
+    "version": "1.0.0",
+    "config_hash": "3ba1bf8192a565fa86f9d0211cfb8a1a653c36eb5448a143521567573495f576",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "rugpull": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379859Z"
+    "version": "1.0.0",
+    "config_hash": "380fc479515c9ff2ba5e0f1fc9bfdeeb7f3d9b31a5a5c2dbf3044d31088c666f",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "sandwich": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379861Z"
+    "version": "1.2.0",
+    "config_hash": "410e44c54bb005acb2307121f52680206a286c5ecce75728b7774b703da9e208",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   },
   "wash-trading": {
-    "precision": 1.0,
-    "recall": 1.0,
-    "hit_rate": 0.023809523809523808,
-    "sample_size": 42,
-    "measured_at": "2026-09-16T18:48:33.379862Z"
+    "version": "1.0.0",
+    "config_hash": "10ad57c57db6dea2235803bf839cc3fbe67e58e7f195b9f912953a8c6b6d36af",
+    "metrics": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "hit_rate": 0.023809523809523808,
+      "sample_size": 42,
+      "measured_at": "2026-09-17T13:31:47.307894Z"
+    }
   }
 }

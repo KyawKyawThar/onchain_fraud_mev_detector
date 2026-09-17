@@ -119,6 +119,9 @@ pub trait CrossBlockSlot: Rewindable + Send {
     /// `apply` asserts it). Returns the events in finding order; a detector that
     /// finds nothing contributes none.
     fn observe_and_detect(&mut self, ctx: &DetectionCtx) -> Vec<DomainEvent>;
+
+    /// The triple this slot's events are stamped with.
+    fn detector_ref(&self) -> &DetectorRef;
 }
 
 /// One cross-block detector bundled with everything the scheduler needs to run and
@@ -141,6 +144,10 @@ impl<D: CrossBlockDetector> Rewindable for Slot<D> {
 }
 
 impl<D: CrossBlockDetector> CrossBlockSlot for Slot<D> {
+    fn detector_ref(&self) -> &DetectorRef {
+        &self.detector_ref
+    }
+
     fn observe_and_detect(&mut self, ctx: &DetectionCtx) -> Vec<DomainEvent> {
         // Fork the tip snapshot (or seed a fresh state on the first block), fold this
         // block in, and record it as the new tip — a full snapshot per block, so a
@@ -328,6 +335,12 @@ impl CrossBlockStates {
     /// counterpart of [`DetectionPlan::ids`](crate::emit::DetectionPlan::ids).
     pub fn ids(&self) -> impl Iterator<Item = DetectorId> + '_ {
         self.by_key.keys().map(|(id, _)| *id)
+    }
+
+    /// Every registered `(id, version, config_hash)` triple, in key order —
+    /// the counterpart of [`DetectionPlan::detector_refs`](crate::emit::DetectionPlan::detector_refs).
+    pub fn detector_refs(&self) -> impl Iterator<Item = &DetectorRef> + '_ {
+        self.by_key.values().map(|slot| slot.detector_ref())
     }
 
     /// Whether a slot is registered for `key`.

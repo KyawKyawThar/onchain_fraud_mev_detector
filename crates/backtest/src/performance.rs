@@ -13,12 +13,15 @@ use std::num::NonZeroU64;
 
 use crate::Report;
 
-/// Derive a performance store from a fresh [`Report`], one entry per detector
-/// with *both* a measured precision and recall — mirroring
+/// Derive a performance store from a fresh [`Report`], one entry per linked
+/// detector with *both* a measured precision and recall — mirroring
 /// [`crate::baseline::from_report`]'s "skip rather than fabricate" rule. A
 /// detector that never fired (or has no ground-truthed incident) stays
 /// `Performance::Unmeasured` in the live catalogue, which is correct: nothing
 /// was actually verified about it yet.
+///
+/// Each record is keyed on the build the report measured; `detection`'s boot
+/// shows it only for that exact `(id, version, config_hash)`.
 ///
 /// `sample_size` is `total_blocks` (not the tp/fp/fn count) — the scale a
 /// precision/recall/hit_rate reading was taken over, per
@@ -28,24 +31,20 @@ pub fn from_report(report: &Report) -> PerformanceStore {
     let Some(sample_size) = NonZeroU64::new(report.total_blocks) else {
         return PerformanceStore::new();
     };
+    let measured_at = Utc::now();
 
     report
-        .detectors
-        .iter()
-        .filter_map(|(id, stats)| {
-            let precision = stats.precision()?;
-            let recall = stats.recall()?;
-            let hit_rate = report.hit_rate(id).unwrap_or(0.0);
-            Some((
-                id.clone(),
-                PerformanceRecord {
-                    precision,
-                    recall,
-                    hit_rate,
-                    sample_size,
-                    measured_at: Utc::now(),
-                },
-            ))
+        .linked()
+        .filter_map(|(id, build, stats)| {
+            let record = PerformanceRecord::try_new(
+                stats.precision()?,
+                stats.recall()?,
+                report.hit_rate(id).unwrap_or(0.0),
+                sample_size,
+                measured_at,
+            )
+            .expect("ratios of non-negative counts are within [0, 1]");
+            Some((build.clone(), record))
         })
         .collect()
 }
@@ -53,18 +52,8 @@ pub fn from_report(report: &Report) -> PerformanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DetectorStats;
-
-    fn report_of(total_blocks: u64, entries: &[(&str, DetectorStats)]) -> Report {
-        Report {
-            fixtures: Vec::new(),
-            detectors: entries
-                .iter()
-                .map(|(id, stats)| (id.to_string(), *stats))
-                .collect(),
-            total_blocks,
-        }
-    }
+    use crate::{test_build, test_report, DetectorStats};
+    use detection::Lookup;
 
     fn measured() -> DetectorStats {
         DetectorStats {
@@ -78,21 +67,23 @@ mod tests {
 
     #[test]
     fn from_report_fills_a_detector_with_both_precision_and_recall() {
-        let report = report_of(100, &[("sandwich", measured())]);
+        let report = test_report(100, &[("sandwich", measured())]);
         let store = from_report(&report);
 
-        let record = store.get("sandwich").expect("sandwich was measured");
-        assert_eq!(record.precision, 0.75);
-        assert_eq!(record.recall, 1.0);
-        assert_eq!(record.hit_rate, 0.03);
-        assert_eq!(record.sample_size.get(), 100);
+        let Lookup::Current(record) = store.lookup(&test_build("sandwich", "1.0.0", "cfg")) else {
+            panic!("sandwich was measured on exactly this build");
+        };
+        assert_eq!(record.precision(), 0.75);
+        assert_eq!(record.recall(), 1.0);
+        assert_eq!(record.hit_rate(), 0.03);
+        assert_eq!(record.sample_size().get(), 100);
     }
 
     #[test]
     fn from_report_skips_a_detector_with_no_ground_truthed_recall() {
         // Raised alerts but no ground-truthed incident for it at all: recall is
-        // `None`, so it must not be baselined at a fabricated number.
-        let report = report_of(
+        // `None`, so it must not be recorded at a fabricated number.
+        let report = test_report(
             100,
             &[(
                 "brand-new",
@@ -109,15 +100,20 @@ mod tests {
     }
 
     #[test]
-    fn from_report_is_empty_over_an_empty_fixture_set() {
-        let report = report_of(0, &[]);
+    fn from_report_skips_an_unlinked_detector() {
+        let mut report = test_report(100, &[("sandwich", measured())]);
+        report.detectors.get_mut("sandwich").unwrap().build = None;
         assert!(from_report(&report).is_empty());
     }
 
     #[test]
+    fn from_report_is_empty_over_an_empty_fixture_set() {
+        assert!(from_report(&test_report(0, &[])).is_empty());
+    }
+
+    #[test]
     fn from_report_round_trips_through_the_shared_store_io() {
-        let report = report_of(100, &[("sandwich", measured())]);
-        let store = from_report(&report);
+        let store = from_report(&test_report(100, &[("sandwich", measured())]));
 
         let path = std::env::temp_dir().join(format!(
             "backtest-model-performance-test-{}",

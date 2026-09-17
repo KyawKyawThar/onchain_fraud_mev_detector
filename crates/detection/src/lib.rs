@@ -78,6 +78,7 @@ pub mod config;
 pub mod drift;
 pub mod emit;
 pub mod flags;
+pub mod measured;
 pub mod metrics;
 #[cfg(feature = "anomaly")]
 pub mod ml;
@@ -103,11 +104,13 @@ pub use emit::{
     detector_triggered, implicated_addresses, preliminary_alert, DetectionPlan, UnlinkedDetector,
 };
 pub use flags::{FeatureFlags, DISABLED_DETECTORS_ENV};
+pub use measured::{Build, BuildKeyed, BuildParseError, Lookup, Measured, StaleMeasurement};
 pub use model::{
-    default_performance_store_path, load_performance_store, save_performance_store, ConfigHash,
+    committed_performance_store, default_performance_store_path, load_performance_store,
+    performance_store_from_env, save_performance_store, ConfigHash, ConfigHashParseError,
     LifecycleStatus, ModelCard, ModelRegistry, ModelRegistryBuilder, ModelRegistryError,
-    Performance, PerformanceRecord, PerformanceStore, PerformanceStoreError, RolloutPolicy,
-    SHADOW_DETECTORS_ENV,
+    Performance, PerformanceRecord, PerformanceSource, PerformanceStore, PerformanceStoreError,
+    RolloutPolicy, COMMITTED_PERFORMANCE_STORE, PERFORMANCE_STORE_ENV, SHADOW_DETECTORS_ENV,
 };
 pub use registry::{
     register_builtins, register_builtins_with, register_cross_block_builtins, Registry,

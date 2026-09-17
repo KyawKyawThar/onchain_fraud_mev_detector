@@ -81,6 +81,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use detection::Build;
 use detection::{LifecycleStatus, RolloutPolicy};
 use serde::{Deserialize, Serialize};
 
@@ -220,6 +221,11 @@ impl Verdict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateOutcome {
     pub detector: String,
+    /// The `(id, version, config_hash)` the numbers were measured on, or
+    /// `None` for a staged detector this build does not link. A verdict
+    /// belongs to this build only: `PROMOTABLE` for one config says nothing
+    /// about the next, which is why the report prints it.
+    pub build: Option<Build>,
     pub status: LifecycleStatus,
     pub thresholds: GateThresholds,
     pub precision: Option<f64>,
@@ -285,20 +291,27 @@ pub fn evaluate(
     ids.into_iter()
         .filter_map(|id| {
             let status = rollout.status_of_name(id);
-            (status != LifecycleStatus::Deprecated)
-                .then(|| outcome(id, status, report.detectors.get(id).copied(), gate))
+            (status != LifecycleStatus::Deprecated).then(|| {
+                outcome(
+                    id,
+                    report.build(id).cloned(),
+                    status,
+                    report.stats(id),
+                    gate,
+                )
+            })
         })
         .collect()
 }
 
 fn outcome(
     id: &str,
+    build: Option<Build>,
     status: LifecycleStatus,
-    stats: Option<DetectorStats>,
+    stats: DetectorStats,
     gate: &PromotionGate,
 ) -> GateOutcome {
     let thresholds = gate.thresholds(id);
-    let stats = stats.unwrap_or_default();
     let incidents = stats.true_positives + stats.false_negatives;
     let (precision, recall) = (stats.precision(), stats.recall());
 
@@ -343,6 +356,7 @@ fn outcome(
 
     GateOutcome {
         detector: id.to_owned(),
+        build,
         status,
         thresholds,
         precision,
@@ -407,7 +421,7 @@ impl Corpus {
             incidents: report
                 .detectors
                 .values()
-                .map(|s| s.true_positives + s.false_negatives)
+                .map(|e| e.stats.true_positives + e.stats.false_negatives)
                 .sum(),
         }
     }
@@ -436,8 +450,9 @@ impl std::fmt::Display for GateReport {
         for o in &self.outcomes {
             writeln!(
                 f,
-                "  {id:<20} {status:<10} {headline}  (precision {p} ≥ {mp:.2}, recall {r} ≥ {mr:.2}, incidents {n} ≥ {mn})",
+                "  {id:<20} {build:<24} {status:<10} {headline}  (precision {p} ≥ {mp:.2}, recall {r} ≥ {mr:.2}, incidents {n} ≥ {mn})",
                 id = o.detector,
+                build = o.build.as_ref().map_or_else(|| "not linked".to_owned(), ToString::to_string),
                 status = o.status.to_string(),
                 headline = o.headline(),
                 p = fmt_rate(o.precision),
@@ -449,7 +464,7 @@ impl std::fmt::Display for GateReport {
             )?;
             if let Verdict::Held(short) = &o.verdict {
                 for s in short {
-                    writeln!(f, "  {:<20} {:<10}   ↳ {s}", "", "")?;
+                    writeln!(f, "  {:<20} {:<24} {:<10}   ↳ {s}", "", "", "")?;
                 }
             }
         }
@@ -481,14 +496,7 @@ mod tests {
     }
 
     fn report_of(entries: &[(&str, DetectorStats)]) -> Report {
-        Report {
-            fixtures: Vec::new(),
-            detectors: entries
-                .iter()
-                .map(|(id, stats)| (id.to_string(), *stats))
-                .collect(),
-            total_blocks: 10,
-        }
+        crate::test_report(10, entries)
     }
 
     fn perfect() -> DetectorStats {
@@ -521,6 +529,28 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("not disqualified"), "{rendered}");
+    }
+
+    #[test]
+    fn every_verdict_names_the_build_it_was_reached_on() {
+        // A PROMOTABLE for one config is not a PROMOTABLE for the next; the
+        // report has to say which one it judged.
+        let rollout = RolloutPolicy::new()
+            .shadow(DetectorId::new("anomaly"))
+            .shadow(DetectorId::new("unlinked"));
+        let report = report_of(&[("anomaly", perfect())]);
+        let outcomes = evaluate(&report, &gate(), &rollout);
+
+        assert_eq!(
+            only(outcomes.clone(), "anomaly").build,
+            Some(crate::test_build("anomaly", "1.0.0", "cfg"))
+        );
+        assert_eq!(only(outcomes, "unlinked").build, None);
+
+        let rendered = GateReport::new(&report, &gate(), &rollout).to_string();
+        let build = crate::test_build("anomaly", "1.0.0", "cfg").to_string();
+        assert!(rendered.contains(&build), "{rendered}");
+        assert!(rendered.contains("not linked"), "{rendered}");
     }
 
     #[test]

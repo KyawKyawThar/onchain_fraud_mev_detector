@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use detection::boot::link_roster;
+use detection::boot::{link_roster, linked_builds};
 use detection::config::Config;
-use detection::model::{default_performance_store_path, load_performance_store, RolloutPolicy};
+use detection::model::{performance_store_from_env, RolloutPolicy};
 use detection::registry::{register_builtins_with, register_cross_block_builtins};
 use detection::scheduler::{
     build_consumer, run_committer, run_consumer, BlockBoundaryEvents, BlockEvent, Offsets,
@@ -89,9 +89,10 @@ granularity={g:?} inputs={n} baseline={baseline}",
     }
     // The third component of the `(id, version, config_hash)` triple this
     // bundle will stamp on every event it produces (§6, §20.2).
-    let config_hash = ConfigHash::boot_placeholder(
+    let config_hash = ConfigHash::for_build(
         anomaly_detector::AnomalyDetector::ID,
         anomaly_detector::AnomalyDetector::VERSION,
+        &detector.config_value(),
     )
     .with_model_artifact(
         &detector
@@ -140,10 +141,11 @@ async fn run(cfg: Config) -> Result<()> {
     let rollout = RolloutPolicy::builtin().with_env_demotions();
 
     // Measured precision/recall/hit_rate from the backtest harness (§18, Sprint 10
-    // t4), committed at `crates/detection/model_performance.json`. A missing file
-    // (no backtest has run yet) just leaves every card `Unmeasured`.
-    let performance = load_performance_store(&default_performance_store_path())
-        .context("loading measured detector performance")?;
+    // t4). Compiled into this binary (the image has no source tree), unless
+    // `DETECTION_PERFORMANCE_STORE` names an operator override. Fail-fast
+    // either way.
+    let (performance, performance_source) =
+        performance_store_from_env().context("loading measured detector performance")?;
 
     // The ML detector is the one detector the *binary* constructs: its weights
     // and training-window baselines are mounted files, read here at boot,
@@ -167,10 +169,36 @@ async fn run(cfg: Config) -> Result<()> {
     // roster is empty in a build that links no cross-block detector feature.
     let cross_block = register_cross_block_builtins(&flags, &rollout, &performance);
 
+    // A card shows a measurement only for the exact build it was taken on
+    // (§18, Epic E). One that names another build is not an error — the
+    // detector still runs — but it is a card showing "unmeasured" for a
+    // detector that was measured, so it is logged and exported (§15: fail open
+    // and count it).
+    let running =
+        linked_builds(&plan, &cross_block).context("reading back the linked detector triples")?;
+    let stale = performance.stale_against(&running);
+    for s in &stale {
+        tracing::warn!(
+            detector = %s.running.id,
+            running = %s.running,
+            measured = %s.measured,
+            "model card unmeasured: its stored performance was measured on another build \
+             (run `just backtest-update-baseline`)"
+        );
+    }
+    detection::metrics::record_performance_state(&running, &stale);
+    let measured = running
+        .iter()
+        .filter(|b| matches!(performance.lookup(b), detection::Lookup::Current(_)))
+        .count();
+
     tracing::info!(
         chain = cfg.chain.id(),
         detectors = plan.len(),
         cross_block_detectors = cross_block.len(),
+        performance_source = %performance_source,
+        measured,
+        stale_measurements = stale.len(),
         "starting detection service"
     );
     tracing::debug!(roster = ?registry, "linked detector roster");

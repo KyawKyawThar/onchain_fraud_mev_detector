@@ -17,7 +17,8 @@ fn seven_detectors_score_perfect_precision_and_recall_with_no_cross_triggers() {
         report.detectors.keys().collect::<Vec<_>>()
     );
 
-    for (id, stats) in &report.detectors {
+    for (id, entry) in &report.detectors {
+        let stats = &entry.stats;
         assert_eq!(
             stats.false_positives, 0,
             "{id} raised an alert no fixture expected"

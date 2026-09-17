@@ -31,6 +31,7 @@ pub struct MockDetector {
     scope: Scope,
     findings: Vec<Evidence>,
     model_digest: Option<[u8; 32]>,
+    config: serde_json::Value,
 }
 
 impl MockDetector {
@@ -44,6 +45,7 @@ impl MockDetector {
             scope: Scope::Block,
             findings: Vec::new(),
             model_digest: None,
+            config: serde_json::Value::Null,
         }
     }
 
@@ -63,6 +65,14 @@ impl MockDetector {
     #[must_use]
     pub fn returning(mut self, findings: Vec<Evidence>) -> Self {
         self.findings = findings;
+        self
+    }
+
+    /// Report `config` as this build's tunable configuration — for exercising
+    /// the `config_hash` a threshold change must move.
+    #[must_use]
+    pub fn with_config(mut self, config: serde_json::Value) -> Self {
+        self.config = config;
         self
     }
 
@@ -92,6 +102,9 @@ impl DetectorPlugin for MockDetector {
     }
     fn detect(&self, _ctx: &DetectionCtx) -> Vec<Evidence> {
         self.findings.clone()
+    }
+    fn config_value(&self) -> serde_json::Value {
+        self.config.clone()
     }
     fn model_digest(&self) -> Option<[u8; 32]> {
         self.model_digest
@@ -165,6 +178,9 @@ where
     }
     fn kind(&self) -> ModelKind {
         self.kind
+    }
+    fn config_value(&self) -> serde_json::Value {
+        serde_json::json!({ "window_blocks": self.window_blocks })
     }
     fn window_blocks(&self) -> u32 {
         self.window_blocks

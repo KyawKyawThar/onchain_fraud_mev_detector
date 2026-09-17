@@ -148,6 +148,11 @@ impl DetectorPlugin for LiquidationDetector {
         Self::VERSION
     }
 
+    fn config_value(&self) -> serde_json::Value {
+        serde_json::to_value(&self.config)
+            .expect("detector config is plain data and always serialises")
+    }
+
     fn kind(&self) -> ModelKind {
         ModelKind::Rule
     }
