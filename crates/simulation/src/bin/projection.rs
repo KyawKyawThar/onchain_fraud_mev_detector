@@ -46,8 +46,8 @@ use simulation::monitored_wallet_store::{MonitoredWalletStore, PgMonitoredWallet
 use simulation::projection_consumer::{build_consumer, ProjectionConsumer};
 use simulation::rebuild::{PostgresStore, SimulationReadModel, Stores, Targets};
 use simulation::store::{
-    build_clickhouse_client, ClickhouseAnalytics, CrossChainFindingStore, PgIncidentStore,
-    TimingStore, WalletExposureStore,
+    build_clickhouse_client, ClickhouseAnalytics, CrossChainFindingStore, FeedbackLedger,
+    FeedbackSliStore, PgIncidentStore, TimingStore, WalletExposureStore,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -76,12 +76,92 @@ async fn main() -> Result<()> {
         Some(mode @ ("rebuild" | "verify" | "fingerprint")) => {
             run_rebuild(mode, RebuildArgs::parse(args)?, cfg, client).await
         }
+        Some("feedback") => print_feedback_sli(cfg, client).await,
         Some(other) => bail!(
             "unknown argument {other:?}; expected `migrate up|down|info`, \
              `fingerprint|rebuild|verify [--model incidents|dashboards|all] [--yes] [--page-size N]`, \
-             or no args to run the consumer"
+             `feedback`, or no args to run the consumer"
         ),
     }
+}
+
+/// `simulation-projection feedback` — print the §19 false-positive SLI for the
+/// current settled window (readiness Epic E).
+///
+/// Read-only, and the same evidence the exporter publishes folded under the
+/// same policy, so an operator checking why `FalsePositiveRateAboveTarget`
+/// fired (or why the SLO is disarmed) sees the numbers the alert saw rather
+/// than a second implementation of them. It prints the sample size and the
+/// concentration beside the rate: a rate without those is exactly what the
+/// arming rules exist to stop anyone acting on.
+async fn print_feedback_sli(cfg: ProjectionConfig, client: Client) -> Result<()> {
+    use events::feedback::FeedbackCohort;
+    use simulation::feedback_sli::{Arming, Sli, Window};
+
+    let store = ClickhouseAnalytics::new(client);
+    let sli_cfg = cfg.feedback_sli;
+    let window = Window::settled(Utc::now(), sli_cfg.span, sli_cfg.settle);
+    let evidence = store
+        .feedback_evidence(window)
+        .await
+        .context("reading the feedback ledger")?;
+    let sli = Sli::new(window, evidence, sli_cfg.policy);
+
+    println!("window     {} .. {} (settled)", window.from, window.to);
+    println!("policy     {}", sli_cfg.policy.disagreement.as_str());
+    println!("incidents  {}", sli.evidence.incidents);
+    match sli.evidence.top_customer_share() {
+        Some(share) => println!(
+            "sample     {} verdicts, top customer {:.1}% (cap {:.0}%)",
+            sli.evidence.verdicts,
+            share * 100.0,
+            sli_cfg.policy.max_customer_share * 100.0
+        ),
+        None => println!("sample     no verdicts in this window"),
+    }
+    match (sli.evidence.lag_p50_seconds, sli.evidence.lag_p95_seconds) {
+        (Some(p50), Some(p95)) => println!(
+            "lag        p50 {:.1}h, p95 {:.1}h (settle is {:.1}h)",
+            p50 / 3_600.0,
+            p95 / 3_600.0,
+            sli_cfg.settle.0.as_secs_f64() / 3_600.0
+        ),
+        _ => println!("lag        not measurable — nothing adjudicated in this window"),
+    }
+
+    for cohort in [FeedbackCohort::Volunteered, FeedbackCohort::Solicited] {
+        let c = sli.cohort(cohort);
+        println!("\n[{}]", cohort.as_str());
+        println!(
+            "  adjudicated  {} ({} false positive, {} true positive)",
+            c.counts.adjudicated, c.counts.false_positives, c.counts.true_positives
+        );
+        match c.counts.false_positive_rate() {
+            Some(rate) => println!(
+                "  fp rate      {rate:.4} against a target of {:.4}",
+                sli_cfg.policy.target
+            ),
+            // Said in words, because "0.0000" is what a reader would otherwise
+            // assume and it is the one answer this number must never give.
+            None => println!("  fp rate      none — nothing in this cohort was adjudicated"),
+        }
+        match c.counts.coverage() {
+            Some(coverage) => println!("  coverage     {coverage:.4}"),
+            None => println!("  coverage     none — no incidents in this window"),
+        }
+        match c.arming {
+            Arming::Armed => println!("  slo          ARMED"),
+            Arming::TooFewAdjudications { found, needed } => {
+                println!("  slo          DISARMED — {found} decided verdicts, {needed} needed")
+            }
+            Arming::Concentrated { share, cap } => println!(
+                "  slo          DISARMED — one customer holds {:.1}% of the sample (cap {:.0}%)",
+                share * 100.0,
+                cap * 100.0
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Flags for the three projection-rebuild modes (readiness Epic B). Hand-parsed
@@ -290,6 +370,11 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
     // same connection.
     let exposure_store: Arc<dyn WalletExposureStore> = Arc::new(analytics.clone());
     let timing_store: Arc<dyn TimingStore> = Arc::new(analytics.clone());
+    // The §19 feedback ledger's two ends over the same connection: the
+    // consumer writes verdicts, the SLI exporter reads them back joined
+    // against the incidents they judge (readiness Epic E).
+    let feedback_ledger: Arc<dyn FeedbackLedger> = Arc::new(analytics.clone());
+    let feedback_sli_store: Arc<dyn FeedbackSliStore> = Arc::new(analytics.clone());
     let analytics = Arc::new(analytics);
 
     // The opt-in monitored-wallet list (§25, Sprint 15 t5) — shares the same
@@ -329,9 +414,10 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
         let shutdown = shutdown.clone();
         let cross_chain_store = cross_chain_store.clone();
         async move {
-            let result = ProjectionConsumer::new(store, analytics, cross_chain_store)
-                .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
-                .await;
+            let result =
+                ProjectionConsumer::new(store, analytics, cross_chain_store, feedback_ledger)
+                    .run(consumer, PUBLISH_BACKOFF, Some(&dlq), &shutdown)
+                    .await;
             if let Err(ref err) = result {
                 tracing::error!(error = %err, "projection consumer failed; initiating shutdown");
                 shutdown.cancel();
@@ -339,6 +425,16 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
             result
         }
     });
+
+    // ── §19 false-positive SLI exporter (readiness Epic E, background task) ──
+    // Runs here because this binary already owns both halves of the join and
+    // is a single writer (one replica, `Recreate`) — two replicas would
+    // publish two versions of the same gauge.
+    let feedback_sli_task = tokio::spawn(simulation::feedback_sli::run_exporter(
+        feedback_sli_store,
+        cfg.feedback_sli,
+        shutdown.clone(),
+    ));
 
     // ── Scheduled §25 exposure-report push (Sprint 15 t5, background task) ──
     // A `KafkaEventSink` is new to this binary — until now it only consumed;
@@ -414,6 +510,7 @@ async fn run(cfg: ProjectionConfig, client: Client) -> Result<()> {
 
     shutdown.cancel();
     let _ = report_task.await;
+    let _ = feedback_sli_task.await;
     let consumer_result = consumer_task.await.context("consumer task panicked")?;
     tracing::info!("simulation projection consumer shut down");
     consumer_result.context("projection consumer exited with error")

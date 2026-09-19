@@ -53,7 +53,8 @@ use revm::primitives::B256;
 use simulation::projection_consumer::ProjectionConsumer;
 use simulation::rebuild::{PostgresStore, SimulationReadModel, Stores};
 use simulation::store::{
-    ClickhouseAnalytics, CrossChainFindingStore, IncidentAnalytics, IncidentStore, PgIncidentStore,
+    ClickhouseAnalytics, CrossChainFindingStore, FeedbackLedger, IncidentAnalytics, IncidentStore,
+    PgIncidentStore,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
@@ -311,7 +312,9 @@ async fn run_live(stack: &Stack, events: &[EventEnvelope]) {
     let cross_chain: Arc<dyn CrossChainFindingStore> = Arc::new(pg);
     let analytics: Arc<dyn IncidentAnalytics> =
         Arc::new(ClickhouseAnalytics::new(stack.clickhouse.clone()));
-    let consumer = ProjectionConsumer::new(store, analytics, cross_chain);
+    let feedback: Arc<dyn FeedbackLedger> =
+        Arc::new(ClickhouseAnalytics::new(stack.clickhouse.clone()));
+    let consumer = ProjectionConsumer::new(store, analytics, cross_chain, feedback);
 
     for event in events {
         match consumer.handle(event.clone()).await {

@@ -54,6 +54,16 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: SMTP_PASSWORD
+            # §19 feedback capability (readiness Epic E) — the MINTING half; the only service that issues grants.
+            - name: FEEDBACK_GRANT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: FEEDBACK_GRANT_SECRET
+                  # Optional: a missing key disables the feedback loop on
+                  # this pod instead of keeping it from starting. The loop
+                  # is not worth an outage of everything else it serves.
+                  optional: true
             - name: NOTIFICATION_METRICS_ADDR
               value: 0.0.0.0:9100
           ports:

@@ -495,6 +495,13 @@ retention-status:
 prompt-manifest:
     cargo run -q -p copilot -- prompts > crates/copilot/prompts/MANIFEST
 
+# Print the §19 false-positive SLI for the current settled window (readiness
+# Epic E): the counts, the rate, and whether the SLO is armed. Read-only; the
+# same query the exporter publishes, so this is what the alert saw. Needs
+# ClickHouse up.
+feedback-sli:
+    cargo run -p simulation --bin simulation-projection -- feedback
+
 # Print the current per-customer token spend against the configured budget
 # (§20.4 t5). The alarm's metrics deliberately carry no customer label, so
 # this is where an operator finds out *who* is over budget. Needs

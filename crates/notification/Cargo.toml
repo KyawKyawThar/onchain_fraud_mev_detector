@@ -16,6 +16,10 @@ publish.workspace = true
 
 [dependencies]
 events = { workspace = true }
+# The §19 feedback capability — this service holds the MINTING key, because it
+# is the one that delivers alerts and therefore the only one that can honestly
+# say "this recipient was shown this incident" (readiness Epic E).
+feedback-grant = { workspace = true }
 bounded-map = { workspace = true }
 
 thiserror = { workspace = true }

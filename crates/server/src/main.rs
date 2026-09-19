@@ -33,6 +33,7 @@ use server::facts_source::{
     TrackedSource, BUDGET_QUANTILE, HEDGE_BURST, HEDGE_MIN_DELAY, LATENCY_MIN_SAMPLES,
     LATENCY_WINDOW,
 };
+use server::feedback::{self};
 use server::http::{self, AppState};
 use server::intelligence_client::IntelligenceClient;
 use server::policy_store::PgPolicyStore;
@@ -93,6 +94,24 @@ async fn main() -> Result<()> {
     // `POST /v1/address/{addr}/screen` resolves a named policy through this
     // (customer-authored ones only — the built-in catalog is server code,
     // never a row); shares the same pool, same fail-fast-at-boot posture.
+    // The §19 feedback outbox rides the same pool: it is this service's own
+    // table (§14), written in the request path and drained by the flusher
+    // spawned below.
+    let pg_pool_for_feedback = pg_pool.clone();
+    // §19 feedback capability, verifying half. Optional: without it the
+    // feedback endpoint 503s and every other route serves normally (see
+    // `Config::feedback_grant_secret`).
+    let feedback_grant_key = cfg
+        .feedback_grant_secret
+        .clone()
+        .map(|secret| Arc::new(feedback_grant::VerifyingKey::from_secret(secret)));
+    if feedback_grant_key.is_none() {
+        tracing::warn!(
+            "FEEDBACK_GRANT_SECRET unset: POST /v1/incidents/{{id}}/feedback will answer 503 \
+             and the false-positive SLO cannot arm"
+        );
+    }
+    let feedback_pool_for_flusher = pg_pool.clone();
     let policy_store = PgPolicyStore::new(pg_pool);
     policy_store
         .ping()
@@ -226,6 +245,8 @@ async fn main() -> Result<()> {
         alerts: alerts_tx.clone(),
         usage: usage_recorder,
         audit: audit_recorder,
+        feedback: Arc::new(server::feedback::OutboxQueue::new(pg_pool_for_feedback)),
+        feedback_grant: feedback_grant_key,
         rules: Arc::new(rule_store),
         events: sink.clone(),
         policies: Arc::new(policy_store),
@@ -264,9 +285,23 @@ async fn main() -> Result<()> {
     // ── ScreeningDecisionRecorded publisher (§11 Sprint 14 t3, background
     // task) — the access-audit trail, sharing the same Kafka producer.
     let audit_task = tokio::spawn(audit::run(
-        sink,
+        sink.clone(),
         audit_rx,
         PUBLISH_BACKOFF,
+        shutdown.clone(),
+    ));
+
+    // ── AlertFeedbackRecorded publisher (§19 readiness Epic E, background
+    // task) — the analyst verdicts the false-positive SLO is measured from.
+    //
+    // A *flusher*, not a queue drain: the verdict is already durable in
+    // `feedback_outbox` by the time the customer got their 202, so this task
+    // owns only the broker's availability. Its lease means several API
+    // replicas do not each publish every pending row.
+    let feedback_task = tokio::spawn(feedback::FEEDBACK_OUTBOX.run_flusher(
+        feedback_pool_for_flusher,
+        sink,
+        cfg.feedback_flush_interval,
         shutdown.clone(),
     ));
 
@@ -317,6 +352,9 @@ async fn main() -> Result<()> {
     audit_task
         .await
         .context("screening audit publisher task panicked")?;
+    feedback_task
+        .await
+        .context("alert feedback publisher task panicked")?;
     sanctions_task
         .await
         .context("sanctions view refresher task panicked")?;

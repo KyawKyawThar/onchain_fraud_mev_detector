@@ -30,6 +30,13 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// 403 — the caller is authenticated, and still may not do this. Distinct
+    /// from a 401 (who are you?) and from a 404 (a capability check must not
+    /// double as an existence oracle — see `feedback-grant`): the answer is
+    /// the same whether or not the resource exists.
+    #[error("{0}")]
+    Forbidden(String),
+
     /// 404 — the addressed resource doesn't exist (an unknown entity id, ...).
     /// The caller named something real-looking but absent; the detail is safe
     /// and useful to return.
@@ -60,6 +67,16 @@ pub enum ApiError {
     #[error("{0}")]
     BadGateway(String),
 
+    /// 503 — this service is temporarily unable to accept the request, and
+    /// the caller retrying shortly is the right response. Distinct from a 500
+    /// (nothing is broken) and from a 502 (no downstream failed): the work was
+    /// *not* done, deliberately, and saying so is better than accepting it
+    /// into a queue that is already full. Used by
+    /// `POST /v1/incidents/{id}/feedback`, where silently dropping a verdict
+    /// would bias an accuracy measurement rather than merely lose a record.
+    #[error("{0}")]
+    Unavailable(String),
+
     /// 500 — an unexpected failure on this service's own side (storage down,
     /// a serialization bug, ...). The detail is logged, never returned.
     #[error("{0}")]
@@ -81,6 +98,13 @@ impl ApiError {
     /// internals.
     pub fn not_found(message: impl std::fmt::Display) -> Self {
         Self::NotFound(message.to_string())
+    }
+
+    /// 403 — authenticated, but not permitted. The message is returned
+    /// verbatim, so it must describe the *rule* ("the grant is not for this
+    /// incident"), never the resource's existence.
+    pub fn forbidden(message: impl std::fmt::Display) -> Self {
+        Self::Forbidden(message.to_string())
     }
 
     /// 409 — the addressed resource exists but is in the wrong state for this
@@ -107,6 +131,13 @@ impl ApiError {
         Self::BadGateway(err.to_string())
     }
 
+    /// 503 — temporarily can't accept this request; retry. `message` names
+    /// what is saturated. Like every 5xx, the detail is logged rather than
+    /// returned (the *status* is the caller's actionable half).
+    pub fn unavailable(message: impl std::fmt::Display) -> Self {
+        Self::Unavailable(message.to_string())
+    }
+
     /// 500 — this service's own failure. Takes any `Display` for the same
     /// reason as [`Self::bad_gateway`].
     pub fn internal(err: impl std::fmt::Display) -> Self {
@@ -116,11 +147,13 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -150,6 +183,7 @@ mod tests {
     fn each_constructor_maps_to_its_documented_status() {
         assert_eq!(ApiError::bad_request("x").status(), StatusCode::BAD_REQUEST);
         assert_eq!(ApiError::not_found("x").status(), StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::forbidden("x").status(), StatusCode::FORBIDDEN);
         assert_eq!(ApiError::conflict("x").status(), StatusCode::CONFLICT);
         assert_eq!(
             ApiError::payload_too_large("x").status(),
@@ -160,6 +194,10 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(ApiError::bad_gateway("x").status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            ApiError::unavailable("x").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             ApiError::internal("x").status(),
             StatusCode::INTERNAL_SERVER_ERROR

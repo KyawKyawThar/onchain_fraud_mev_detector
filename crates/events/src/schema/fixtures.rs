@@ -29,6 +29,7 @@ use crate::cross_chain::{
     BridgeMevDetected, CrossChainFindingRetracted, CrossChainLegRef, CrossChainMevDetected,
 };
 use crate::detection::{DetectorTriggered, PreliminaryAlertCreated};
+use crate::feedback::{AlertFeedbackRecorded, FeedbackCohort, FeedbackReason, FeedbackVerdict};
 use crate::intelligence::{
     AddressEmbeddingUpdated, AttributionRetracted, AttributionUpdated, BehaviorFactor,
     EntityCreated, EntityLinkProposed, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
@@ -162,6 +163,15 @@ pub fn sample_events() -> Vec<DomainEvent> {
             impact_usd: Some(UsdAmount::new(150_000.0)),
             severity: Severity::High,
             suggested_action: SuggestedAction::Escalate,
+        }),
+        DomainEvent::AlertFeedbackRecorded(AlertFeedbackRecorded {
+            incident_id: incident_id(),
+            customer_id: customer_id(),
+            verdict: FeedbackVerdict::FalsePositive,
+            reason_code: FeedbackReason::OurOwnActivity,
+            reason: Some("our own rebalancer, not a sandwich".into()),
+            cohort: FeedbackCohort::Solicited,
+            submitted_at: ts(),
         }),
         // Simulation (§7)
         DomainEvent::SimulationRequested(SimulationRequested {

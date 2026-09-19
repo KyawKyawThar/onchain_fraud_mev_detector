@@ -27,6 +27,8 @@ use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use event_bus::EventSink;
 use event_bus::Transience;
+use events::feedback::{AlertFeedbackRecorded, FeedbackReason, FeedbackVerdict};
+use events::primitives::IncidentId;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
 use events::system::{FactsStaleness, ScreeningDecisionRecorded, UsageEventType};
@@ -48,6 +50,7 @@ use crate::audit::AuditRecorder;
 use crate::auth::require_jwt;
 use crate::config::JwtConfig;
 use crate::degrade::{self, ScreeningFallback};
+use crate::feedback;
 use crate::intelligence_client::{self, IntelligenceClient};
 use crate::policy_store::{self, PolicyStore};
 use crate::rate_limit::{self, ScreeningRateLimiter};
@@ -64,6 +67,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// router-wide 2 MiB default would not.
 const SCREEN_BODY_LIMIT_BYTES: usize = 1024;
 
+/// `POST /v1/incidents/{incident_id}/feedback`'s payload cap (§19, readiness
+/// Epic E): a verdict plus at most [`MAX_FEEDBACK_REASON_CHARS`] of prose.
+const FEEDBACK_BODY_LIMIT_BYTES: usize = 4096;
+
+/// Ceiling on the free-text `reason` a verdict may carry. It is read by a
+/// human looking into why a detector's precision moved, and anything longer
+/// than a short paragraph is a document that belongs somewhere else — but the
+/// real reason for a limit is that this string is copied onto the event
+/// backbone, into the ledger and into every replay of both.
+const MAX_FEEDBACK_REASON_CHARS: usize = 1000;
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -74,7 +88,7 @@ const SCREEN_BODY_LIMIT_BYTES: usize = 1024;
             `provisional_alert` → `alert_confirmed` → `alert_retracted` — bearer-gated the same as \
             every other `/v1` route.",
     ),
-    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, events::system::FactsStaleness, events::system::ScreeningStaleReason, crate::screen::StalePolicy, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, SimilarAddressesResponse, SimilarAddressResponse, SimilarityFactorResponse, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest)),
+    components(schemas(RiskResponse, LabelResponse, LabelsResponse, ScreenRequest, ScreenResponse, SanctionMatchResponse, FactorResponse, crate::screen::Decision, crate::screen::DecisionBasis, events::system::FactsStaleness, events::system::ScreeningStaleReason, crate::screen::StalePolicy, CreateRuleRequest, CreateRuleResponse, BuildersResponse, BuilderEntry, RelayEntry, SimilarAddressesResponse, SimilarAddressResponse, SimilarityFactorResponse, EntityGraphResponse, GraphNodeResponse, GraphEdgeResponse, EntityTimelineResponse, TimelineMilestoneResponse, UpsertPolicyRequest, PolicyResponse, PoliciesResponse, AddMonitoredWalletRequest, FeedbackRequest, FeedbackResponse, events::feedback::FeedbackVerdict)),
     modifiers(&SecurityAddon),
     tags((name = "api-service", description = "Public read API (§11)")),
 )]
@@ -114,6 +128,20 @@ pub struct AppState {
     /// `ScreeningDecisionRecorded` — the access-audit trail, independent of
     /// the `usage` metering fact above.
     pub audit: AuditRecorder,
+    /// §19 readiness Epic E: the pool `POST /v1/incidents/{id}/feedback`
+    /// writes its verdict through, into the `feedback_outbox` a background
+    /// flusher publishes from ([`crate::feedback`]). A durable write rather
+    /// than an in-memory queue because a dropped verdict is a *sample*
+    /// removed from an accuracy measurement, non-randomly, exactly when the
+    /// platform is unhealthy.
+    pub feedback: Arc<dyn feedback::FeedbackQueue>,
+    /// The §19 feedback capability's **verifying** half (readiness Epic E).
+    /// This service can check a grant and cannot mint one — the type is the
+    /// enforcement (`feedback_grant::VerifyingKey`), not a convention.
+    ///
+    /// `None` when this deployment has no `FEEDBACK_GRANT_SECRET`: the
+    /// feedback endpoint answers 503 and nothing else is affected.
+    pub feedback_grant: Option<Arc<feedback_grant::VerifyingKey>>,
     /// The customer-isolated rule-definition store behind `POST /v1/rules`
     /// (§9, Sprint 9 t4) — `PgRuleStore` in production, keyed by the JWT's
     /// `CustomerId` so a body can never write another customer's rules.
@@ -189,6 +217,14 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
             rate_limit::enforce_similarity_rate_limit,
         ));
 
+    // Its own sub-router for the body cap alone: a verdict is a one-line
+    // judgement plus a sentence of prose, so the router-wide 2 MiB default is
+    // three orders of magnitude of slack on a write that reaches the Kafka
+    // backbone. Capped at the source rather than validated after buffering.
+    let feedback_route = OpenApiRouter::new()
+        .routes(routes!(record_incident_feedback))
+        .route_layer(DefaultBodyLimit::max(FEEDBACK_BODY_LIMIT_BYTES));
+
     let protected = OpenApiRouter::new()
         .routes(routes!(address_risk))
         .routes(routes!(address_labels))
@@ -208,6 +244,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
         .routes(routes!(list_monitored_wallets))
         .routes(routes!(remove_monitored_wallet))
         .routes(routes!(create_rule))
+        .merge(feedback_route)
         .route("/v1/stream", get(stream::stream_ws))
         .route_layer(middleware::from_fn_with_state(
             state.usage.clone(),
@@ -1956,6 +1993,209 @@ fn rule_created_announcement(rule: &Rule) -> Result<serde_json::Value, serde_jso
     serde_json::to_value(EventEnvelope::new(RULE_EVENT_CHAIN, event))
 }
 
+/// `POST /v1/incidents/{incident_id}/feedback` body: the customer's verdict on
+/// one incident, plus optional prose. Nothing else — `customer_id` comes from
+/// the bearer token (owner-from-JWT, the same rule `POST /v1/rules` follows: a
+/// body can never attribute an opinion to somebody else) and `submitted_at`
+/// comes from this service's clock, because a client-supplied timestamp is the
+/// ledger's last-writer key and would let one caller pin a verdict at the end
+/// of time.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+struct FeedbackRequest {
+    /// The capability token from the alert that was delivered — proof that
+    /// this incident was shown to this customer (`feedback-grant`). Without
+    /// it there is nothing authorizing the write: "the incident exists" is
+    /// true of every incident in the platform.
+    grant: String,
+    /// `true_positive` | `false_positive` | `unclear`.
+    #[schema(value_type = String, example = "false_positive")]
+    verdict: FeedbackVerdict,
+    /// Why, as a closed set — `our_own_activity`, `known_counterparty`,
+    /// `threshold_too_sensitive`, `duplicate_alert`, `confirmed_harm`,
+    /// `unspecified`. This is the field the platform acts on.
+    #[serde(default)]
+    #[schema(value_type = String, example = "our_own_activity")]
+    reason_code: FeedbackReason,
+    /// Optional free text, at most [`MAX_FEEDBACK_REASON_CHARS`] characters.
+    /// Never parsed and never routed on.
+    ///
+    /// **Do not include personal data.** It is written to an append-only
+    /// event log held for the §18 statutory window, where individual fields
+    /// cannot be edited or erased.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct FeedbackResponse {
+    incident_id: String,
+    /// Always `recorded` — the verdict is on its way to the backbone. A
+    /// verdict that could *not* be queued is a 503, never this.
+    status: &'static str,
+}
+
+/// `POST /v1/incidents/{incident_id}/feedback` — tell the platform it was
+/// right or wrong about one incident (§19, readiness Epic E).
+///
+/// This is the false-positive loop's only input. The verdict is published as
+/// `AlertFeedbackRecorded`, folded into the simulation service's feedback
+/// ledger, and read by the §19 false-positive panel and the SLO alert behind
+/// it. It changes nothing about the incident itself: a `false_positive`
+/// verdict is *not* a retraction (§7 retraction is the platform withdrawing
+/// its own finding), the incident stays exactly as it was, and both statements
+/// live on the record.
+///
+/// Authorized by a **capability**, not by a lookup: the caller presents the
+/// signed grant that was delivered with the alert, which proves the incident
+/// was shown to them. Every accepted verdict moves an accuracy number, so
+/// "this incident exists" — true of every incident in the platform — is not a
+/// sufficient reason to keep one.
+#[utoipa::path(
+    post,
+    path = "/v1/incidents/{incident_id}/feedback",
+    tag = "api-service",
+    params(("incident_id" = String, Path, format = Uuid, description = "Incident id")),
+    request_body = FeedbackRequest,
+    security(("bearer_token" = [])),
+    responses(
+        (status = 202, description = "Verdict recorded", body = FeedbackResponse),
+        (status = 200, description = "Idempotent retry: this verdict was already recorded", body = FeedbackResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 403, description = "The grant is invalid, expired, or not for this incident/customer"),
+        (status = 422, description = "The verdict is malformed (reason in the body)"),
+        (status = 503, description = "The verdict could not be durably accepted — retry"),
+    ),
+)]
+async fn record_incident_feedback(
+    State(state): State<AppState>,
+    Extension(customer): Extension<CustomerId>,
+    Path(incident_id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<FeedbackRequest>,
+) -> Result<Response, ApiError> {
+    // The standard retry-safety header. Optional: a caller who does not send
+    // one still gets deduplicated on the verdict's own identity.
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty() && v.len() <= 128);
+    if let Some(reason) = body.reason.as_deref() {
+        // Counted in characters, not bytes: the body limit already bounds the
+        // bytes, and a customer writing in a non-Latin script should get the
+        // same allowance as one writing in English.
+        if reason.chars().count() > MAX_FEEDBACK_REASON_CHARS {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "reason is longer than {MAX_FEEDBACK_REASON_CHARS} characters"
+                    )
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    // Authorization, and the only I/O-free part of it: the grant proves this
+    // incident was *delivered* to this customer. It replaces the existence
+    // check an earlier draft did against event-store, which authorized
+    // nothing (every incident exists), leaked an existence oracle through its
+    // 404, and coupled a scarce human signal to a second service being up.
+    let Some(verifying_key) = state.feedback_grant.as_deref() else {
+        // Not configured here. 503, not 404: the route exists and a retry
+        // against a correctly configured deployment will work — and the
+        // absent secret must never read as "no such incident".
+        return Err(ApiError::unavailable(
+            "feedback is not enabled on this deployment (FEEDBACK_GRANT_SECRET unset)",
+        ));
+    };
+    let grant = feedback_grant::verify(verifying_key, &body.grant)
+        .map_err(|_| ApiError::forbidden("the feedback grant is not valid"))?;
+
+    // The grant names an incident and a recipient; the request names a path
+    // and carries a bearer token. All four must agree. Checking the customer
+    // here rather than inside `verify` is deliberate: the capability says who
+    // it was issued to, and the *service* says who is calling — conflating
+    // them turns a capability into a bearer token anyone who intercepts it
+    // can spend.
+    if grant.incident_id != incident_id || grant.customer_id != customer.0 {
+        return Err(ApiError::forbidden(
+            "the feedback grant is not for this incident",
+        ));
+    }
+
+    let verdict = AlertFeedbackRecorded {
+        incident_id: IncidentId(incident_id),
+        customer_id: customer,
+        verdict: body.verdict,
+        reason_code: body.reason_code,
+        // An empty string is not a reason; normalize it away here so the
+        // ledger never has to distinguish `None` from `Some("")`.
+        reason: body
+            .reason
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty()),
+        // From the signed grant, never from the body: the cohort decides which
+        // sample this verdict joins, and a recipient who could choose it could
+        // promote their own opinion into the number a README quotes.
+        cohort: grant.cohort.parse().unwrap_or_default(),
+        submitted_at: Utc::now(),
+    };
+
+    let labels = [
+        ("verdict", verdict.verdict.as_str()),
+        ("reason_code", verdict.reason_code.as_str()),
+        ("cohort", verdict.cohort.as_str()),
+    ];
+    let key = feedback::idempotency_key(&verdict, idempotency_key.as_deref());
+    let envelope =
+        serde_json::to_value(feedback::envelope_for(verdict)).map_err(ApiError::internal)?;
+
+    // One INSERT, then 202. No transaction: this outbox row *is* the write —
+    // there is no second table for it to commit atomically with — so the
+    // pool's implicit single-statement transaction is exactly the guarantee
+    // needed, and holding an explicit one would only widen the window.
+    let queued = state.feedback.enqueue(&envelope, &key).await;
+
+    match queued {
+        Ok(outbox::Enqueued::Queued) => {
+            metrics::counter!(feedback::FEEDBACK_RECORDED_TOTAL, &labels).increment(1);
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(FeedbackResponse {
+                    incident_id: incident_id.to_string(),
+                    status: "recorded",
+                }),
+            )
+                .into_response())
+        }
+        // A retry of something already accepted. `200` rather than `202`, and
+        // a different `status`, so a client can tell the two apart — the same
+        // shape `POST /v1/rules` uses for an idempotent create.
+        Ok(outbox::Enqueued::AlreadyQueued) => {
+            metrics::counter!(feedback::FEEDBACK_DUPLICATE_TOTAL).increment(1);
+            Ok((
+                StatusCode::OK,
+                Json(FeedbackResponse {
+                    incident_id: incident_id.to_string(),
+                    status: "already_recorded",
+                }),
+            )
+                .into_response())
+        }
+        Err(err) => {
+            // Postgres is down. Say so rather than 202-ing a verdict we could
+            // not keep: this sample is small, the caller is a human who will
+            // happily retry, and a lie here biases the FP rate toward optimism
+            // exactly when the platform is unhealthy.
+            metrics::counter!(feedback::FEEDBACK_REFUSED_TOTAL).increment(1);
+            tracing::warn!(error = %err, "could not durably accept a verdict");
+            Err(ApiError::unavailable("could not record the verdict; retry"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1963,6 +2203,7 @@ mod tests {
     use super::{build_router, AppState};
     use crate::audit::AuditRecorder;
     use crate::config::JwtConfig;
+    use crate::feedback::test_util::InMemoryFeedbackQueue;
     use crate::intelligence_client::IntelligenceClient;
     use crate::policy_store::test_util::InMemoryPolicyStore;
     use crate::policy_store::PolicyStore;
@@ -1984,6 +2225,8 @@ mod tests {
         state: AppState,
         usage_rx: mpsc::Receiver<UsageRecorded>,
         audit_rx: mpsc::Receiver<ScreeningDecisionRecorded>,
+        /// What the handler parked — the doubles' view of the outbox.
+        feedback: Arc<InMemoryFeedbackQueue>,
         rules: Arc<InMemoryRuleStore>,
         events: Arc<RecordingSink>,
         policies: Arc<InMemoryPolicyStore>,
@@ -1994,6 +2237,7 @@ mod tests {
     fn test_state() -> TestState {
         let (usage, usage_rx) = UsageRecorder::channel(16);
         let (audit, audit_rx) = AuditRecorder::channel(16);
+        let feedback = Arc::new(InMemoryFeedbackQueue::new());
         let rules = Arc::new(InMemoryRuleStore::new());
         let events = Arc::new(RecordingSink::default());
         let policies = Arc::new(InMemoryPolicyStore::new());
@@ -2010,6 +2254,10 @@ mod tests {
             alerts: tokio::sync::broadcast::channel(16).0,
             usage,
             audit,
+            feedback: feedback.clone(),
+            feedback_grant: Some(Arc::new(feedback_grant::VerifyingKey::from_secret(
+                SecretString::from(TEST_GRANT_SECRET),
+            ))),
             rules: rules.clone(),
             events: events.clone(),
             policies: policies.clone(),
@@ -2022,6 +2270,7 @@ mod tests {
             state,
             usage_rx,
             audit_rx,
+            feedback,
             rules,
             events,
             policies,
@@ -2069,6 +2318,9 @@ mod tests {
             "PolicyResponse",
             "PoliciesResponse",
             "AddMonitoredWalletRequest",
+            "FeedbackRequest",
+            "FeedbackResponse",
+            "FeedbackVerdict",
         ] {
             assert!(
                 spec["components"]["schemas"].get(name).is_some(),
@@ -2097,6 +2349,7 @@ mod tests {
             ("/v1/monitored-wallets", "get"),
             ("/v1/monitored-wallets/{chain_id}/{address}", "delete"),
             ("/v1/rules", "post"),
+            ("/v1/incidents/{incident_id}/feedback", "post"),
         ] {
             assert!(
                 spec["paths"][path][method].is_object(),
@@ -3356,5 +3609,301 @@ mod tests {
 
         let (status, _) = post_rules(router, None, trader_rule_body("x")).await;
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+    // ── §19 analyst feedback (readiness Epic E) ────────────────────────
+
+    use super::{FeedbackReason, FeedbackVerdict, MAX_FEEDBACK_REASON_CHARS};
+    use axum::http::StatusCode;
+
+    /// The capability secret both halves of the test share — the same value a
+    /// deployment gives notification (which mints) and the API service (which
+    /// verifies).
+    const TEST_GRANT_SECRET: &str = "test-grant-secret";
+
+    /// Mint a grant the way notification would.
+    fn mint_grant(incident: uuid::Uuid, customer: &str, cohort: &str) -> String {
+        let key = feedback_grant::MintingKey::from_secret(SecretString::from(TEST_GRANT_SECRET));
+        feedback_grant::mint(
+            &key,
+            &feedback_grant::Grant {
+                incident_id: incident,
+                customer_id: customer.parse().expect("a customer uuid"),
+                cohort: cohort.to_owned(),
+            },
+            (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        )
+        .expect("mint")
+    }
+
+    async fn post_feedback(
+        router: axum::Router,
+        bearer: Option<&str>,
+        incident_id: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let mut request = Request::post(format!("/v1/incidents/{incident_id}/feedback"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, bearer);
+        }
+        let response = router
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn feedback_records_the_verdict_under_the_token_owner() {
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state.clone());
+
+        let (status, body) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(incident, customer, "solicited"),
+                "verdict": "false_positive",
+                "reason_code": "our_own_activity",
+                "reason": "  our own rebalancer  ",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["status"], "recorded");
+
+        // The parked envelope, read back the way the flusher will.
+        let queued = ts.feedback.queued();
+        assert_eq!(queued.len(), 1);
+        let envelope: events::EventEnvelope =
+            serde_json::from_value(queued[0].clone()).expect("a wire-form envelope");
+        let events::DomainEvent::AlertFeedbackRecorded(recorded) = envelope.payload else {
+            panic!("expected an AlertFeedbackRecorded payload");
+        };
+        assert_eq!(recorded.incident_id.0, incident);
+        assert_eq!(recorded.verdict, FeedbackVerdict::FalsePositive);
+        assert_eq!(recorded.reason_code, FeedbackReason::OurOwnActivity);
+        // Owner-from-JWT: the body has no say in who the verdict belongs to.
+        assert_eq!(recorded.customer_id.0.to_string(), customer);
+        assert_eq!(recorded.reason.as_deref(), Some("our own rebalancer"));
+        // And the cohort comes from the signed grant, not the request.
+        assert_eq!(recorded.cohort, events::feedback::FeedbackCohort::Solicited);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_without_a_grant_is_refused() {
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let router = super::router(ts.state.clone());
+
+        let (status, _) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({ "grant": "not-a-token", "verdict": "false_positive" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            ts.feedback.queued().is_empty(),
+            "an unauthorized verdict must never reach the SLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_another_customers_delivery_is_refused() {
+        // The isolation property, adversarially: Mallory holds a *valid*
+        // grant — it was minted for Alice, and Mallory intercepted it. Her own
+        // bearer token does not match the grant's recipient, so the capability
+        // is worthless to her. Without this check a grant would be a bearer
+        // token anyone who read an email could spend.
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let alice = "00000000-0000-0000-0000-0000000000a1";
+        let mallory = "00000000-0000-0000-0000-0000000000b2";
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, mallory);
+        let router = super::router(ts.state.clone());
+
+        let (status, _) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(incident, alice, "volunteered"),
+                "verdict": "false_positive",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(ts.feedback.queued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_a_different_incident_is_refused() {
+        // Self-service poisoning: one legitimately delivered incident's grant
+        // replayed against every other incident id in the platform.
+        let delivered = uuid::Uuid::from_u128(0x1c);
+        let target = uuid::Uuid::from_u128(0xdead);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state.clone());
+
+        let (status, _) = post_feedback(
+            router,
+            Some(&bearer),
+            &target.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(delivered, customer, "volunteered"),
+                "verdict": "false_positive",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(ts.feedback.queued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_deployment_503s_feedback_and_serves_everything_else() {
+        // The rollout hazard this guards: prod provisions `app-secrets`
+        // outside the repo, and a missing key must degrade one endpoint —
+        // never keep the pod from starting.
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let mut ts = test_state();
+        ts.state.feedback_grant = None;
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state.clone());
+
+        let (status, _) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(incident, customer, "volunteered"),
+                "verdict": "false_positive",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ts.feedback.queued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn feedback_requires_a_bearer_token() {
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let ts = test_state();
+        let router = super::router(ts.state);
+
+        let (status, _) = post_feedback(
+            router,
+            None,
+            &incident.to_string(),
+            serde_json::json!({ "grant": "irrelevant", "verdict": "true_positive" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_an_over_long_reason_with_422() {
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state.clone());
+
+        let (status, body) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(incident, customer, "volunteered"),
+                "verdict": "unclear",
+                "reason": "x".repeat(MAX_FEEDBACK_REASON_CHARS + 1),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"].as_str().unwrap().contains("longer than"));
+    }
+
+    #[tokio::test]
+    async fn feedback_503s_rather_than_pretending_a_verdict_was_recorded() {
+        // Postgres is down, so the platform cannot promise to keep this
+        // verdict. Saying so beats a comfortable 202: the caller is a human
+        // who will retry, and the sample is small enough that quietly losing
+        // one biases the rate toward flattering the platform.
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let mut ts = test_state();
+        ts.state.feedback = Arc::new(InMemoryFeedbackQueue::failing());
+        let bearer = mint_bearer(&ts.state, customer);
+        let router = super::router(ts.state.clone());
+
+        let (status, _) = post_feedback(
+            router,
+            Some(&bearer),
+            &incident.to_string(),
+            serde_json::json!({
+                "grant": mint_grant(incident, customer, "volunteered"),
+                "verdict": "false_positive",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_retried_submission_is_recognised_rather_than_counted_twice() {
+        // The whole point of the durable path: a client that times out and
+        // retries must not add a second opinion to an accuracy measurement.
+        let incident = uuid::Uuid::from_u128(0x1c);
+        let customer = "00000000-0000-0000-0000-0000000000c0";
+        let ts = test_state();
+        let bearer = mint_bearer(&ts.state, customer);
+        let queue = ts.feedback.clone();
+        let router = super::router(ts.state.clone());
+
+        let body = serde_json::json!({
+            "grant": mint_grant(incident, customer, "volunteered"),
+            "verdict": "false_positive",
+        });
+        let (first, _) = post_feedback(
+            router.clone(),
+            Some(&bearer),
+            &incident.to_string(),
+            body.clone(),
+        )
+        .await;
+        let (second, second_body) =
+            post_feedback(router, Some(&bearer), &incident.to_string(), body).await;
+
+        assert_eq!(first, StatusCode::ACCEPTED);
+        assert_eq!(second, StatusCode::OK, "a retry is not a second verdict");
+        assert_eq!(second_body["status"], "already_recorded");
+        assert_eq!(queue.queued().len(), 1);
     }
 }

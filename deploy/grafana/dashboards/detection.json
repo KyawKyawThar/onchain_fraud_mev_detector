@@ -110,6 +110,169 @@
           "legendFormat": "{{detector}}"
         }
       ]
+    },
+    {
+      "id": 5,
+      "title": "False-positive rate from feedback (§19)",
+      "description": "The §19 false-positive panel: of the incidents created in the settled window that a customer adjudicated, the fraction at least one of them called noise (POST /v1/incidents/{id}/feedback → incident_feedback). The rate is ABSENT, not zero, when nothing has been adjudicated — an unmeasured rate is not a perfect one. One series per cohort: `volunteered` is self-selected (people report what annoyed them) and is a product signal; `solicited` comes from incidents the platform picked without looking at the finding, and is the only one that can back a published claim. The dashed series is this deployment's published target, exported by the same process so the panel and the FalsePositiveRateAboveTarget alert cannot disagree. Read it beside the coverage panel: a rate over 3% of the platform is a statement about 3% of the platform.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "target" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "detection_feedback_false_positive_rate",
+          "legendFormat": "{{sample}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(detection_feedback_false_positive_rate_target)",
+          "legendFormat": "target"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Adjudication coverage",
+      "description": "How much of the platform's output anybody actually looked at: adjudicated / incidents created in the settled window. This is the false-positive rate's own quality measure — the rate is only as trustworthy as this number, and the SLO stays disarmed below detection_feedback_min_adjudications however good the rate looks.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "detection_feedback_coverage",
+          "legendFormat": "{{sample}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Feedback sample in the settled window",
+      "description": "The two counts behind the rate: incidents created in the window, and how many of them carry a decided verdict (true_positive or false_positive — an `unclear` counts in neither). The window ends a settle delay before now, because the most recent days are always under-adjudicated.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "detection_feedback_window_incidents",
+          "legendFormat": "incidents"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "detection_feedback_window_adjudicated",
+          "legendFormat": "adjudicated ({{sample}})"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(detection_feedback_min_adjudications)",
+          "legendFormat": "arms at"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "SLO armed",
+      "description": "1 when the settled window holds enough decided verdicts for FalsePositiveRateAboveTarget to fire at all; 0 when it does not. Published explicitly rather than inferred from a missing series (engineering conventions §15b) — a zero here means the platform's accuracy claim is currently unmeasured, which is not the same as met.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "disarmed", "color": "orange", "index": 0 }, "1": { "text": "armed", "color": "green", "index": 1 } } }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "detection_feedback_slo_armed",
+          "legendFormat": "{{sample}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Why customers say we were wrong",
+      "description": "alert_feedback_recorded_total by reason_code — the actionable half of the loop. `threshold_too_sensitive` concentrated on one detector is a config change; `our_own_activity` is a labelling gap in the entity graph; `duplicate_alert` is a correlation defect rather than a detection one. A false-positive count without this breakdown is a mood, not a work item.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason_code) (rate(alert_feedback_recorded_total{verdict=\"false_positive\"}[$__rate_interval]))",
+          "legendFormat": "{{reason_code}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Loop health: asked, answered, refused",
+      "description": "The solicited cohort's response rate, derived in PromQL from two counters rather than stored (the same convention as detection's hit rate). `refused` is the platform turning a customer away because it could not durably keep their verdict — it should be flat zero. If `asked` is zero, this deployment is not soliciting at all: see alert_feedback_solicitation_enabled.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(alert_feedback_solicited_total{cohort=\"solicited\"}[$__rate_interval]))",
+          "legendFormat": "asked"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(alert_feedback_recorded_total{cohort=\"solicited\"}[$__rate_interval]))",
+          "legendFormat": "answered"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(alert_feedback_refused_total[$__rate_interval]))",
+          "legendFormat": "refused"
+        }
+      ]
     }
   ]
 }

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::delivery::{ChannelSink, DeliveryError};
 use crate::email_delivery::EmailDelivery;
+use crate::feedback_invite::FeedbackInvite;
 use crate::http_delivery::HttpDelivery;
 use crate::model::Channel;
 use crate::notice::Notice;
@@ -25,14 +26,24 @@ impl MultiChannelSink {
 
 #[async_trait]
 impl ChannelSink for MultiChannelSink {
-    async fn deliver(&self, notice: &Notice, channel: &Channel) -> Result<(), DeliveryError> {
+    async fn deliver(
+        &self,
+        notice: &Notice,
+        channel: &Channel,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError> {
         match channel {
-            Channel::Webhook { url } => self.http.deliver_webhook(notice, url).await,
-            Channel::Slack { webhook_url } => self.http.deliver_slack(notice, webhook_url).await,
+            Channel::Webhook { url } => self.http.deliver_webhook(notice, url, invite).await,
+            Channel::Slack { webhook_url } => {
+                self.http.deliver_slack(notice, webhook_url, invite).await
+            }
+            // PagerDuty is an incident-management target, not a place a human
+            // reads prose: its payload stays exactly as it was. A responder
+            // adjudicates from the webhook or the email, not from a page.
             Channel::PagerDuty { routing_key } => {
                 self.http.deliver_pagerduty(notice, routing_key).await
             }
-            Channel::Email { address } => self.email.deliver_email(notice, address).await,
+            Channel::Email { address } => self.email.deliver_email(notice, address, invite).await,
         }
     }
 }

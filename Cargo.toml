@@ -65,6 +65,15 @@ retention = { path = "crates/retention" }
 # Shared JWT bearer verification (§11) — one issuer and one claim set for every
 # service that authenticates a caller (see crates/auth/src/lib.rs).
 auth = { path = "crates/auth" }
+# The §19 feedback capability token (readiness Epic E): notification mints one
+# per delivered incident, the API service verifies it. Separate from `auth`
+# because a grant is a *capability* ("this recipient may adjudicate this
+# incident"), not an identity, and because `auth` is verify-only by charter.
+feedback-grant = { path = "crates/feedback-grant" }
+# The transactional-outbox seam (§20): a customer-facing write and its event
+# announcement commit in one transaction, and a leased flusher drains them.
+# Shared by rule-engine (`rule_outbox`) and the API service (`feedback_outbox`).
+outbox = { path = "crates/outbox" }
 # Detection seam (§6): `detector-api` is the thin, stable contract every detector
 # builds against — the `DetectorPlugin` trait + `DetectionCtx`/enrichment, and
 # nothing of the service's internals. The `detection` service crate re-exports it

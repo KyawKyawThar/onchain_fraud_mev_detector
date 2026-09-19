@@ -72,6 +72,8 @@ fn notice() -> Notice {
         addresses: vec![],
         owner: Some(CustomerId::new()),
         summary: "confirmed sandwich".into(),
+        // Not under test here: this file exercises the HTTP transport.
+        incident_id: None,
         occurred_at: chrono::Utc::now(),
     }
 }
@@ -97,7 +99,7 @@ fn delivery(allow_private: bool) -> HttpDelivery {
 async fn a_2xx_response_delivers_the_notice_payload() {
     let (url, hook) = spawn_hook(&[200]).await;
     let sink = delivery(true);
-    sink.deliver_webhook(&notice(), &url)
+    sink.deliver_webhook(&notice(), &url, None)
         .await
         .expect("delivered");
     let requests = hook.requests();
@@ -109,7 +111,10 @@ async fn a_2xx_response_delivers_the_notice_payload() {
 async fn a_4xx_response_rejects_without_retrying() {
     let (url, hook) = spawn_hook(&[404, 200]).await;
     let sink = delivery(true);
-    let err = sink.deliver_webhook(&notice(), &url).await.unwrap_err();
+    let err = sink
+        .deliver_webhook(&notice(), &url, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DeliveryError::Rejected { .. }));
     assert!(!err.is_transient());
     assert_eq!(
@@ -123,7 +128,10 @@ async fn a_4xx_response_rejects_without_retrying() {
 async fn a_5xx_response_retries_then_surfaces_if_still_failing() {
     let (url, hook) = spawn_hook(&[500, 500, 500]).await;
     let sink = delivery(true);
-    let err = sink.deliver_webhook(&notice(), &url).await.unwrap_err();
+    let err = sink
+        .deliver_webhook(&notice(), &url, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DeliveryError::Transport { .. }));
     assert_eq!(hook.requests().len(), 3, "retried up to the attempt bound");
 }
@@ -132,7 +140,7 @@ async fn a_5xx_response_retries_then_surfaces_if_still_failing() {
 async fn a_5xx_response_that_recovers_within_the_attempt_bound_delivers() {
     let (url, hook) = spawn_hook(&[500, 200]).await;
     let sink = delivery(true);
-    sink.deliver_webhook(&notice(), &url)
+    sink.deliver_webhook(&notice(), &url, None)
         .await
         .expect("delivered on retry");
     assert_eq!(hook.requests().len(), 2);
@@ -142,7 +150,7 @@ async fn a_5xx_response_that_recovers_within_the_attempt_bound_delivers() {
 async fn slack_delivers_a_text_payload_to_its_own_webhook_url() {
     let (url, hook) = spawn_hook(&[200]).await;
     let sink = delivery(true);
-    sink.deliver_slack(&notice(), &url)
+    sink.deliver_slack(&notice(), &url, None)
         .await
         .expect("delivered");
     let requests = hook.requests();
@@ -160,7 +168,10 @@ async fn slack_delivers_a_text_payload_to_its_own_webhook_url() {
 async fn a_loopback_target_is_refused_by_the_ssrf_guard() {
     let (url, hook) = spawn_hook(&[200]).await;
     let sink = delivery(false);
-    let err = sink.deliver_webhook(&notice(), &url).await.unwrap_err();
+    let err = sink
+        .deliver_webhook(&notice(), &url, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DeliveryError::Rejected { .. }));
     assert!(!err.is_transient());
     assert!(

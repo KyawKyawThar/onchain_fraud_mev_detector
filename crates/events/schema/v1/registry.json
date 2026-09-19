@@ -98,6 +98,64 @@
         }
       ]
     },
+    "AlertFeedbackRecorded": {
+      "topic": "mev.events.AlertFeedbackRecorded",
+      "partition_key": "incident",
+      "fields": [
+        {
+          "path": "cohort",
+          "type": "enum",
+          "values": [
+            "volunteered",
+            "solicited"
+          ],
+          "required": false
+        },
+        {
+          "path": "customer_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "incident_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "reason",
+          "type": "string",
+          "required": false
+        },
+        {
+          "path": "reason_code",
+          "type": "enum",
+          "values": [
+            "our_own_activity",
+            "known_counterparty",
+            "threshold_too_sensitive",
+            "duplicate_alert",
+            "confirmed_harm",
+            "unspecified"
+          ],
+          "required": false
+        },
+        {
+          "path": "submitted_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "verdict",
+          "type": "enum",
+          "values": [
+            "true_positive",
+            "false_positive",
+            "unclear"
+          ],
+          "required": true
+        }
+      ]
+    },
     "AttributionRetracted": {
       "topic": "mev.events.AttributionRetracted",
       "partition_key": "chain",

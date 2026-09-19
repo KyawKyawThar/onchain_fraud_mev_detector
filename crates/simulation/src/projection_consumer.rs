@@ -52,7 +52,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cross_chain_projection::CrossChainFindingProjection;
 use crate::projection::{Applied, IncidentProjection, IncidentRecord};
 use crate::store::{
-    AnalyticsRow, CrossChainFindingStore, IncidentAnalytics, IncidentStore, JobUpdate, PersistError,
+    AnalyticsRow, CrossChainFindingStore, FeedbackLedger, FeedbackRow, IncidentAnalytics,
+    IncidentStore, JobUpdate, PersistError,
 };
 
 /// The result-path event types the projection consumes. `SimulationRequested` is here for
@@ -70,6 +71,10 @@ const CONSUMED_EVENT_TYPES: &[&str] = &[
     "BridgeMevDetected",
     "CrossChainMevDetected",
     "CrossChainFindingRetracted",
+    // §19 readiness Epic E: a customer's verdict on an incident. Folded into
+    // its own ledger, not through `IncidentProjection` — feedback changes
+    // nothing about the incident's lifecycle state (see `events::feedback`).
+    "AlertFeedbackRecorded",
 ];
 
 /// The topics the projection subscribes to (one per [`CONSUMED_EVENT_TYPES`] entry).
@@ -111,6 +116,11 @@ pub struct ProjectionConsumer {
     /// it's a separate read model rather than folded through `projection`).
     cross_chain_projection: Mutex<CrossChainFindingProjection>,
     cross_chain_store: Arc<dyn CrossChainFindingStore>,
+    /// The §19 analyst-feedback ledger. No projection behind it: the stored
+    /// row *is* the fold (a `ReplacingMergeTree` keyed by incident + customer,
+    /// versioned by `submitted_at`), so there is no in-memory state to keep
+    /// and redelivery converges in the store rather than in this process.
+    feedback: Arc<dyn FeedbackLedger>,
 }
 
 impl ProjectionConsumer {
@@ -119,6 +129,7 @@ impl ProjectionConsumer {
         store: Arc<dyn IncidentStore>,
         analytics: Arc<dyn IncidentAnalytics>,
         cross_chain_store: Arc<dyn CrossChainFindingStore>,
+        feedback: Arc<dyn FeedbackLedger>,
     ) -> Self {
         Self {
             projection: Mutex::new(IncidentProjection::new()),
@@ -126,6 +137,7 @@ impl ProjectionConsumer {
             analytics,
             cross_chain_projection: Mutex::new(CrossChainFindingProjection::new()),
             cross_chain_store,
+            feedback,
         }
     }
 
@@ -193,6 +205,19 @@ impl ProjectionConsumer {
 #[async_trait]
 impl EventHandler for ProjectionConsumer {
     async fn handle(&self, envelope: EventEnvelope) -> Handled {
+        // 0a. Analyst feedback (§19, readiness Epic E) — routed first and on
+        //     its own, because it is the one consumed event that says nothing
+        //     about an incident's *state*. Writing it through the incident
+        //     fold would be the mistake the event's own docs warn about:
+        //     letting a customer's opinion retract the platform's finding.
+        if let DomainEvent::AlertFeedbackRecorded(ref verdict) = envelope.payload {
+            let row = FeedbackRow::from_event(verdict);
+            if let Err(err) = self.feedback.record_feedback(&row).await {
+                return handled_for(err, "feedback ledger write");
+            }
+            return Handled::Commit;
+        }
+
         // 0. Cross-chain findings (§24, Sprint 17 t4) fold and persist through
         //    their own, separate read model — routed first since they share
         //    nothing with the incident fold below (no `alert_id`/job tracking).
@@ -307,6 +332,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::store::{JobState, JobUpdate, PersistError};
+    use events::feedback::{AlertFeedbackRecorded, FeedbackVerdict};
+    use events::primitives::CustomerId;
 
     /// Records every incident upsert + job update, and can be told to fail — transiently
     /// (a closed pool → `Retry`) or permanently (a decode/schema bug → skip) — to exercise
@@ -354,6 +381,28 @@ mod tests {
     #[async_trait]
     impl IncidentAnalytics for RecordingAnalytics {
         async fn append(&self, row: &AnalyticsRow) -> Result<(), PersistError> {
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+    }
+
+    /// Records every verdict written to the §19 feedback ledger, and can be
+    /// told to fail transiently — the ledger is the SLI's only input, so
+    /// "does a failed write leave the offset" is the question that matters.
+    #[derive(Default)]
+    struct RecordingFeedback {
+        rows: Mutex<Vec<FeedbackRow>>,
+        fail_transient: bool,
+    }
+
+    #[async_trait]
+    impl FeedbackLedger for RecordingFeedback {
+        async fn record_feedback(&self, row: &FeedbackRow) -> Result<(), PersistError> {
+            if self.fail_transient {
+                return Err(PersistError::Clickhouse(clickhouse::error::Error::Custom(
+                    "clickhouse unreachable".into(),
+                )));
+            }
             self.rows.lock().unwrap().push(row.clone());
             Ok(())
         }
@@ -422,11 +471,28 @@ mod tests {
         Arc<RecordingStore>,
         Arc<RecordingAnalytics>,
     ) {
+        let (consumer, store, analytics, _feedback) = consumer_with_feedback();
+        (consumer, store, analytics)
+    }
+
+    /// The same wiring, keeping the feedback double — the §19 tests need it.
+    fn consumer_with_feedback() -> (
+        ProjectionConsumer,
+        Arc<RecordingStore>,
+        Arc<RecordingAnalytics>,
+        Arc<RecordingFeedback>,
+    ) {
         let store = Arc::new(RecordingStore::default());
         let analytics = Arc::new(RecordingAnalytics::default());
         let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
-        (consumer, store, analytics)
+        let feedback = Arc::new(RecordingFeedback::default());
+        let consumer = ProjectionConsumer::new(
+            store.clone(),
+            analytics.clone(),
+            cross_chain_store,
+            feedback.clone(),
+        );
+        (consumer, store, analytics, feedback)
     }
 
     #[tokio::test]
@@ -505,7 +571,12 @@ mod tests {
         });
         let analytics = Arc::new(RecordingAnalytics::default());
         let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
+        let consumer = ProjectionConsumer::new(
+            store.clone(),
+            analytics.clone(),
+            cross_chain_store,
+            Arc::new(RecordingFeedback::default()),
+        );
 
         let alert = AlertId::new();
         assert_eq!(
@@ -524,7 +595,12 @@ mod tests {
         });
         let analytics = Arc::new(RecordingAnalytics::default());
         let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
-        let consumer = ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store);
+        let consumer = ProjectionConsumer::new(
+            store.clone(),
+            analytics.clone(),
+            cross_chain_store,
+            Arc::new(RecordingFeedback::default()),
+        );
 
         let alert = AlertId::new();
         assert_eq!(
@@ -565,12 +641,13 @@ mod tests {
     #[test]
     fn consumed_topics_are_the_result_path_and_cross_chain_finding_topics() {
         let topics = consumed_topics();
-        assert_eq!(topics.len(), 8);
+        assert_eq!(topics.len(), 9);
         assert!(topics.contains(&"mev.events.SimulationCompleted".to_string()));
         assert!(topics.contains(&"mev.events.IncidentRetracted".to_string()));
         assert!(topics.contains(&"mev.events.BridgeMevDetected".to_string()));
         assert!(topics.contains(&"mev.events.CrossChainMevDetected".to_string()));
         assert!(topics.contains(&"mev.events.CrossChainFindingRetracted".to_string()));
+        assert!(topics.contains(&"mev.events.AlertFeedbackRecorded".to_string()));
     }
 
     // ── Cross-chain findings (§24, Sprint 17 t4) ──────────────────────
@@ -624,8 +701,12 @@ mod tests {
         let store = Arc::new(RecordingStore::default());
         let analytics = Arc::new(RecordingAnalytics::default());
         let cross_chain_store = Arc::new(RecordingCrossChainStore::default());
-        let consumer =
-            ProjectionConsumer::new(store.clone(), analytics.clone(), cross_chain_store.clone());
+        let consumer = ProjectionConsumer::new(
+            store.clone(),
+            analytics.clone(),
+            cross_chain_store.clone(),
+            Arc::new(RecordingFeedback::default()),
+        );
         let finding_id = events::primitives::CrossChainFindingId::new();
 
         consumer
@@ -643,5 +724,95 @@ mod tests {
         let findings = cross_chain_store.findings.lock().unwrap();
         assert_eq!(findings.len(), 2, "one upsert per real change");
         assert!(findings.last().unwrap().retracted);
+    }
+    fn verdict(
+        incident: IncidentId,
+        customer: CustomerId,
+        verdict: FeedbackVerdict,
+        at_secs: i64,
+    ) -> DomainEvent {
+        DomainEvent::AlertFeedbackRecorded(AlertFeedbackRecorded {
+            incident_id: incident,
+            customer_id: customer,
+            verdict,
+            reason_code: events::feedback::FeedbackReason::OurOwnActivity,
+            reason: Some("our own rebalancer".into()),
+            cohort: events::feedback::FeedbackCohort::Volunteered,
+            submitted_at: at(at_secs),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_verdict_lands_in_the_ledger_and_nowhere_else() {
+        let (consumer, store, analytics, feedback) = consumer_with_feedback();
+        let incident = IncidentId::new();
+
+        assert_eq!(
+            consumer
+                .handle(env(
+                    verdict(
+                        incident,
+                        CustomerId::new(),
+                        FeedbackVerdict::FalsePositive,
+                        20
+                    ),
+                    at(20)
+                ))
+                .await,
+            Handled::Commit
+        );
+
+        let rows = feedback.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].incident_id, incident.0);
+        assert_eq!(rows[0].verdict, "false_positive");
+
+        // The point of the separate branch: a customer calling an incident
+        // noise must not touch the incident's own lifecycle state. The read
+        // model still says what simulation concluded.
+        assert!(
+            store.incidents.lock().unwrap().is_empty(),
+            "feedback is not a retraction — it must not write the incident read model"
+        );
+        assert!(analytics.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_ledger_write_leaves_the_offset_for_redelivery() {
+        let feedback = Arc::new(RecordingFeedback {
+            fail_transient: true,
+            ..Default::default()
+        });
+        let consumer = ProjectionConsumer::new(
+            Arc::new(RecordingStore::default()),
+            Arc::new(RecordingAnalytics::default()),
+            Arc::new(RecordingCrossChainStore::default()),
+            feedback,
+        );
+
+        assert_eq!(
+            consumer
+                .handle(env(
+                    verdict(
+                        IncidentId::new(),
+                        CustomerId::new(),
+                        FeedbackVerdict::TruePositive,
+                        30
+                    ),
+                    at(30)
+                ))
+                .await,
+            Handled::Retry,
+            "a lost verdict is a lost sample from the SLI; redeliver it"
+        );
+    }
+
+    #[test]
+    fn the_feedback_topic_is_subscribed_and_replayed() {
+        assert!(
+            consumed_event_types().contains(&"AlertFeedbackRecorded".to_string()),
+            "a rebuild replays what the live consumer subscribes to; the ledger \
+             must be in both lists or a rebuilt model silently loses every verdict"
+        );
     }
 }

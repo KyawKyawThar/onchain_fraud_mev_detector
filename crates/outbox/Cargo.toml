@@ -1,0 +1,37 @@
+[package]
+name = "outbox"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The transactional-outbox seam (§20). Promoted out of rule-engine when a
+# second customer-facing write needed the same guarantee: the row and its
+# announcement commit together, or neither does. Two implementations of that
+# is one too many — the same argument the `resilience` retrofit makes about
+# four hand-rolled retry loops.
+
+[dependencies]
+event-bus = { workspace = true }
+events = { workspace = true }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+metrics = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Real Postgres in a throwaway container for the `#[ignore]`d tests: the lease
+# and the unique constraint are database behaviour, not Rust behaviour.
+db = { workspace = true }
+async-trait = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

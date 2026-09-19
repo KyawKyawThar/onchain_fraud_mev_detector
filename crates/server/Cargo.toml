@@ -35,6 +35,13 @@ tracing = { workspace = true }
 api-error = { workspace = true }
 # Shared JWT verification (§11) — this service adds only the customer-UUID rule.
 auth = { workspace = true }
+# The §19 feedback capability — this service holds the VERIFYING key only
+# (readiness Epic E); minting lives in notification, and the key types are what
+# keep it that way.
+feedback-grant = { workspace = true }
+# The shared transactional-outbox seam (§20): a verdict is durable before the
+# customer is answered, and a leased flusher publishes it (readiness Epic E).
+outbox = { workspace = true }
 
 # HTTP server. axum + tower-http mirror event-store's own stack; utoipa/-swagger-ui/
 # -axum give this public surface the same OpenAPI/Swagger docs event-store's append

@@ -72,6 +72,10 @@ const GOLDENS: &[(&str, &str)] = &[
         r#"{"type":"PreliminaryAlertCreated","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","detector":{"id":"sandwich","version":"1.2","config_hash":"cfg-abc"},"addresses":["0x3333333333333333333333333333333333333333"],"kind":"sandwich","confidence":0.8,"provisional":true,"impact_usd":150000.0,"severity":"high","suggested_action":"escalate"}}"#,
     ),
     (
+        "AlertFeedbackRecorded",
+        r#"{"type":"AlertFeedbackRecorded","payload":{"incident_id":"00000000-0000-0000-0000-00000000001c","customer_id":"00000000-0000-0000-0000-0000000000c0","verdict":"false_positive","reason_code":"our_own_activity","reason":"our own rebalancer, not a sandwich","cohort":"solicited","submitted_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
         "SimulationRequested",
         r#"{"type":"SimulationRequested","payload":{"alert_id":"00000000-0000-0000-0000-0000000000a1","evidence":{"txs":["0xaa"]}}}"#,
     ),

@@ -17,7 +17,8 @@
 //! when intelligence is slow or unavailable (readiness Epic D) — with
 //! [`facts_source`]'s breaker/bulkhead/hedging in front of the fresh read,
 //! [`snapshot_tier`]'s per-pod memory tier and [`sanctions_view`]'s pod-local
-//! sanctions list behind it — and
+//! sanctions list behind it — [`feedback`] publishes the analyst verdicts the
+//! §19 false-positive SLO is measured from (readiness Epic E) — and
 //! [`http`] assembles the whole router.
 //!
 //! Keeping this in a library (mirrors `event-store`) is what lets the router/
@@ -28,6 +29,7 @@ pub mod auth;
 pub mod config;
 pub mod degrade;
 pub mod facts_source;
+pub mod feedback;
 pub mod http;
 pub mod intelligence_client;
 pub mod metrics;

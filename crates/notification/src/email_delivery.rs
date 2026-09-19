@@ -18,6 +18,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 
 use crate::delivery::{count_delivery, DeliveryConfig, DeliveryError};
+use crate::feedback_invite::FeedbackInvite;
 use crate::notice::Notice;
 use event_bus::Transience;
 
@@ -71,7 +72,12 @@ impl EmailDelivery {
         })
     }
 
-    fn build_message(&self, notice: &Notice, to: &Mailbox) -> Result<Message, DeliveryError> {
+    fn build_message(
+        &self,
+        notice: &Notice,
+        to: &Mailbox,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<Message, DeliveryError> {
         let severity = notice
             .severity
             .map(|s| <&str>::from(s).to_owned())
@@ -83,14 +89,28 @@ impl EmailDelivery {
                 "[MEVWatch] {} alert (severity={severity})",
                 notice.stage.as_wire_str()
             ))
-            .body(notice.summary.clone())
+            // The feedback link is the whole solicitation path: for most
+            // customers this line is the only invitation they will ever see to
+            // tell us the platform was wrong (§19, readiness Epic E).
+            .body(match invite {
+                Some(invite) => format!(
+                    "{}\n\nWas this right? Tell us: {}\n",
+                    notice.summary, invite.url
+                ),
+                None => notice.summary.clone(),
+            })
             .map_err(|err| DeliveryError::Rejected {
                 reason: format!("building email message: {err}"),
             })
     }
 
-    async fn send_once(&self, notice: &Notice, to: &Mailbox) -> Result<(), DeliveryError> {
-        let message = self.build_message(notice, to)?;
+    async fn send_once(
+        &self,
+        notice: &Notice,
+        to: &Mailbox,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError> {
+        let message = self.build_message(notice, to, invite)?;
         self.transport
             .send(message)
             .await
@@ -98,7 +118,12 @@ impl EmailDelivery {
             .map_err(classify_smtp_error)
     }
 
-    pub async fn deliver_email(&self, notice: &Notice, address: &str) -> Result<(), DeliveryError> {
+    pub async fn deliver_email(
+        &self,
+        notice: &Notice,
+        address: &str,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError> {
         let to: Mailbox = match address.parse() {
             Ok(to) => to,
             Err(err) => {
@@ -113,7 +138,7 @@ impl EmailDelivery {
         let mut backoff = self.config.retry_backoff;
         let mut attempt = 1;
         let outcome = loop {
-            match self.send_once(notice, &to).await {
+            match self.send_once(notice, &to, invite).await {
                 Ok(()) => break Ok(()),
                 Err(err) if err.is_transient() && attempt < self.config.attempts.max(1) => {
                     tracing::warn!(attempt, error = %err, "SMTP delivery failed transiently; backing off");
