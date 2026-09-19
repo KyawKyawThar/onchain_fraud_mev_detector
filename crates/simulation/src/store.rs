@@ -214,6 +214,126 @@ pub trait IncidentStore: Send + Sync {
         -> Result<IncidentPage, PersistError>;
 }
 
+/// The analyst-feedback ledger (§19, readiness Epic E) — the append side.
+///
+/// Its own seam rather than a method on [`IncidentAnalytics`] for the reason
+/// [`WalletExposureStore`] is separate too: a verdict is not a snapshot of the
+/// incident fold, it is a statement *about* one, and it arrives on its own
+/// event with no [`IncidentRecord`] behind it.
+#[async_trait]
+pub trait FeedbackLedger: Send + Sync {
+    /// Record one customer's verdict. Idempotent by construction rather than
+    /// by convention: the table is a `ReplacingMergeTree` keyed
+    /// `(incident_id, customer_id)` and versioned by `submitted_at`, so a
+    /// redelivered event writes a row that collapses into the one already
+    /// there, and a revised verdict supersedes it.
+    async fn record_feedback(&self, row: &FeedbackRow) -> Result<(), PersistError>;
+}
+
+/// The analyst-feedback ledger's read side: the **evidence** behind the §19
+/// false-positive panel over one window.
+///
+/// Deliberately not "the rate". This seam returns facts — how many incidents
+/// the window holds, how the verdicts on them fell, how concentrated they are
+/// in one customer, how late they arrived — and
+/// [`crate::feedback_sli`] decides what those facts *mean*. The split matters
+/// because the meaning is policy (how to resolve two customers who disagree,
+/// when a sample is too small or too concentrated to judge), and policy that
+/// lives inside a SQL string cannot be unit-tested, cannot be named in a type,
+/// and cannot be changed without a database to try it against.
+#[async_trait]
+pub trait FeedbackSliStore: Send + Sync {
+    /// Read the window's evidence.
+    ///
+    /// The window is keyed on incident creation, not on when a verdict was
+    /// written, which is what makes the two numbers comparable: "of the
+    /// incidents we raised that week, how many did a customer call noise" is a
+    /// statement about detection quality, whereas "of the verdicts submitted
+    /// this week" is a statement about whoever happened to be doing review.
+    async fn feedback_evidence(
+        &self,
+        window: crate::feedback_sli::Window,
+    ) -> Result<crate::feedback_sli::Evidence, PersistError>;
+}
+
+/// One verdict as stored. Field names are the `incident_feedback` column
+/// names; `recorded_at` is intentionally absent (it has a `DEFAULT`).
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, Serialize)]
+pub struct FeedbackRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub incident_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub customer_id: Uuid,
+    /// `FeedbackVerdict`'s wire string.
+    pub verdict: String,
+    /// `FeedbackReason`'s wire string — the actionable half.
+    pub reason_code: String,
+    /// `FeedbackCohort`'s wire string (`volunteered` / `solicited`).
+    pub cohort: String,
+    /// The customer's words, or `""` when they gave none — ClickHouse has no
+    /// nullable-by-default and an empty string says the same thing here.
+    pub reason: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub submitted_at: DateTime<Utc>,
+}
+
+impl FeedbackRow {
+    /// Project an `AlertFeedbackRecorded` event into its stored row. Total —
+    /// every field is a direct mapping, so this cannot fail.
+    pub fn from_event(event: &events::feedback::AlertFeedbackRecorded) -> Self {
+        Self {
+            incident_id: event.incident_id.0,
+            customer_id: event.customer_id.0,
+            verdict: event.verdict.as_str().to_owned(),
+            reason_code: event.reason_code.as_str().to_owned(),
+            cohort: event.cohort.as_str().to_owned(),
+            reason: event.reason.clone().unwrap_or_default(),
+            submitted_at: event.submitted_at,
+        }
+    }
+}
+
+/// One contingency cell: how many of the window's adjudicated incidents, in
+/// one cohort, carry this exact combination of verdicts.
+///
+/// Fourteen rows at most (two cohorts x seven non-empty combinations of three
+/// booleans), whatever the window holds — which is the point. The grouping is
+/// pushed into ClickHouse, where it is cheap; the *interpretation* is pulled
+/// back into Rust, where it is testable.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, serde::Deserialize)]
+struct EvidenceCellRow {
+    cohort: String,
+    any_fp: u8,
+    any_tp: u8,
+    any_unclear: u8,
+    incidents: u64,
+}
+
+/// The window's population: incidents created in it, adjudicated or not.
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct PopulationRow {
+    incidents: u64,
+}
+
+/// Total verdicts in the sample and the largest single customer's share of
+/// them — the concentration guard's input (see
+/// [`crate::feedback_sli::Arming::Concentrated`]). Two numbers rather than a
+/// per-customer breakdown on purpose: an unbounded customer-id set has no
+/// business anywhere near a time series (§19).
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct ConcentrationRow {
+    verdicts: u64,
+    top_customer_verdicts: u64,
+}
+
+/// How long after an incident its verdict arrived, in seconds. The measurement
+/// that decides whether the settle delay is right, instead of asserted.
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct LagRow {
+    p50: f64,
+    p95: f64,
+}
+
 /// The append-only ClickHouse analytics firehose (§14). Object-safe for the same reason.
 #[async_trait]
 pub trait IncidentAnalytics: Send + Sync {
@@ -730,6 +850,179 @@ impl IncidentAnalytics for ClickhouseAnalytics {
         insert.end().await?;
         Ok(())
     }
+}
+
+#[async_trait]
+impl FeedbackLedger for ClickhouseAnalytics {
+    async fn record_feedback(&self, row: &FeedbackRow) -> Result<(), PersistError> {
+        let mut insert = self
+            .client
+            .insert::<FeedbackRow>("incident_feedback")
+            .await?;
+        insert.write(row).await?;
+        insert.end().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FeedbackSliStore for ClickhouseAnalytics {
+    async fn feedback_evidence(
+        &self,
+        window: crate::feedback_sli::Window,
+    ) -> Result<crate::feedback_sli::Evidence, PersistError> {
+        use crate::feedback_sli::{Cell, Evidence};
+
+        let from = window.from.timestamp_millis();
+        let to = window.to.timestamp_millis();
+
+        // Four small reads rather than one clever one. They share CTE text,
+        // which looks like duplication and is not: each answers a differently
+        // *shaped* question (one number, a contingency table, a pair, two
+        // quantiles), and at a five-minute cadence the extra round trips cost
+        // nothing next to a single query nobody can read. Every one of them is
+        // bounded — see [`LATEST`] for the predicate that bounds the ledger
+        // side, and why it is exact rather than approximate.
+        let population: PopulationRow = self
+            .client
+            .query(&format!("SELECT count() AS incidents FROM ({CREATED})"))
+            .bind(from)
+            .bind(to)
+            .fetch_one()
+            .await?;
+
+        let cells: Vec<EvidenceCellRow> = self
+            .client
+            .query(&format!(
+                "WITH created AS ({CREATED}), latest AS ({LATEST}), \
+                 per_incident AS ( \
+                     SELECT cohort, incident_id, \
+                         countIf(verdict = 'false_positive') > 0 AS any_fp, \
+                         countIf(verdict = 'true_positive')  > 0 AS any_tp, \
+                         countIf(verdict = 'unclear')        > 0 AS any_unclear \
+                     FROM latest INNER JOIN created USING (incident_id) \
+                     GROUP BY cohort, incident_id \
+                 ) \
+                 SELECT cohort, any_fp, any_tp, any_unclear, count() AS incidents \
+                 FROM per_incident \
+                 GROUP BY cohort, any_fp, any_tp, any_unclear"
+            ))
+            .bind(from)
+            .bind(to)
+            .bind(from)
+            .fetch_all()
+            .await?;
+
+        let concentration: ConcentrationRow = self
+            .client
+            .query(&format!(
+                "WITH created AS ({CREATED}), latest AS ({LATEST}) \
+                 SELECT sum(n) AS verdicts, max(n) AS top_customer_verdicts FROM ( \
+                     SELECT count() AS n \
+                     FROM latest INNER JOIN created USING (incident_id) \
+                     GROUP BY customer_id \
+                 )"
+            ))
+            .bind(from)
+            .bind(to)
+            .bind(from)
+            .fetch_one()
+            .await?;
+
+        // `created_at` is aliased away from the column name it aggregates, and
+        // so is `decided_at`: ClickHouse resolves an alias that shadows its own
+        // column back into the sibling aggregates and rejects the query as an
+        // aggregate inside an aggregate. The same trap is called out on
+        // `mev_exposure`'s `minIf` and cost `rebuild::digest_feedback` a
+        // container-backed test to find.
+        let lag: LagRow = self
+            .client
+            .query(
+                "WITH created_times AS ( \
+                     SELECT assumeNotNull(incident_id) AS incident_id, \
+                            min(occurred_at) AS created_at \
+                     FROM incident_analytics \
+                     WHERE event_type = 'IncidentCreated' \
+                       AND incident_id IS NOT NULL \
+                       AND occurred_at >= fromUnixTimestamp64Milli(?) \
+                       AND occurred_at <  fromUnixTimestamp64Milli(?) \
+                     GROUP BY incident_id \
+                 ), decided AS ( \
+                     SELECT incident_id, customer_id, max(submitted_at) AS decided_at \
+                     FROM incident_feedback \
+                     WHERE submitted_at >= fromUnixTimestamp64Milli(?) \
+                     GROUP BY incident_id, customer_id \
+                 ) \
+                 SELECT \
+                     quantile(0.5)(dateDiff('second', created_at, decided_at))  AS p50, \
+                     quantile(0.95)(dateDiff('second', created_at, decided_at)) AS p95 \
+                 FROM decided INNER JOIN created_times USING (incident_id)",
+            )
+            .bind(from)
+            .bind(to)
+            .bind(from)
+            .fetch_one()
+            .await?;
+
+        Ok(Evidence {
+            incidents: population.incidents,
+            cells: cells
+                .into_iter()
+                .map(|row| Cell {
+                    // An unrecognised cohort string reads as the conservative
+                    // default (`volunteered` — self-selected until proven
+                    // otherwise) rather than being dropped: losing a verdict
+                    // silently is the one behaviour this whole subsystem is
+                    // built to avoid.
+                    cohort: row.cohort.parse().unwrap_or_default(),
+                    any_fp: row.any_fp == 1,
+                    any_tp: row.any_tp == 1,
+                    any_unclear: row.any_unclear == 1,
+                    incidents: row.incidents,
+                })
+                .collect(),
+            verdicts: concentration.verdicts,
+            top_customer_verdicts: concentration.top_customer_verdicts,
+            // `quantile` over an empty set is NaN, which is not a lag of zero.
+            lag_p50_seconds: finite(lag.p50),
+            lag_p95_seconds: finite(lag.p95),
+        })
+    }
+}
+
+/// The window's incidents, by creation event only, so a later retraction or
+/// finalization cannot move one into or out of the window. Binds: from, to.
+const CREATED: &str = "SELECT assumeNotNull(incident_id) AS incident_id \
+     FROM incident_analytics \
+     WHERE event_type = 'IncidentCreated' \
+       AND incident_id IS NOT NULL \
+       AND occurred_at >= fromUnixTimestamp64Milli(?) \
+       AND occurred_at <  fromUnixTimestamp64Milli(?) \
+     GROUP BY incident_id";
+
+/// One verdict per (incident, customer), collapsed with `argMax`.
+///
+/// **`submitted_at >= window.from` is what keeps this read bounded**, and it is
+/// exact rather than approximate: a verdict cannot predate the incident it
+/// judges, so nothing older than the window's start can join to it. Without
+/// the predicate this CTE scans the entire ledger — every refresh, forever,
+/// against a table with a two-year TTL.
+///
+/// The `argMax` is not optional. `ReplacingMergeTree` merges are eventual
+/// *and per-partition*, so a verdict revised in a later month never merges
+/// with the original at all; reading raw rows would count a customer who
+/// changed their mind twice. Binds: from.
+const LATEST: &str = "SELECT incident_id, customer_id, \
+         argMax(verdict, submitted_at) AS verdict, \
+         argMax(cohort, submitted_at)  AS cohort \
+     FROM incident_feedback \
+     WHERE submitted_at >= fromUnixTimestamp64Milli(?) \
+     GROUP BY incident_id, customer_id";
+
+/// A quantile ClickHouse could not compute (an empty set yields NaN) is
+/// **absent**, not zero — the same rule the false-positive rate itself obeys.
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 #[async_trait]

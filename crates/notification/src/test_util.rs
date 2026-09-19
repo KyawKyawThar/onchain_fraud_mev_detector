@@ -13,6 +13,7 @@ use events::primitives::{AlertId, CustomerId, IncidentId};
 use uuid::Uuid;
 
 use crate::delivery::{ChannelSink, DeliveryError};
+use crate::feedback_invite::FeedbackInvite;
 use crate::model::{
     Channel, ChannelKind, DeliveryStatus, LifecycleStage, Subscriber, SubscriberId,
 };
@@ -197,6 +198,8 @@ impl NotificationStore for InMemoryNotificationStore {
 #[derive(Default)]
 pub struct RecordingChannelSink {
     deliveries: Mutex<Vec<(Notice, Channel)>>,
+    /// One entry per delivery, in step with `deliveries`.
+    invites: Mutex<Vec<Option<FeedbackInvite>>>,
     #[allow(clippy::type_complexity)]
     queued_failures: Mutex<HashMap<ChannelKind, Vec<DeliveryError>>>,
 }
@@ -208,6 +211,13 @@ impl RecordingChannelSink {
 
     pub fn deliveries(&self) -> Vec<(Notice, Channel)> {
         self.deliveries.lock().expect("deliveries lock").clone()
+    }
+
+    /// The §19 feedback invitations that rode along with each delivery
+    /// (readiness Epic E) — what a test asserts on to prove that a customer
+    /// was actually given a way to answer.
+    pub fn invites(&self) -> Vec<Option<FeedbackInvite>> {
+        self.invites.lock().expect("invites lock").clone()
     }
 
     /// Queue `error` to be returned on the next `deliver()` call for
@@ -224,7 +234,12 @@ impl RecordingChannelSink {
 
 #[async_trait]
 impl ChannelSink for RecordingChannelSink {
-    async fn deliver(&self, notice: &Notice, channel: &Channel) -> Result<(), DeliveryError> {
+    async fn deliver(
+        &self,
+        notice: &Notice,
+        channel: &Channel,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError> {
         if let Some(queue) = self
             .queued_failures
             .lock()
@@ -239,6 +254,10 @@ impl ChannelSink for RecordingChannelSink {
             .lock()
             .expect("deliveries lock")
             .push((notice.clone(), channel.clone()));
+        self.invites
+            .lock()
+            .expect("invites lock")
+            .push(invite.cloned());
         Ok(())
     }
 }

@@ -80,6 +80,7 @@ use rdkafka::consumer::StreamConsumer;
 use tokio_util::sync::CancellationToken;
 
 use crate::delivery::{ChannelSink, DeliveryError};
+use crate::feedback_invite::Inviter;
 use crate::model::{Channel, LifecycleStage, SubscriberId};
 use crate::notice::{self, Notice};
 use crate::store::{ClaimOutcome, DeliveryOutcome, NotificationStore, StoreError};
@@ -216,6 +217,12 @@ struct DeliveryEngine {
     /// keyed by `dedup_key`, not by "every enabled subscriber", so a cache
     /// wouldn't help it the way it helps the fan-out scan.
     subscribers: Arc<SubscriberSetHandle>,
+    /// Mints the §19 feedback capability for each delivery (readiness Epic E).
+    /// `None` disables the loop entirely — a deployment with no
+    /// `FEEDBACK_GRANT_SECRET` delivers alerts with no way to answer them, and
+    /// `alert_feedback_solicitation_enabled` says so out loud rather than
+    /// leaving an absent series to mean two things.
+    inviter: Option<Inviter>,
     shutdown: CancellationToken,
     publish_backoff: Duration,
 }
@@ -226,6 +233,7 @@ impl DeliveryEngine {
         channels: Arc<dyn ChannelSink>,
         sink: Arc<dyn EventSink>,
         subscribers: Arc<SubscriberSetHandle>,
+        inviter: Option<Inviter>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -233,6 +241,7 @@ impl DeliveryEngine {
             channels,
             sink,
             subscribers,
+            inviter,
             shutdown,
             publish_backoff: event_bus::PUBLISH_BACKOFF,
         }
@@ -329,7 +338,22 @@ impl DeliveryEngine {
             ClaimOutcome::Proceed(id) => id,
         };
 
-        match self.channels.deliver(notice, &channel).await {
+        // The capability is minted per *(incident, recipient)*, here, where
+        // both are known — and only for a confirmed incident, which is the
+        // only thing worth asking about. Minted before the claim is spent so
+        // a delivery that goes out carries the same link whether or not it is
+        // a retry.
+        let invite = self
+            .inviter
+            .as_ref()
+            .zip(notice.incident_id)
+            .and_then(|(inviter, incident)| inviter.invite(incident, owner, Utc::now()));
+
+        match self
+            .channels
+            .deliver(notice, &channel, invite.as_ref())
+            .await
+        {
             Ok(()) => {
                 self.store
                     .record_outcome(delivery_id, DeliveryOutcome::Delivered, Utc::now())
@@ -387,10 +411,11 @@ impl NotificationConsumer {
         channels: Arc<dyn ChannelSink>,
         sink: Arc<dyn EventSink>,
         subscribers: Arc<SubscriberSetHandle>,
+        inviter: Option<Inviter>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            engine: DeliveryEngine::new(store, channels, sink, subscribers, shutdown),
+            engine: DeliveryEngine::new(store, channels, sink, subscribers, inviter, shutdown),
             pending: Mutex::new(BoundedFifoMap::new(
                 DEFAULT_PENDING_CAPACITY,
                 "notification consumer's pending-correlation buffer",
@@ -586,10 +611,11 @@ impl PredictiveConsumer {
         channels: Arc<dyn ChannelSink>,
         sink: Arc<dyn EventSink>,
         subscribers: Arc<SubscriberSetHandle>,
+        inviter: Option<Inviter>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            engine: DeliveryEngine::new(store, channels, sink, subscribers, shutdown),
+            engine: DeliveryEngine::new(store, channels, sink, subscribers, inviter, shutdown),
         }
     }
 
@@ -723,6 +749,16 @@ mod tests {
         }
     }
 
+    /// An inviter whose grants the API service's verifier would accept.
+    fn test_inviter() -> crate::feedback_invite::Inviter {
+        crate::feedback_invite::Inviter::new(
+            secrecy::SecretString::from("test-grant-secret"),
+            "https://app.example".into(),
+            1_000,
+            chrono::Duration::days(30),
+        )
+    }
+
     fn harness() -> Harness {
         let store = Arc::new(InMemoryNotificationStore::new());
         let subscribers = Arc::new(SubscriberSetHandle::new(vec![]));
@@ -733,6 +769,10 @@ mod tests {
             channels.clone(),
             sink.clone(),
             subscribers.clone(),
+            // The feedback loop has its own tests (`feedback_invite`, and the
+            // delivery test below); the routing tests here are about who gets
+            // told, not about what the telling contains.
+            Some(test_inviter()),
             CancellationToken::new(),
         )
         .with_publish_backoff(Duration::from_millis(1));
@@ -777,6 +817,7 @@ mod tests {
             channels.clone(),
             sink,
             subscribers.clone(),
+            Some(test_inviter()),
             CancellationToken::new(),
         )
         .with_publish_backoff(Duration::from_millis(1));

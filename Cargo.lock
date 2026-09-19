@@ -3172,6 +3172,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "feedback-grant"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "secrecy",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "ferroid"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4854,6 +4865,7 @@ dependencies = [
  "db",
  "event-bus",
  "events",
+ "feedback-grant",
  "lettre",
  "metrics",
  "metrics-util",
@@ -5160,6 +5172,26 @@ name = "ort-sys"
 version = "2.0.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
+
+[[package]]
+name = "outbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "db",
+ "event-bus",
+ "events",
+ "metrics",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "p12-keystore"
@@ -6744,6 +6776,7 @@ dependencies = [
  "events",
  "intelligence",
  "metrics",
+ "outbox",
  "rdkafka",
  "redis",
  "reqwest 0.13.4",
@@ -7387,10 +7420,12 @@ dependencies = [
  "db",
  "event-bus",
  "events",
+ "feedback-grant",
  "futures-util",
  "intelligence",
  "jsonwebtoken",
  "metrics",
+ "outbox",
  "prost 0.14.4",
  "rdkafka",
  "redis",

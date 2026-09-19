@@ -15,13 +15,26 @@
 //! order is preserved and the failed row retries next tick. Published rows
 //! are stamped, not deleted (audit: what did we announce, when), which the
 //! partial index on `published_at IS NULL` keeps free.
+//!
+//! # This module is now a binding, not an implementation
+//!
+//! The mechanics moved to [`outbox`] when the §19 feedback loop needed the
+//! same guarantee (readiness Epic E): two hand-written outboxes would be two
+//! sets of answers to "what happens if we crash here". What stays here is the
+//! *binding* — which table, which metric names — because those are this
+//! service's facts, and because a shared crate that also owned the metric
+//! names could rename a dashboard's series from another crate's changelog.
+//!
+//! One behaviour did change: the drain now takes a **lease** on the rows it
+//! claims, so two rule-engine replicas no longer each publish every pending
+//! announcement.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use event_bus::EventSink;
-use events::EventEnvelope;
+use outbox::Outbox;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -31,93 +44,24 @@ pub const OUTBOX_PUBLISHED_TOTAL: &str = "rule_outbox_published_total";
 /// sustained rate, it means Kafka is rejecting the announcements).
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "rule_outbox_publish_failures_total";
 
-/// How many pending rows one tick drains at most. Rule creation is a human
-/// action — a burst beyond this just spills into the next tick.
-const BATCH: i64 = 64;
+/// This service's outbox: the `rule_outbox` table, publishing under the metric
+/// names above. `const` so the binding is one value, not a construction every
+/// call site repeats.
+pub const RULE_OUTBOX: Outbox = Outbox::new("rule_outbox", "rule_outbox");
 
-/// Drain the outbox every `interval` until `shutdown`. Errors are logged and
-/// retried on the next tick — the flusher itself must never die to a broker
-/// blip, or the outbox silently stops being an outbox.
+/// Drain the outbox every `interval` until `shutdown`.
 pub async fn run_flusher(
     pool: PgPool,
     sink: Arc<dyn EventSink>,
     interval: Duration,
     shutdown: CancellationToken,
 ) {
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => {
-                tracing::info!("outbox flusher stopping");
-                return;
-            }
-            () = tokio::time::sleep(interval) => {}
-        }
-        match flush_once(&pool, sink.as_ref()).await {
-            Ok(0) => {}
-            Ok(published) => tracing::debug!(published, "outbox announcements published"),
-            Err(err) => tracing::warn!(error = %err, "outbox flush failed; retrying next tick"),
-        }
-    }
+    RULE_OUTBOX
+        .run_flusher(pool, sink, interval, shutdown)
+        .await
 }
 
-/// One drain pass: publish up to [`BATCH`] pending announcements in id order,
-/// stamping each `published_at` only after its publish succeeds. Returns how
-/// many were published. A publish failure stops the pass (order preserved;
-/// the row retries next tick).
+/// One drain pass. Returns how many announcements were published.
 pub async fn flush_once(pool: &PgPool, sink: &dyn EventSink) -> Result<u64> {
-    let rows = sqlx::query!(
-        r#"SELECT id, envelope AS "envelope: serde_json::Value"
-           FROM rule_outbox
-           WHERE published_at IS NULL
-           ORDER BY id
-           LIMIT $1"#,
-        BATCH,
-    )
-    .fetch_all(pool)
-    .await
-    .context("reading pending outbox rows")?;
-
-    let mut published = 0u64;
-    for row in rows {
-        let envelope: EventEnvelope = match serde_json::from_value(row.envelope) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                // A malformed envelope can never publish: stamp it (with a
-                // loud log) so it can't wedge the drain — the row itself is
-                // the audit trail of what was mis-written.
-                tracing::error!(
-                    outbox_id = row.id,
-                    error = %err,
-                    "outbox row holds an undecodable envelope; marking published to unblock the drain"
-                );
-                mark_published(pool, row.id).await?;
-                continue;
-            }
-        };
-        if let Err(err) = sink.publish(envelope).await {
-            metrics::counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
-            tracing::warn!(
-                outbox_id = row.id,
-                error = %err,
-                "outbox publish failed; row stays pending"
-            );
-            break;
-        }
-        mark_published(pool, row.id).await?;
-        metrics::counter!(OUTBOX_PUBLISHED_TOTAL).increment(1);
-        published += 1;
-    }
-    Ok(published)
-}
-
-async fn mark_published(pool: &PgPool, id: i64) -> Result<()> {
-    sqlx::query!(
-        "UPDATE rule_outbox SET published_at = now() WHERE id = $1",
-        id,
-    )
-    .execute(pool)
-    .await
-    .with_context(|| format!("stamping outbox row {id} published"))?;
-    Ok(())
+    RULE_OUTBOX.flush_once(pool, sink).await
 }

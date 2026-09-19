@@ -140,6 +140,15 @@ pub struct ProjectionConfig {
     /// 24h — a customer's report cadence, not a tuning knob operators need to
     /// touch often, so a coarse env override is enough.
     pub exposure_report_interval: Duration,
+    /// The §19 false-positive SLI exporter (readiness Epic E,
+    /// [`crate::feedback_sli`]): the settled window it measures, the target it
+    /// publishes and the sample size below which the SLO stays disarmed.
+    ///
+    /// Every field has an env override, and the two that decide whether anyone
+    /// is woken up — `target` and `min_adjudications` — have deliberately
+    /// conservative defaults: the README's published number, and a sample big
+    /// enough that a single reviewer's bad afternoon cannot page the team.
+    pub feedback_sli: crate::feedback_sli::ExporterConfig,
 }
 
 /// How to reach ClickHouse. The `clickhouse` crate wants a credential-free base URL plus
@@ -187,6 +196,7 @@ impl ProjectionConfig {
                 "EXPOSURE_REPORT_INTERVAL_SECS",
                 86_400u64,
             )?),
+            feedback_sli: feedback_sli_config()?,
         })
     }
 }
@@ -329,6 +339,76 @@ fn job_deadline(secs: u64) -> Result<Duration> {
         "SIMULATION_JOB_DEADLINE_SECS must be >= 1: 0 would requeue every job"
     );
     Ok(Duration::from_secs(secs))
+}
+
+/// Resolve the §19 false-positive SLI exporter's settings
+/// ([`crate::feedback_sli`]).
+///
+/// Defaults, and why each is what it is:
+///
+/// * **28-day window.** Long enough that a few hundred incidents and the
+///   handful of verdicts they attract make a sample at all; short enough that a
+///   detector fixed last week shows up in the number this month.
+/// * **48-hour settle.** Feedback lands a day or two after the incident, so the
+///   window's tail is always under-adjudicated — measuring it would read
+///   whichever verdicts arrived fastest, which is not a random sample.
+/// * **Target 0.04.** The README's published false-positive target. Exported as
+///   a gauge so the alert rule compares two series rather than carrying a
+///   second copy of the number.
+/// * **30 adjudications.** Below this the SLO stays disarmed: a rate over four
+///   verdicts is noise with a decimal point.
+/// * **Refresh every 5 minutes.** The numerator moves at human speed and each
+///   refresh is a join over a month of incidents; scraping it faster would only
+///   cost ClickHouse.
+fn feedback_sli_config() -> Result<crate::feedback_sli::ExporterConfig> {
+    use crate::feedback_sli::{DisagreementPolicy, ExporterConfig, Settle, SloPolicy, Span};
+
+    let target = fraction("FEEDBACK_FP_RATE_TARGET", 0.04)?;
+    // A cap of 1.0 disables the concentration guard, which is a legitimate
+    // single-tenant deployment; 0.0 would disarm the SLO permanently and is
+    // almost certainly a typo, so it is refused by the range check below
+    // rather than silently honoured.
+    let max_customer_share = fraction("FEEDBACK_SLI_MAX_CUSTOMER_SHARE", 0.5)?;
+    if max_customer_share == 0.0 {
+        anyhow::bail!(
+            "FEEDBACK_SLI_MAX_CUSTOMER_SHARE=0 disarms the false-positive SLO permanently; \
+             use 1.0 to disable the concentration guard instead"
+        );
+    }
+    let disagreement = match env_or("FEEDBACK_DISAGREEMENT_POLICY", "any_false_positive").as_str() {
+        "any_false_positive" => DisagreementPolicy::AnyFalsePositive,
+        "require_unanimous" => DisagreementPolicy::RequireUnanimous,
+        other => anyhow::bail!(
+            "FEEDBACK_DISAGREEMENT_POLICY must be any_false_positive|require_unanimous, \
+             got {other:?}"
+        ),
+    };
+    Ok(ExporterConfig {
+        span: Span(Duration::from_secs(
+            env_parse("FEEDBACK_SLI_WINDOW_DAYS", 28u64)? * 86_400,
+        )),
+        settle: Settle(Duration::from_secs(
+            env_parse("FEEDBACK_SLI_SETTLE_HOURS", 48u64)? * 3_600,
+        )),
+        policy: SloPolicy {
+            target,
+            min_adjudications: env_parse("FEEDBACK_SLI_MIN_ADJUDICATIONS", 30u64)?,
+            max_customer_share,
+            disagreement,
+        },
+        refresh: Duration::from_secs(env_parse("FEEDBACK_SLI_REFRESH_SECS", 300u64)?),
+    })
+}
+
+/// An env-configured fraction, refused at boot if it is not one. A rate
+/// threshold typed as a percentage (`4` for 4%) would otherwise arm an alert
+/// that can never fire — the §19b defect class, in config form.
+fn fraction(key: &str, default: f64) -> Result<f64> {
+    let value: f64 = env_parse(key, default)?;
+    if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+        anyhow::bail!("{key} must be a fraction in [0, 1], got {value}");
+    }
+    Ok(value)
 }
 
 /// Read a required env var, with the variable name in the error.

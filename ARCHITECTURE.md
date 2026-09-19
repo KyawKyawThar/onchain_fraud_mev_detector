@@ -591,6 +591,12 @@ the event store. · **Emits:** `UsageRecorded` (feeds billing).
 - `GET /v1/builders` — builder leaderboard by MEV type.
 - `POST /v1/address/{addr}/screen` — synchronous allow/review/block decision.
 - `POST /v1/rules` — create a custom rule.
+- `POST /v1/incidents/{id}/feedback` — adjudicate an incident (`true_positive` /
+  `false_positive` / `unclear`, plus a closed-set `reason_code`). Authorized by
+  the **signed capability** delivered with the alert, not by the bearer token
+  alone: possession proves the incident was shown to that recipient, which is
+  the only thing that makes the verdict meaningful *and* the only thing that
+  stops any tenant adjudicating any finding. A verdict is never a retraction.
 - `WS  /v1/stream` — live incident stream.
 
 ### WebSocket contract
@@ -722,6 +728,34 @@ evaluation and delivery counters, API p50/p99. Grafana dashboards track the
 key SLOs: end-to-end alert latency (block → notification), simulation
 confirmation rate, false-positive rate.
 
+The false-positive rate is the only SLO whose input comes from outside the
+platform, which makes it the only one that has to be defended against the
+people supplying it. A delivered alert carries a signed, expiring capability
+(`feedback-grant`); the API service verifies it, checks it against the caller's
+own identity, and parks the verdict in a transactional outbox before answering,
+so a broker outage never costs a sample. The projection folds it into the
+`incident_feedback` ledger, and an exporter publishes the rate over a
+**settled** window — false positives over *adjudicated* incidents, never over
+all of them.
+
+Five properties are deliberate. An unadjudicated window publishes no rate at
+all (absent, not zero: an unmeasured rate is not a perfect one). The SLO is
+armed by its own `detection_feedback_slo_armed` gauge, so a rate computed from
+four verdicts cannot page anybody (§15b). It **disarms** when one customer
+dominates the sample rather than reweighting it, because a winsorized rate is a
+number nobody can reproduce from the ledger. Cohorts are never merged:
+`volunteered` verdicts are self-selected and are a product signal, while
+`solicited` ones come from incidents sampled without looking at the finding and
+are the only ones that can back a published claim. And a separate alert fires
+when nothing has been adjudicated for a week — without it, a platform nobody
+reviews reads exactly like a platform with no false positives.
+
+The *policy* — how two customers who disagree are reconciled, when a sample is
+too small or too concentrated — lives in Rust over a fourteen-row contingency
+table the store returns, not inside the SQL that produces it. Grouping belongs
+in the database; deciding what the groups mean belongs somewhere it can be
+named in a type and tested without one.
+
 ---
 
 ## 18. Deployment
@@ -814,7 +848,12 @@ replaying that window (§16) — reproducible byte-for-byte, because replay is.
 - **Labels:** `DetectorTriggered` joined to its `SimulationCompleted` outcome.
   `confirmed: true` with measured profit is a positive; a retraction or
   failed confirmation is a hard negative. The false-positive feedback loop
-  (production-readiness Epic E) supplies corrective relabels.
+  (production-readiness Epic E) is the corrective signal: `AlertFeedbackRecorded`
+  is on the backbone and in the `incident_feedback` ledger, where the §19 SLO
+  reads it. Folding those verdicts into the label rule is a **separate,
+  deliberate step** and has not been taken — the rule is versioned
+  (`LABEL_RULE_ID`) and stamped into every dataset manifest, so changing what a
+  label means changes what every previously exported dataset is comparable to.
 - **Features:** an `ml-features` crate extracts a versioned, deterministic
   feature vector from the same `DetectionCtx` detectors see (§6) —
   transaction structure, gas dynamics, value flows, pool interactions,

@@ -61,6 +61,7 @@ pub mod config;
 pub mod consumer;
 pub mod delivery;
 pub mod email_delivery;
+pub mod feedback_invite;
 pub mod http_delivery;
 pub mod model;
 pub mod notice;

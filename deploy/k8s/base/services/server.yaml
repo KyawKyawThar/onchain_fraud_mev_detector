@@ -101,6 +101,16 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: JWT_SECRET
+            # §19 feedback capability (readiness Epic E) — the VERIFYING half; api-server cannot mint.
+            - name: FEEDBACK_GRANT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: FEEDBACK_GRANT_SECRET
+                  # Optional: a missing key disables the feedback loop on
+                  # this pod instead of keeping it from starting. The loop
+                  # is not worth an outage of everything else it serves.
+                  optional: true
           ports:
             - name: http
               containerPort: 8080

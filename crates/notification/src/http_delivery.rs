@@ -17,6 +17,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::delivery::{count_delivery, DeliveryConfig, DeliveryError};
+use crate::feedback_invite::FeedbackInvite;
 use crate::model::LifecycleStage;
 use crate::notice::Notice;
 use event_bus::Transience;
@@ -36,10 +37,15 @@ struct WebhookPayload<'a> {
     chain: u64,
     addresses: &'a [AccountAddress],
     summary: &'a str,
+    /// Where to tell us this was right or wrong (§19, readiness Epic E). An
+    /// addition, not a rename — this payload is a wire contract with
+    /// customers. Absent when there is nothing to adjudicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feedback_url: Option<&'a str>,
 }
 
-impl<'a> From<&'a Notice> for WebhookPayload<'a> {
-    fn from(notice: &'a Notice) -> Self {
+impl<'a> WebhookPayload<'a> {
+    fn new(notice: &'a Notice, invite: Option<&'a FeedbackInvite>) -> Self {
         Self {
             dedup_key: &notice.dedup_key,
             stage: notice.stage.as_wire_str(),
@@ -48,6 +54,7 @@ impl<'a> From<&'a Notice> for WebhookPayload<'a> {
             chain: notice.chain.id(),
             addresses: &notice.addresses,
             summary: &notice.summary,
+            feedback_url: invite.map(|i| i.url.as_str()),
         }
     }
 }
@@ -59,16 +66,19 @@ struct SlackPayload {
     text: String,
 }
 
-impl From<&Notice> for SlackPayload {
-    fn from(notice: &Notice) -> Self {
+impl SlackPayload {
+    fn new(notice: &Notice, invite: Option<&FeedbackInvite>) -> Self {
         let stage = notice.stage.as_wire_str();
         let severity = notice
             .severity
             .map(|s| <&str>::from(s).to_owned())
             .unwrap_or_else(|| "n/a".into());
+        let feedback = invite
+            .map(|i| format!("\nWas this right? {}", i.url))
+            .unwrap_or_default();
         Self {
             text: format!(
-                "[{stage}] severity={severity} chain={} — {}",
+                "[{stage}] severity={severity} chain={} — {}{feedback}",
                 notice.chain.id(),
                 notice.summary
             ),
@@ -281,14 +291,19 @@ impl HttpDelivery {
         }
     }
 
-    pub async fn deliver_webhook(&self, notice: &Notice, url: &str) -> Result<(), DeliveryError> {
+    pub async fn deliver_webhook(
+        &self,
+        notice: &Notice,
+        url: &str,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError> {
         // Counted on every path, including an SSRF-guard rejection — a
         // refused target is still a delivery *receipt* (`rejected`), not a
         // silent non-event; a live boot caught this the first time the guard
         // fired and the metric didn't move.
         let outcome = match self.ensure_public_target(url).await {
             Ok(()) => {
-                self.post_with_retry(url, &WebhookPayload::from(notice))
+                self.post_with_retry(url, &WebhookPayload::new(notice, invite))
                     .await
             }
             Err(err) => Err(err),
@@ -301,10 +316,11 @@ impl HttpDelivery {
         &self,
         notice: &Notice,
         webhook_url: &str,
+        invite: Option<&FeedbackInvite>,
     ) -> Result<(), DeliveryError> {
         let outcome = match self.ensure_public_target(webhook_url).await {
             Ok(()) => {
-                self.post_with_retry(webhook_url, &SlackPayload::from(notice))
+                self.post_with_retry(webhook_url, &SlackPayload::new(notice, invite))
                     .await
             }
             Err(err) => Err(err),
@@ -350,6 +366,7 @@ mod tests {
             addresses: vec![AccountAddress::repeat_byte(0xAB)],
             owner: Some(CustomerId::new()),
             summary: "confirmed sandwich".into(),
+            incident_id: Some(events::primitives::IncidentId::new()),
             occurred_at: chrono::Utc::now(),
         }
     }
@@ -358,9 +375,10 @@ mod tests {
     fn webhook_payload_shape_is_pinned() {
         let n = Notice {
             dedup_key: "fixed-key".into(),
+            incident_id: None,
             ..notice()
         };
-        let json = serde_json::to_value(WebhookPayload::from(&n)).expect("serialize");
+        let json = serde_json::to_value(WebhookPayload::new(&n, None)).expect("serialize");
         assert_eq!(
             json,
             serde_json::json!({
@@ -372,6 +390,29 @@ mod tests {
                 "addresses": ["0xabababababababababababababababababababab"],
                 "summary": "confirmed sandwich",
             })
+        );
+    }
+
+    #[test]
+    fn the_webhook_payload_carries_a_feedback_link_when_one_was_minted() {
+        // The §19 loop's last mile: a customer who never receives a link
+        // never sends a verdict, and the SLO stays permanently disarmed with
+        // nothing in the platform looking broken.
+        let n = notice();
+        let invite = FeedbackInvite {
+            url: "https://app.example/incidents/x/feedback?grant=tok".into(),
+            cohort: events::feedback::FeedbackCohort::Solicited,
+        };
+        let json = serde_json::to_value(WebhookPayload::new(&n, Some(&invite))).expect("serialize");
+        assert_eq!(json["feedback_url"], invite.url);
+
+        // And it is *absent*, not null, when there is nothing to adjudicate —
+        // this payload is a wire contract, so an added field has to be
+        // invisible to customers who do not use it.
+        let without = serde_json::to_value(WebhookPayload::new(&n, None)).expect("serialize");
+        assert!(
+            without.get("feedback_url").is_none(),
+            "an absent invite must not add a null field to a customer's payload"
         );
     }
 

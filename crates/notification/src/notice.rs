@@ -53,6 +53,19 @@ pub struct Notice {
     /// own timestamp, not the original provisional alert's — each stage
     /// measures its own event-to-delivery hop.
     pub occurred_at: DateTime<Utc>,
+    /// The confirmed incident this notice is about, when it is about one
+    /// (§19, readiness Epic E) — the subject of the feedback capability the
+    /// delivery mints. `None` for everything that is not a confirmed incident:
+    /// a provisional alert has not been adjudicated by *simulation* yet, let
+    /// alone by a human, and a retraction is the platform withdrawing its own
+    /// finding rather than asking about it.
+    ///
+    /// Note what this field is **not**: a per-recipient invitation. A
+    /// [`Notice`] is a deterministic function of one domain event (see the
+    /// module docs), and the grant is a function of the event *and* the
+    /// recipient, so it is built at delivery time and passed beside the
+    /// notice, never folded into it.
+    pub incident_id: Option<IncidentId>,
 }
 
 impl Notice {
@@ -87,6 +100,8 @@ impl Notice {
                 event.kind,
                 event.confidence.get() * 100.0
             ),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -107,6 +122,11 @@ impl Notice {
     /// them through here would mean a second cross-topic correlation buffer
     /// (alert_id → addresses) purely for repeated payload context; not worth
     /// the complexity since addresses play no part in routing.
+    ///
+    /// This is the one constructor that sets [`Notice::incident_id`]: a
+    /// confirmed incident is the only thing worth asking a customer to
+    /// adjudicate (§19, readiness Epic E). A provisional alert has not been
+    /// simulated yet, and a retraction is the platform changing its own mind.
     pub fn from_incident_created(
         event: &IncidentCreated,
         chain: Chain,
@@ -125,6 +145,7 @@ impl Notice {
                 "confirmed {:?} incident: ${:.2} profit, ${:.2} victim loss",
                 event.kind, event.profit, event.victim_loss
             ),
+            incident_id: Some(event.incident_id),
             occurred_at,
         }
     }
@@ -150,6 +171,8 @@ impl Notice {
             addresses: vec![event.address],
             owner: Some(event.owner),
             summary: event.explanation.clone(),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -184,6 +207,8 @@ impl Notice {
             addresses: vec![event.address],
             owner: Some(event.customer_id),
             summary: event.headline.clone(),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -216,6 +241,8 @@ impl Notice {
             addresses: vec![event.address],
             owner: None,
             summary: format!("sanctions match: {} ({})", event.list, event.entry),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -250,6 +277,8 @@ impl Notice {
                 event.kind,
                 event.confidence.get() * 100.0
             ),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -281,6 +310,8 @@ impl Notice {
                 "{:?} liquidation risk on {:?}: health factor {:.3} ({:.1}% from liquidation)",
                 event.severity, event.protocol, event.health_factor, event.distance_pct
             ),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -319,6 +350,8 @@ impl Notice {
                     ""
                 }
             ),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }
@@ -350,6 +383,8 @@ impl Notice {
             addresses: Vec::new(),
             owner: None,
             summary: format!("retracted: {reason}"),
+            // Not a confirmed incident: nothing to ask a customer about.
+            incident_id: None,
             occurred_at,
         }
     }

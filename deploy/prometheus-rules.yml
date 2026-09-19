@@ -354,12 +354,12 @@ groups:
           description: "event_store_append_errors_total has been increasing for 5m — the audit trail's write path is degraded. A `permanent`-labeled error is a bug (encode failure); `transient` points at ClickHouse. The Kafka ingest retries a failed flush indefinitely rather than commit past evidence it did not store, so while this fires ingest is wedged on purpose: kafka_consumer_lag{consumer=\"event-store\"} climbs, and nothing is lost."
 
       # Threshold provenance (§19b): derived from the committed capacity model,
-      # not typed. 4609880285 = 1.25 × the model's 1× projection of `payload`
+      # not typed. 4609990535 = 1.25 × the model's 1× projection of `payload`
       # bytes per day at the end of year one (`just capacity-plan` prints it as
       # the drift ceiling). crates/capacity/tests/committed.rs fails the build
       # if this number and the model disagree, so neither can move alone.
       - alert: EventStoreGrowthAboveCapacityPlan
-        expr: sum(increase(event_store_appended_payload_bytes_total[1d])) > 4609880285
+        expr: sum(increase(event_store_appended_payload_bytes_total[1d])) > 4609990535
         for: 6h
         labels:
           severity: warning
@@ -662,6 +662,143 @@ groups:
   # to remove. Deploy kube-state-metrics and that rule becomes worth writing;
   # until then these are the backstop for a scraped or in-process run, and the
   # CronJob's own status is the primary.
+  # ── The false-positive SLO (§19, readiness Epic E) ──────────────────────
+  #
+  # The one number in this file that a *customer*, not the platform, produces.
+  # A delivered alert carries a signed capability (`feedback-grant`); the API
+  # service verifies it and parks the verdict in `feedback_outbox`; the
+  # simulation projection folds it into `incident_feedback`, and exports the
+  # gauges below once every refresh interval (simulation::feedback_sli).
+  #
+  # Three properties make these rules unusual, and all three are deliberate:
+  #
+  #   * **The rate may be absent.** A window nobody adjudicated has no
+  #     false-positive rate — not a zero. The rule below does not fire then,
+  #     which is correct: there is nothing to judge.
+  #   * **Everything is per cohort.** `sample="volunteered"` is self-selected
+  #     (people report what annoyed them) and is a product signal;
+  #     `sample="solicited"` comes from incidents the platform picked without
+  #     looking at the finding, and is the only one that can back a published
+  #     claim. They are never merged, and every series here carries the label
+  #     so each rule is a one-to-one match rather than an `on()` join.
+  #   * **The SLO declares its arming state.** Too small a sample, or too much
+  #     of it from one customer, and `detection_feedback_slo_armed` goes to 0
+  #     rather than the series vanishing (§15b).
+  #
+  # Every threshold is category 2 (an exported gauge): the target, the arming
+  # minimum, the concentration cap and the refresh interval are all published
+  # by the exporter, so a deployment that retunes one moves its own alerts and
+  # this file never carries a second copy of the policy.
+  - name: mevwatch-detection-quality
+    rules:
+      # The SLO itself. Fires only for a cohort whose sample is armed, so a
+      # quiet month cannot page anyone — and, for the same reason, never fires
+      # on a platform nobody reviews. That blind spot is what
+      # FalsePositiveFeedbackUnarmed below exists to cover; the two are a pair
+      # and neither is complete alone.
+      - alert: FalsePositiveRateAboveTarget
+        expr: |
+          (detection_feedback_false_positive_rate > detection_feedback_false_positive_rate_target)
+          and (detection_feedback_slo_armed == 1)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.sample }} feedback puts the false-positive rate above target"
+          description: "detection_feedback_false_positive_rate{sample=\"{{ $labels.sample }}\"} has been above its target for an hour, over a window with enough adjudications to judge. This is the README's accuracy claim, measured in production rather than against fixtures — treat it as a detection-quality incident, not a monitoring one. A `solicited` breach is the serious one: that sample is not self-selected. Start with WHY: alert_feedback_recorded_total is labelled by reason_code, and a spike in `threshold_too_sensitive` on one detector is a config change where `our_own_activity` is a labelling problem. `just feedback-sli` prints the same numbers the alert saw."
+
+      # Monitoring the monitor (§15). An SLO nobody supplies data for is not a
+      # met SLO, and the rule above is silent in precisely that case — so the
+      # absence of adjudications has to be its own alert or the whole loop can
+      # rot quietly. Watched on the volunteered cohort, which is always on;
+      # the solicited path has its own rule below.
+      #
+      # `max_over_time`, not `min_over_time`: the condition is "never armed all
+      # week", not "was disarmed at some point". The exporter publishes
+      # `slo_armed = 0` before its first read (§15b — the gauge must exist
+      # before it can be true), so a `min` over the window would fire on every
+      # deployment restart and mean nothing.
+      - alert: FalsePositiveFeedbackUnarmed
+        expr: max_over_time(detection_feedback_slo_armed{sample="volunteered"}[7d]) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The false-positive SLO has had too little feedback to arm for a week"
+          description: "detection_feedback_slo_armed{sample=\"volunteered\"} has been 0 for seven days: the settled window holds fewer than detection_feedback_min_adjudications decided verdicts, so FalsePositiveRateAboveTarget cannot fire whatever the real rate is. Check in order: are alerts carrying feedback links at all (alert_feedback_solicitation_enabled, alert_feedback_solicited_total), are submissions being refused (alert_feedback_refused_total), and did the platform raise anything in the window (detection_feedback_window_incidents). This is the failure mode that reads as success: a green false-positive dashboard on a platform nobody reviews."
+
+      # Sampling bias, made visible. One tenant adjudicating most of the window
+      # turns a "platform" rate into one customer's opinion wearing a
+      # platform's name — so the SLO disarms rather than quoting it, and this
+      # rule says why. Deliberately NOT a reweighting: a winsorized rate is a
+      # number nobody can reproduce from the ledger.
+      - alert: FeedbackSampleConcentrated
+        expr: detection_feedback_top_customer_share > detection_feedback_concentration_cap
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "One customer dominates the false-positive sample"
+          description: "A single customer has contributed more than detection_feedback_concentration_cap of the settled window's verdicts, so the false-positive SLO has disarmed itself rather than publish one tenant's opinion as a platform rate. Either the loop has one enthusiastic user and needs more reach, or somebody is deliberately poisoning the sample — `just feedback-sli` names the customer (the metric deliberately does not: an unbounded id set has no business in a time series, §19). Raising FEEDBACK_SLI_MAX_CUSTOMER_SHARE to silence this is a decision about what the number means, not a tuning change."
+
+      # The settle delay, checked against the lag it assumes. The window ends
+      # `settle` before now so verdicts have arrived; if the measured p95 lag
+      # exceeds that, the window is closing before the evidence lands and the
+      # rate is computed from whichever verdicts came fastest — which is not a
+      # random sample.
+      - alert: FeedbackSettleTooShort
+        expr: detection_feedback_lag_p95_seconds > detection_feedback_window_settle_seconds
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Verdicts are arriving after the SLI window has closed"
+          description: "The p95 incident-to-verdict lag is longer than FEEDBACK_SLI_SETTLE_HOURS, so the settled window is being measured before its evidence has landed — and the verdicts that do make it in are the fast ones, which over-represent the obvious false positives. Raise the settle delay to the measured p95 (`just feedback-sli` prints both). This is the parameter that is most tempting to shorten because the dashboard looks stale; the staleness is the measurement working."
+
+      # The exporter's own liveness. Every gauge above is a gauge, so a dead
+      # exporter leaves the last values standing indefinitely — indistinguishable
+      # from a healthy, unchanging platform, which is the same defect class as a
+      # rule that cannot reach its threshold. Six missed refreshes at whatever
+      # cadence this deployment configured.
+      - alert: FalsePositiveSliStale
+        expr: |
+          detection_feedback_sli_age_seconds
+          > detection_feedback_sli_refresh_seconds * 6
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The false-positive SLI has not refreshed in six cycles"
+          description: "simulation-projection has not completed a detection_feedback_false_positive_rate read for six refresh intervals. The gauges are frozen at their last values and the SLO above is now judging stale numbers. Usual cause is ClickHouse: the SLI query joins incident_feedback against incident_analytics, and the exporter deliberately leaves the previous values standing on a read failure rather than zeroing them (a broken store must not read as 'the platform got perfect'). Check the projection's logs for 'false-positive SLI read failed'."
+
+      # STRUCTURAL: a count that should be zero. A refused submission is not
+      # yet a lost verdict — the caller saw a 503 and can retry — but it is the
+      # loop closing, and the customer who tried is exactly the one least
+      # likely to try again.
+      - alert: AlertFeedbackRefused
+        expr: sum(increase(alert_feedback_refused_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Customers are being turned away when they try to tell us we were wrong"
+          description: "alert_feedback_refused_total is rising: the API service could not durably park a verdict, which means Postgres is unreachable or the feedback_outbox insert is failing. The verdict was NOT accepted (the caller got a 503, deliberately, rather than a comfortable 202 over a record we would have dropped). Check the api-service pods' database connectivity first; feedback_outbox_publish_failures_total is the separate, downstream signal for a broker problem, and those rows are safe on disk."
+
+      # Solicitation health: the platform is asking and nobody is answering.
+      # Armed by its own gauge so a deployment that does not solicit stays
+      # silent rather than firing forever (§15b).
+      - alert: SolicitedFeedbackIgnored
+        expr: |
+          (sum(increase(alert_feedback_solicited_total{cohort="solicited"}[7d])) > 100)
+          and (sum(increase(alert_feedback_recorded_total{cohort="solicited"}[7d])) == 0)
+          and (max(alert_feedback_solicitation_enabled) == 1)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nobody is answering the feedback the platform asks for"
+          description: "More than a hundred solicited feedback invitations went out in the last week and not one came back, so the only cohort whose rate can back a published accuracy claim will never arm. Usually this is the last mile rather than apathy: check that FEEDBACK_LINK_BASE points at a surface that actually renders the form, that the grant secret matches between notification and the API service (a mismatch shows up as 403s), and that the link is surviving whatever renders the alert."
+
   - name: mevwatch-copilot-governance
     rules:
       - alert: CopilotFabricatedCitations

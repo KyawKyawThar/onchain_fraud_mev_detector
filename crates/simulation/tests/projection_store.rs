@@ -26,8 +26,9 @@ use events::{DomainEvent, EventEnvelope};
 use revm::primitives::B256;
 use simulation::projection::{IncidentProjection, IncidentStatus};
 use simulation::store::{
-    AnalyticsRow, ClickhouseAnalytics, IncidentAnalytics, IncidentFilters, IncidentStore, JobState,
-    JobUpdate, PgIncidentStore, WalletExposureStore,
+    AnalyticsRow, ClickhouseAnalytics, FeedbackLedger, FeedbackRow, FeedbackSliStore,
+    IncidentAnalytics, IncidentFilters, IncidentStore, JobState, JobUpdate, PgIncidentStore,
+    WalletExposureStore,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
@@ -528,4 +529,220 @@ async fn mev_exposure_excludes_retracted_incidents_and_totals_by_kind() {
     );
     assert_eq!(since.incident_count, 1);
     assert_eq!(since.incidents[0].incident_id, b_incident.0);
+}
+
+/// The §19 false-positive SLI, end to end against real ClickHouse (readiness
+/// Epic E). This is the part of the loop whose correctness lives in SQL, and
+/// four of its behaviours are invisible to a unit test:
+///
+/// * the window is keyed on **incident creation**, so an incident outside it
+///   contributes to neither half however recently it was adjudicated;
+/// * a customer who changes their mind is counted **once**, by `argMax` over
+///   `submitted_at` — `ReplacingMergeTree` merges are eventual, and the two
+///   rows are still physically present when this reads them;
+/// * the contingency table it returns carries the *evidence* (did anyone say
+///   false positive / true positive / unclear), never the verdict — the fold
+///   is `feedback_sli`'s, and this test pins the two halves agreeing;
+/// * cohorts stay separate all the way from the column to the counts.
+///
+/// Timestamps here are **relative to now**, unlike the `at(…)` fixtures the
+/// rest of this file uses. `incident_feedback` carries a TTL on
+/// `submitted_at`, and a 1970-dated row is fifty years past it: ClickHouse
+/// drops it during the insert's own merge, and the table reads back empty —
+/// which looks exactly like a broken write path.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers ClickHouse)"]
+async fn the_false_positive_sli_counts_the_settled_window_and_dedups_revisions() {
+    use events::feedback::FeedbackCohort;
+    use events::primitives::CustomerId;
+    use simulation::feedback_sli::{Sli, SloPolicy, Window};
+
+    let container = ClickHouse::default()
+        .start()
+        .await
+        .expect("start ClickHouse container");
+    let http_port = container
+        .get_host_port_ipv4(CLICKHOUSE_PORT)
+        .await
+        .expect("ClickHouse port");
+    let client = clickhouse::Client::default()
+        .with_url(format!("http://127.0.0.1:{http_port}"))
+        .with_user("default")
+        .with_database("default");
+    simulation::ch_migrate::migrate(&client)
+        .await
+        .expect("apply ClickHouse migrations");
+    let store = ClickhouseAnalytics::new(client.clone());
+
+    // Four incidents inside the window, one long outside it. Days before
+    // `now`, because of the TTL noted above.
+    let now = Utc::now();
+    let days_ago = |d: i64| now - chrono::Duration::days(d);
+    let mut ids = Vec::new();
+    for (i, created_at) in [
+        days_ago(10),
+        days_ago(9),
+        days_ago(8),
+        days_ago(7),
+        days_ago(200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let alert = AlertId::new();
+        let incident = IncidentId::new();
+        let mut proj = IncidentProjection::new();
+        let created_env = env(
+            DomainEvent::IncidentCreated(IncidentCreated {
+                incident_id: incident,
+                alert_id: alert,
+                kind: AlertKind::Sandwich,
+                txs: vec![B256::repeat_byte(i as u8)],
+                profit: 10.0,
+                victim_loss: 5.0,
+                impact_usd: None,
+                severity: Severity::High,
+                suggested_action: events::primitives::SuggestedAction::Escalate,
+                victim_address: None,
+                victim_loss_usd: None,
+            }),
+            created_at,
+        );
+        proj.apply(&created_env);
+        let record = proj.record(&alert).expect("row");
+        store
+            .append(&AnalyticsRow::from_event(&created_env, record))
+            .await
+            .expect("append analytics");
+        ids.push(incident);
+    }
+
+    let alice = CustomerId::new();
+    let bob = CustomerId::new();
+    let verdict =
+        |incident: IncidentId, customer: CustomerId, v: &str, cohort: FeedbackCohort, d: i64| {
+            FeedbackRow {
+                incident_id: incident.0,
+                customer_id: customer.0,
+                verdict: v.to_owned(),
+                reason_code: "unspecified".to_owned(),
+                cohort: cohort.as_str().to_owned(),
+                reason: String::new(),
+                submitted_at: days_ago(d),
+            }
+        };
+    let volunteered = FeedbackCohort::Volunteered;
+
+    // ids[0]: Alice said false positive, then changed her mind — the later
+    // submission wins and this is a TRUE positive, counted once.
+    store
+        .record_feedback(&verdict(ids[0], alice, "false_positive", volunteered, 5))
+        .await
+        .expect("write");
+    store
+        .record_feedback(&verdict(ids[0], alice, "true_positive", volunteered, 4))
+        .await
+        .expect("write");
+    // ids[1]: Alice and Bob disagree — the cell carries both flags.
+    store
+        .record_feedback(&verdict(ids[1], alice, "true_positive", volunteered, 5))
+        .await
+        .expect("write");
+    store
+        .record_feedback(&verdict(ids[1], bob, "false_positive", volunteered, 5))
+        .await
+        .expect("write");
+    // ids[2]: looked at, could not decide — adjudicated by nobody.
+    store
+        .record_feedback(&verdict(ids[2], alice, "unclear", volunteered, 5))
+        .await
+        .expect("write");
+    // ids[3]: the platform asked about this one — the solicited cohort.
+    store
+        .record_feedback(&verdict(
+            ids[3],
+            bob,
+            "false_positive",
+            FeedbackCohort::Solicited,
+            5,
+        ))
+        .await
+        .expect("write");
+    // ids[4]: outside the window, and called noise — must not count at all.
+    store
+        .record_feedback(&verdict(ids[4], alice, "false_positive", volunteered, 5))
+        .await
+        .expect("write");
+
+    let window = Window {
+        from: days_ago(30),
+        to: days_ago(1),
+    };
+    let evidence = store.feedback_evidence(window).await.expect("sli read");
+
+    assert_eq!(
+        evidence.incidents, 4,
+        "the incident created 200 days ago is outside the window"
+    );
+    assert_eq!(
+        evidence.verdicts, 5,
+        "five (incident, customer) pairs inside the window; the revision \
+         collapses and the out-of-window verdict does not join"
+    );
+    assert_eq!(evidence.top_customer_verdicts, 3, "Alice has three of them");
+
+    // The contingency table, read back as the store found it.
+    let cell = |cohort: FeedbackCohort, fp: bool, tp: bool, unclear: bool| {
+        evidence
+            .cells
+            .iter()
+            .find(|c| {
+                c.cohort == cohort && c.any_fp == fp && c.any_tp == tp && c.any_unclear == unclear
+            })
+            .map(|c| c.incidents)
+            .unwrap_or(0)
+    };
+    assert_eq!(cell(volunteered, false, true, false), 1, "ids[0], revised");
+    assert_eq!(cell(volunteered, true, true, false), 1, "ids[1], contested");
+    assert_eq!(cell(volunteered, false, false, true), 1, "ids[2], unclear");
+    assert_eq!(cell(FeedbackCohort::Solicited, true, false, false), 1);
+
+    // Lag: every verdict here landed four or five days after its incident.
+    let p50 = evidence.lag_p50_seconds.expect("a lag was measured");
+    assert!(
+        (2.0 * 86_400.0..8.0 * 86_400.0).contains(&p50),
+        "median lag should be a few days, got {p50}s"
+    );
+
+    // And the fold on top of it, under the default policy: the contested
+    // incident is a false positive, `unclear` is neither, and the cohorts
+    // never mix.
+    let policy = SloPolicy {
+        target: 0.04,
+        min_adjudications: 1,
+        max_customer_share: 1.0,
+        disagreement: simulation::feedback_sli::DisagreementPolicy::AnyFalsePositive,
+    };
+    let sli = Sli::new(window, evidence, policy);
+    let v = sli.cohort(volunteered).counts;
+    assert_eq!(
+        (v.adjudicated, v.false_positives, v.true_positives),
+        (2, 1, 1)
+    );
+    let s = sli.cohort(FeedbackCohort::Solicited).counts;
+    assert_eq!((s.adjudicated, s.false_positives), (1, 1));
+    assert_eq!(v.coverage(), Some(0.5));
+
+    // An empty window is not a perfect one.
+    let quiet = store
+        .feedback_evidence(Window {
+            from: days_ago(400),
+            to: days_ago(300),
+        })
+        .await
+        .expect("sli read");
+    assert_eq!(quiet.incidents, 0);
+    assert_eq!(quiet.lag_p50_seconds, None, "no lag, not a lag of zero");
+    let quiet = Sli::new(window, quiet, policy);
+    assert_eq!(quiet.cohort(volunteered).counts.false_positive_rate(), None);
 }

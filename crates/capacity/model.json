@@ -50,6 +50,7 @@
     },
     "PreliminaryAlertCreated": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "Hits collapse to fewer alerts than triggers after correlation." },
     "SimulationRequested": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "One simulation per preliminary alert (§7)." },
+    "AlertFeedbackRecorded": { "terms": [{ "driver": "customer", "per": 1 }], "rationale": "Analyst verdicts on incidents (§19 false-positive SLO, readiness Epic E). Human-rate and assumed: one adjudication per customer per day is generous for a review workflow nobody is obliged to use, and deliberately so — this is the one event the platform wants MORE of, since the SLO stays disarmed without a sample. Replace with the measured alert_feedback_recorded_total rate once the loop has run." },
     "SimulationCompleted": { "terms": [{ "driver": "alerting_block", "per": 1.5 }], "rationale": "One result per simulation." },
     "IncidentCreated": { "terms": [{ "driver": "alerting_block", "per": 1.2 }], "rationale": "Confirmed share of simulated alerts." },
     "IncidentRetracted": { "terms": [{ "driver": "alerting_block", "per": 0.3 }], "rationale": "The unconfirmed share, plus reorg retractions." },

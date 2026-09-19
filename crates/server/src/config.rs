@@ -68,6 +68,11 @@ const DEFAULT_SCREENING_SANCTIONS_REFRESH_SECS: u64 = 60;
 /// unset (§11, Sprint 14 t3).
 const DEFAULT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Feedback outbox drain interval when `FEEDBACK_FLUSH_SECS` is unset (§19,
+/// readiness Epic E). Two seconds, matching `RULE_OUTBOX_FLUSH_SECS`: the row
+/// is already durable, so this is latency to a dashboard, not to a customer.
+const DEFAULT_FEEDBACK_FLUSH_SECS: u64 = 2;
+
 /// All runtime configuration for the public §11 API service: where to bind,
 /// where to reach the three internal services it fronts, and the JWT
 /// verification settings that gate every `/v1` route.
@@ -89,6 +94,19 @@ pub struct Config {
     /// cache uses, a different key prefix (`screen_rl:`).
     pub redis_url: SecretString,
     pub jwt: JwtConfig,
+    /// The §19 feedback capability's shared secret (readiness Epic E), the
+    /// verifying half. Same value as notification's minting secret and
+    /// deliberately *not* `JWT_SECRET`: one secret for identity and another
+    /// for capabilities is what stops a bearer token being spent as a grant,
+    /// and vice versa.
+    ///
+    /// **Optional on purpose.** Unset, `POST /v1/incidents/{id}/feedback`
+    /// answers 503 and every other route serves normally. A required key
+    /// would let an optional feature take the public API down: in production
+    /// `app-secrets` is provisioned outside this repo, and a pod whose
+    /// `secretKeyRef` names a missing key never starts — so forgetting one
+    /// key during rollout would take `/screen` offline along with it.
+    pub feedback_grant_secret: Option<SecretString>,
     /// Kafka settings for the `/v1/stream` WebSocket's consumer (§11).
     pub kafka: KafkaConfig,
     /// Capacity of the broadcast channel `WS /v1/stream` fans alerts out
@@ -110,6 +128,14 @@ pub struct Config {
     /// `usage_channel_capacity`, for the same p50 < 100ms SLO reason.
     /// Defaults to [`DEFAULT_AUDIT_CHANNEL_CAPACITY`].
     pub audit_channel_capacity: usize,
+    /// How often the §19 feedback outbox is drained onto the backbone
+    /// (readiness Epic E, see `src/feedback.rs`). There is no queue capacity
+    /// to configure: a verdict is durable in Postgres before the customer is
+    /// answered, so this interval only decides how quickly it reaches the
+    /// ledger — seconds, not milliseconds, because nothing downstream is
+    /// waiting on it. From `FEEDBACK_FLUSH_SECS`, defaulting to
+    /// [`DEFAULT_FEEDBACK_FLUSH_SECS`].
+    pub feedback_flush_interval: Duration,
     /// Client-side deadline on the screening gRPC read (§11), from
     /// `SCREENING_DEADLINE_MS` (default
     /// [`crate::intelligence_client::DEFAULT_SCREENING_DEADLINE`]). `/screen`
@@ -202,6 +228,10 @@ impl Config {
                 secret: SecretString::from(env("JWT_SECRET")?),
                 issuer: env("JWT_ISSUER")?,
             },
+            feedback_grant_secret: std::env::var("FEEDBACK_GRANT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(SecretString::from),
             kafka: KafkaConfig {
                 brokers: env("KAFKA_BROKERS")?,
                 group_id: env("SERVER_KAFKA_GROUP")?,
@@ -218,6 +248,10 @@ impl Config {
                 "AUDIT_CHANNEL_CAPACITY",
                 DEFAULT_AUDIT_CHANNEL_CAPACITY,
             )?,
+            feedback_flush_interval: Duration::from_secs(env_parse(
+                "FEEDBACK_FLUSH_SECS",
+                DEFAULT_FEEDBACK_FLUSH_SECS,
+            )?),
             screening_deadline,
             screening_rate_limit_per_minute: screening_rate_limit_per_minute()?,
             screening_degradation: screening_degradation(

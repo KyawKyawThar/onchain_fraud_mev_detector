@@ -138,6 +138,8 @@ Running the tree on kind found that **no pod could have started**: `deploy/Docke
 
 Result (`mainnet-peak`, 4 blocks/s, everything on one laptop): p99 ≤ 250ms with the API idle; with 100 qps of co-resident API load, queue wait rose from 2.5ms to 500ms and the fast path reached 1.000s, exactly on budget. That 4× came entirely from contention, and it would have been invisible to the old alert.
 
+**In production, the number comes from customers.** The CI gate above measures the platform against fixtures and replayed windows; neither can see the incident that was technically correct and still noise to the person who received it. `POST /v1/incidents/{id}/feedback` is the only input to that judgement, and the §19 panel divides false positives by **adjudicated** incidents — not by all of them, because dividing into everything nobody read turns a 10% rate among reviewed findings into a reassuring 0.4%. Three consequences follow. A window nobody adjudicated publishes **no rate at all** (absent, not zero). The window is *settled*, ending a delay before now, because verdicts arrive days late and the fastest ones are not a random sample. And the SLO arms on its own gauge, so a rate over four verdicts cannot page anyone — with a second alert for the failure that looks like success, a platform nobody reviews.
+
 **Not measured yet:** anything on real mainnet transactions, any staging run at 1.5× projected peak, and the screening budgets against a real stack.
 
 ## Why Rust
@@ -180,6 +182,7 @@ GET  /v1/incidents                       paginated incident feed
 GET  /v1/audit/incident/{id}             the complete event stream for one incident
 GET  /v1/builders                        builder leaderboard by MEV type
 POST /v1/rules                           create a custom alert rule
+POST /v1/incidents/{id}/feedback         adjudicate an incident: true_positive / false_positive / unclear
 WS   /v1/stream                          live incidents: provisional → confirmed → retracted
 ```
 

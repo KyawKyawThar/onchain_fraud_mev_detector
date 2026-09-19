@@ -103,6 +103,15 @@ data:
   SMTP_PORT: "587"
   SMTP_FROM: alerts@mevwatch.example
 
+  # ── §19 feedback loop (readiness Epic E) ──────────────────────
+  # Where a delivered alert's "was this right?" link points. Read by
+  # notification only, and only together with FEEDBACK_GRANT_SECRET (boot
+  # refuses one without the other). Override per environment.
+  FEEDBACK_LINK_BASE: https://app.mevwatch.example
+  # Incidents per thousand the platform ASKS about — the solicited cohort, the
+  # only one whose false-positive rate can back a published claim.
+  FEEDBACK_SOLICIT_PERMILLE: "50"
+
   # ── §10 block-production pipeline (intelligence) ──────────────
   # Public MEV-Boost relay data APIs; relay identity is configuration, never
   # code. Empty ⇒ header facts only.

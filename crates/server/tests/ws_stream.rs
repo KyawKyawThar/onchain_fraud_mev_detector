@@ -12,6 +12,7 @@
 //! purely the WS transport contract.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -65,6 +66,10 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
     // and what gets audit-recorded.
     let (usage, _) = server::usage::UsageRecorder::channel(16);
     let (audit, _) = server::audit::AuditRecorder::channel(16);
+    // The §19 feedback loop is inert here — this file exercises the WS
+    // transport, and `src/http.rs`'s tests cover the capability and the
+    // durable write.
+    let feedback = Arc::new(server::feedback::test_util::InMemoryFeedbackQueue::new());
 
     let state = AppState {
         intelligence: IntelligenceClient::connect_lazy("http://127.0.0.1:50051".to_owned())
@@ -76,6 +81,10 @@ async fn spawn_server() -> (SocketAddr, tokio::sync::broadcast::Sender<WsMessage
         alerts: alerts_tx.clone(),
         usage,
         audit,
+        feedback,
+        feedback_grant: Some(Arc::new(feedback_grant::VerifyingKey::from_secret(
+            SecretString::from("test-grant-secret"),
+        ))),
         // This file exercises the WS transport only; rules/events/policies
         // get inert doubles (`src/http.rs`'s tests cover `POST /v1/rules`
         // and the policy surface).

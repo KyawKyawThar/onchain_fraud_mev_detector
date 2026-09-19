@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::feedback_invite::FeedbackInvite;
 use crate::model::Channel;
 use crate::notice::Notice;
 
@@ -38,9 +39,22 @@ impl event_bus::Transience for DeliveryError {
 /// Where notices go. One call per `(notice, channel)` pair — a subscriber
 /// with three channels makes three deliveries, each independently
 /// retryable and independently claimed/receipted in the store.
+///
+/// `invite` is the §19 feedback capability for *this recipient* (readiness
+/// Epic E) — a separate parameter rather than a field on [`Notice`] on
+/// purpose: a notice is a deterministic function of one domain event, and a
+/// grant is a function of the event *and* who is being told about it. Folding
+/// it in would make the notice per-recipient and quietly break that contract.
+/// `None` when there is nothing to adjudicate (anything but a confirmed
+/// incident) or when this deployment mints no grants.
 #[async_trait]
 pub trait ChannelSink: Send + Sync {
-    async fn deliver(&self, notice: &Notice, channel: &Channel) -> Result<(), DeliveryError>;
+    async fn deliver(
+        &self,
+        notice: &Notice,
+        channel: &Channel,
+        invite: Option<&FeedbackInvite>,
+    ) -> Result<(), DeliveryError>;
 }
 
 /// Tuning shared by every HTTP-based channel (webhook/Slack/PagerDuty) —

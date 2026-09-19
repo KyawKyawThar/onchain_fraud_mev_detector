@@ -1,0 +1,18 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "cohort": "solicited",
+      "customer_id": "00000000-0000-0000-0000-0000000000c0",
+      "incident_id": "00000000-0000-0000-0000-00000000001c",
+      "reason": "our own rebalancer, not a sandwich",
+      "reason_code": "our_own_activity",
+      "submitted_at": "2023-11-14T22:13:20Z",
+      "verdict": "false_positive"
+    },
+    "type": "AlertFeedbackRecorded"
+  },
+  "schema_version": 1
+}

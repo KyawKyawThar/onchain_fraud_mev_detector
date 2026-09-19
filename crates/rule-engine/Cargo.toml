@@ -58,6 +58,9 @@ alloy-primitives = { workspace = true }
 # `EventSink`/`publish_resilient`) — never raw rdkafka in the logic; rdkafka
 # itself only to build the `StreamConsumer` the seam drives.
 event-bus = { workspace = true }
+# The shared transactional-outbox seam (§20); this crate binds it to
+# `rule_outbox` in src/outbox.rs.
+outbox = { workspace = true }
 rdkafka = { workspace = true }
 anyhow = { workspace = true }
 

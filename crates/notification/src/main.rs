@@ -176,6 +176,23 @@ async fn run(cfg: &Config) -> Result<()> {
     // own Kafka consumer group and DLQ, so a lagging or down predictive
     // pipeline can never stall the incident-stream consumer below (see the
     // module docs).
+    // One inviter, cloned into both consumers: the minting key is loaded once
+    // and the sampling rate is one number for the whole service.
+    let inviter = cfg.feedback.as_ref().map(|feedback| {
+        notification::feedback_invite::Inviter::new(
+            feedback.grant_secret.clone(),
+            feedback.link_base.clone(),
+            feedback.solicit_permille,
+            chrono::Duration::from_std(feedback.grant_ttl).unwrap_or(chrono::Duration::MAX),
+        )
+    });
+    if inviter.is_none() {
+        tracing::info!(
+            "feedback loop disabled (FEEDBACK_GRANT_SECRET/FEEDBACK_LINK_BASE unset): alerts \
+             will carry no way for a customer to tell us they were wrong"
+        );
+    }
+
     let predictive_task = if cfg.predictive.enabled {
         let predictive_dlq = event_bus::dlq::DeadLetterQueue::ensure_from_env(
             &cfg.kafka.brokers,
@@ -189,16 +206,18 @@ async fn run(cfg: &Config) -> Result<()> {
             Arc::clone(&channels),
             Arc::clone(&sink),
             Arc::clone(&subscribers),
+            inviter.clone(),
         );
         let predictive_shutdown = shutdown.clone();
         Some(tokio::spawn(async move {
-            let (store, channels, sink, subscribers) = predictive_collaborators;
+            let (store, channels, sink, subscribers, inviter) = predictive_collaborators;
             run_predictive_supervised(
                 &predictive_cfg,
                 store,
                 channels,
                 sink,
                 subscribers,
+                inviter,
                 &predictive_dlq,
                 predictive_shutdown,
             )
@@ -209,7 +228,14 @@ async fn run(cfg: &Config) -> Result<()> {
         None
     };
 
-    let engine = NotificationConsumer::new(store, channels, sink, subscribers, shutdown.clone());
+    let engine = NotificationConsumer::new(
+        store,
+        channels,
+        sink,
+        subscribers,
+        inviter.clone(),
+        shutdown.clone(),
+    );
     health.set_ready(true);
     let result = engine
         .run(consumer_handle, RETRY_BACKOFF, Some(&dlq), &shutdown)
@@ -243,6 +269,7 @@ async fn run_predictive_supervised(
     channels: Arc<dyn ChannelSink>,
     sink: Arc<dyn EventSink>,
     subscribers: Arc<SubscriberSetHandle>,
+    inviter: Option<notification::feedback_invite::Inviter>,
     dlq: &DeadLetterQueue,
     shutdown: CancellationToken,
 ) {
@@ -268,6 +295,7 @@ async fn run_predictive_supervised(
             Arc::clone(&channels),
             Arc::clone(&sink),
             Arc::clone(&subscribers),
+            inviter.clone(),
             shutdown.clone(),
         );
 

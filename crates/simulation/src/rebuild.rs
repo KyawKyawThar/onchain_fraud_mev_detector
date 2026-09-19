@@ -118,8 +118,8 @@ use uuid::Uuid;
 use crate::ch_migrate;
 use crate::projection_consumer::{consumed_event_types, ProjectionConsumer};
 use crate::store::{
-    AnalyticsRow, ClickhouseAnalytics, CrossChainFindingStore, IncidentAnalytics, IncidentPage,
-    IncidentStore, JobUpdate, PersistError, PgIncidentStore,
+    AnalyticsRow, ClickhouseAnalytics, CrossChainFindingStore, FeedbackLedger, FeedbackRow,
+    IncidentAnalytics, IncidentPage, IncidentStore, JobUpdate, PersistError, PgIncidentStore,
 };
 
 /// Rows per page when scanning a table to fingerprint it. Bounds the
@@ -134,7 +134,11 @@ const PG_TABLES: [&str; 3] = ["incidents", "sim_jobs", "cross_chain_findings"];
 
 /// The ClickHouse tables that hold data (the materialized view is a trigger,
 /// not a table, and stays attached to whatever `incident_analytics` names).
-const CH_TABLES: [&str; 2] = ["incident_analytics", "incident_timing_rollup"];
+const CH_TABLES: [&str; 3] = [
+    "incident_analytics",
+    "incident_timing_rollup",
+    "incident_feedback",
+];
 
 /// Which of the simulation service's stores a rebuild acts on — the operator's
 /// `--model` choice, before any connection has been made.
@@ -283,6 +287,13 @@ impl IncidentAnalytics for NoWrites {
 }
 
 #[async_trait]
+impl FeedbackLedger for NoWrites {
+    async fn record_feedback(&self, _row: &FeedbackRow) -> Result<(), PersistError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl CrossChainFindingStore for NoWrites {
     async fn upsert_finding(
         &self,
@@ -393,6 +404,7 @@ impl SimulationReadModel {
         if let Some(client) = clickhouse {
             Self::digest_analytics(client, &mut digest).await?;
             Self::digest_timing_rollup(client, &mut digest).await?;
+            Self::digest_feedback(client, &mut digest).await?;
         }
         Ok(digest)
     }
@@ -582,6 +594,61 @@ impl SimulationReadModel {
         Ok(())
     }
 
+    /// Fingerprint `incident_feedback` **through the same dedup the read path
+    /// uses** (§19, readiness Epic E).
+    ///
+    /// The ledger is a `ReplacingMergeTree`, so the physical rows are not a
+    /// stable value: a redelivered event and a revised verdict both leave two
+    /// rows behind until a merge that may never come (dedup is per partition,
+    /// and a revision made in a later month lands in a different one). The
+    /// `argMax` collapse is what `FeedbackSliStore::feedback_counts` reads,
+    /// and a fingerprint owes the rebuild the same view — the same argument
+    /// `digest_timing_rollup` makes for its `SummingMergeTree`.
+    ///
+    /// `recorded_at` is excluded, like `incident_analytics.appended_at`: it is
+    /// `now()` at write time, so a faithful rebuild necessarily differs on it.
+    ///
+    /// The `max(submitted_at)` is aliased to `last_submitted_at` and **not** to
+    /// the column's own name: ClickHouse resolves the alias back into the other
+    /// aggregates in the same `SELECT` and rejects the query as an aggregate
+    /// inside an aggregate. The same trap is called out in
+    /// `store::mev_exposure`'s `minIf`; a container-backed test is what catches
+    /// it, since nothing about the SQL looks wrong until it runs.
+    async fn digest_feedback(client: &Client, digest: &mut ModelDigest) -> Result<(), ModelError> {
+        let mut cursor = client
+            .query(
+                "SELECT incident_id, customer_id, \
+                 argMax(verdict, submitted_at) AS verdict, \
+                 argMax(reason, submitted_at)  AS reason, \
+                 max(submitted_at)             AS last_submitted_at \
+                 FROM incident_feedback \
+                 GROUP BY incident_id, customer_id \
+                 ORDER BY incident_id, customer_id",
+            )
+            .fetch::<FeedbackScanRow>()
+            .map_err(|err| ModelError::wrap("scanning incident_feedback", err))?;
+
+        while let Some(row) = cursor
+            .next()
+            .await
+            .map_err(|err| ModelError::wrap("reading incident_feedback", err))?
+        {
+            let encoded = RowEncoder::new()
+                .text(&row.incident_id.to_string())
+                .text(&row.customer_id.to_string())
+                .text(&row.verdict)
+                .text(&row.reason)
+                .timestamp(row.last_submitted_at)
+                .finish();
+            insert(
+                digest,
+                format!("incident_feedback/{}/{}", row.incident_id, row.customer_id),
+                encoded,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Fingerprint `incident_timing_rollup` **through an aggregating read**.
     ///
     /// A `SummingMergeTree` holds one row per key per unmerged part, and merges
@@ -663,6 +730,23 @@ struct TimingScanRow {
     slot_of_day: u16,
     incident_count: u64,
     total_victim_loss_usd: f64,
+}
+
+/// The ClickHouse scan row for the deduped `incident_feedback` read. Separate
+/// from [`FeedbackRow`] (the `Serialize`-only insert shape) so the read side
+/// names exactly the derived columns and never `recorded_at`.
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct FeedbackScanRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    incident_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    customer_id: Uuid,
+    verdict: String,
+    reason: String,
+    /// `max(submitted_at)` under an alias that is not the column's own name —
+    /// see [`SimulationReadModel::digest_feedback`].
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    last_submitted_at: DateTime<Utc>,
 }
 
 #[async_trait]
@@ -767,13 +851,17 @@ impl Stageable for SimulationReadModel {
             Some(pool) => Arc::new(PgIncidentStore::new(pool.clone())),
             None => Arc::new(NoWrites),
         };
-        let analytics: Arc<dyn IncidentAnalytics> = match staged_ch {
+        let analytics: Arc<dyn IncidentAnalytics> = match &staged_ch {
+            Some(client) => Arc::new(ClickhouseAnalytics::new(client.clone())),
+            None => Arc::new(NoWrites),
+        };
+        let feedback: Arc<dyn FeedbackLedger> = match staged_ch {
             Some(client) => Arc::new(ClickhouseAnalytics::new(client)),
             None => Arc::new(NoWrites),
         };
 
         Ok(Arc::new(SimulationProjector {
-            consumer: ProjectionConsumer::new(incidents, analytics, cross_chain),
+            consumer: ProjectionConsumer::new(incidents, analytics, cross_chain, feedback),
             _staging_pool: staging_pool,
         }))
     }
@@ -915,7 +1003,18 @@ async fn count_clickhouse(client: &Client) -> Result<u64, ModelError> {
         .fetch_one()
         .await
         .map_err(|err| ModelError::wrap("counting incident_timing_rollup", err))?;
-    Ok(analytics + rollup)
+    // Counted through the same dedup the read path uses, for the reason the
+    // rollup is counted through its aggregate: a `ReplacingMergeTree`'s
+    // unmerged parts are not a divergence.
+    let feedback: u64 = client
+        .query(
+            "SELECT count() FROM (SELECT incident_id FROM incident_feedback \
+             GROUP BY incident_id, customer_id)",
+        )
+        .fetch_one()
+        .await
+        .map_err(|err| ModelError::wrap("counting incident_feedback", err))?;
+    Ok(analytics + rollup + feedback)
 }
 
 /// Read one column, turning a decode failure into a named [`ModelError`] rather
@@ -974,7 +1073,14 @@ mod tests {
         assert!(PG_TABLES.contains(&"incidents"));
         assert!(PG_TABLES.contains(&"sim_jobs"));
         assert!(PG_TABLES.contains(&"cross_chain_findings"));
-        assert_eq!(CH_TABLES, ["incident_analytics", "incident_timing_rollup"]);
+        assert_eq!(
+            CH_TABLES,
+            [
+                "incident_analytics",
+                "incident_timing_rollup",
+                "incident_feedback"
+            ]
+        );
     }
 
     /// A rebuild must replay every type the live consumer subscribes to,
@@ -983,6 +1089,7 @@ mod tests {
     fn the_replayed_event_types_are_the_consumed_ones() {
         let projector = SimulationProjector {
             consumer: ProjectionConsumer::new(
+                Arc::new(NoWrites),
                 Arc::new(NoWrites),
                 Arc::new(NoWrites),
                 Arc::new(NoWrites),

@@ -45,6 +45,13 @@ const MIGRATIONS: &[Migration] = &[
         up: include_str!("../migrations/0005_create_incident_analytics_next.up.sql"),
         down: include_str!("../migrations/0005_create_incident_analytics_next.down.sql"),
     },
+    // The analyst-feedback ledger (§19, readiness Epic E) — the table the
+    // false-positive SLI reads, joined against incident_analytics.
+    Migration {
+        version: "0006_create_incident_feedback",
+        up: include_str!("../migrations/0006_create_incident_feedback.up.sql"),
+        down: include_str!("../migrations/0006_create_incident_feedback.down.sql"),
+    },
 ];
 
 /// The simulation service's migrator, driven explicitly through the

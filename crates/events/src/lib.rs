@@ -23,6 +23,7 @@ pub mod chain;
 pub mod copilot;
 pub mod cross_chain;
 pub mod detection;
+pub mod feedback;
 pub mod intelligence;
 /// Where a keyed record lands on a topic — shared by the producer's partitioner
 /// and the capacity plan.
@@ -245,6 +246,7 @@ pub enum DomainEvent {
     // Detection (§6)
     DetectorTriggered(detection::DetectorTriggered),
     PreliminaryAlertCreated(detection::PreliminaryAlertCreated),
+    AlertFeedbackRecorded(feedback::AlertFeedbackRecorded),
 
     // Simulation (§7)
     SimulationRequested(simulation::SimulationRequested),
@@ -351,7 +353,9 @@ impl DomainEvent {
             | BlockCanonicalized(_)
             | BlockReverted(_)
             | BlockFinalized(_) => EventFamily::Chain,
-            DetectorTriggered(_) | PreliminaryAlertCreated(_) => EventFamily::Detection,
+            DetectorTriggered(_) | PreliminaryAlertCreated(_) | AlertFeedbackRecorded(_) => {
+                EventFamily::Detection
+            }
             SimulationRequested(_)
             | SimulationCompleted(_)
             | IncidentCreated(_)
@@ -409,6 +413,11 @@ impl DomainEvent {
             // of that incident's history, and a reviewer pulling the trail
             // must see it beside the events it cites.
             IncidentNarrativeDrafted(e) => Some(e.incident_id),
+            // A customer's adjudication belongs to the incident's audit trail
+            // for the same reason the narrative does: "a human looked at this
+            // and called it noise" is part of that incident's history, and the
+            // reviewer pulling the trail is exactly who needs to see it.
+            AlertFeedbackRecorded(e) => Some(e.incident_id),
             RawBlockReceived(_)
             | BlockAssembled(_)
             | BlockCanonicalized(_)
@@ -517,6 +526,13 @@ impl DomainEvent {
             // on the same partition as the first, so a reader sees the two in
             // the order they were produced rather than in broker order.
             IncidentNarrativeDrafted(e) => Some(PartitionKey::Incident(e.incident_id)),
+            // Keyed by the incident rather than by the customer who wrote it:
+            // the ledger's last-writer key is per `(incident, customer)`, and
+            // a customer who changes their mind must have their two verdicts
+            // land in submission order. Customer-keying would spread one
+            // incident's verdicts across partitions for no gain — nobody reads
+            // "this customer's feedback" as a stream.
+            AlertFeedbackRecorded(e) => Some(PartitionKey::Incident(e.incident_id)),
             // Keyed by owner: a customer's rule drafts are one ordered
             // stream, the same way `RuleCreated` and every other
             // customer-scoped record on the backbone is.
@@ -631,7 +647,13 @@ impl DomainEvent {
             // destroyed — putting those addresses on the *record of their
             // destruction* would defeat the destruction.
             | RetentionPolicyChanged(_)
-            | RetentionPurgeCompleted(_) => Vec::new(),
+            | RetentionPurgeCompleted(_)
+            // A verdict is about the platform's own finding, not about a
+            // party. The incident it adjudicates carries whatever addresses
+            // are in scope; repeating them here would make "a customer called
+            // this noise" findable by address, which is a statement about the
+            // customer's opinion, not about the address.
+            | AlertFeedbackRecorded(_) => Vec::new(),
         }
     }
 }
