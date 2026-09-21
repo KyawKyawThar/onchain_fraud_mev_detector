@@ -33,9 +33,11 @@ use crate::link_candidate::{
 };
 use crate::model::{
     address_key, parse_address_key, plan_reversal, AddressKeyError, AttributionRecord,
-    EntityRecord, EntityStatus, LabelRecord, MergeId, MergeLogEntry, ReversalPlan, SanctionEntry,
-    UnreversibleReason,
+    EntityRecord, EntityStatus, LabelKind, LabelRecord, ListSyncRecord, MergeId, MergeLogEntry,
+    PromotionRecord, ReversalPlan, SanctionEntry, SanctionsList, SnapshotStatus, SnapshotSummary,
+    UnreversibleReason, Validators,
 };
+use crate::sanctions_list::{self, Designation, ListContent, PromotionFacts};
 
 /// A failure reading or writing the Postgres store. Carries the retry/skip
 /// *decision* (its [`event_bus::Transience`] impl) so every consumer handles
@@ -494,6 +496,161 @@ pub trait SanctionsStore: Send + Sync {
         }
         Ok(out)
     }
+}
+
+/// A fetched list version to stage.
+#[derive(Debug, Clone, Copy)]
+pub struct StagedSnapshot<'a> {
+    pub list: SanctionsList,
+    pub content: &'a ListContent,
+    pub source: &'a str,
+    pub fetched_at: DateTime<Utc>,
+}
+
+/// "The current version is still what the source serves", as of `synced_at`.
+#[derive(Debug, Clone, Copy)]
+pub struct Confirmation<'a> {
+    pub list: SanctionsList,
+    /// Must equal the list's current digest, or nothing is written.
+    pub digest: &'a str,
+    pub synced_at: DateTime<Utc>,
+    pub source: &'a str,
+    pub validators: &'a Validators,
+}
+
+/// Replace a list's current version with a staged snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionRequest {
+    pub promotion_id: Uuid,
+    pub list: SanctionsList,
+    pub digest: String,
+    /// The version this promotion was decided against. If another promotion
+    /// landed since, nothing is written ([`PromotionOutcome::Conflict`]).
+    pub expected_previous: Option<String>,
+    pub promoted_by: String,
+    pub promoted_at: DateTime<Utc>,
+    /// The freshness stamp: the fetch time of the content being promoted.
+    pub synced_at: DateTime<Utc>,
+    pub source: String,
+    pub validators: Validators,
+}
+
+/// What a promotion did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    Promoted(PromotionRecord),
+    /// The list's current version was not the one the request expected.
+    Conflict {
+        current: Option<String>,
+    },
+    /// No snapshot with that digest is staged for the list.
+    UnknownSnapshot,
+}
+
+/// Sanctions lists as versioned snapshots, plus the freshness ledger (§8.5).
+/// See [`crate::sanctions_list`] for the model and [`crate::sanctions_sync`]
+/// for the flow over it.
+///
+/// Its own seam rather than more methods on [`SanctionsStore`]: that trait is
+/// the read model every consumer shares through [`StoreSeams`]; this one has
+/// two callers (the sync and the freshness monitor) and a transactional write
+/// no consumer should be able to reach.
+///
+/// Every write is monotonic or conditional: freshness and failure stamps never
+/// move backwards, a confirmation only lands on the current version, and a
+/// promotion only lands on the version it was decided against. So a slow run
+/// finishing after a newer one, or two runs racing, cannot corrupt a list.
+#[async_trait]
+pub trait SanctionsListStore: Send + Sync {
+    /// The database clock — the one clock every freshness stamp is taken
+    /// from, so a skewed job pod cannot make a list look fresher than it is.
+    async fn db_now(&self) -> Result<DateTime<Utc>, StoreError>;
+
+    /// Every list the ledger has a row for, in name order.
+    async fn list_syncs(&self) -> Result<Vec<ListSyncRecord>, StoreError>;
+
+    /// One list's row; a never-seen list reads as [`ListSyncRecord::empty`].
+    async fn list_sync(&self, list: SanctionsList) -> Result<ListSyncRecord, StoreError> {
+        Ok(self
+            .list_syncs()
+            .await?
+            .into_iter()
+            .find(|record| record.list == list)
+            .unwrap_or_else(|| ListSyncRecord::empty(list)))
+    }
+
+    /// Record a failed attempt with a one-line reason.
+    async fn record_sync_failure(
+        &self,
+        list: SanctionsList,
+        failed_at: DateTime<Utc>,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Store a fetched version, keyed by its digest. Idempotent: re-staging
+    /// the same content only advances `last_fetched_at`.
+    async fn stage_snapshot(&self, snapshot: &StagedSnapshot<'_>) -> Result<(), StoreError>;
+
+    /// Mark a staged snapshot refused, with the checks it failed.
+    async fn refuse_snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// A stored snapshot and its designations.
+    async fn snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+    ) -> Result<Option<(SnapshotSummary, ListContent)>, StoreError>;
+
+    /// The list's live `sanctions` rows as a version — what screening sees,
+    /// compared against the current version to catch drift.
+    async fn live_content(&self, list: SanctionsList) -> Result<ListContent, StoreError>;
+
+    /// Stamp the current version confirmed. `Ok(false)` when `digest` is not
+    /// the current version (a promotion landed since); nothing is written.
+    async fn confirm_unchanged(&self, confirmation: &Confirmation<'_>) -> Result<bool, StoreError>;
+
+    /// In one transaction: make the list's live rows equal the snapshot, log
+    /// the promotion and its diff, advance the ledger, and queue the
+    /// announcements ([`crate::sanctions_list::announcements`]) in the
+    /// sanctions outbox.
+    async fn promote(&self, request: &PromotionRequest) -> Result<PromotionOutcome, StoreError>;
+
+    /// Promotions of the list whose post-commit effects have not finished,
+    /// oldest first.
+    async fn pending_promotions(
+        &self,
+        list: SanctionsList,
+    ) -> Result<Vec<PromotionRecord>, StoreError>;
+
+    async fn mark_effects_applied(
+        &self,
+        promotion_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// The list's promotions, newest first.
+    async fn promotions(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<PromotionRecord>, StoreError>;
+
+    /// The list's snapshots, most recently fetched first.
+    async fn snapshots(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<SnapshotSummary>, StoreError>;
+
+    /// When the oldest announcement still waiting in the sanctions outbox was
+    /// queued; `None` when it is drained. The outbox carries retroactive
+    /// `SanctionHit`s — hard alerts — so how long one has waited is watched.
+    async fn oldest_pending_announcement(&self) -> Result<Option<DateTime<Utc>>, StoreError>;
 }
 
 /// The four Postgres-backed seams a pass needs, bundled so a consumer's
@@ -1747,6 +1904,606 @@ impl SanctionsStore for PgIntelligenceStore {
             rows: u64::try_from(rows).unwrap_or(0),
             last_imported_at,
         })
+    }
+}
+
+// ── Sanctions list versioning (§8.5) ─────────────────────────────
+// Every query below is runtime-checked (`FromRow` / `query_scalar`), like
+// every read of a table newer than the offline `.sqlx` cache.
+
+fn parse_list(raw: &str) -> Result<SanctionsList, StoreError> {
+    raw.parse()
+        .map_err(|_| StoreError::malformed(format!("unknown sanctions list {raw:?}")))
+}
+
+fn to_u64(n: i64, what: &str) -> Result<u64, StoreError> {
+    u64::try_from(n).map_err(|_| StoreError::malformed(format!("{what} {n} is negative")))
+}
+
+fn to_i64(n: u64, what: &str) -> Result<i64, StoreError> {
+    i64::try_from(n).map_err(|_| StoreError::malformed(format!("{what} {n} overflows BIGINT")))
+}
+
+fn parse_addresses(raw: &[String]) -> Result<Vec<AccountAddress>, StoreError> {
+    raw.iter()
+        .map(|a| parse_address_key(a).map_err(Into::into))
+        .collect()
+}
+
+#[derive(sqlx::FromRow)]
+struct ListSyncRow {
+    list_name: String,
+    synced_at: Option<DateTime<Utc>>,
+    entries: Option<i64>,
+    content_digest: Option<String>,
+    content_changed_at: Option<DateTime<Utc>>,
+    source: Option<String>,
+    http_etag: Option<String>,
+    http_last_modified: Option<String>,
+    failed_at: Option<DateTime<Utc>>,
+    failure_reason: Option<String>,
+    effects_pending: bool,
+}
+
+impl TryFrom<ListSyncRow> for ListSyncRecord {
+    type Error = StoreError;
+
+    fn try_from(row: ListSyncRow) -> Result<Self, StoreError> {
+        Ok(ListSyncRecord {
+            list: parse_list(&row.list_name)?,
+            synced_at: row.synced_at,
+            entries: row
+                .entries
+                .map(|n| to_u64(n, "sanctions_list_syncs.entries"))
+                .transpose()?,
+            content_digest: row.content_digest,
+            content_changed_at: row.content_changed_at,
+            source: row.source,
+            validators: Validators {
+                etag: row.http_etag,
+                last_modified: row.http_last_modified,
+            },
+            failed_at: row.failed_at,
+            failure_reason: row.failure_reason,
+            effects_pending: row.effects_pending,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SnapshotRow {
+    list_name: String,
+    digest: String,
+    entries: i64,
+    source: String,
+    first_fetched_at: DateTime<Utc>,
+    last_fetched_at: DateTime<Utc>,
+    status: String,
+    refusal: Option<String>,
+}
+
+impl TryFrom<SnapshotRow> for SnapshotSummary {
+    type Error = StoreError;
+
+    fn try_from(row: SnapshotRow) -> Result<Self, StoreError> {
+        Ok(SnapshotSummary {
+            list: parse_list(&row.list_name)?,
+            entries: to_u64(row.entries, "sanctions_list_snapshots.entries")?,
+            status: row.status.parse::<SnapshotStatus>().map_err(|_| {
+                StoreError::malformed(format!("unknown snapshot status {:?}", row.status))
+            })?,
+            digest: row.digest,
+            source: row.source,
+            first_fetched_at: row.first_fetched_at,
+            last_fetched_at: row.last_fetched_at,
+            refusal: row.refusal,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PromotionRow {
+    promotion_id: Uuid,
+    list_name: String,
+    digest: String,
+    previous_digest: Option<String>,
+    entries: i64,
+    added: Vec<String>,
+    changed: Vec<String>,
+    removed: Vec<String>,
+    promoted_by: String,
+    promoted_at: DateTime<Utc>,
+    effects_applied_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<PromotionRow> for PromotionRecord {
+    type Error = StoreError;
+
+    fn try_from(row: PromotionRow) -> Result<Self, StoreError> {
+        Ok(PromotionRecord {
+            promotion_id: row.promotion_id,
+            list: parse_list(&row.list_name)?,
+            digest: row.digest,
+            previous_digest: row.previous_digest,
+            entries: to_u64(row.entries, "sanctions_list_promotions.entries")?,
+            added: parse_addresses(&row.added)?,
+            changed: parse_addresses(&row.changed)?,
+            removed: parse_addresses(&row.removed)?,
+            promoted_by: row.promoted_by,
+            promoted_at: row.promoted_at,
+            effects_applied_at: row.effects_applied_at,
+        })
+    }
+}
+
+const PROMOTION_COLUMNS: &str = "promotion_id, list_name, digest, previous_digest, entries, \
+     added, changed, removed, promoted_by, promoted_at, effects_applied_at";
+
+/// Read `(address, entry)` rows into a version.
+fn content_from_rows(rows: Vec<(String, String)>) -> Result<ListContent, StoreError> {
+    let designations = rows
+        .into_iter()
+        .map(|(address, entry)| {
+            Ok(Designation {
+                address: parse_address_key(&address)?,
+                entry,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(ListContent::new(designations))
+}
+
+#[async_trait]
+impl SanctionsListStore for PgIntelligenceStore {
+    async fn db_now(&self) -> Result<DateTime<Utc>, StoreError> {
+        Ok(sqlx::query_scalar("SELECT now()")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn list_syncs(&self) -> Result<Vec<ListSyncRecord>, StoreError> {
+        let rows = sqlx::query_as::<_, ListSyncRow>(
+            "SELECT s.list_name, s.synced_at, s.entries, s.content_digest,
+                    s.content_changed_at, s.source, s.http_etag, s.http_last_modified,
+                    s.failed_at, s.failure_reason,
+                    EXISTS (SELECT 1 FROM sanctions_list_promotions p
+                            WHERE p.list_name = s.list_name
+                              AND p.effects_applied_at IS NULL) AS effects_pending
+             FROM sanctions_list_syncs s ORDER BY s.list_name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn record_sync_failure(
+        &self,
+        list: SanctionsList,
+        failed_at: DateTime<Utc>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO sanctions_list_syncs (list_name, failed_at, failure_reason)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (list_name) DO UPDATE SET
+                 failed_at      = EXCLUDED.failed_at,
+                 failure_reason = EXCLUDED.failure_reason
+             WHERE sanctions_list_syncs.failed_at IS NULL
+                OR sanctions_list_syncs.failed_at <= EXCLUDED.failed_at",
+        )
+        .bind(list.as_str())
+        .bind(failed_at)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn stage_snapshot(&self, snapshot: &StagedSnapshot<'_>) -> Result<(), StoreError> {
+        let list = snapshot.list.as_str();
+        let entries = to_i64(snapshot.content.entries(), "snapshot entries")?;
+        let mut tx = self.pool.begin().await?;
+        // `xmax = 0` is true only for a freshly inserted row: the one case the
+        // designations still need writing. A concurrent stager of the same
+        // content blocks on the conflicting row until this commits, then
+        // takes the update branch — so the entries are written exactly once.
+        let inserted: bool = sqlx::query_scalar(
+            "INSERT INTO sanctions_list_snapshots
+                 (list_name, digest, entries, source, first_fetched_at, last_fetched_at, status)
+             VALUES ($1, $2, $3, $4, $5, $5, 'staged')
+             ON CONFLICT (list_name, digest) DO UPDATE SET
+                 last_fetched_at = GREATEST(sanctions_list_snapshots.last_fetched_at,
+                                            EXCLUDED.last_fetched_at),
+                 source          = EXCLUDED.source
+             RETURNING (xmax = 0)",
+        )
+        .bind(list)
+        .bind(snapshot.content.digest())
+        .bind(entries)
+        .bind(snapshot.source)
+        .bind(snapshot.fetched_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if inserted {
+            let (addresses, entry_texts): (Vec<String>, Vec<String>) = snapshot
+                .content
+                .iter()
+                .map(|(address, entry)| (address_key(address), entry.to_owned()))
+                .unzip();
+            sqlx::query(
+                "INSERT INTO sanctions_list_snapshot_entries (list_name, digest, address, entry)
+                 SELECT $1, $2, t.address, t.entry
+                 FROM UNNEST($3::text[], $4::text[]) AS t(address, entry)",
+            )
+            .bind(list)
+            .bind(snapshot.content.digest())
+            .bind(&addresses)
+            .bind(&entry_texts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn refuse_snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        // A snapshot that was promoted before stays `promoted`: a later refusal
+        // of the same content (the policy tightened) is recorded, not a demotion
+        // of history.
+        sqlx::query(
+            "UPDATE sanctions_list_snapshots
+             SET status = CASE WHEN status = 'promoted' THEN status ELSE 'refused' END,
+                 refusal = $3
+             WHERE list_name = $1 AND digest = $2",
+        )
+        .bind(list.as_str())
+        .bind(digest)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+    ) -> Result<Option<(SnapshotSummary, ListContent)>, StoreError> {
+        let Some(row) = sqlx::query_as::<_, SnapshotRow>(
+            "SELECT list_name, digest, entries, source, first_fetched_at, last_fetched_at,
+                    status, refusal
+             FROM sanctions_list_snapshots WHERE list_name = $1 AND digest = $2",
+        )
+        .bind(list.as_str())
+        .bind(digest)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT address, entry FROM sanctions_list_snapshot_entries
+             WHERE list_name = $1 AND digest = $2",
+        )
+        .bind(list.as_str())
+        .bind(digest)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Some((row.try_into()?, content_from_rows(rows)?)))
+    }
+
+    async fn live_content(&self, list: SanctionsList) -> Result<ListContent, StoreError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT address, entry FROM sanctions WHERE list_name = $1")
+                .bind(list.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+        content_from_rows(rows)
+    }
+
+    async fn confirm_unchanged(&self, confirmation: &Confirmation<'_>) -> Result<bool, StoreError> {
+        let updated = sqlx::query(
+            "UPDATE sanctions_list_syncs SET
+                 synced_at          = GREATEST(COALESCE(synced_at, $3), $3),
+                 source             = $4,
+                 http_etag          = $5,
+                 http_last_modified = $6
+             WHERE list_name = $1 AND content_digest = $2",
+        )
+        .bind(confirmation.list.as_str())
+        .bind(confirmation.digest)
+        .bind(confirmation.synced_at)
+        .bind(confirmation.source)
+        .bind(&confirmation.validators.etag)
+        .bind(&confirmation.validators.last_modified)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn promote(&self, request: &PromotionRequest) -> Result<PromotionOutcome, StoreError> {
+        let list = request.list.as_str();
+        let mut tx = self.pool.begin().await?;
+
+        // The ledger row is the per-list lock: every promotion of this list
+        // serializes here, and the check below is against a value no one else
+        // can change until this commits.
+        sqlx::query(
+            "INSERT INTO sanctions_list_syncs (list_name) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(list)
+        .execute(&mut *tx)
+        .await?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT content_digest FROM sanctions_list_syncs WHERE list_name = $1 FOR UPDATE",
+        )
+        .bind(list)
+        .fetch_one(&mut *tx)
+        .await?;
+        if current != request.expected_previous {
+            return Ok(PromotionOutcome::Conflict { current });
+        }
+
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sanctions_list_snapshots
+                            WHERE list_name = $1 AND digest = $2)",
+        )
+        .bind(list)
+        .bind(&request.digest)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Ok(PromotionOutcome::UnknownSnapshot);
+        }
+
+        let next: Vec<(String, String)> = sqlx::query_as(
+            "SELECT address, entry FROM sanctions_list_snapshot_entries
+             WHERE list_name = $1 AND digest = $2",
+        )
+        .bind(list)
+        .bind(&request.digest)
+        .fetch_all(&mut *tx)
+        .await?;
+        let next = content_from_rows(next)?;
+        let live: Vec<(String, String)> =
+            sqlx::query_as("SELECT address, entry FROM sanctions WHERE list_name = $1")
+                .bind(list)
+                .fetch_all(&mut *tx)
+                .await?;
+        // Diffed against the live rows, not the previous snapshot: the live
+        // rows are what screening sees, so this also repairs any drift.
+        let diff = sanctions_list::diff(&content_from_rows(live)?, &next);
+
+        let removed: Vec<String> = diff.removed.iter().map(address_key).collect();
+        if !removed.is_empty() {
+            sqlx::query("DELETE FROM sanctions WHERE list_name = $1 AND address = ANY($2)")
+                .bind(list)
+                .bind(&removed)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let (upsert_addresses, upsert_entries): (Vec<String>, Vec<String>) = diff
+            .added
+            .iter()
+            .chain(&diff.changed)
+            .map(|d| (address_key(&d.address), d.entry.clone()))
+            .unzip();
+        if !upsert_addresses.is_empty() {
+            sqlx::query(
+                "INSERT INTO sanctions (address, list_name, entry, listed_at, imported_at)
+                 SELECT t.address, $1, t.entry, NULL, now()
+                 FROM UNNEST($2::text[], $3::text[]) AS t(address, entry)
+                 ON CONFLICT (address, list_name) DO UPDATE SET
+                     entry       = EXCLUDED.entry,
+                     imported_at = now()",
+            )
+            .bind(list)
+            .bind(&upsert_addresses)
+            .bind(&upsert_entries)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // "Known" = seen independently of any sanctions list: a label of any
+        // other kind, or entity membership. A `SanctionedEntity` label alone
+        // only means another list already carries the address.
+        let added: Vec<String> = diff.added.iter().map(|d| address_key(&d.address)).collect();
+        let known: Vec<String> = if added.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar(
+                "SELECT address FROM labels
+                 WHERE address = ANY($1) AND kind <> $2 AND revoked_at IS NULL
+                 UNION
+                 SELECT address FROM entity_addresses WHERE address = ANY($1)",
+            )
+            .bind(&added)
+            .bind(<&str>::from(LabelKind::SanctionedEntity))
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        let known: std::collections::HashSet<AccountAddress> =
+            parse_addresses(&known)?.into_iter().collect();
+
+        let changed: Vec<String> = diff
+            .changed
+            .iter()
+            .map(|d| address_key(&d.address))
+            .collect();
+        let entries = to_i64(next.entries(), "promotion entries")?;
+        sqlx::query(
+            "INSERT INTO sanctions_list_promotions
+                 (promotion_id, list_name, digest, previous_digest, entries,
+                  added, changed, removed, promoted_by, promoted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(request.promotion_id)
+        .bind(list)
+        .bind(&request.digest)
+        .bind(&current)
+        .bind(entries)
+        .bind(&added)
+        .bind(&changed)
+        .bind(&removed)
+        .bind(&request.promoted_by)
+        .bind(request.promoted_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE sanctions_list_snapshots SET status = 'promoted', refusal = NULL
+             WHERE list_name = $1 AND digest = $2",
+        )
+        .bind(list)
+        .bind(&request.digest)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE sanctions_list_syncs SET
+                 synced_at          = GREATEST(COALESCE(synced_at, $2), $2),
+                 entries            = $3,
+                 content_digest     = $4,
+                 content_changed_at = $5,
+                 source             = $6,
+                 http_etag          = $7,
+                 http_last_modified = $8
+             WHERE list_name = $1",
+        )
+        .bind(list)
+        .bind(request.synced_at)
+        .bind(entries)
+        .bind(&request.digest)
+        .bind(request.promoted_at)
+        .bind(&request.source)
+        .bind(&request.validators.etag)
+        .bind(&request.validators.last_modified)
+        .execute(&mut *tx)
+        .await?;
+
+        let facts = PromotionFacts {
+            promotion_id: request.promotion_id,
+            list: request.list,
+            digest: request.digest.clone(),
+            previous_digest: current.clone(),
+            entries: next.entries(),
+            promoted_by: request.promoted_by.clone(),
+            promoted_at: request.promoted_at,
+        };
+        for announcement in sanctions_list::announcements(&facts, &diff, &known) {
+            let envelope =
+                events::EventEnvelope::new(sanctions_list::ANNOUNCEMENT_CHAIN, announcement.event);
+            let json = serde_json::to_value(&envelope).map_err(|err| {
+                StoreError::malformed(format!("encoding a sanctions announcement: {err}"))
+            })?;
+            crate::sanctions_sync::SANCTIONS_OUTBOX
+                .enqueue(
+                    &mut *tx,
+                    &json,
+                    Some(&announcement.key),
+                    request.promoted_at,
+                )
+                .await
+                .map_err(|err| match err.downcast::<sqlx::Error>() {
+                    Ok(sql) => StoreError::Postgres(sql),
+                    Err(other) => StoreError::malformed(format!("{other:#}")),
+                })?;
+        }
+
+        tx.commit().await?;
+        Ok(PromotionOutcome::Promoted(PromotionRecord {
+            promotion_id: request.promotion_id,
+            list: request.list,
+            digest: request.digest.clone(),
+            previous_digest: current,
+            entries: next.entries(),
+            added: diff.added.iter().map(|d| d.address).collect(),
+            changed: diff.changed.iter().map(|d| d.address).collect(),
+            removed: diff.removed,
+            promoted_by: request.promoted_by.clone(),
+            promoted_at: request.promoted_at,
+            effects_applied_at: None,
+        }))
+    }
+
+    async fn pending_promotions(
+        &self,
+        list: SanctionsList,
+    ) -> Result<Vec<PromotionRecord>, StoreError> {
+        let rows = sqlx::query_as::<_, PromotionRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {PROMOTION_COLUMNS} FROM sanctions_list_promotions
+             WHERE list_name = $1 AND effects_applied_at IS NULL
+             ORDER BY promoted_at, promotion_id"
+        )))
+        .bind(list.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn mark_effects_applied(
+        &self,
+        promotion_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE sanctions_list_promotions SET effects_applied_at = $2
+             WHERE promotion_id = $1 AND effects_applied_at IS NULL",
+        )
+        .bind(promotion_id)
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn promotions(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<PromotionRecord>, StoreError> {
+        let rows = sqlx::query_as::<_, PromotionRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {PROMOTION_COLUMNS} FROM sanctions_list_promotions
+             WHERE list_name = $1 ORDER BY promoted_at DESC, promotion_id LIMIT $2"
+        )))
+        .bind(list.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn snapshots(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<SnapshotSummary>, StoreError> {
+        let rows = sqlx::query_as::<_, SnapshotRow>(
+            "SELECT list_name, digest, entries, source, first_fetched_at, last_fetched_at,
+                    status, refusal
+             FROM sanctions_list_snapshots WHERE list_name = $1
+             ORDER BY last_fetched_at DESC, digest LIMIT $2",
+        )
+        .bind(list.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn oldest_pending_announcement(&self) -> Result<Option<DateTime<Utc>>, StoreError> {
+        // Served by `sanctions_outbox_pending_idx`: the pending rows only.
+        Ok(sqlx::query_scalar(
+            "SELECT min(created_at) FROM sanctions_outbox WHERE published_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 }
 

@@ -33,7 +33,7 @@ use crate::feedback::{AlertFeedbackRecorded, FeedbackCohort, FeedbackReason, Fee
 use crate::intelligence::{
     AddressEmbeddingUpdated, AttributionRetracted, AttributionUpdated, BehaviorFactor,
     EntityCreated, EntityLinkProposed, EntityMerged, EntitySplit, LabelAdded, LabelRevoked,
-    LabelUpdated, LinkFactor, RiskFactor, RiskScoreUpdated, SanctionHit,
+    LabelUpdated, LinkFactor, RiskFactor, RiskScoreUpdated, SanctionHit, SanctionsListUpdated,
 };
 use crate::predictive::{LiquidationCascadeWarned, LiquidationRiskPredicted, PredictedAlert};
 use crate::primitives::{
@@ -48,8 +48,8 @@ use crate::simulation::{
 };
 use crate::system::{
     DriftedFeature, FactsStaleness, ModelDriftDetected, RetentionPolicyChanged,
-    RetentionPurgeCompleted, ScreeningDecision, ScreeningDecisionBasis, ScreeningDecisionRecorded,
-    ScreeningStaleReason, UsageRecorded,
+    RetentionPurgeCompleted, SanctionsListProvenance, ScreeningDecision, ScreeningDecisionBasis,
+    ScreeningDecisionRecorded, ScreeningStaleReason, UsageRecorded,
 };
 use crate::{DomainEvent, EventEnvelope};
 use alloy_primitives::{Address, B256};
@@ -276,6 +276,21 @@ pub fn sample_events() -> Vec<DomainEvent> {
             list: "OFAC".into(),
             entry: "SDN-123".into(),
         }),
+        DomainEvent::SanctionsListUpdated(SanctionsListUpdated {
+            promotion_id: uuid::Uuid::from_u128(0x5A),
+            list: "ofac_sdn".into(),
+            digest: "9f86d081".into(),
+            previous_digest: Some("60303ae2".into()),
+            entries: 120,
+            added_total: 2,
+            removed_total: 1,
+            added: vec![addr()],
+            removed: vec![Address::repeat_byte(0x55)],
+            chunk: 0,
+            chunks: 2,
+            promoted_by: "scheduled".into(),
+            promoted_at: ts(),
+        }),
         DomainEvent::AddressEmbeddingUpdated(AddressEmbeddingUpdated {
             address: addr(),
             entity_id: Some(entity_id()),
@@ -399,6 +414,12 @@ pub fn sample_events() -> Vec<DomainEvent> {
                 observed_at: ts(),
                 age_ms: 1500,
             }),
+            sanctions_lists: vec![SanctionsListProvenance {
+                list: "ofac_sdn".into(),
+                digest: "9f86d081".into(),
+                synced_at: ts(),
+                stale: false,
+            }],
         }),
         // AI copilot (§20.4)
         DomainEvent::IncidentNarrativeDrafted(IncidentNarrativeDrafted {

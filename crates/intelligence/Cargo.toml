@@ -30,6 +30,11 @@ path = "src/main.rs"
 [dependencies]
 events = { workspace = true }
 event-bus = { workspace = true }
+# The shared transactional-outbox seam (§20): a sanctions-list promotion and
+# its announcements (`SanctionsListUpdated`, retroactive `SanctionHit`s)
+# commit in one transaction; bound to `sanctions_outbox` in
+# src/sanctions_sync.rs.
+outbox = { workspace = true }
 telemetry = { workspace = true }
 bounded-map = { workspace = true }
 

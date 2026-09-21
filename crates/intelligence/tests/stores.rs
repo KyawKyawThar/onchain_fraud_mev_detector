@@ -26,8 +26,9 @@ use intelligence::model::{
     SanctionEntry,
 };
 use intelligence::store::{
-    AttributionStore, CreateOutcome, EntityStore, LabelStore, LinkOutcome, MergeOutcome,
-    PgIntelligenceStore, SanctionsStore, SplitOutcome,
+    AttributionStore, Confirmation, CreateOutcome, EntityStore, LabelStore, LinkOutcome,
+    MergeOutcome, PgIntelligenceStore, PromotionOutcome, PromotionRequest, SanctionsListStore,
+    SanctionsStore, SplitOutcome, StagedSnapshot,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::clickhouse::{ClickHouse, CLICKHOUSE_PORT};
@@ -629,6 +630,242 @@ async fn sanctions_page_by_keyset_and_the_watermark_moves_with_the_list() {
         grown.rows, 4,
         "a new designation always moves the watermark"
     );
+}
+
+/// Sanctions list versioning (§8.5) against real Postgres: the promotion is
+/// one transaction that diffs against the *live* rows (including legacy rows
+/// no snapshot produced), queues its announcements in `sanctions_outbox`, and
+/// refuses to land on a version it was not decided against; confirmations and
+/// failures never move a clock backwards.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers Postgres)"]
+async fn sanctions_lists_stage_promote_and_confirm_transactionally() {
+    use intelligence::model::{SanctionsList, SnapshotStatus, Validators};
+    use intelligence::sanctions_list::{Designation, ListContent};
+
+    let (store, pg) = pg_store().await;
+    // A second connection to read the outbox table directly.
+    let port = pg.get_host_port_ipv4(5432).await.expect("Postgres port");
+    let pool = db::connect(&format!(
+        "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await
+    .expect("connect");
+    let ofac = SanctionsList::OfacSdn;
+    let ts = |secs: i64| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+    let content = |bytes: &[u8]| {
+        ListContent::new(bytes.iter().map(|b| Designation {
+            address: addr(*b),
+            entry: "OFAC SDN digital-currency address".into(),
+        }))
+    };
+    let request = |digest: &str, expected: Option<String>, secs: i64| PromotionRequest {
+        promotion_id: uuid::Uuid::new_v4(),
+        list: ofac,
+        digest: digest.to_owned(),
+        expected_previous: expected,
+        promoted_by: "scheduled".into(),
+        promoted_at: ts(secs),
+        synced_at: ts(secs),
+        source: "https://example.org/list.txt".into(),
+        validators: Validators {
+            etag: Some("\"e1\"".into()),
+            last_modified: None,
+        },
+    };
+
+    // A legacy row from the pre-versioning import, and an independently known
+    // address (a heuristic label) that the list is about to designate.
+    store
+        .seed_sanctions(&[SanctionEntry {
+            address: addr(0x09),
+            list_name: "ofac_sdn".into(),
+            entry: "legacy".into(),
+            listed_at: None,
+        }])
+        .await
+        .expect("legacy row");
+    store
+        .add_label(&LabelRecord::new(
+            addr(0x02),
+            LabelKind::MevBot,
+            "bot",
+            LabelSource::Heuristic,
+            "test",
+            ts(1),
+        ))
+        .await
+        .expect("known label");
+
+    // Staging is content-addressed and idempotent: a re-stage only moves
+    // `last_fetched_at`.
+    let v1 = content(&[0x01, 0x02]);
+    for secs in [100, 150] {
+        store
+            .stage_snapshot(&StagedSnapshot {
+                list: ofac,
+                content: &v1,
+                source: "https://example.org/list.txt",
+                fetched_at: ts(secs),
+            })
+            .await
+            .expect("stage");
+    }
+    let (summary, stored) = store
+        .snapshot(ofac, v1.digest())
+        .await
+        .expect("read")
+        .expect("staged");
+    assert_eq!(stored, v1);
+    assert_eq!(summary.status, SnapshotStatus::Staged);
+    assert_eq!(
+        (summary.first_fetched_at, summary.last_fetched_at),
+        (ts(100), ts(150))
+    );
+
+    // Promote v1: the legacy row is removed, both designations land.
+    let PromotionOutcome::Promoted(p1) = store
+        .promote(&request(v1.digest(), None, 200))
+        .await
+        .expect("promote v1")
+    else {
+        panic!("v1 promotes");
+    };
+    assert_eq!(p1.added, vec![addr(0x01), addr(0x02)]);
+    assert_eq!(p1.removed, vec![addr(0x09)]);
+    assert_eq!(store.live_content(ofac).await.expect("live"), v1);
+    let row = store.list_sync(ofac).await.expect("ledger");
+    assert_eq!(row.content_digest.as_deref(), Some(v1.digest()));
+    assert_eq!(row.synced_at, Some(ts(200)));
+    assert_eq!(row.validators.etag.as_deref(), Some("\"e1\""));
+    assert!(row.effects_pending);
+
+    // The outbox got one list update and one hit (the known address only).
+    let outbox: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT envelope FROM sanctions_outbox ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("outbox");
+    let types: Vec<&str> = outbox
+        .iter()
+        .map(|e| e["payload"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, vec!["SanctionsListUpdated", "SanctionHit"]);
+    assert_eq!(
+        outbox[1]["payload"]["payload"]["address"],
+        "0x0202020202020202020202020202020202020202"
+    );
+
+    // A promotion decided against a stale version writes nothing.
+    let v2 = content(&[0x01, 0x03]);
+    store
+        .stage_snapshot(&StagedSnapshot {
+            list: ofac,
+            content: &v2,
+            source: "s",
+            fetched_at: ts(300),
+        })
+        .await
+        .expect("stage v2");
+    let conflict = store
+        .promote(&request(v2.digest(), None, 300))
+        .await
+        .expect("conflict is an outcome");
+    assert_eq!(
+        conflict,
+        PromotionOutcome::Conflict {
+            current: Some(v1.digest().to_owned())
+        }
+    );
+    assert_eq!(store.live_content(ofac).await.expect("live"), v1);
+
+    // A confirmation lands only on the current version, and never backwards.
+    let validators = Validators::default();
+    for (digest, secs, lands) in [
+        ("not-current", 400, false),
+        (v1.digest(), 400, true),
+        (v1.digest(), 350, true),
+    ] {
+        let landed = store
+            .confirm_unchanged(&Confirmation {
+                list: ofac,
+                digest,
+                synced_at: ts(secs),
+                source: "s",
+                validators: &validators,
+            })
+            .await
+            .expect("confirm");
+        assert_eq!(landed, lands, "confirming {digest} at {secs}");
+    }
+    assert_eq!(
+        store.list_sync(ofac).await.expect("ledger").synced_at,
+        Some(ts(400))
+    );
+
+    // Failures: monotonic, and kept beside a later success.
+    store
+        .record_sync_failure(ofac, ts(500), "HTTP 503")
+        .await
+        .expect("failure");
+    store
+        .record_sync_failure(ofac, ts(450), "older")
+        .await
+        .expect("late failure");
+    let row = store.list_sync(ofac).await.expect("ledger");
+    assert_eq!(row.failure_reason.as_deref(), Some("HTTP 503"));
+    assert!(row.last_attempt_failed());
+
+    // Promote v2 against the right version: a delisting and a designation.
+    let PromotionOutcome::Promoted(p2) = store
+        .promote(&request(v2.digest(), Some(v1.digest().to_owned()), 600))
+        .await
+        .expect("promote v2")
+    else {
+        panic!("v2 promotes");
+    };
+    assert_eq!(
+        (p2.added.clone(), p2.removed.clone()),
+        (vec![addr(0x03)], vec![addr(0x02)])
+    );
+    assert!(store
+        .sanction_matches(&addr(0x02))
+        .await
+        .expect("read")
+        .is_empty());
+    assert!(!store
+        .list_sync(ofac)
+        .await
+        .expect("ledger")
+        .last_attempt_failed());
+
+    // Effects bookkeeping, and the history reads.
+    let pending = store.pending_promotions(ofac).await.expect("pending");
+    assert_eq!(pending.len(), 2);
+    for p in &pending {
+        store
+            .mark_effects_applied(p.promotion_id, ts(700))
+            .await
+            .expect("mark");
+    }
+    assert!(!store.list_sync(ofac).await.expect("ledger").effects_pending);
+    let history = store.promotions(ofac, 10).await.expect("history");
+    assert_eq!(history[0].digest, v2.digest());
+    assert_eq!(history[0].previous_digest.as_deref(), Some(v1.digest()));
+    assert_eq!(store.snapshots(ofac, 10).await.expect("snapshots").len(), 2);
+
+    // Refusing an already-promoted snapshot records why but keeps history.
+    store
+        .refuse_snapshot(ofac, v1.digest(), "policy tightened")
+        .await
+        .expect("refuse");
+    let (summary, _) = store
+        .snapshot(ofac, v1.digest())
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(summary.status, SnapshotStatus::Promoted);
+    assert_eq!(summary.refusal.as_deref(), Some("policy tightened"));
 }
 
 #[tokio::test]

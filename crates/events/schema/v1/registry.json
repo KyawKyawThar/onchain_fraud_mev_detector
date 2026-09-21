@@ -1695,6 +1695,85 @@
         }
       ]
     },
+    "SanctionsListUpdated": {
+      "topic": "mev.events.SanctionsListUpdated",
+      "partition_key": "chain",
+      "fields": [
+        {
+          "path": "added",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "added[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "added_total",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "chunk",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "chunks",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "digest",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "entries",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "path": "list",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "previous_digest",
+          "type": "string",
+          "required": false
+        },
+        {
+          "path": "promoted_at",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "promoted_by",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "promotion_id",
+          "type": "validated_string",
+          "required": true
+        },
+        {
+          "path": "removed",
+          "type": "array",
+          "required": true
+        },
+        {
+          "path": "removed[]",
+          "type": "validated_string"
+        },
+        {
+          "path": "removed_total",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
     "ScreeningDecisionRecorded": {
       "topic": "mev.events.ScreeningDecisionRecorded",
       "partition_key": "customer",
@@ -1730,7 +1809,8 @@
           "values": [
             "sanctions_hard_block",
             "score_thresholds",
-            "stale_facts_review"
+            "stale_facts_review",
+            "stale_sanctions_list_review"
           ],
           "required": true
         },
@@ -1800,6 +1880,35 @@
         {
           "path": "sanctioned",
           "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "sanctions_lists",
+          "type": "array",
+          "required": false
+        },
+        {
+          "path": "sanctions_lists[]",
+          "type": "object"
+        },
+        {
+          "path": "sanctions_lists[].digest",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "sanctions_lists[].list",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "sanctions_lists[].stale",
+          "type": "boolean",
+          "required": true
+        },
+        {
+          "path": "sanctions_lists[].synced_at",
+          "type": "validated_string",
           "required": true
         },
         {

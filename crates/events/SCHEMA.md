@@ -31,7 +31,7 @@ set of types that drift freely.
 | **Chain** (§5) | `RawBlockReceived`, `BlockAssembled`, `BlockCanonicalized`, `BlockReverted`, `BlockFinalized` | ingestion |
 | **Detection** (§6) | `DetectorTriggered`, `PreliminaryAlertCreated` | detection |
 | **Simulation** (§7) | `SimulationRequested`, `SimulationCompleted`, `IncidentCreated`, `IncidentRetracted`, `IncidentFinalized` | simulation |
-| **Intelligence** (§8) | `LabelAdded`, `LabelUpdated`, `LabelRevoked`, `EntityCreated`, `EntityMerged`, `EntitySplit`, `AttributionUpdated`, `RiskScoreUpdated`, `SanctionHit` | intelligence |
+| **Intelligence** (§8) | `LabelAdded`, `LabelUpdated`, `LabelRevoked`, `EntityCreated`, `EntityMerged`, `EntitySplit`, `AttributionUpdated`, `RiskScoreUpdated`, `SanctionHit`, `SanctionsListUpdated` | intelligence |
 | **Rule engine** (§9) | `RuleCreated`, `RuleTriggered`, `RuleAlertCreated` | rule-engine |
 | **System** (§13) | `UsageRecorded`, `ScreeningDecisionRecorded` | api |
 | **Predictive** (§16) | `PredictedAlert`, `LiquidationRiskPredicted`, `LiquidationCascadeWarned` | predictive |

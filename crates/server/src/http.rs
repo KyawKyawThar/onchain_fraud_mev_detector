@@ -31,7 +31,9 @@ use events::feedback::{AlertFeedbackRecorded, FeedbackReason, FeedbackVerdict};
 use events::primitives::IncidentId;
 use events::primitives::{AccountAddress, Chain, CustomerId, RuleId};
 use events::rule_engine::RuleCreated;
-use events::system::{FactsStaleness, ScreeningDecisionRecorded, UsageEventType};
+use events::system::{
+    FactsStaleness, SanctionsListProvenance, ScreeningDecisionRecorded, UsageEventType,
+};
 use events::{DomainEvent, EventEnvelope};
 use intelligence::model::address_key;
 use intelligence::pb::ScreeningFactsReply;
@@ -483,7 +485,21 @@ struct ScreenResponse {
     /// Why the facts were stale and how old they were — omitted when fresh.
     #[serde(skip_serializing_if = "Option::is_none")]
     staleness: Option<FactsStaleness>,
+    /// The version of each sanctions list the decision was screened against
+    /// (§8.5), and whether each was past its freshness SLA. A `stale` list may
+    /// be missing designations made since it was last confirmed; a customer
+    /// that cannot accept that holds on it (or uses an `on_stale: review`
+    /// policy, which does). Omitted before the API service has read list
+    /// states from intelligence.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sanctions_lists: Vec<SanctionsListProvenance>,
 }
+
+/// Counter: screening decisions rendered while a sanctions list was past its
+/// freshness SLA. The page is `SanctionsListStale`; this is the customer
+/// impact while it fires.
+pub const SCREENING_STALE_SANCTIONS_LIST_DECISIONS_TOTAL: &str =
+    "screening_stale_sanctions_list_decisions_total";
 
 /// `POST /v1/address/{address}/screen` — the **synchronous** counterparty
 /// screening decision (§11): pre-transaction `allow`/`review`/`block` over
@@ -582,7 +598,16 @@ async fn screen_address(
     // Wire → domain → policy: the prost reply is distilled once at the
     // transport edge's `From` impl; the decision layer only ever sees the
     // typed input.
-    let input = crate::screen::ScreeningInput::from(&facts);
+    // Which version of each sanctions list this decision is screened against
+    // (§8.5), and whether any is past its SLA — recorded on the response and
+    // the audit trail alike, and a hold under an `on_stale: review` policy.
+    let decided_at = Utc::now();
+    let sanctions_lists = state.sanctions.list_provenance(decided_at);
+    let mut input = crate::screen::ScreeningInput::from(&facts);
+    input.sanctions_lists_stale = sanctions_lists.iter().any(|list| list.stale);
+    if input.sanctions_lists_stale {
+        metrics::counter!(SCREENING_STALE_SANCTIONS_LIST_DECISIONS_TOTAL).increment(1);
+    }
     let sanctioned = input.sanctioned;
     let verdict = crate::screen::decide(input, &policy, freshness);
 
@@ -601,7 +626,8 @@ async fn screen_address(
         verdict,
         sanctioned,
         freshness,
-        decided_at: Utc::now(),
+        sanctions_lists,
+        decided_at,
     };
 
     // The access-audit trail (§11 Sprint 14 t3): recorded for *every* decision,
@@ -639,6 +665,8 @@ struct ScreeningOutcome {
     verdict: crate::screen::Verdict,
     sanctioned: bool,
     freshness: crate::screen::Freshness,
+    /// The version of each sanctions list the decision was screened against.
+    sanctions_lists: Vec<SanctionsListProvenance>,
     decided_at: DateTime<Utc>,
 }
 
@@ -661,6 +689,7 @@ impl ScreeningOutcome {
             factors: self.verdict.factors.clone(),
             timestamp: self.decided_at,
             facts_staleness: self.freshness.staleness(),
+            sanctions_lists: self.sanctions_lists.clone(),
         }
     }
 
@@ -710,6 +739,7 @@ impl ScreeningOutcome {
             factors,
             stale: staleness.is_some(),
             staleness,
+            sanctions_lists: self.sanctions_lists,
         }
     }
 }
@@ -3084,6 +3114,53 @@ mod tests {
         assert_eq!(json["decision"], "block");
         assert_eq!(json["decision_basis"], "sanctions_hard_block");
         assert_eq!(json["sanctions"][0]["list"], "ofac_sdn");
+    }
+
+    /// Every decision names the version of each sanctions list it was
+    /// screened against and whether that list is past its SLA (§8.5) — a list
+    /// that never synced is reported stale, not left out.
+    #[tokio::test]
+    async fn a_decision_records_which_list_versions_it_was_screened_against() {
+        use crate::sanctions_view::{ListState, SanctionsView};
+
+        let address = alloy_primitives::Address::repeat_byte(0xA5);
+        let store = Arc::new(crate::degrade::test_util::InMemorySnapshotStore::new());
+        store.insert(address, clean_snapshot(5));
+
+        let mut ts = test_state();
+        ts.state.intelligence = unreachable_intelligence();
+        ts.state.screening_fallback = Some(armed_fallback(store));
+        ts.state.sanctions = Arc::new(SanctionsView::seeded_with_lists(
+            vec![],
+            vec![
+                ListState {
+                    list: "ofac_sdn".into(),
+                    digest: "d1".into(),
+                    synced_at: Some(chrono::Utc::now()),
+                    max_age: std::time::Duration::from_secs(3_600),
+                },
+                ListState {
+                    list: "eu_consolidated".into(),
+                    digest: String::new(),
+                    synced_at: None,
+                    max_age: std::time::Duration::from_secs(3_600),
+                },
+            ],
+            std::time::Duration::from_secs(180),
+        ));
+        let bearer = mint_bearer(&ts.state, "00000000-0000-0000-0000-0000000000c0");
+        let json = screen_json(super::router(ts.state), &bearer, address, "").await;
+
+        // The default policy serves: disclosed, not held.
+        assert_eq!(json["decision"], "allow");
+        let lists = json["sanctions_lists"].as_array().expect("provenance");
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0]["list"], "ofac_sdn");
+        assert_eq!(lists[0]["digest"], "d1");
+        assert_eq!(lists[0]["stale"], false);
+        assert_eq!(lists[1]["list"], "eu_consolidated");
+        assert_eq!(lists[1]["stale"], true);
+        assert_eq!(lists[1]["synced_at"], "1970-01-01T00:00:00Z");
     }
 
     /// `on_stale` is part of a policy's versioned identity: authoring it mints a

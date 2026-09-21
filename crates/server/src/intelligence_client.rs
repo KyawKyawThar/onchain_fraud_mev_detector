@@ -11,6 +11,8 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use api_error::ApiError;
 use events::intelligence::RiskFactor;
 use events::primitives::AccountAddress;
@@ -93,6 +95,7 @@ impl From<&ScreeningFactsReply> for ScreeningInput {
                     evidence_ref: f.evidence_ref.clone(),
                 })
                 .collect(),
+            sanctions_lists_stale: false,
         }
     }
 }
@@ -338,6 +341,20 @@ impl crate::sanctions_view::SanctionsSource for IntelligenceClient {
             }
         }
         let watermark = reply.watermark.unwrap_or_default();
+        let lists = reply
+            .lists
+            .into_iter()
+            .map(|state| crate::sanctions_view::ListState {
+                list: state.list,
+                digest: state.digest,
+                // 0 is the wire's "never"; anything unrepresentable reads as
+                // never too, which is the stale side.
+                synced_at: (state.synced_unix_millis > 0)
+                    .then(|| DateTime::<Utc>::from_timestamp_millis(state.synced_unix_millis))
+                    .flatten(),
+                max_age: Duration::from_secs(state.max_age_secs),
+            })
+            .collect();
         Ok(crate::sanctions_view::SanctionsPage {
             entries,
             next_after: (!reply.next_after.is_empty()).then_some(reply.next_after),
@@ -345,6 +362,7 @@ impl crate::sanctions_view::SanctionsSource for IntelligenceClient {
                 rows: watermark.rows,
                 last_imported_unix_millis: watermark.last_imported_unix_millis,
             },
+            lists,
         })
     }
 }

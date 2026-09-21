@@ -4153,6 +4153,7 @@ dependencies = [
  "libm",
  "metrics",
  "metrics-util",
+ "outbox",
  "proptest",
  "prost 0.14.4",
  "protoc-bin-vendored",

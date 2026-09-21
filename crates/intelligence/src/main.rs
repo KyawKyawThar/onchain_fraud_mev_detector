@@ -11,7 +11,20 @@
 //!     ClickHouse), so a misconfigured deployment fails fast and visibly.
 //!   - `seed <feed> <file> [source-detail]` — import a downloaded §8.1 public
 //!     feed (t2). Downloading stays out-of-band (see the justfile), so the
-//!     import is a reproducible file, not a moving URL.
+//!     import is a reproducible file, not a moving URL. A *sanctions* feed is
+//!     routed through `sanctions-sync`, the one path that writes a list.
+//!   - `sanctions-sync <ofac-sdn|eu-consolidated> <url|file>` — the scheduled
+//!     §8.5 sync (a CronJob per list): fetch, stage, check, promote or
+//!     confirm, and stamp the freshness ledger — see
+//!     [`intelligence::sanctions_sync`]. Exits 0, 75 (transient: retry), 3
+//!     (refused: a human must look) or 1 (permanent).
+//!   - `sanctions-promote <ofac-sdn|eu-consolidated> <digest> <operator>` —
+//!     promote a refused snapshot after checking upstream that what the checks
+//!     flagged (a mass delisting, a large designation round) is real.
+//!   - `sanctions-history <ofac-sdn|eu-consolidated>` — the list's recent
+//!     promotions and snapshots: what was current when, and what is waiting.
+//!   - `sanctions-status` — print every monitored list against its freshness
+//!     SLA; exits non-zero if any list is stale or has never synced.
 //!   - `cluster <chain-id> <address>` — run one clustering pass (t3).
 //!   - `attribute` (default; also the no-arg run) — drive the t4 attribution
 //!     consumer: `PreliminaryAlertCreated` + `IncidentCreated` in, entities/
@@ -104,11 +117,12 @@ use intelligence::embedding_consumer::{self, EmbeddingConsumer};
 use intelligence::embedding_job::{self, Embedder, EmbedderSeams};
 use intelligence::embedding_store::{ClickhouseEmbeddingStore, EmbeddingStore};
 use intelligence::embedding_sweep::EmbeddingSweep;
-use intelligence::grpc::{IntelligenceReadService, SimilaritySeams};
+use intelligence::grpc::{IntelligenceReadService, SanctionsListsRead, SimilaritySeams};
 use intelligence::leaderboard::ClickhouseLeaderboard;
 use intelligence::link_candidate::{Decision, LinkCandidateStore, LinkStatus};
 use intelligence::link_signal::{self, LinkSignal, LinkSignalConsumer, LinkSignalSeams};
 use intelligence::merge_actor::MergeActor;
+use intelligence::model::SanctionsList;
 use intelligence::pb::intelligence_read_server::IntelligenceReadServer;
 use intelligence::production::BookCapacity;
 use intelligence::production_consumer::{self, ProductionConsumer};
@@ -117,14 +131,21 @@ use intelligence::production_store::ClickhouseProductionStore;
 use intelligence::reorg::{self, ReorgConsumer};
 use intelligence::risk;
 use intelligence::risk_scorer::{self, RiskScorer};
+use intelligence::sanctions_freshness::{self, Freshness};
+use intelligence::sanctions_sync::{self, SanctionsSync, SyncError, SANCTIONS_OUTBOX};
 use intelligence::seed::{Feed, Seeder};
-use intelligence::store::{EntityStore, LabelStore, PgIntelligenceStore, SplitOutcome, StoreSeams};
+use intelligence::store::{
+    EntityStore, LabelStore, PgIntelligenceStore, SanctionsListStore, SplitOutcome, StoreSeams,
+};
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
-                     `seed <etherscan-tags|ofac-sdn|mev-list|protocol-registry> <file> [source-detail]`, \
+                     `seed <etherscan-tags|ofac-sdn|eu-consolidated|mev-list|protocol-registry> <file> [source-detail]`, \
+                     `sanctions-sync <ofac-sdn|eu-consolidated> <url|file>`, \
+                     `sanctions-promote <ofac-sdn|eu-consolidated> <digest> <operator>`, \
+                     `sanctions-history <ofac-sdn|eu-consolidated>`, `sanctions-status`, \
                      `cluster <chain-id> <address>`, `attribute` (also the no-arg default), \
                      `risk <address>`, `score`, `reorg`, `grpc`, `block-production`, \
                      `cross-chain-attribute`, `embed <address>`, `embedding`, \
@@ -135,9 +156,27 @@ const USAGE: &str = "expected `migrate up|down|info`, `ping`, \
                      `entity-split <chain-id> <entity-id> <reason> <group> <group> [...]` \
                      (group = comma-separated addresses)";
 
+/// The process's exit code carries the retry decision for the sanctions
+/// commands (the CronJob's `podFailurePolicy` reads it): a [`SyncError`]
+/// anywhere in the chain picks its own code, anything else is 1. `run` owns
+/// the telemetry guard, so spans flush before the code is returned — which
+/// `std::process::exit` would skip.
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Hold the guard for the lifetime of `main` so spans flush on exit (§19).
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            let code = err
+                .downcast_ref::<SyncError>()
+                .map_or(sanctions_sync::EXIT_PERMANENT, SyncError::exit_code);
+            std::process::ExitCode::from(code)
+        }
+    }
+}
+
+async fn run() -> Result<()> {
+    // Hold the guard for the lifetime of `run` so spans flush on exit (§19).
     let _telemetry = telemetry::init(telemetry::TelemetryConfig::from_env("intelligence"))?;
     let cfg = Config::from_env()?;
     let client = build_clickhouse_client(&cfg.clickhouse);
@@ -151,6 +190,10 @@ async fn main() -> Result<()> {
         }
         Some("ping") => ping(&cfg, client).await,
         Some("seed") => seed(&cfg, args).await,
+        Some("sanctions-sync") => sanctions_sync_cmd(&cfg, args).await,
+        Some("sanctions-promote") => sanctions_promote(&cfg, args).await,
+        Some("sanctions-history") => sanctions_history(&cfg, args).await,
+        Some("sanctions-status") => sanctions_status(&cfg).await,
         Some("cluster") => cluster(&cfg, client, args).await,
         Some("attribute") | None => attribute(&cfg, client).await,
         Some("risk") => address_risk(&cfg, args).await,
@@ -222,10 +265,22 @@ async fn seed(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()
     };
     // Optional provenance override naming the specific list/registry; an empty
     // arg (justfile default) means "use the feed's canonical name".
-    let detail = args
-        .next()
-        .filter(|raw| !raw.is_empty())
-        .unwrap_or_else(|| feed.canonical_detail().to_owned());
+    let detail = args.next().filter(|raw| !raw.is_empty());
+
+    // A sanctions list has exactly one write path — stage, check, promote —
+    // so a manual import cannot bypass the checks or the freshness ledger.
+    if let Some(list) = feed.sanctions_list() {
+        if detail.is_some() {
+            bail!(
+                "{feed} is a sanctions list: its labels always carry the canonical provenance \
+                 (`{}`), so a source-detail override is refused rather than ignored",
+                feed.canonical_detail()
+            );
+        }
+        let source = sanctions_sync::FileFeedSource::new(&path, cfg.sanctions.fetch_max_bytes);
+        return run_sanctions_sync(cfg, list, &source).await;
+    }
+    let detail = detail.unwrap_or_else(|| feed.canonical_detail().to_owned());
 
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading feed file {path:?}"))?;
@@ -252,6 +307,234 @@ async fn seed(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()
         .await
         .context("applying the parsed feed (safe to re-run: writes are keyed)")?;
     println!("✅ {report}");
+    Ok(())
+}
+
+/// Parse a sanctions-list argument: the feed's CLI name (`ofac-sdn`), or the
+/// list's own (`ofac_sdn`) — operators read the latter off alerts.
+fn parse_list_arg(raw: Option<String>) -> Result<SanctionsList> {
+    let Some(raw) = raw else {
+        bail!("missing sanctions list; {USAGE}");
+    };
+    if let Ok(list) = raw.parse::<SanctionsList>() {
+        return Ok(list);
+    }
+    match raw.parse::<Feed>().ok().and_then(Feed::sanctions_list) {
+        Some(list) => Ok(list),
+        None => bail!("{raw:?} is not a sanctions list; {USAGE}"),
+    }
+}
+
+/// The scheduled §8.5 sync of one sanctions list from a URL or file.
+async fn sanctions_sync_cmd(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let list = parse_list_arg(args.next())?;
+    let Some(location) = args.next() else {
+        bail!("missing sanctions source (URL or file); {USAGE}");
+    };
+    if let Some(extra) = args.next() {
+        bail!(
+            "unexpected argument {extra:?}: a refused snapshot is promoted with \
+             `sanctions-promote <list> <digest> <operator>`, not re-fetched with an override"
+        );
+    }
+    let source = sanctions_sync::source_for(
+        &location,
+        cfg.sanctions.fetch_timeout,
+        cfg.sanctions.fetch_max_bytes,
+    )?;
+    run_sanctions_sync(cfg, list, source.as_ref()).await
+}
+
+/// The stores a sanctions command needs, connected.
+struct SanctionsStores {
+    pool: sqlx::PgPool,
+    store: Arc<PgIntelligenceStore>,
+    sync: SanctionsSync,
+}
+
+async fn sanctions_stores(cfg: &Config) -> Result<SanctionsStores> {
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = Arc::new(PgIntelligenceStore::new(pool.clone()));
+    let cache = RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
+        .await
+        .context("connecting to Redis")?;
+    let sync = SanctionsSync::new(
+        store.clone(),
+        store.clone(),
+        Arc::new(cache),
+        cfg.sanctions.policy.clone(),
+    );
+    Ok(SanctionsStores { pool, store, sync })
+}
+
+/// Drain the sanctions outbox once, best-effort: the `grpc` mode's flusher is
+/// the durable path, this only gets a fresh promotion's announcements out
+/// without waiting for its next tick. A failure here loses nothing.
+async fn flush_sanctions_outbox(cfg: &Config, pool: &sqlx::PgPool) {
+    let sink = match KafkaEventSink::new(&cfg.kafka.brokers) {
+        Ok(sink) => sink,
+        Err(err) => {
+            tracing::warn!(error = %err, "no Kafka sink; the grpc flusher will publish");
+            return;
+        }
+    };
+    match SANCTIONS_OUTBOX.flush_once(pool, &sink).await {
+        Ok(published) => tracing::info!(published, "sanctions announcements published"),
+        Err(err) => {
+            tracing::warn!(error = %err, "sanctions outbox flush failed; the grpc flusher will retry")
+        }
+    }
+}
+
+/// Connect and run one sync; shared by `sanctions-sync` and `seed`.
+async fn run_sanctions_sync(
+    cfg: &Config,
+    list: SanctionsList,
+    source: &dyn sanctions_sync::FeedSource,
+) -> Result<()> {
+    let stores = sanctions_stores(cfg).await?;
+    let result = stores.sync.sync(list, source).await;
+    // Whatever happened, anything queued (this run's promotion, or an earlier
+    // one's) goes out now.
+    flush_sanctions_outbox(cfg, &stores.pool).await;
+    let report = result.with_context(|| format!("syncing {list} from {}", source.describe()))?;
+    println!("✅ {report}");
+    Ok(())
+}
+
+/// Promote a refused snapshot by hand.
+async fn sanctions_promote(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let list = parse_list_arg(args.next())?;
+    let Some(digest) = args.next() else {
+        bail!("missing snapshot digest (see `sanctions-history {list}`); {USAGE}");
+    };
+    let operator = args.collect::<Vec<_>>().join(" ");
+    let stores = sanctions_stores(cfg).await?;
+    let result = stores.sync.promote_staged(list, &digest, &operator).await;
+    flush_sanctions_outbox(cfg, &stores.pool).await;
+    let report = result.with_context(|| format!("promoting {list} snapshot {digest}"))?;
+    println!("✅ {report}");
+    Ok(())
+}
+
+/// The list's recent promotions and snapshots.
+async fn sanctions_history(cfg: &Config, mut args: impl Iterator<Item = String>) -> Result<()> {
+    let list = parse_list_arg(args.next())?;
+    let stores = sanctions_stores(cfg).await?;
+    let current = stores.store.list_sync(list).await?;
+    println!(
+        "{list}: current version {}",
+        current.content_digest.as_deref().unwrap_or("(none)")
+    );
+    println!("\npromotions (newest first):");
+    for p in stores.store.promotions(list, 20).await? {
+        let effects = if p.effects_applied_at.is_some() {
+            ""
+        } else {
+            "  [effects pending]"
+        };
+        println!(
+            "  {}  {}  {:>7} addresses  +{} -{} ~{}  by {}{effects}",
+            p.promoted_at,
+            p.digest,
+            p.entries,
+            p.added.len(),
+            p.removed.len(),
+            p.changed.len(),
+            p.promoted_by
+        );
+    }
+    println!("\nsnapshots (most recently fetched first):");
+    for s in stores.store.snapshots(list, 20).await? {
+        println!(
+            "  {}  {}  {:>7} addresses  {:<8}  last fetched {}{}",
+            s.first_fetched_at,
+            s.digest,
+            s.entries,
+            s.status,
+            s.last_fetched_at,
+            s.refusal
+                .as_deref()
+                .map(|r| format!("\n      refused: {r}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Print every monitored list against its SLA — the same judgement the
+/// `SanctionsListStale` alert makes. Exits non-zero if any list is stale or
+/// has never synced, so it doubles as a pre-flight check.
+async fn sanctions_status(cfg: &Config) -> Result<()> {
+    let pool = db::connect(cfg.postgres_url.expose_secret())
+        .await
+        .context("connecting to Postgres")?;
+    let store = PgIntelligenceStore::new(pool);
+    let records = store
+        .list_syncs()
+        .await
+        .context("reading the sanctions freshness ledger")?;
+    let now = store.db_now().await?;
+
+    let mut breached = Vec::new();
+    for sla in &cfg.sanctions.lists {
+        let record = records.iter().find(|r| r.list == sla.list);
+        let freshness = sanctions_freshness::assess(sla, record, now);
+        let sla_secs = sla.max_age.as_secs();
+        let state = match freshness {
+            Freshness::NeverSynced => "NEVER SYNCED".to_owned(),
+            Freshness::Fresh { age } => format!("fresh   (age {}s ≤ {sla_secs}s)", age.as_secs()),
+            Freshness::Stale { age } => format!("STALE   (age {}s > {sla_secs}s)", age.as_secs()),
+        };
+        println!("{:<16} {state}", sla.list);
+        if let Some(record) = record {
+            if let Some(digest) = &record.content_digest {
+                println!(
+                    "{:<16}   version {digest} ({} addresses)",
+                    "",
+                    record.entries.unwrap_or(0)
+                );
+            }
+            if let Some(changed) = record.content_changed_at {
+                println!("{:<16}   content last changed {changed}", "");
+            }
+            if let Some(source) = &record.source {
+                println!("{:<16}   source {source}", "");
+            }
+            if record.effects_pending {
+                println!(
+                    "{:<16}   EFFECTS PENDING: a promotion's labels/cache evictions did not \
+                     finish; the next sync resumes them",
+                    ""
+                );
+            }
+            if record.last_attempt_failed() {
+                println!(
+                    "{:<16}   LAST ATTEMPT FAILED at {}: {}",
+                    "",
+                    record
+                        .failed_at
+                        .map(|at| at.to_string())
+                        .unwrap_or_default(),
+                    record
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("(no reason recorded)")
+                );
+            }
+        }
+        if !freshness.is_within_sla() {
+            breached.push(sla.list.as_str());
+        }
+    }
+    if !breached.is_empty() {
+        bail!(
+            "sanctions freshness SLA breached for: {}",
+            breached.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1393,7 +1676,7 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     let pool = db::connect(cfg.postgres_url.expose_secret())
         .await
         .context("connecting to Postgres")?;
-    let store = Arc::new(PgIntelligenceStore::new(pool));
+    let store = Arc::new(PgIntelligenceStore::new(pool.clone()));
 
     let cache = Arc::new(
         RedisHotCache::connect(cfg.redis.url.expose_secret(), cfg.redis.cache_ttl)
@@ -1435,7 +1718,31 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
     let baseline =
         start_baseline_snapshot(cfg, similarity_schema, embeddings.clone(), shutdown.clone()).await;
 
+    // §8.5 freshness SLA: this mode is always up (screening depends on it), so
+    // it is where the ledger is watched — see
+    // [`intelligence::sanctions_freshness`] for why not the sync job itself.
+    tokio::spawn(sanctions_freshness::run_monitor(
+        store.clone(),
+        cfg.sanctions.lists.clone(),
+        cfg.sanctions.poll_interval,
+        shutdown.clone(),
+    ));
+    // The durable publisher of sanctions promotions' announcements. Every
+    // replica runs it; the outbox's lease keeps that to one publish per row.
+    let sanctions_sink: Arc<dyn EventSink> =
+        Arc::new(KafkaEventSink::new(&cfg.kafka.brokers).context("building the Kafka event sink")?);
+    tokio::spawn(SANCTIONS_OUTBOX.run_flusher(
+        pool,
+        sanctions_sink,
+        cfg.sanctions.outbox_flush_interval,
+        shutdown.clone(),
+    ));
+
     let links = store.clone();
+    let sanctions_lists = SanctionsListsRead {
+        store: store.clone(),
+        slas: cfg.sanctions.lists.clone(),
+    };
     let service = IntelligenceReadService::new(
         StoreSeams::single(store),
         cache,
@@ -1452,7 +1759,8 @@ async fn grpc_serve(cfg: &Config, client: Client) -> Result<()> {
             )),
         },
         links,
-    );
+    )
+    .with_sanctions_lists(sanctions_lists);
     health.set_ready(true);
     tonic::transport::Server::builder()
         .add_service(IntelligenceReadServer::new(service))

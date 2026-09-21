@@ -1,0 +1,28 @@
+{
+  "chain": 1,
+  "event_id": "00000000-0000-0000-0000-000000000e2e",
+  "occurred_at": "2023-11-14T22:13:20Z",
+  "payload": {
+    "payload": {
+      "added": [
+        "0x3333333333333333333333333333333333333333"
+      ],
+      "added_total": 2,
+      "chunk": 0,
+      "chunks": 2,
+      "digest": "9f86d081",
+      "entries": 120,
+      "list": "ofac_sdn",
+      "previous_digest": "60303ae2",
+      "promoted_at": "2023-11-14T22:13:20Z",
+      "promoted_by": "scheduled",
+      "promotion_id": "00000000-0000-0000-0000-00000000005a",
+      "removed": [
+        "0x5555555555555555555555555555555555555555"
+      ],
+      "removed_total": 1
+    },
+    "type": "SanctionsListUpdated"
+  },
+  "schema_version": 1
+}

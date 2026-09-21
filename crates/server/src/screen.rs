@@ -310,6 +310,11 @@ pub struct ScreeningInput {
     /// this layer decides through the score, never re-derives it from the
     /// factors (§8.3's score/confidence pass already did that).
     pub factors: Vec<RiskFactor>,
+    /// A sanctions list this decision was screened against is past its
+    /// freshness SLA (§8.5), so a designation made since its last confirmation
+    /// could be missing. Set by the handler from the pod-local sanctions view;
+    /// the transport `From` impl cannot know it and leaves it `false`.
+    pub sanctions_lists_stale: bool,
 }
 
 /// The outcome of one screening decision, plus the exact policy that
@@ -370,6 +375,14 @@ impl Freshness {
 /// or the sanctions view cannot vouch for the address. The hold is the
 /// platform's for the second reason — an unverifiable sanctions status is not a
 /// customer's trade to make — and never applies to a `block` or a `review`.
+///
+/// A stale sanctions *list*, fourth: an `allow` rendered while a list is past
+/// its freshness SLA is held as `review`
+/// ([`DecisionBasis::StaleSanctionsListReview`]) when the policy says
+/// `on_stale: review`. It is the customer's choice here, unlike an
+/// unverifiable view: a list outage can last hours, and holding every
+/// withdrawal platform-wide for it is a decision a customer makes, not one we
+/// make for them. `serve` policies still disclose it on every decision.
 pub fn decide(input: ScreeningInput, policy: &Policy, freshness: Freshness) -> Verdict {
     // Taken by value so the factor breakdown *moves* into the verdict (and on
     // into the audit event) with no clone on the p50 < 100ms path; the caller
@@ -385,6 +398,11 @@ pub fn decide(input: ScreeningInput, policy: &Policy, freshness: Freshness) -> V
                 },
             ) if policy.on_stale == StalePolicy::Review || !sanctions_verified => {
                 (Decision::Review, DecisionBasis::StaleFactsReview)
+            }
+            (Decision::Allow, _)
+                if input.sanctions_lists_stale && policy.on_stale == StalePolicy::Review =>
+            {
+                (Decision::Review, DecisionBasis::StaleSanctionsListReview)
             }
             (decision, _) => (decision, DecisionBasis::ScoreThresholds),
         }
@@ -407,6 +425,14 @@ mod tests {
             score,
             sanctioned,
             factors: vec![],
+            sanctions_lists_stale: false,
+        }
+    }
+
+    fn stale_lists(score: u8, sanctioned: bool) -> ScreeningInput {
+        ScreeningInput {
+            sanctions_lists_stale: true,
+            ..input(score, sanctioned)
         }
     }
 
@@ -578,6 +604,42 @@ mod tests {
         assert_eq!(
             decide(input(10, false), &policy, Freshness::Fresh).decision,
             Decision::Allow
+        );
+    }
+
+    /// A stale sanctions list holds an allow only where the customer asked
+    /// for stale inputs to be held; it never softens a block and never
+    /// touches a review.
+    #[test]
+    fn a_stale_list_holds_an_allow_only_under_a_review_policy() {
+        let review = builtin_policy("default")
+            .unwrap()
+            .with_on_stale(StalePolicy::Review);
+        let verdict = decide(stale_lists(10, false), &review, Freshness::Fresh);
+        assert_eq!(verdict.decision, Decision::Review);
+        assert_eq!(verdict.basis, DecisionBasis::StaleSanctionsListReview);
+
+        let serve = builtin_policy("default").unwrap();
+        assert_eq!(serve.on_stale, StalePolicy::Serve);
+        let verdict = decide(stale_lists(10, false), &serve, Freshness::Fresh);
+        assert_eq!(
+            (verdict.decision, verdict.basis),
+            (Decision::Allow, DecisionBasis::ScoreThresholds)
+        );
+
+        // A block is never softened, and a sanctions match still hard-blocks.
+        assert_eq!(
+            decide(stale_lists(95, false), &review, Freshness::Fresh).decision,
+            Decision::Block
+        );
+        assert_eq!(
+            decide(stale_lists(0, true), &review, Freshness::Fresh).basis,
+            DecisionBasis::SanctionsHardBlock
+        );
+        // Stale facts take precedence: their hold is reported, not the list's.
+        assert_eq!(
+            decide(stale_lists(10, false), &review, stale(true)).basis,
+            DecisionBasis::StaleFactsReview
         );
     }
 

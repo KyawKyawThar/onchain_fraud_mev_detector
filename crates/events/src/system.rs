@@ -133,6 +133,11 @@ pub enum ScreeningDecisionBasis {
     /// because the sanctions view could not vouch for the address. A stale
     /// `block` is never softened this way.
     StaleFactsReview,
+    /// The thresholds alone would have allowed, but a sanctions list the
+    /// decision was screened against is past its freshness SLA (§8.5), and
+    /// the customer's policy holds on stale inputs (`on_stale: review`). The
+    /// address may have been designated since the list was last confirmed.
+    StaleSanctionsListReview,
 }
 
 /// Why a screening decision was rendered over a last-known-good snapshot rather
@@ -161,6 +166,25 @@ pub struct FactsStaleness {
     pub observed_at: DateTime<Utc>,
     /// How old the facts were when the decision was made, in milliseconds.
     pub age_ms: u64,
+}
+
+/// Which version of one sanctions list a screening decision was rendered
+/// against (§8.5): the point-in-time provenance a compliance reviewer needs to
+/// answer "was this address on the list we were screening with, at the time?".
+///
+/// `digest` names the promoted list version, which intelligence keeps as an
+/// append-only snapshot, so the exact designations can be recovered later.
+/// `stale` is whether the list was past its freshness SLA when the decision
+/// was made: the response and the audit record carry the same value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SanctionsListProvenance {
+    pub list: String,
+    pub digest: String,
+    /// When the list was last confirmed against its source; the Unix epoch
+    /// if it never was (and `stale` is then true).
+    pub synced_at: DateTime<Utc>,
+    pub stale: bool,
 }
 
 /// One synchronous counterparty-screening decision (§11, Sprint 14 t3): the
@@ -203,6 +227,11 @@ pub struct ScreeningDecisionRecorded {
     /// guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts_staleness: Option<FactsStaleness>,
+    /// The version of each monitored sanctions list the decision was screened
+    /// against (§8.5). Additive (SCHEMA.md): an old record has none, which is
+    /// the truth — list versions were not tracked before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sanctions_lists: Vec<SanctionsListProvenance>,
 }
 
 #[cfg(test)]

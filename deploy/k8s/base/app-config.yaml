@@ -116,3 +116,32 @@ data:
   # Public MEV-Boost relay data APIs; relay identity is configuration, never
   # code. Empty ⇒ header facts only.
   MEV_RELAY_ENDPOINTS: flashbots=https://boost-relay.flashbots.net,ultrasound=https://relay.ultrasound.money,agnostic=https://agnostic-relay.net
+
+  # ── §8.5 sanctions freshness SLA (intelligence) ───────────────
+  # The lists that must stay fresh, each `list[=max_age_secs]`; a bare name
+  # takes INTEL_SANCTIONS_MAX_AGE_SECS (default 21600 = 6h). Read by the grpc
+  # pods, which publish the SLA as `intel_sanctions_list_max_age_seconds` — the
+  # SanctionsListStale alert's threshold. Removing a list here stops it being
+  # monitored; it does not stop it being screened against.
+  INTEL_SANCTIONS_LISTS: ofac_sdn,eu_consolidated
+  # Where the hourly sanctions-sync CronJobs read each list. OFAC: the
+  # community-standard extraction of the SDN digital-currency addresses. EU:
+  # no public extraction exists — point this at the operator's own (plain
+  # text, one 0x address per line). Until it resolves, the EU CronJob fails,
+  # SanctionsListSyncFailing warns, and SanctionsListStale pages: claiming EU
+  # coverage without an EU source is the gap the SLA exists to expose.
+  # The checks a fetched version must pass before it replaces the live one.
+  # Growth is the direction that matters: the live rows hard-block withdrawals,
+  # so a wrong file's extra addresses are the damaging case, while a shrink
+  # only removes designations the source no longer carries. A refused version
+  # is staged, not discarded — an operator promotes it by digest after checking
+  # upstream (`intelligence sanctions-promote`).
+  INTEL_SANCTIONS_MAX_SHRINK_PERCENT: "20"
+  INTEL_SANCTIONS_MAX_GROWTH_PERCENT: "100"
+  INTEL_SANCTIONS_GROWTH_FLOOR: "500"
+  # Addresses a list must always carry, `list:0xaddr,…;list:…` — the cheapest
+  # check for "right URL, wrong file". Empty until the compliance team picks
+  # designations they are confident are permanent.
+  INTEL_SANCTIONS_SENTINELS: ""
+  INTEL_SANCTIONS_OFAC_URL: https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt
+  INTEL_SANCTIONS_EU_URL: https://sanctions.mevwatch.example/eu_consolidated_ETH.txt

@@ -354,12 +354,12 @@ groups:
           description: "event_store_append_errors_total has been increasing for 5m — the audit trail's write path is degraded. A `permanent`-labeled error is a bug (encode failure); `transient` points at ClickHouse. The Kafka ingest retries a failed flush indefinitely rather than commit past evidence it did not store, so while this fires ingest is wedged on purpose: kafka_consumer_lag{consumer=\"event-store\"} climbs, and nothing is lost."
 
       # Threshold provenance (§19b): derived from the committed capacity model,
-      # not typed. 4609990535 = 1.25 × the model's 1× projection of `payload`
+      # not typed. 4906646363 = 1.25 × the model's 1× projection of `payload`
       # bytes per day at the end of year one (`just capacity-plan` prints it as
       # the drift ceiling). crates/capacity/tests/committed.rs fails the build
       # if this number and the model disagree, so neither can move alone.
       - alert: EventStoreGrowthAboveCapacityPlan
-        expr: sum(increase(event_store_appended_payload_bytes_total[1d])) > 4609990535
+        expr: sum(increase(event_store_appended_payload_bytes_total[1d])) > 4906646363
         for: 6h
         labels:
           severity: warning
@@ -798,6 +798,92 @@ groups:
         annotations:
           summary: "Nobody is answering the feedback the platform asks for"
           description: "More than a hundred solicited feedback invitations went out in the last week and not one came back, so the only cohort whose rate can back a published accuracy claim will never arm. Usually this is the last mile rather than apathy: check that FEEDBACK_LINK_BASE points at a surface that actually renders the form, that the grant secret matches between notification and the API service (a mismatch shows up as 403s), and that the link is surviving whatever renders the alert."
+
+  # ── Sanctions freshness SLA (§8.5, readiness Epic E) ───────────────────────
+  #
+  # `SanctionHit` is a hard alert and `/screen` hard-blocks on a match, so a
+  # list that stopped refreshing is a compliance failure, and before this group
+  # it was a silent one. The gauges come from intelligence's `grpc` pods, which
+  # read the `sanctions_list_syncs` ledger on a timer. They are NOT emitted by
+  # the hourly sync CronJobs: a Job that never starts (suspended, broken
+  # schedule, image that no longer pulls) produces no failure to alert on, but
+  # its list still ages in the ledger. The timestamps are published as 0 before
+  # the first ledger read (§15b), so a list that never synced fires the stale
+  # rule rather than satisfying it by absence. `max by (list)` because every
+  # grpc replica publishes the same ledger.
+  # Runbook: docs/runbooks/sanctions-freshness.md.
+  - name: mevwatch-sanctions-compliance
+    rules:
+      # AN EXPORTED GAUGE — the SLA is `intel_sanctions_list_max_age_seconds`,
+      # i.e. the deployment's own INTEL_SANCTIONS_LISTS, so a tuned SLA and
+      # this rule cannot disagree.
+      - alert: SanctionsListStale
+        expr: |
+          (time() - max by (list) (intel_sanctions_list_synced_timestamp_seconds))
+            > max by (list) (intel_sanctions_list_max_age_seconds)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sanctions list {{ $labels.list }} is past its freshness SLA"
+          description: "The {{ $labels.list }} list has not been confirmed against its source within its SLA (intel_sanctions_list_max_age_seconds). Screening and SanctionHit are running against a list that may be missing designations made since. That is a compliance failure, not a data-quality one. Every screening decision now reports this list as stale, and customers on an `on_stale: review` policy have their allows held. A synced timestamp of 0 means the list has NEVER synced in this deployment (no source wired, or the CronJob was never deployed). `intelligence sanctions-status` prints each list's age and its last failure reason; SanctionsListSyncFailing usually fired first and says why."
+
+      # STRUCTURAL — two series that contradict each other: the latest attempt
+      # is a failure. The early warning, hours before the SLA pages. Refusals
+      # by the snapshot checks land here too, and do not clear on their own:
+      # the scheduled job never overrides a check.
+      - alert: SanctionsListSyncFailing
+        expr: |
+          max by (list) (intel_sanctions_list_failed_timestamp_seconds)
+            > max by (list) (intel_sanctions_list_synced_timestamp_seconds)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The latest sync of sanctions list {{ $labels.list }} failed"
+          description: "The most recent intelligence sanctions-sync run for {{ $labels.list }} failed, and no later run has succeeded. Screening still uses the last promoted version, and the list will page as SanctionsListStale once that passes its SLA. `intelligence sanctions-status` shows the recorded reason. A fetch/HTTP error or a parse failure (the upstream format changed, or it served an error page) is fixed at the source. A 'refused' reason means the snapshot checks stopped a version from going live: it grew, shrank, or lost a sentinel address beyond the configured bounds. Check upstream that the change is real, then promote exactly that version: `intelligence sanctions-history {{ $labels.list }}` lists it, and `intelligence sanctions-promote {{ $labels.list }} <digest> <your name>` promotes it."
+
+      # STRUCTURAL — should be zero for long. A promotion committed (screening
+      # already sees it) but its label writes / hot-cache evictions did not
+      # finish. Every sync resumes them first, so one hourly run should clear
+      # it; two hours means runs are failing before they get that far.
+      - alert: SanctionsPromotionEffectsPending
+        expr: max by (list) (intel_sanctions_list_effects_pending) == 1
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "A promotion of sanctions list {{ $labels.list }} has unfinished effects"
+          description: "A promotion of {{ $labels.list }} committed but its SanctionedEntity label writes and hot-cache evictions have not completed for two hours. Screening is unaffected: it reads the promoted designations directly. Risk scores for the touched addresses may be stale until the evictions run. Each sync resumes the effects before doing anything else, so this persisting means the sync itself is failing: see SanctionsListSyncFailing, or the sanctions-sync CronJob's pod log (usually Redis unreachable from the job)."
+
+      # AN EXPORTED GAUGE, with a structural reading — the outbox should drain
+      # within a few flush intervals. It carries retroactive SanctionHits (a
+      # hard alert, §8.5): an address designated after we first saw it raises
+      # its hit only when this drains. 15m is many flush intervals (5s) and
+      # sync runs; anything older is a stuck publisher, not a slow one. Paged
+      # because what is waiting is a hard alert. The gauge is 0 when drained.
+      - alert: SanctionsAnnouncementsStuck
+        expr: |
+          (time() - min(intel_sanctions_outbox_oldest_pending_timestamp_seconds > 0)) > 900
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sanctions announcements, including retroactive SanctionHits, are not being published"
+          description: "An announcement has waited in sanctions_outbox for over 15 minutes. It may be a retroactive SanctionHit for an address we already knew that has just been designated: a hard alert, delayed. The designation itself is live and screening already blocks it; what is delayed is the alert and the SanctionsListUpdated audit record. The intelligence grpc pods publish the outbox (intel_sanctions_outbox_publish_failures_total counts their failed attempts), so check Kafka reachability from them. Rows are durable, and nothing is lost while this fires."
+
+      # STRUCTURAL — should be zero. The grpc pods cannot read the ledger; the
+      # gauges keep their last values (timestamps, so the computed age keeps
+      # growing and the stale rule still fires eventually), but a list that
+      # recovers or fails in the meantime is invisible.
+      - alert: SanctionsFreshnessUnreadable
+        expr: sum(rate(intel_sanctions_freshness_read_failures_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Intelligence cannot read the sanctions freshness ledger"
+          description: "intel_sanctions_freshness_read_failures_total has been rising for 15 minutes: the intelligence grpc pods cannot read sanctions_list_syncs from Postgres. Freshness gauges are frozen at their last values. If the table is missing, the 20260920000000 migration has not been applied (`just migrate-up`); otherwise check the pods' Postgres connectivity."
 
   - name: mevwatch-copilot-governance
     rules:

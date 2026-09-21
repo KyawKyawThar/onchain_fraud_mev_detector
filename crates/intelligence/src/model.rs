@@ -348,6 +348,148 @@ pub struct SanctionsWatermark {
     pub last_imported_at: Option<DateTime<Utc>>,
 }
 
+/// A sanctions list the platform ingests and versions (§8.5). Closed: adding
+/// a list is a new variant, which the compiler then walks through the feed,
+/// the SLA table and the sync. The wire/storage form is the snake_case name
+/// (`ofac_sdn`), which is also the `sanctions.list_name` the list's rows carry.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum SanctionsList {
+    OfacSdn,
+    EuConsolidated,
+}
+
+impl SanctionsList {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// HTTP cache validators from the fetch that produced or last confirmed a
+/// list's current version, replayed as `If-None-Match`/`If-Modified-Since`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+/// One sanctions list's row in the freshness ledger (§8.5): its current
+/// version, when that was last confirmed against the source, and when an
+/// attempt last failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListSyncRecord {
+    pub list: SanctionsList,
+    /// When the source was fetched for the last sync that confirmed or
+    /// promoted the current version. `None` if only failures were recorded.
+    pub synced_at: Option<DateTime<Utc>>,
+    /// Designations in the current version.
+    pub entries: Option<u64>,
+    /// Content digest of the current (last promoted) version.
+    pub content_digest: Option<String>,
+    /// When the current version was promoted — the list's content clock.
+    pub content_changed_at: Option<DateTime<Utc>>,
+    /// Where the current version was last read from (URL or path).
+    pub source: Option<String>,
+    pub validators: Validators,
+    /// The most recent failed attempt, kept after a later success as history.
+    pub failed_at: Option<DateTime<Utc>>,
+    pub failure_reason: Option<String>,
+    /// A promotion of this list whose post-commit effects (labels, hot-cache
+    /// evictions) have not completed yet.
+    pub effects_pending: bool,
+}
+
+impl ListSyncRecord {
+    /// A row for a list the ledger has never seen.
+    pub fn empty(list: SanctionsList) -> Self {
+        Self {
+            list,
+            synced_at: None,
+            entries: None,
+            content_digest: None,
+            content_changed_at: None,
+            source: None,
+            validators: Validators::default(),
+            failed_at: None,
+            failure_reason: None,
+            effects_pending: false,
+        }
+    }
+
+    /// Whether the most recent attempt failed — a failure newer than the last
+    /// success, or failures with no success at all.
+    pub fn last_attempt_failed(&self) -> bool {
+        match (self.failed_at, self.synced_at) {
+            (Some(failed), Some(synced)) => failed > synced,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
+/// Where a staged snapshot stands.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum SnapshotStatus {
+    /// Fetched and stored, not (yet) promoted.
+    Staged,
+    /// Failed a check; waiting for an operator or a corrected source.
+    Refused,
+    /// Promoted at least once (it may since have been superseded).
+    Promoted,
+}
+
+/// A stored snapshot's metadata (its designations are read separately).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub list: SanctionsList,
+    pub digest: String,
+    pub entries: u64,
+    pub source: String,
+    pub first_fetched_at: DateTime<Utc>,
+    pub last_fetched_at: DateTime<Utc>,
+    pub status: SnapshotStatus,
+    pub refusal: Option<String>,
+}
+
+/// One promotion, as logged: which version replaced which, the diff it
+/// applied to the live rows, and whether its post-commit effects finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionRecord {
+    pub promotion_id: uuid::Uuid,
+    pub list: SanctionsList,
+    pub digest: String,
+    pub previous_digest: Option<String>,
+    pub entries: u64,
+    pub added: Vec<AccountAddress>,
+    pub changed: Vec<AccountAddress>,
+    pub removed: Vec<AccountAddress>,
+    pub promoted_by: String,
+    pub promoted_at: DateTime<Utc>,
+    pub effects_applied_at: Option<DateTime<Utc>>,
+}
+
 /// The clustering signal an adjacency edge records (§8.2). These are the §8.2
 /// heuristics as *graph facts*: A funded B, A deployed B, A received B's
 /// profit, A and B share deployed bytecode, A interacted with B.

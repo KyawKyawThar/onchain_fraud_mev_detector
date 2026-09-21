@@ -176,11 +176,28 @@ message SanctionsWatermark {
   int64 last_imported_unix_millis = 2;
 }
 
+// One monitored sanctions list's current version and freshness (§8.5). The
+// SLA travels with it so the API service judges staleness against
+// intelligence's configuration instead of keeping a second copy of it.
+message SanctionsListState {
+  // `ofac_sdn`, `eu_consolidated`, …
+  string list = 1;
+  // Content digest of the current version; empty if the list never synced.
+  string digest = 2;
+  // Unix milliseconds of the last confirmation against the source; 0 if never.
+  int64 synced_unix_millis = 3;
+  // The list's freshness SLA.
+  uint64 max_age_secs = 4;
+}
+
 message ListSanctionsReply {
   repeated SanctionsListEntry entries = 1;
   // Cursor for the next page; empty on the last.
   string next_after = 2;
   SanctionsWatermark watermark = 3;
+  // Every monitored list's state. Filled on the watermark-only call
+  // (`limit = 0`) — the one a reader makes every refresh — and empty on pages.
+  repeated SanctionsListState lists = 4;
 }
 
 message BuilderLeaderboardRequest {

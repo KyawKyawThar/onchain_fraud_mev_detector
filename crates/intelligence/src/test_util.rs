@@ -19,11 +19,14 @@ use crate::adjacency::{AdjacencyStore, GraphError};
 use crate::cache::{CacheError, CachedScore, CachedScreeningFacts, HotCache};
 use crate::model::{
     plan_reversal, AddressEdge, AdjacencyEdge, AttributionRecord, EdgeHistory, EntityRecord,
-    EntityStatus, LabelRecord, MergeId, MergeLogEntry, Neighborhood, ReversalPlan, SanctionEntry,
+    EntityStatus, LabelKind, LabelRecord, ListSyncRecord, MergeId, MergeLogEntry, Neighborhood,
+    PromotionRecord, ReversalPlan, SanctionEntry, SanctionsList, SnapshotStatus, SnapshotSummary,
 };
+use crate::sanctions_list::{self, Announcement, Designation, ListContent, PromotionFacts};
 use crate::store::{
-    AttributionStore, CreateOutcome, EntityStore, LabelStore, LinkOutcome, MergeOutcome,
-    ReversalOutcome, SanctionsStore, SplitOutcome, StoreError,
+    AttributionStore, Confirmation, CreateOutcome, EntityStore, LabelStore, LinkOutcome,
+    MergeOutcome, PromotionOutcome, PromotionRequest, ReversalOutcome, SanctionsListStore,
+    SanctionsStore, SplitOutcome, StagedSnapshot, StoreError,
 };
 
 /// In-memory implementation of all four Postgres seams.
@@ -41,6 +44,14 @@ struct StoreState {
     memberships: HashMap<AccountAddress, EntityId>,
     attributions: HashMap<(IncidentId, EntityId), AttributionRecord>,
     sanctions: HashMap<(AccountAddress, String), SanctionEntry>,
+    /// Sanctions list versioning (§8.5): the ledger, snapshots, promotions and
+    /// the outbox a promotion queues into.
+    list_syncs: std::collections::BTreeMap<SanctionsList, ListSyncRecord>,
+    snapshots: HashMap<(SanctionsList, String), (SnapshotSummary, ListContent)>,
+    promotions: Vec<PromotionRecord>,
+    sanctions_outbox: Vec<Announcement>,
+    /// What [`SanctionsListStore::db_now`] answers; `None` = the wall clock.
+    now: Option<DateTime<Utc>>,
     /// The merge log (§15) — one entry per `absorb` call, mirroring the
     /// `entity_merges` table.
     merges: Vec<MergeLogEntry>,
@@ -529,6 +540,342 @@ impl SanctionsStore for InMemoryIntelligenceStore {
             rows: state.sanctions.len() as u64,
             last_imported_at: None,
         })
+    }
+}
+
+impl InMemoryIntelligenceStore {
+    /// Pin the clock [`SanctionsListStore::db_now`] answers with.
+    pub fn set_now(&self, now: DateTime<Utc>) {
+        self.inner.lock().expect("store lock").now = Some(now);
+    }
+
+    /// Every announcement promotions have queued, in order.
+    pub fn sanctions_outbox(&self) -> Vec<Announcement> {
+        self.inner
+            .lock()
+            .expect("store lock")
+            .sanctions_outbox
+            .clone()
+    }
+
+    /// Drop a list's live rows behind the store's back — drift for the
+    /// reconcile path to find.
+    pub fn corrupt_live_sanctions(&self, list: SanctionsList) {
+        self.inner
+            .lock()
+            .expect("store lock")
+            .sanctions
+            .retain(|(_, name), _| name != list.as_str());
+    }
+}
+
+fn live_content_of(state: &StoreState, list: SanctionsList) -> ListContent {
+    ListContent::new(
+        state
+            .sanctions
+            .values()
+            .filter(|e| e.list_name == list.as_str())
+            .map(|e| Designation {
+                address: e.address,
+                entry: e.entry.clone(),
+            }),
+    )
+}
+
+/// Mirrors the Postgres implementation, including the monotonic stamps, the
+/// optimistic promotion check, and the "known address" rule — through the
+/// same pure `diff`/`announcements` functions.
+#[async_trait]
+impl SanctionsListStore for InMemoryIntelligenceStore {
+    async fn db_now(&self) -> Result<DateTime<Utc>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("store lock")
+            .now
+            .unwrap_or_else(Utc::now))
+    }
+
+    async fn list_syncs(&self) -> Result<Vec<ListSyncRecord>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state
+            .list_syncs
+            .values()
+            .map(|record| ListSyncRecord {
+                effects_pending: state
+                    .promotions
+                    .iter()
+                    .any(|p| p.list == record.list && p.effects_applied_at.is_none()),
+                ..record.clone()
+            })
+            .collect())
+    }
+
+    async fn record_sync_failure(
+        &self,
+        list: SanctionsList,
+        failed_at: DateTime<Utc>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let row = state
+            .list_syncs
+            .entry(list)
+            .or_insert_with(|| ListSyncRecord::empty(list));
+        if row.failed_at.is_some_and(|at| at > failed_at) {
+            return Ok(());
+        }
+        row.failed_at = Some(failed_at);
+        row.failure_reason = Some(reason.to_owned());
+        Ok(())
+    }
+
+    async fn stage_snapshot(&self, snapshot: &StagedSnapshot<'_>) -> Result<(), StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let key = (snapshot.list, snapshot.content.digest().to_owned());
+        match state.snapshots.get_mut(&key) {
+            Some((summary, _)) => {
+                summary.last_fetched_at = summary.last_fetched_at.max(snapshot.fetched_at);
+                summary.source = snapshot.source.to_owned();
+            }
+            None => {
+                let summary = SnapshotSummary {
+                    list: snapshot.list,
+                    digest: key.1.clone(),
+                    entries: snapshot.content.entries(),
+                    source: snapshot.source.to_owned(),
+                    first_fetched_at: snapshot.fetched_at,
+                    last_fetched_at: snapshot.fetched_at,
+                    status: SnapshotStatus::Staged,
+                    refusal: None,
+                };
+                state
+                    .snapshots
+                    .insert(key, (summary, snapshot.content.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refuse_snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        if let Some((summary, _)) = state.snapshots.get_mut(&(list, digest.to_owned())) {
+            if summary.status != SnapshotStatus::Promoted {
+                summary.status = SnapshotStatus::Refused;
+            }
+            summary.refusal = Some(reason.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn snapshot(
+        &self,
+        list: SanctionsList,
+        digest: &str,
+    ) -> Result<Option<(SnapshotSummary, ListContent)>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state.snapshots.get(&(list, digest.to_owned())).cloned())
+    }
+
+    async fn live_content(&self, list: SanctionsList) -> Result<ListContent, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(live_content_of(&state, list))
+    }
+
+    async fn confirm_unchanged(&self, confirmation: &Confirmation<'_>) -> Result<bool, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let Some(row) = state.list_syncs.get_mut(&confirmation.list) else {
+            return Ok(false);
+        };
+        if row.content_digest.as_deref() != Some(confirmation.digest) {
+            return Ok(false);
+        }
+        row.synced_at = Some(
+            row.synced_at
+                .map_or(confirmation.synced_at, |at| at.max(confirmation.synced_at)),
+        );
+        row.source = Some(confirmation.source.to_owned());
+        row.validators = confirmation.validators.clone();
+        Ok(true)
+    }
+
+    async fn promote(&self, request: &PromotionRequest) -> Result<PromotionOutcome, StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        let current = state
+            .list_syncs
+            .get(&request.list)
+            .and_then(|row| row.content_digest.clone());
+        if current != request.expected_previous {
+            return Ok(PromotionOutcome::Conflict { current });
+        }
+        let key = (request.list, request.digest.clone());
+        let Some((_, next)) = state.snapshots.get(&key).cloned() else {
+            return Ok(PromotionOutcome::UnknownSnapshot);
+        };
+
+        let diff = sanctions_list::diff(&live_content_of(&state, request.list), &next);
+        let list_name = request.list.as_str().to_owned();
+        for address in &diff.removed {
+            state.sanctions.remove(&(*address, list_name.clone()));
+        }
+        for designation in diff.added.iter().chain(&diff.changed) {
+            state.sanctions.insert(
+                (designation.address, list_name.clone()),
+                SanctionEntry {
+                    address: designation.address,
+                    list_name: list_name.clone(),
+                    entry: designation.entry.clone(),
+                    listed_at: None,
+                },
+            );
+        }
+
+        let known: HashSet<AccountAddress> = diff
+            .added
+            .iter()
+            .map(|d| d.address)
+            .filter(|address| {
+                state.memberships.contains_key(address)
+                    || state.labels.iter().any(|label| {
+                        label.address == *address
+                            && label.kind != LabelKind::SanctionedEntity
+                            && !state.revoked.contains(&label.label_id)
+                    })
+            })
+            .collect();
+
+        let record = PromotionRecord {
+            promotion_id: request.promotion_id,
+            list: request.list,
+            digest: request.digest.clone(),
+            previous_digest: current.clone(),
+            entries: next.entries(),
+            added: diff.added.iter().map(|d| d.address).collect(),
+            changed: diff.changed.iter().map(|d| d.address).collect(),
+            removed: diff.removed.clone(),
+            promoted_by: request.promoted_by.clone(),
+            promoted_at: request.promoted_at,
+            effects_applied_at: None,
+        };
+        state.promotions.push(record.clone());
+        if let Some((summary, _)) = state.snapshots.get_mut(&key) {
+            summary.status = SnapshotStatus::Promoted;
+            summary.refusal = None;
+        }
+        let row = state
+            .list_syncs
+            .entry(request.list)
+            .or_insert_with(|| ListSyncRecord::empty(request.list));
+        row.synced_at = Some(
+            row.synced_at
+                .map_or(request.synced_at, |at| at.max(request.synced_at)),
+        );
+        row.entries = Some(next.entries());
+        row.content_digest = Some(request.digest.clone());
+        row.content_changed_at = Some(request.promoted_at);
+        row.source = Some(request.source.clone());
+        row.validators = request.validators.clone();
+
+        let facts = PromotionFacts {
+            promotion_id: request.promotion_id,
+            list: request.list,
+            digest: request.digest.clone(),
+            previous_digest: current,
+            entries: next.entries(),
+            promoted_by: request.promoted_by.clone(),
+            promoted_at: request.promoted_at,
+        };
+        for announcement in sanctions_list::announcements(&facts, &diff, &known) {
+            if !state
+                .sanctions_outbox
+                .iter()
+                .any(|queued| queued.key == announcement.key)
+            {
+                state.sanctions_outbox.push(announcement);
+            }
+        }
+        Ok(PromotionOutcome::Promoted(record))
+    }
+
+    async fn pending_promotions(
+        &self,
+        list: SanctionsList,
+    ) -> Result<Vec<PromotionRecord>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state
+            .promotions
+            .iter()
+            .filter(|p| p.list == list && p.effects_applied_at.is_none())
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_effects_applied(
+        &self,
+        promotion_id: uuid::Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut state = self.inner.lock().expect("store lock");
+        if let Some(p) = state
+            .promotions
+            .iter_mut()
+            .find(|p| p.promotion_id == promotion_id && p.effects_applied_at.is_none())
+        {
+            p.effects_applied_at = Some(at);
+        }
+        Ok(())
+    }
+
+    async fn promotions(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<PromotionRecord>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state
+            .promotions
+            .iter()
+            .rev()
+            .filter(|p| p.list == list)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn snapshots(
+        &self,
+        list: SanctionsList,
+        limit: u32,
+    ) -> Result<Vec<SnapshotSummary>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        let mut out: Vec<SnapshotSummary> = state
+            .snapshots
+            .values()
+            .filter(|(s, _)| s.list == list)
+            .map(|(s, _)| s.clone())
+            .collect();
+        out.sort_by(|a, b| {
+            b.last_fetched_at
+                .cmp(&a.last_fetched_at)
+                .then_with(|| a.digest.cmp(&b.digest))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    /// The double never publishes, so this is "anything queued": the promotion
+    /// time of the first queued announcement.
+    async fn oldest_pending_announcement(&self) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let state = self.inner.lock().expect("store lock");
+        Ok(state.sanctions_outbox.first().and_then(|a| match &a.event {
+            events::DomainEvent::SanctionsListUpdated(u) => Some(u.promoted_at),
+            _ => None,
+        }))
     }
 }
 

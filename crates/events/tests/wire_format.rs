@@ -140,6 +140,10 @@ const GOLDENS: &[(&str, &str)] = &[
         r#"{"type":"SanctionHit","payload":{"address":"0x3333333333333333333333333333333333333333","list":"OFAC","entry":"SDN-123"}}"#,
     ),
     (
+        "SanctionsListUpdated",
+        r#"{"type":"SanctionsListUpdated","payload":{"promotion_id":"00000000-0000-0000-0000-00000000005a","list":"ofac_sdn","digest":"9f86d081","previous_digest":"60303ae2","entries":120,"added_total":2,"removed_total":1,"added":["0x3333333333333333333333333333333333333333"],"removed":["0x5555555555555555555555555555555555555555"],"chunk":0,"chunks":2,"promoted_by":"scheduled","promoted_at":"2023-11-14T22:13:20Z"}}"#,
+    ),
+    (
         "AddressEmbeddingUpdated",
         r#"{"type":"AddressEmbeddingUpdated","payload":{"address":"0x3333333333333333333333333333333333333333","entity_id":"00000000-0000-0000-0000-0000000000e1","embedding_version":"behavior-v1","schema_hash":"a1b2c3","vector":[0.5,0.25,0.0],"content_digest":"9f86d081884c7d65","top_factors":[{"feature":"edge_count_log","value":0.5,"share":0.75}],"observations_truncated":false}}"#,
     ),
@@ -165,7 +169,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
     (
         "ScreeningDecisionRecorded",
-        r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z","facts_staleness":{"reason":"intelligence_slow","observed_at":"2023-11-14T22:13:20Z","age_ms":1500}}}"#,
+        r#"{"type":"ScreeningDecisionRecorded","payload":{"customer_id":"00000000-0000-0000-0000-0000000000c0","address":"0x3333333333333333333333333333333333333333","decision":"block","decision_basis":"sanctions_hard_block","policy_name":"default","policy_version":1,"score":87,"confidence":0.7,"sanctioned":true,"model_version":"risk-v1","factors":[{"name":"sanctions-match","delta":45.0,"evidence_ref":"sanctions:ofac_sdn"}],"timestamp":"2023-11-14T22:13:20Z","facts_staleness":{"reason":"intelligence_slow","observed_at":"2023-11-14T22:13:20Z","age_ms":1500},"sanctions_lists":[{"list":"ofac_sdn","digest":"9f86d081","synced_at":"2023-11-14T22:13:20Z","stale":false}]}}"#,
     ),
     (
         "ModelDriftDetected",
