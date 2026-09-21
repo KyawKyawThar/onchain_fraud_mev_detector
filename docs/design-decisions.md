@@ -70,6 +70,8 @@ Behavioral embeddings widen recall without weakening that story. A strong simila
 - **When intelligence is slow**, a stale-but-flagged snapshot answers (disclosed on the response *and* in the audit record) instead of blocking the withdrawal. The fresh read runs behind a bulkhead, a circuit breaker that also counts slow reads, and budgeted hedged reads.
 - **When no snapshot exists**, it still fails closed (502). Degradation widens what can be answered; it never turns "could not decide" into "allow".
 - **Sanctions never come from a snapshot.** A pod-local sanctions view is merged into every decision, and a stale `allow` it cannot vouch for is held as `review`.
+- **A sanctions list is a versioned snapshot.** Each fetch is staged content-addressed, checked, and promoted in one transaction; the live rows then equal exactly one published version. That is what makes delisting expressible, bounds the damage a wrong file can do (extra designations hard-block withdrawals, so *growth* is the guarded direction), and lets a screening decision cite the list version it was screened against.
+- **The lists themselves have a freshness SLA.** A list not confirmed against its source within its SLA pages, and every decision made meanwhile says so. The alert is driven by an always-up reader of the ledger, not by the sync job, so a job that never runs is caught too.
 
 ## Where the ML stops
 

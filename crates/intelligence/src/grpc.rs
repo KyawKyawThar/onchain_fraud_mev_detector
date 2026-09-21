@@ -156,7 +156,23 @@ pub struct IntelligenceReadService {
     /// a computation: the expensive part already happened in the `link-signal`
     /// consumer, which is exactly why the proposals are materialized.
     links: Arc<dyn LinkCandidateStore>,
+    /// The sanctions freshness ledger and the SLAs to report against it (§8.5),
+    /// for `ListSanctions`' list states. `None` reports no lists.
+    sanctions_lists: Option<SanctionsListsRead>,
 }
+
+/// What `ListSanctions` needs to report each monitored list's version and
+/// freshness.
+#[derive(Clone)]
+pub struct SanctionsListsRead {
+    pub store: Arc<dyn crate::store::SanctionsListStore>,
+    pub slas: Vec<crate::sanctions_freshness::ListSla>,
+}
+
+/// Counter: `ListSanctions` head calls that could not read the freshness
+/// ledger and reported every list as never confirmed instead.
+pub const SANCTIONS_LIST_STATE_READ_FAILURES_TOTAL: &str =
+    "intelligence_sanctions_list_state_read_failures_total";
 
 /// The largest sanctions page one `ListSanctions` call returns, whatever the
 /// caller asks for — bounds one response's size and one query's cost.
@@ -180,7 +196,50 @@ impl IntelligenceReadService {
             graph_limits,
             similarity,
             links,
+            sanctions_lists: None,
         }
+    }
+
+    /// Report each monitored sanctions list's version and freshness on
+    /// `ListSanctions` (§8.5).
+    pub fn with_sanctions_lists(mut self, read: SanctionsListsRead) -> Self {
+        self.sanctions_lists = Some(read);
+        self
+    }
+
+    /// Every monitored list's state. A ledger that cannot be read reports
+    /// every list as never confirmed — stale, which is what it is to a reader
+    /// that cannot know better — rather than failing the call: the watermark
+    /// and designations must keep flowing to the API service's sanctions view
+    /// whatever the ledger's health.
+    async fn sanctions_list_states(&self) -> Vec<crate::pb::SanctionsListState> {
+        let Some(read) = &self.sanctions_lists else {
+            return Vec::new();
+        };
+        let records = match read.store.list_syncs().await {
+            Ok(records) => records,
+            Err(err) => {
+                metrics::counter!(SANCTIONS_LIST_STATE_READ_FAILURES_TOTAL).increment(1);
+                tracing::warn!(error = %err, "reading the sanctions freshness ledger failed");
+                Vec::new()
+            }
+        };
+        read.slas
+            .iter()
+            .map(|sla| {
+                let record = records.iter().find(|r| r.list == sla.list);
+                crate::pb::SanctionsListState {
+                    list: sla.list.as_str().to_owned(),
+                    digest: record
+                        .and_then(|r| r.content_digest.clone())
+                        .unwrap_or_default(),
+                    synced_unix_millis: record
+                        .and_then(|r| r.synced_at)
+                        .map_or(0, |at| at.timestamp_millis()),
+                    max_age_secs: sla.max_age.as_secs(),
+                }
+            })
+            .collect()
     }
 
     /// The shared cache-miss path: fetch every input, run the pure kernel,
@@ -566,6 +625,7 @@ impl IntelligenceRead for IntelligenceReadService {
                 entries: Vec::new(),
                 next_after: String::new(),
                 watermark,
+                lists: self.sanctions_list_states().await,
             }));
         }
 
@@ -599,6 +659,7 @@ impl IntelligenceRead for IntelligenceReadService {
                 .collect(),
             next_after,
             watermark,
+            lists: Vec::new(),
         }))
     }
 
@@ -1632,6 +1693,97 @@ mod tests {
     }
 
     // ── ListSanctions (§8.5, screening sanctions view) ───────────────
+
+    /// The head call reports every monitored list — a never-synced one as
+    /// digest "" / synced 0, which a reader must treat as stale — and pages
+    /// carry no list states.
+    #[tokio::test]
+    async fn list_sanctions_reports_each_monitored_lists_state_on_the_head_call() {
+        use crate::model::SanctionsList;
+        use crate::sanctions_freshness::ListSla;
+        use crate::sanctions_list::{Designation, ListContent};
+        use crate::store::{PromotionRequest, SanctionsListStore, StagedSnapshot};
+
+        let (service, store, _cache) = service();
+        let at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let content = ListContent::new([Designation {
+            address: alloy_primitives::Address::repeat_byte(1),
+            entry: "e".into(),
+        }]);
+        store
+            .stage_snapshot(&StagedSnapshot {
+                list: SanctionsList::OfacSdn,
+                content: &content,
+                source: "s",
+                fetched_at: at,
+            })
+            .await
+            .unwrap();
+        store
+            .promote(&PromotionRequest {
+                promotion_id: uuid::Uuid::new_v4(),
+                list: SanctionsList::OfacSdn,
+                digest: content.digest().to_owned(),
+                expected_previous: None,
+                promoted_by: "scheduled".into(),
+                promoted_at: at,
+                synced_at: at,
+                source: "s".into(),
+                validators: Default::default(),
+            })
+            .await
+            .unwrap();
+        let service = service.with_sanctions_lists(SanctionsListsRead {
+            store: store.clone(),
+            slas: vec![
+                ListSla {
+                    list: SanctionsList::OfacSdn,
+                    max_age: std::time::Duration::from_secs(3_600),
+                },
+                ListSla {
+                    list: SanctionsList::EuConsolidated,
+                    max_age: std::time::Duration::from_secs(60),
+                },
+            ],
+        });
+
+        let head = service
+            .list_sanctions(Request::new(crate::pb::ListSanctionsRequest {
+                after: String::new(),
+                limit: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            head.lists,
+            vec![
+                crate::pb::SanctionsListState {
+                    list: "ofac_sdn".into(),
+                    digest: content.digest().to_owned(),
+                    synced_unix_millis: at.timestamp_millis(),
+                    max_age_secs: 3_600,
+                },
+                crate::pb::SanctionsListState {
+                    list: "eu_consolidated".into(),
+                    digest: String::new(),
+                    synced_unix_millis: 0,
+                    max_age_secs: 60,
+                },
+            ]
+        );
+
+        let page = service
+            .list_sanctions(Request::new(crate::pb::ListSanctionsRequest {
+                after: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.lists.is_empty());
+    }
 
     #[tokio::test]
     async fn list_sanctions_pages_the_whole_list_and_reports_a_watermark() {

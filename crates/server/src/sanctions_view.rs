@@ -21,9 +21,13 @@
 //! over, so a half-imported list is never installed. A failed refresh keeps the
 //! previous view; how old that view is, is exported and alerted on.
 //!
-//! **What it cannot do.** The store only upserts; nothing delists. A removal from
-//! a list would have to be modelled in intelligence before this view can learn
-//! of it — until then the view errs toward blocking, which is the safe side.
+//! **List versions.** Every refresh's head read also carries each monitored
+//! list's current version and freshness (§8.5): the digest a decision was
+//! screened against, and whether that list is past its SLA. Every decision
+//! records them ([`SanctionsView::list_provenance`]), and a stale list can hold
+//! an `allow` under an `on_stale: review` policy. Delistings arrive like any
+//! other change: intelligence promotes a new list version, the watermark
+//! moves, and the next walk drops the address.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -32,6 +36,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use events::primitives::AccountAddress;
+use events::system::SanctionsListProvenance;
 use intelligence::pb::SanctionMatch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +74,36 @@ pub struct Watermark {
     pub last_imported_unix_millis: i64,
 }
 
+/// One monitored sanctions list's current version and freshness, as
+/// intelligence reported it on the head read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListState {
+    pub list: String,
+    /// Empty if the list has never synced.
+    pub digest: String,
+    /// The last confirmation against the source; `None` if never.
+    pub synced_at: Option<DateTime<Utc>>,
+    /// The list's SLA, from intelligence's configuration.
+    pub max_age: Duration,
+}
+
+impl ListState {
+    /// The provenance a decision made at `now` records. A list that never
+    /// synced is stale, and reports the Unix epoch as its sync time.
+    pub fn provenance(&self, now: DateTime<Utc>) -> SanctionsListProvenance {
+        let stale = self.digest.is_empty()
+            || self
+                .synced_at
+                .is_none_or(|at| (now - at).to_std().is_ok_and(|age| age > self.max_age));
+        SanctionsListProvenance {
+            list: self.list.clone(),
+            digest: self.digest.clone(),
+            synced_at: self.synced_at.unwrap_or(DateTime::UNIX_EPOCH),
+            stale,
+        }
+    }
+}
+
 /// One page of the sanctions list, already parsed at the transport edge.
 #[derive(Debug, Clone)]
 pub struct SanctionsPage {
@@ -76,6 +111,8 @@ pub struct SanctionsPage {
     /// The cursor for the next page; `None` on the last.
     pub next_after: Option<String>,
     pub watermark: Watermark,
+    /// Every monitored list's state — filled on the head read only.
+    pub lists: Vec<ListState>,
 }
 
 /// Where the list comes from — `IntelligenceClient` in production.
@@ -91,6 +128,7 @@ struct Installed {
     matches: HashMap<AccountAddress, Vec<SanctionMatch>>,
     watermark: Option<Watermark>,
     synced_at: Option<Instant>,
+    lists: Vec<ListState>,
 }
 
 /// The view. Cloned into `AppState` as an `Arc`; lookups take a read lock for
@@ -151,7 +189,20 @@ impl SanctionsView {
                 rows: 0,
                 last_imported_unix_millis: 0,
             },
+            Vec::new(),
         );
+        view
+    }
+
+    /// A seeded view that also reports these list states — for tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn seeded_with_lists(
+        entries: Vec<(AccountAddress, Vec<SanctionMatch>)>,
+        lists: Vec<ListState>,
+        vouch_window: Duration,
+    ) -> Self {
+        let view = Self::seeded(entries, vouch_window);
+        view.mark_synced(lists);
         view
     }
 
@@ -160,6 +211,19 @@ impl SanctionsView {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Which version of each monitored list a decision made at `now` is
+    /// screened against, and whether each is past its SLA. Empty until the
+    /// first head read succeeds, or when intelligence reports no lists: a
+    /// decision then records no provenance, which is the truth — it cannot
+    /// name a version it was never told.
+    pub fn list_provenance(&self, now: DateTime<Utc>) -> Vec<SanctionsListProvenance> {
+        self.current()
+            .lists
+            .iter()
+            .map(|state| state.provenance(now))
+            .collect()
     }
 
     /// The address's designations, if any.
@@ -178,9 +242,11 @@ impl SanctionsView {
 
     /// Bring the view up to date with `source`.
     pub async fn refresh(&self, source: &dyn SanctionsSource) -> Result<Refresh, RefreshError> {
-        let head = source.page(None, 0).await?.watermark;
+        let head_page = source.page(None, 0).await?;
+        let head = head_page.watermark;
+        let lists = head_page.lists;
         if self.current().watermark == Some(head) {
-            self.mark_synced();
+            self.mark_synced(lists);
             return Ok(Refresh::Unchanged);
         }
 
@@ -209,18 +275,24 @@ impl SanctionsView {
                 }
             }
             let addresses = matches.len();
-            self.install(matches, walked.expect("at least one page was read"));
+            self.install(matches, walked.expect("at least one page was read"), lists);
             return Ok(Refresh::Reloaded { addresses });
         }
         Err(RefreshError::KeptChanging)
     }
 
-    fn install(&self, matches: HashMap<AccountAddress, Vec<SanctionMatch>>, watermark: Watermark) {
+    fn install(
+        &self,
+        matches: HashMap<AccountAddress, Vec<SanctionMatch>>,
+        watermark: Watermark,
+        lists: Vec<ListState>,
+    ) {
         metrics::gauge!(VIEW_ADDRESSES).set(matches.len() as f64);
         let installed = Arc::new(Installed {
             matches,
             watermark: Some(watermark),
             synced_at: Some(Instant::now()),
+            lists,
         });
         *self
             .installed
@@ -229,7 +301,7 @@ impl SanctionsView {
         publish_synced(Utc::now());
     }
 
-    fn mark_synced(&self) {
+    fn mark_synced(&self, lists: Vec<ListState>) {
         let mut guard = self
             .installed
             .write()
@@ -239,6 +311,7 @@ impl SanctionsView {
             matches: previous.matches.clone(),
             watermark: previous.watermark,
             synced_at: Some(Instant::now()),
+            lists,
         });
         drop(guard);
         publish_synced(Utc::now());
@@ -304,6 +377,7 @@ mod tests {
         import_after: Mutex<Option<(usize, (u8, &'static str))>>,
         reads: Mutex<usize>,
         failing: bool,
+        lists: Mutex<Vec<ListState>>,
     }
 
     impl ScriptedList {
@@ -319,6 +393,7 @@ mod tests {
                 import_after: Mutex::new(None),
                 reads: Mutex::new(0),
                 failing: false,
+                lists: Mutex::new(Vec::new()),
             }
         }
 
@@ -357,6 +432,7 @@ mod tests {
                     entries: vec![],
                     next_after: None,
                     watermark,
+                    lists: self.lists.lock().unwrap().clone(),
                 });
             }
             let mut rows = self.rows.lock().unwrap().clone();
@@ -379,12 +455,51 @@ mod tests {
                     .collect(),
                 next_after: (next < rows.len()).then(|| next.to_string()),
                 watermark,
+                lists: Vec::new(),
             })
         }
     }
 
     fn addr(byte: u8) -> AccountAddress {
         alloy_primitives::Address::repeat_byte(byte)
+    }
+
+    fn state(digest: &str, synced_secs: Option<i64>, max_age_secs: u64) -> ListState {
+        ListState {
+            list: "ofac_sdn".into(),
+            digest: digest.into(),
+            synced_at: synced_secs.map(|s| DateTime::<Utc>::from_timestamp(s, 0).unwrap()),
+            max_age: Duration::from_secs(max_age_secs),
+        }
+    }
+
+    /// Stale past the SLA, inclusive at it; never-synced is stale and
+    /// reports the epoch.
+    #[test]
+    fn list_provenance_is_stale_past_the_sla_or_when_never_synced() {
+        let now = DateTime::<Utc>::from_timestamp(1_000, 0).unwrap();
+        assert!(!state("d", Some(900), 100).provenance(now).stale);
+        assert!(state("d", Some(899), 100).provenance(now).stale);
+        let never = state("", None, 100).provenance(now);
+        assert!(never.stale);
+        assert_eq!(never.synced_at, DateTime::UNIX_EPOCH);
+        // A future stamp (skew) is not stale.
+        assert!(!state("d", Some(2_000), 100).provenance(now).stale);
+    }
+
+    /// List states ride the head read, so they refresh even when the list
+    /// itself is unchanged — a list going stale is visible without a re-walk.
+    #[tokio::test]
+    async fn list_states_refresh_on_every_head_read() {
+        let source = ScriptedList::new(vec![(1, "ofac_sdn")], 10);
+        let view = SanctionsView::for_refresh_interval(Duration::from_secs(60));
+        *source.lists.lock().unwrap() = vec![state("d1", Some(1), 60)];
+        view.refresh(&source).await.unwrap();
+        assert_eq!(view.list_provenance(Utc::now())[0].digest, "d1");
+
+        *source.lists.lock().unwrap() = vec![state("d2", Some(1), 60)];
+        assert_eq!(view.refresh(&source).await.unwrap(), Refresh::Unchanged);
+        assert_eq!(view.list_provenance(Utc::now())[0].digest, "d2");
     }
 
     #[tokio::test]

@@ -267,6 +267,7 @@ pub enum DomainEvent {
     AttributionRetracted(intelligence::AttributionRetracted),
     RiskScoreUpdated(intelligence::RiskScoreUpdated),
     SanctionHit(intelligence::SanctionHit),
+    SanctionsListUpdated(intelligence::SanctionsListUpdated),
     AddressEmbeddingUpdated(intelligence::AddressEmbeddingUpdated),
     EntityLinkProposed(intelligence::EntityLinkProposed),
 
@@ -372,6 +373,7 @@ impl DomainEvent {
             | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
+            | SanctionsListUpdated(_)
             | AddressEmbeddingUpdated(_)
             | EntityLinkProposed(_) => EventFamily::Intelligence,
             RuleCreated(_) | RuleTriggered(_) | RuleAlertCreated(_) => EventFamily::RuleEngine,
@@ -435,6 +437,7 @@ impl DomainEvent {
             | EntitySplit(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
+            | SanctionsListUpdated(_)
             | AddressEmbeddingUpdated(_)
             | EntityLinkProposed(_)
             | RuleCreated(_)
@@ -555,6 +558,7 @@ impl DomainEvent {
             | AttributionRetracted(_)
             | RiskScoreUpdated(_)
             | SanctionHit(_)
+            | SanctionsListUpdated(_)
             | AddressEmbeddingUpdated(_)
             | EntityLinkProposed(_)
             | RuleCreated(_)
@@ -599,6 +603,9 @@ impl DomainEvent {
             EntityCreated(e) => vec![e.seed_address],
             RiskScoreUpdated(e) => vec![e.address],
             SanctionHit(e) => vec![e.address],
+            // Both directions: "when was this address designated, or
+            // delisted, and by which list version" is a by-address question.
+            SanctionsListUpdated(e) => e.added.iter().chain(&e.removed).copied().collect(),
             AddressEmbeddingUpdated(e) => vec![e.address],
             // Both sides: a candidate link is findable from either address —
             // the investigator who pulls up the anchor's audit trail wants to

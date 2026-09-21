@@ -20,9 +20,13 @@
 //! stops being re-asserted, and an authoritative withdrawal is a soft
 //! [`LabelStore::revoke_label`] (operator curation, t4+).
 //!
-//! The OFAC feed is the §8.5 tie-in: it seeds `sanctions` rows (the exact-match
-//! table behind the immediate `SanctionHit` hard alert) *and* the
-//! `SanctionedEntity` labels. Event emission stays with the t4 consumer.
+//! The sanctions feeds (OFAC SDN, EU consolidated) are the §8.5 tie-in: they
+//! seed `sanctions` rows (the exact-match table behind the immediate
+//! `SanctionHit` hard alert) *and* the `SanctionedEntity` labels. Only the
+//! *parsing* is shared: a sanctions feed is never applied through [`Seeder`].
+//! Its designations are staged as a versioned snapshot, checked and promoted
+//! by [`crate::sanctions_sync`], which is the one path that writes a list's
+//! live rows (the `seed` CLI routes sanctions feeds there too).
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -35,7 +39,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::cache::{CacheError, HotCache};
-use crate::model::{address_key, LabelKind, LabelRecord, LabelSource, SanctionEntry};
+use crate::model::{
+    address_key, LabelKind, LabelRecord, LabelSource, SanctionEntry, SanctionsList,
+};
 use crate::store::{LabelStore, SanctionsStore, StoreError};
 
 /// The sanctions `list_name` OFAC rows are keyed under. Deliberately *not* the
@@ -48,6 +54,13 @@ pub const OFAC_LIST_NAME: &str = "ofac_sdn";
 /// digital-currency list carries no SDN entity names; a richer SDN parse can
 /// upsert real names over these later (same `(address, list_name)` key).
 const OFAC_ENTRY: &str = "OFAC SDN digital-currency address";
+
+/// The sanctions `list_name` EU rows are keyed under — pinned for the same
+/// upsert-key reason as [`OFAC_LIST_NAME`].
+pub const EU_LIST_NAME: &str = "eu_consolidated";
+
+/// The `entry` recorded for a bare-address EU import.
+const EU_ENTRY: &str = "EU consolidated financial sanctions list address";
 
 // ── Import metrics (§19) ─────────────────────────────────────────
 // Recorded once per applied batch through the `metrics` facade — a no-op until
@@ -89,6 +102,15 @@ pub enum Feed {
     /// (e.g. 0xB10C/ofac-sanctioned-digital-currency-addresses). Seeds both
     /// sanctions rows (§8.5) and `SanctionedEntity` labels (§8.1).
     OfacSdn,
+    /// The EU consolidated financial sanctions list's digital-currency
+    /// addresses, in the same plain-text shape as [`Feed::OfacSdn`].
+    ///
+    /// The EU publishes its list as XML/CSV keyed on persons and entities,
+    /// with no maintained digital-currency extraction comparable to the OFAC
+    /// one — so this feed takes the *extraction*, produced by whatever
+    /// pipeline the operator trusts, rather than parsing the FSF XML here.
+    /// The freshness SLA applies to that extraction exactly as to OFAC's.
+    EuConsolidated,
     /// Community MEV-bot list: JSON array of `{"address": …, "name": …}` →
     /// [`LabelKind::MevBot`] labels.
     MevList,
@@ -107,8 +129,19 @@ impl Feed {
         match self {
             Feed::EtherscanTags => "etherscan_tags",
             Feed::OfacSdn => OFAC_LIST_NAME,
+            Feed::EuConsolidated => EU_LIST_NAME,
             Feed::MevList => "community_mev_list",
             Feed::ProtocolRegistry => "protocol_registry",
+        }
+    }
+
+    /// The sanctions list this feed designates under, or `None` for a
+    /// label-only feed. Exhaustive with [`SanctionsList::feed`], its inverse.
+    pub fn sanctions_list(self) -> Option<SanctionsList> {
+        match self {
+            Feed::OfacSdn => Some(SanctionsList::OfacSdn),
+            Feed::EuConsolidated => Some(SanctionsList::EuConsolidated),
+            Feed::EtherscanTags | Feed::MevList | Feed::ProtocolRegistry => None,
         }
     }
 
@@ -128,7 +161,10 @@ impl Feed {
     ) -> Result<SeedBatch, ParseError> {
         let mut batch = match self {
             Feed::EtherscanTags => parse_etherscan_tags(raw, source_detail, now),
-            Feed::OfacSdn => parse_ofac_sdn(raw, source_detail, now),
+            Feed::OfacSdn => parse_address_list(SanctionsList::OfacSdn, raw, source_detail, now),
+            Feed::EuConsolidated => {
+                parse_address_list(SanctionsList::EuConsolidated, raw, source_detail, now)
+            }
             Feed::MevList => parse_mev_list(raw, source_detail, now),
             Feed::ProtocolRegistry => parse_protocol_registry(raw, source_detail, now),
         }?;
@@ -331,13 +367,65 @@ fn parse_etherscan_tags(
     })
 }
 
-fn parse_ofac_sdn(
+/// The feed-side facts of each sanctions list: which feed produces it, the
+/// `entry` its designations carry, and the value of the `SanctionedEntity`
+/// label it seeds. One `match` per fact, so a new list cannot be half-wired.
+impl SanctionsList {
+    pub fn feed(self) -> Feed {
+        match self {
+            SanctionsList::OfacSdn => Feed::OfacSdn,
+            SanctionsList::EuConsolidated => Feed::EuConsolidated,
+        }
+    }
+
+    /// The `entry` recorded for a bare-address import. The plain-text lists
+    /// carry no entity names; a richer parse can put real names here later
+    /// (a changed entry is a content change, promoted like any other).
+    pub fn entry(self) -> &'static str {
+        match self {
+            SanctionsList::OfacSdn => OFAC_ENTRY,
+            SanctionsList::EuConsolidated => EU_ENTRY,
+        }
+    }
+
+    /// The value of the `SanctionedEntity` label this list seeds.
+    pub fn label_value(self) -> &'static str {
+        match self {
+            SanctionsList::OfacSdn => "OFAC SDN",
+            SanctionsList::EuConsolidated => "EU consolidated",
+        }
+    }
+
+    /// The deterministic id of the canonical `SanctionedEntity` label this
+    /// list seeds for `address` — what a delisting revokes.
+    pub fn label_id(self, address: &AccountAddress) -> LabelId {
+        seeded_label_id(
+            self.feed().canonical_detail(),
+            address,
+            LabelKind::SanctionedEntity,
+            self.label_value(),
+        )
+    }
+
+    /// The canonical `SanctionedEntity` label this list seeds for `address`.
+    pub fn label(self, address: AccountAddress, now: DateTime<Utc>) -> LabelRecord {
+        seeded_label(
+            address,
+            LabelKind::SanctionedEntity,
+            self.label_value().to_owned(),
+            self.feed().canonical_detail(),
+            now,
+        )
+    }
+}
+
+fn parse_address_list(
+    list: SanctionsList,
     raw: &str,
     source_detail: &str,
     now: DateTime<Utc>,
 ) -> Result<SeedBatch, ParseError> {
-    const FEED: Feed = Feed::OfacSdn;
-
+    let feed = list.feed();
     let mut batch = SeedBatch::default();
     for (index, line) in raw.lines().enumerate() {
         let line = line.trim();
@@ -345,18 +433,18 @@ fn parse_ofac_sdn(
             continue;
         }
         let at = Location::Line(index as u64 + 1);
-        let address = parse_feed_address(FEED, at, line)?;
+        let address = parse_feed_address(feed, at, line)?;
 
         batch.sanctions.push(SanctionEntry {
             address,
-            list_name: OFAC_LIST_NAME.to_owned(),
-            entry: OFAC_ENTRY.to_owned(),
+            list_name: list.as_str().to_owned(),
+            entry: list.entry().to_owned(),
             listed_at: None,
         });
         batch.labels.push(seeded_label(
             address,
             LabelKind::SanctionedEntity,
-            "OFAC SDN".to_owned(),
+            list.label_value().to_owned(),
             source_detail,
             now,
         ));
@@ -798,6 +886,41 @@ mod tests {
         assert_eq!(batch.sanctions[0].list_name, OFAC_LIST_NAME);
         // …while the label provenance does record the specific import.
         assert_eq!(batch.labels[0].source_detail, "ofac_sdn_2026-07-03");
+    }
+
+    /// The EU feed shares OFAC's parser but designates under its own pinned
+    /// list — the two must never collide on the `(address, list_name)` key, or
+    /// one list's refresh would overwrite the other's designation.
+    #[test]
+    fn eu_list_designates_under_its_own_pinned_list() {
+        let raw = "# EU extraction\n0x1111111111111111111111111111111111111111\n";
+        let batch = Feed::EuConsolidated
+            .parse(raw, "eu_extraction_2026-09-20", at(5))
+            .unwrap();
+        assert_eq!(batch.sanctions.len(), 1);
+        assert_eq!(batch.sanctions[0].list_name, EU_LIST_NAME);
+        assert_ne!(EU_LIST_NAME, OFAC_LIST_NAME);
+        assert_eq!(batch.labels[0].kind, LabelKind::SanctionedEntity);
+        assert_eq!(batch.labels[0].value, "EU consolidated");
+    }
+
+    /// Exactly the two sanctions feeds carry a list; the label-only feeds do
+    /// not — the set an SLA may be declared over.
+    #[test]
+    fn only_sanctions_feeds_name_a_list() {
+        let lists: Vec<_> = Feed::iter().filter_map(Feed::sanctions_list).collect();
+        assert_eq!(
+            lists,
+            vec![SanctionsList::OfacSdn, SanctionsList::EuConsolidated]
+        );
+        // The pinned storage names are the enum's wire strings, and each list
+        // round-trips through its feed.
+        assert_eq!(SanctionsList::OfacSdn.as_str(), OFAC_LIST_NAME);
+        assert_eq!(SanctionsList::EuConsolidated.as_str(), EU_LIST_NAME);
+        for list in SanctionsList::iter() {
+            assert_eq!(list.feed().sanctions_list(), Some(list));
+            assert_eq!(list.feed().canonical_detail(), list.as_str());
+        }
     }
 
     #[test]

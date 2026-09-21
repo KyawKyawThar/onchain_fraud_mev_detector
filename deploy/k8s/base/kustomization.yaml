@@ -29,6 +29,7 @@ resources:
   - services/event-store-repartition.yaml
   - services/simulation.yaml
   - services/intelligence.yaml
+  - services/intelligence-sanctions-sync.yaml
   - services/rule-engine.yaml
   - services/server.yaml
   - services/notification.yaml

@@ -245,11 +245,41 @@ dataset-export-hour out="target/dataset.parquet":
 #   feed:   etherscan-tags (CSV address,kind,value)
 #           ofac-sdn       (plain text, one address/line; e.g.
 #                           https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt)
+#           eu-consolidated (same shape; an operator-maintained extraction)
 #           mev-list       (JSON [{"address","name"}])
 #           protocol-registry (JSON [{"address","name","kind"?}])
 #   detail: optional source_detail naming the specific list/registry.
+# A sanctions feed goes through the same guarded, ledger-recorded path as
+# `intel-sanctions-sync` below.
 intel-seed feed file detail="":
     cargo run -p intelligence -- seed {{feed}} {{file}} {{detail}}
+
+# ── Sanctions lists + freshness SLA (§8.5, readiness Epic E) ─────
+# Sync one list from a URL or file: fetch, stage the version as a snapshot,
+# run the checks, then promote it (or confirm the current one) and stamp the
+# freshness ledger. What the hourly CronJobs run. Exit codes: 0 synced,
+# 75 transient, 3 refused by a check, 1 permanent.
+# Runbook: docs/runbooks/sanctions-freshness.md
+#   just intel-sanctions-sync ofac-sdn https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt
+intel-sanctions-sync list source:
+    cargo run -p intelligence -- sanctions-sync {{list}} {{source}}
+
+# Every monitored list against its SLA; exits non-zero if any is stale or has
+# never synced — the same judgement as the SanctionsListStale alert.
+intel-sanctions-status:
+    cargo run -p intelligence -- sanctions-status
+
+# One list's promotions and staged snapshots: which version was current when,
+# and what a check refused (with the digest to promote).
+intel-sanctions-history list:
+    cargo run -p intelligence -- sanctions-history {{list}}
+
+# Promote a refused snapshot after confirming upstream that the change is real
+# — the operator override, naming who made the call. Promotes exactly the
+# reviewed content (by digest), never a re-fetch that might differ.
+#   just intel-sanctions-promote ofac_sdn 9f86d081… "alice (compliance)"
+intel-sanctions-promote list digest operator:
+    cargo run -p intelligence -- sanctions-promote {{list}} {{digest}} "{{operator}}"
 
 # ── Entity clustering (§8.2, Sprint 7 t3) ─────────────────────────
 # Cluster the bounded component around one seed address: common funder,

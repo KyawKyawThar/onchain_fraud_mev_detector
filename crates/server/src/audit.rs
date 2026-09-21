@@ -137,6 +137,7 @@ mod tests {
             factors: vec![],
             timestamp: Utc::now(),
             facts_staleness: None,
+            sanctions_lists: vec![],
         }
     }
 

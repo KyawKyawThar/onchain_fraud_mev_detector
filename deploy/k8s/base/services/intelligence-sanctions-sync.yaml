@@ -1,0 +1,203 @@
+# ── intelligence sanctions sync (§8.5, readiness Epic E) ──────────
+# One CronJob per sanctions list: fetch, refuse an empty or sharply shrunken
+# list, apply, and stamp the `sanctions_list_syncs` freshness ledger. See
+# crates/intelligence/src/sanctions_sync.rs and
+# docs/runbooks/sanctions-freshness.md.
+#
+# Why the alerting does not come from these Jobs:
+#
+#  * A short-lived pod is not reliably scraped, and kube-state-metrics is not
+#    deployed, so `kube_job_status_failed` is not a series this platform has.
+#  * The failures that matter most never produce a failed Job at all: a
+#    suspended CronJob, a schedule typo, an image that stops pulling, a
+#    namespace nobody applied this file to.
+#
+# So a Job only writes the ledger (success, or failure with its reason) and
+# the always-up `intelligence-grpc` pods read it and publish the gauges
+# `SanctionsListStale` / `SanctionsListSyncFailing` alert on. A Job that never
+# runs is caught because its list ages.
+#
+# The exit code carries the retry decision, so the Job does not retry work that
+# cannot succeed (`podFailurePolicy` below):
+#
+#   0   synced (promoted, confirmed, or reconciled)
+#   75  transient  — network, 5xx, 429, a database blip: retried
+#   3   refused    — the snapshot checks stopped a version going live; a human
+#                    confirms upstream and runs `sanctions-promote`
+#   1   permanent  — a parse failure, a 4xx, a bad config: retrying repeats it
+#
+# One CronJob per list, not one for both: each list has its own clock and its
+# own source, and one list's outage must not stop the other from refreshing.
+#
+# Cadence: hourly against a 6h SLA (INTEL_SANCTIONS_LISTS), so five
+# consecutive failures are tolerated before paging, and the first one warns.
+# Minutes are staggered so the two lists do not contend for the same pool.
+#
+# Run one now (after a delisting, or to clear a stale page):
+#   kubectl -n mev create job --from=cronjob/intelligence-sanctions-sync-ofac ofac-now
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: intelligence-sanctions-sync-ofac
+  labels:
+    app.kubernetes.io/name: intelligence-sanctions-sync-ofac
+    app.kubernetes.io/component: intelligence
+spec:
+  schedule: "17 * * * *"
+  # A sync still running an hour later is wedged; a second one racing it would
+  # only contend. The ledger is monotonic either way.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Failed runs are kept longer: the pod log names the failure in full, where
+  # the ledger stores one line.
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 1800
+  jobTemplate:
+    spec:
+      # Retries apply only to the transient exit code (below); two of them,
+      # since a blip usually clears within seconds.
+      backoffLimit: 2
+      activeDeadlineSeconds: 1200
+      podFailurePolicy:
+        rules:
+          # Anything that is not EX_TEMPFAIL(75) fails the Job now: a refusal
+          # and a permanent fault both need a human, and re-running them just
+          # fills the Job history with the same failure.
+          - action: FailJob
+            onExitCodes:
+              containerName: intelligence
+              operator: NotIn
+              values: [75]
+          # A node drain is not the list's fault.
+          - action: Ignore
+            onPodConditions:
+              - type: DisruptionTarget
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: intelligence-sanctions-sync-ofac
+            app.kubernetes.io/part-of: mevwatch
+            app.kubernetes.io/component: intelligence
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: intelligence
+              image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+              # `$(VAR)` is expanded by the kubelet from the container env.
+              args: [sanctions-sync, ofac-sdn, $(INTEL_SANCTIONS_OFAC_URL)]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              # The whole config resolves at boot (§9), so the job carries the
+              # same env as the service even though it touches only Postgres
+              # and Redis.
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: clickhouse-credentials
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-credentials
+                      key: DATABASE_URL
+                - name: REDIS_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: redis-credentials
+                      key: REDIS_URL
+                # Required by Config::from_env; the sync serves nothing.
+                - name: INTELLIGENCE_GRPC_HOST
+                  value: 0.0.0.0
+                - name: INTELLIGENCE_GRPC_PORT
+                  value: "50051"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: intelligence-sanctions-sync-eu
+  labels:
+    app.kubernetes.io/name: intelligence-sanctions-sync-eu
+    app.kubernetes.io/component: intelligence
+spec:
+  schedule: "47 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 1800
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1200
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: intelligence
+              operator: NotIn
+              values: [75]
+          - action: Ignore
+            onPodConditions:
+              - type: DisruptionTarget
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: intelligence-sanctions-sync-eu
+            app.kubernetes.io/part-of: mevwatch
+            app.kubernetes.io/component: intelligence
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: intelligence
+              image: ghcr.io/kyawkyawthar/onchain_fraud_mev_detector/intelligence:latest
+              args: [sanctions-sync, eu-consolidated, $(INTEL_SANCTIONS_EU_URL)]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: clickhouse-credentials
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-credentials
+                      key: DATABASE_URL
+                - name: REDIS_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: redis-credentials
+                      key: REDIS_URL
+                - name: INTELLIGENCE_GRPC_HOST
+                  value: 0.0.0.0
+                - name: INTELLIGENCE_GRPC_PORT
+                  value: "50051"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi

@@ -338,6 +338,52 @@
           "legendFormat": "p90 proposals per listing"
         }
       ]
+    },
+    {
+      "id": 16,
+      "title": "Sanctions list age vs SLA (§8.5)",
+      "description": "Per list: time since the list was last confirmed against its source (the sync job's fetch time, read from the sanctions_list_syncs ledger by the grpc pods), next to its SLA. Age crossing the SLA line is SanctionsListStale — a compliance page. A list that never synced shows as ~56 years (its timestamp is published as 0). `intelligence sanctions-status` prints the same numbers plus the last failure reason.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "time() - max by (list) (intel_sanctions_list_synced_timestamp_seconds)",
+          "legendFormat": "{{list}} age"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (list) (intel_sanctions_list_max_age_seconds)",
+          "legendFormat": "{{list}} SLA"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Sanctions list content age (upstream liveness)",
+      "description": "Per list: time since the list's address set last changed. Not alerted — no list promises a publication cadence — but a list that is fresh (synced hourly) while its content has not changed for months usually means the upstream extraction stopped updating and we are faithfully re-reading a dead file.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "time() - max by (list) (intel_sanctions_list_content_changed_timestamp_seconds)",
+          "legendFormat": "{{list}}"
+        }
+      ]
     }
   ]
 }

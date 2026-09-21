@@ -6,6 +6,7 @@
 use crate::primitives::{
     AccountAddress, Confidence, EntityId, IncidentId, LabelId, LinkCandidateId,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A label was attached to an address (§8.1). Carries provenance (`source`) and
@@ -130,6 +131,56 @@ pub struct SanctionHit {
     pub address: AccountAddress,
     pub list: String,
     pub entry: String,
+}
+
+/// A sanctions list moved to a new version (§8.5): intelligence promoted a
+/// fetched snapshot of the list, and the designations screening sees changed
+/// by exactly `added` and `removed`.
+///
+/// This is the audit fact for "when was this address designated (or
+/// delisted), and by which version of which list". It is findable by address
+/// in the event store through `added`/`removed`.
+///
+/// **Chunked.** A first promotion can carry tens of thousands of addresses,
+/// which would breach the broker's message-size limit as one record. So one
+/// promotion is published as `chunks` events of at most a bounded number of
+/// addresses each, sharing `promotion_id`, `digest` and every count. Each
+/// chunk is independently meaningful, because each address is: a consumer
+/// needs no reassembly, and an at-least-once redelivery of one chunk repeats
+/// only that chunk. `entries`, `added_total` and `removed_total` describe the
+/// *whole* promotion, so a reader of any single chunk knows its size.
+///
+/// `list` is the intelligence service's list name (`ofac_sdn`,
+/// `eu_consolidated`), a plain string here for the same reason
+/// [`SanctionHit::list`] is: the closed vocabulary lives in the service that
+/// owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SanctionsListUpdated {
+    /// One promotion — shared by all of its chunks.
+    pub promotion_id: uuid::Uuid,
+    pub list: String,
+    /// Content digest of the promoted version (see intelligence's
+    /// `sanctions_sync::content_digest`).
+    pub digest: String,
+    /// The version it replaced; `None` for a list's first promotion.
+    pub previous_digest: Option<String>,
+    /// Designations in the promoted version.
+    pub entries: u64,
+    pub added_total: u64,
+    pub removed_total: u64,
+    /// This chunk's share of the diff.
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub added: Vec<AccountAddress>,
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub removed: Vec<AccountAddress>,
+    /// 0-based position of this chunk, and how many the promotion has.
+    pub chunk: u32,
+    pub chunks: u32,
+    /// `scheduled` for the sync job, otherwise the operator who promoted a
+    /// refused snapshot by hand.
+    pub promoted_by: String,
+    pub promoted_at: DateTime<Utc>,
 }
 
 /// One behavioral feature's contribution to an address's embedding (§20.3) —

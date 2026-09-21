@@ -66,6 +66,7 @@
     "AttributionRetracted": { "terms": [{ "driver": "alerting_block", "per": 0.3 }], "rationale": "Follows incident retractions." },
     "RiskScoreUpdated": { "terms": [{ "driver": "alerting_block", "per": 6 }], "rationale": "Each label or attribution invalidates the addresses it names (attacker, victim, pool: about three), recomputed and republished (intelligence::risk_scorer)." },
     "SanctionHit": { "terms": [{ "driver": "screen", "per": 0.001 }, { "driver": "day", "per": 20 }], "rationale": "A screening that matches a list, plus list-refresh hits on already-known addresses." },
+    "SanctionsListUpdated": { "terms": [{ "driver": "day", "per": 2 }], "rationale": "A list's content changes a few times a week at most; a promotion is one event per 1,000-address chunk, so a first import adds a one-off burst, not a rate." },
     "AddressEmbeddingUpdated": {
       "terms": [
         { "driver": "active_address", "per": 0.3, "payload_bytes": 1300 },

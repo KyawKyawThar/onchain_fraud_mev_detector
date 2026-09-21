@@ -50,7 +50,50 @@ pub struct Config {
     /// §20.3 clustering-signal settings — read by the `link-signal` run mode
     /// and the `link-candidates`/`link-decide` operator commands.
     pub link_signal: LinkSignalConfig,
+    /// §8.5 sanctions freshness SLA + scheduled sync settings — read by the
+    /// `grpc` run mode (the monitor) and the `sanctions-sync`/
+    /// `sanctions-status`/`seed` commands.
+    pub sanctions: SanctionsConfig,
 }
+
+/// Settings for the sanctions freshness SLA (§8.5, readiness Epic E).
+#[derive(Debug, Clone)]
+pub struct SanctionsConfig {
+    /// The lists that must stay fresh and each one's SLA
+    /// (`INTEL_SANCTIONS_LISTS`, `list[=max_age_secs]` comma-separated; a bare
+    /// name takes `INTEL_SANCTIONS_MAX_AGE_SECS`, default 6h). The default
+    /// monitors both OFAC and the EU list: a deployment that has not wired an
+    /// EU source pages until it does, because claiming EU coverage without it
+    /// is the gap this SLA exists to expose.
+    pub lists: Vec<crate::sanctions_freshness::ListSla>,
+    /// How often the monitor re-reads the ledger
+    /// (`INTEL_SANCTIONS_FRESHNESS_POLL_SECS`, default 60).
+    pub poll_interval: Duration,
+    /// The checks a fetched version must pass before it is promoted:
+    /// `INTEL_SANCTIONS_MAX_SHRINK_PERCENT` (default 20),
+    /// `INTEL_SANCTIONS_MAX_GROWTH_PERCENT` (default 100) and
+    /// `INTEL_SANCTIONS_GROWTH_FLOOR` (default 500 addresses) bound how far one
+    /// sync may move a list; `INTEL_SANCTIONS_SENTINELS`
+    /// (`list:0xaddr,…;list:…`, default none) names addresses a list must
+    /// always carry. Growth is the direction that matters most: every extra
+    /// address hard-blocks withdrawals.
+    pub policy: crate::sanctions_list::SnapshotPolicy,
+    /// How often the `grpc` mode drains the sanctions outbox
+    /// (`INTEL_SANCTIONS_OUTBOX_FLUSH_SECS`, default 5). Each sync run also
+    /// drains it once right after it commits.
+    pub outbox_flush_interval: Duration,
+    /// HTTP fetch timeout (`INTEL_SANCTIONS_FETCH_TIMEOUT_SECS`, default 60).
+    pub fetch_timeout: Duration,
+    /// Size cap on a fetched list (`INTEL_SANCTIONS_FETCH_MAX_BYTES`, default
+    /// 16 MiB — the OFAC ETH extraction is a few KiB, so this only stops a
+    /// runaway response).
+    pub fetch_max_bytes: u64,
+}
+
+/// Default per-list SLA: six hours. With the hourly sync this tolerates five
+/// consecutive failed runs before paging; the first failure already raises
+/// `SanctionsListSyncFailing`.
+pub const DEFAULT_SANCTIONS_MAX_AGE_SECS: u64 = 6 * 3_600;
 
 /// Settings for the §20.3 clustering signal (Sprint 19 t3).
 #[derive(Debug, Clone)]
@@ -397,6 +440,35 @@ impl Config {
                         )?,
                     },
                 },
+            },
+            sanctions: SanctionsConfig {
+                lists: crate::sanctions_freshness::parse_list_slas(
+                    &env_or("INTEL_SANCTIONS_LISTS", "ofac_sdn,eu_consolidated"),
+                    Duration::from_secs(env_parse(
+                        "INTEL_SANCTIONS_MAX_AGE_SECS",
+                        DEFAULT_SANCTIONS_MAX_AGE_SECS,
+                    )?),
+                )?,
+                poll_interval: Duration::from_secs(
+                    env_parse("INTEL_SANCTIONS_FRESHNESS_POLL_SECS", 60u64)?.max(1),
+                ),
+                policy: crate::sanctions_list::SnapshotPolicy::new(
+                    env_parse("INTEL_SANCTIONS_MAX_SHRINK_PERCENT", 20u8)?,
+                    env_parse("INTEL_SANCTIONS_MAX_GROWTH_PERCENT", 100u32)?,
+                    env_parse("INTEL_SANCTIONS_GROWTH_FLOOR", 500u64)?,
+                    crate::sanctions_list::parse_sentinels(&env_or(
+                        "INTEL_SANCTIONS_SENTINELS",
+                        "",
+                    ))?,
+                )?,
+                outbox_flush_interval: Duration::from_secs(
+                    env_parse("INTEL_SANCTIONS_OUTBOX_FLUSH_SECS", 5u64)?.max(1),
+                ),
+                fetch_timeout: Duration::from_secs(env_parse(
+                    "INTEL_SANCTIONS_FETCH_TIMEOUT_SECS",
+                    60u64,
+                )?),
+                fetch_max_bytes: env_parse("INTEL_SANCTIONS_FETCH_MAX_BYTES", 16u64 << 20)?,
             },
             graph_limits: crate::graph::GraphLimits {
                 degree_cap: env_parse(
