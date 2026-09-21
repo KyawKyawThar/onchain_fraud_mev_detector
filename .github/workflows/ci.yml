@@ -122,7 +122,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: cargo nextest run (incl. ignored)
-        run: cargo nextest run --workspace --all-features --locked --run-ignored all --no-tests=pass
+        run: cargo nextest run --workspace --all-features --locked --profile integration --run-ignored all --no-tests=pass
 
   # ── per-service release build (§20) ──────────────────────────────
   build:

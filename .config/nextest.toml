@@ -1,0 +1,19 @@
+# The `integration` profile is what CI's integration job and
+# `just test-integration` run: every `#[ignore]`d test that needs only Docker.
+#
+# `--run-ignored all` would otherwise also sweep in ignored tests that are
+# ignored for a different reason, and are wrong to run there:
+#   - chain-enrich::live_mainnet needs a real archive node and fails (by
+#     design) without DATASET_ARCHIVE_RPC_URL; the nightly archive-probe
+#     workflow is its CI home.
+#   - events::schema_registry `bless` rewrites the committed schema, and
+#     events::wire_format `print_goldens` only prints — both are manual tools.
+# A new ignored test that is not Docker-backed belongs in this filter.
+[profile.integration]
+default-filter = '''
+not (
+    binary_id(chain-enrich::live_mainnet)
+    | (binary_id(events::schema_registry) & test(=bless))
+    | (binary_id(events::wire_format) & test(=print_goldens))
+)
+'''

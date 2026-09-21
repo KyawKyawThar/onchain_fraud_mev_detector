@@ -626,7 +626,7 @@ test:
 
 # Run all tests incl. #[ignore] integration (needs docker for testcontainers)
 test-integration:
-    cargo nextest run --workspace --run-ignored all --no-tests=pass
+    cargo nextest run --workspace --profile integration --run-ignored all --no-tests=pass
 
 # ── Projection rebuild (§2, readiness Epic B) ─────────────────────
 #
