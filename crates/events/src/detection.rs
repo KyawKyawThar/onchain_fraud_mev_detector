@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DetectorTriggered {
+    /// The provisional alert this trigger raised. `None` for a Shadow or
+    /// Deprecated detector: it was scored but deliberately emitted no alert.
+    /// Defaulted so historical triggers remain readable.
+    #[serde(default)]
+    pub alert_id: Option<AlertId>,
     pub detector: DetectorRef,
     pub block: BlockRef,
     /// Transactions implicated in the pattern.

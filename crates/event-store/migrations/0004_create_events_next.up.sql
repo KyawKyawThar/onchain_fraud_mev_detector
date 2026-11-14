@@ -47,8 +47,10 @@ CREATE TABLE IF NOT EXISTS events__next
     payload         String CODEC(ZSTD(3)),
     appended_at     DateTime64(3, 'UTC') DEFAULT now64(3, 'UTC'),
     incident_id     Nullable(UUID),
+    alert_id        Nullable(UUID),
     addresses       Array(String),
     INDEX idx_incident_id incident_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_alert_id alert_id TYPE bloom_filter GRANULARITY 1,
     INDEX idx_addresses addresses TYPE bloom_filter GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree

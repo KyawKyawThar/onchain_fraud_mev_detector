@@ -54,9 +54,23 @@ pub struct RawBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTx {
     pub hash: B256,
+    /// Canonical zero-based position in the containing block. The archive
+    /// adapter verifies this against the node response instead of relying on
+    /// response-array order alone, so a resolver can replay an implicated
+    /// bundle in exactly the order the EVM executed it.
+    pub index: u64,
     pub from: Address,
     /// `None` for contract creation.
     pub to: Option<Address>,
+    /// Sender nonce from the canonical transaction.
+    pub nonce: u64,
+    /// Native value transferred with the call, in wei.
+    pub value: U256,
+    /// Calldata / contract-creation init code.
+    pub input: Bytes,
+    /// The transaction's declared gas limit. Simulation may clamp it to its
+    /// hostile-bytecode cap, but must start from the transaction's real bound.
+    pub gas_limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,8 +357,13 @@ pub(crate) mod tests {
                 .iter()
                 .map(|t| RawTx {
                     hash: B256::repeat_byte(*t),
+                    index: u64::from(*t),
                     from: addr(*t),
                     to: Some(addr(0xEE)),
+                    nonce: u64::from(*t),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                    gas_limit: 21_000,
                 })
                 .collect(),
         }

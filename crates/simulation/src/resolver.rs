@@ -58,6 +58,7 @@ impl event_bus::Transience for ResolveError {
 /// worker holds `Arc<dyn JobResolver>` and a test swaps in a double that returns a
 /// canned [`SimulationRequest`] with no event store or RPC.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait JobResolver: Send + Sync {
     /// Resolve one job. Async because the production impl does I/O (event-store
     /// query + state fork); the engine it feeds is the only CPU-bound part and runs

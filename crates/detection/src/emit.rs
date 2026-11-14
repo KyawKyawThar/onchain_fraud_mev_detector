@@ -49,11 +49,13 @@ use crate::registry::Registry;
 /// registry); the [`Evidence`] deliberately doesn't know its own detector's
 /// identity, so there's a single source of truth for "who found this" (§6).
 pub fn detector_triggered(
+    alert_id: Option<AlertId>,
     detector: DetectorRef,
     block: BlockRef,
     evidence: &Evidence,
 ) -> DetectorTriggered {
     DetectorTriggered {
+        alert_id,
         detector,
         block,
         txs: evidence.txs.clone(),
@@ -77,6 +79,7 @@ pub fn detector_triggered(
 /// every `PreliminaryAlertCreated` carries a self-consistent triple rather than
 /// leaving each consumer to re-derive severity from confidence alone.
 pub fn preliminary_alert(
+    alert_id: AlertId,
     detector: DetectorRef,
     kind: AlertKind,
     addresses: Vec<AccountAddress>,
@@ -85,7 +88,7 @@ pub fn preliminary_alert(
 ) -> PreliminaryAlertCreated {
     let severity = severity_band(impact_usd, confidence);
     PreliminaryAlertCreated {
-        alert_id: AlertId::new(),
+        alert_id,
         detector,
         addresses,
         kind,
@@ -209,16 +212,19 @@ pub(crate) fn evidence_events(
     enrichment: &Enrichment,
     evidence: &Evidence,
 ) -> Vec<DomainEvent> {
+    let alert_id = (status == LifecycleStatus::Active).then(AlertId::new);
     let mut events = vec![DomainEvent::DetectorTriggered(detector_triggered(
+        alert_id,
         detector_ref.clone(),
         block,
         evidence,
     ))];
 
-    if status == LifecycleStatus::Active {
+    if let Some(alert_id) = alert_id {
         let addresses = implicated_addresses(enrichment, &evidence.txs);
         let impact = impact_usd(evidence, enrichment);
         events.push(DomainEvent::PreliminaryAlertCreated(preliminary_alert(
+            alert_id,
             detector_ref.clone(),
             evidence.kind,
             addresses,
@@ -467,7 +473,7 @@ mod tests {
             evidence(AlertKind::Sandwich, vec![hash(1), hash(2)], 0.8).with_detail(detail.clone());
         let block = BlockRef::new(42, hash(0xbb));
 
-        let dt = detector_triggered(a_ref(), block, &ev);
+        let dt = detector_triggered(None, a_ref(), block, &ev);
 
         assert_eq!(dt.detector, a_ref(), "exact (id, version, config_hash)");
         assert_eq!(dt.block, block);
@@ -481,6 +487,7 @@ mod tests {
     #[test]
     fn preliminary_alert_is_provisional_and_mints_distinct_ids() {
         let a = preliminary_alert(
+            AlertId::new(),
             a_ref(),
             AlertKind::Arbitrage,
             vec![addr(1)],
@@ -488,6 +495,7 @@ mod tests {
             None,
         );
         let b = preliminary_alert(
+            AlertId::new(),
             a_ref(),
             AlertKind::Arbitrage,
             vec![],
@@ -506,6 +514,7 @@ mod tests {
     fn preliminary_alert_carries_impact_and_its_derived_severity_and_action() {
         // impact 150_000 * confidence 0.8 = 120_000 ⇒ High ⇒ Escalate.
         let a = preliminary_alert(
+            AlertId::new(),
             a_ref(),
             AlertKind::Sandwich,
             vec![],
@@ -769,6 +778,7 @@ mod tests {
             panic!("expected PreliminaryAlertCreated");
         };
         assert!(arb_alert.provisional);
+        assert_eq!(arb_dt.alert_id, Some(arb_alert.alert_id));
         assert_eq!(arb_alert.kind, AlertKind::Arbitrage);
         assert_eq!(arb_alert.confidence, Confidence::new(0.7));
         assert_eq!(arb_alert.addresses, vec![addr(1), addr(9)]);
@@ -916,6 +926,10 @@ mod tests {
             vec!["DetectorTriggered"],
             "a Shadow build is still scored (DetectorTriggered) but doesn't alert"
         );
+        let DomainEvent::DetectorTriggered(trigger) = &events[0] else {
+            panic!("expected DetectorTriggered");
+        };
+        assert_eq!(trigger.alert_id, None, "a suppressed alert has no link");
     }
 
     #[test]

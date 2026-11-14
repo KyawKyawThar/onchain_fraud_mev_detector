@@ -52,6 +52,7 @@ pub enum Disposition {
 /// disposition→broker-action mapping has a single home; object-safe so a test double
 /// can record what it was asked to do.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait DeliveryAck: Send + Sync {
     async fn settle(&self, disposition: Disposition) -> Result<()>;
 }
@@ -89,6 +90,7 @@ impl JobDelivery {
 /// dead-lettered internally); `None` means the stream closed (channel/connection
 /// gone) and the worker should stop.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait JobSource: Send {
     async fn recv(&mut self) -> Option<JobDelivery>;
 }

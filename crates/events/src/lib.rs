@@ -466,6 +466,20 @@ impl DomainEvent {
         }
     }
 
+    /// The provisional alert this event directly carries, if any. The event
+    /// store indexes this key so a simulation worker can retrieve the exact
+    /// trigger evidence for an alert without relying on stream adjacency.
+    pub fn alert_id(&self) -> Option<AlertId> {
+        match self {
+            DomainEvent::DetectorTriggered(event) => event.alert_id,
+            DomainEvent::PreliminaryAlertCreated(event) => Some(event.alert_id),
+            DomainEvent::SimulationRequested(event) => Some(event.alert_id),
+            DomainEvent::SimulationCompleted(event) => Some(event.alert_id),
+            DomainEvent::IncidentCreated(event) => Some(event.alert_id),
+            _ => None,
+        }
+    }
+
     /// The [`PartitionKey`] override for events whose meaningful ordering key is
     /// a **business key**, not their chain — or `None` for every event that
     /// stays chain-partitioned (§20 — see [`EventEnvelope::partition_key`],

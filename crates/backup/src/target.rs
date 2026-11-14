@@ -174,6 +174,7 @@ pub struct Snapshot {
 
 /// The read-only half. A holder of one of these cannot write anything.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait StoreReader: Send + Sync {
     /// Stable name; the artifact directory and every metric label use it.
     fn name(&self) -> &str;
@@ -192,6 +193,7 @@ pub trait StoreReader: Send + Sync {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BackupTarget: StoreReader {
     /// Take a consistent snapshot into `dir`, fingerprinting as it goes.
     ///

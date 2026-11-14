@@ -744,6 +744,7 @@ mod tests {
 
     fn trigger(det: &str, block_ref: BlockRef, txs: Vec<B256>, confidence: f64) -> DomainEvent {
         DomainEvent::DetectorTriggered(DetectorTriggered {
+            alert_id: None,
             detector: detector(det),
             block: block_ref,
             txs,

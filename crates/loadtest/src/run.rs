@@ -56,6 +56,7 @@ use crate::source::LoadSource;
 /// metric — which is why the runbook recommends cross-checking it once per
 /// release rather than pretending the question does not exist.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SubjectMetrics: Send + Sync {
     async fn sample(&self) -> Result<FastPathWindow>;
 }
@@ -178,6 +179,7 @@ impl ScreeningCounters {
 
 /// Reads the API service's screening counters.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ScreeningMetrics: Send + Sync {
     async fn sample(&self) -> Result<ScreeningCounters>;
 }

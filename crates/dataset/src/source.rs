@@ -139,6 +139,7 @@ pub const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Reads pages of the replay stream. Object-safe so the export holds a `&dyn
 /// EventSource` and a test swaps in [`VecEventSource`] with no HTTP.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait EventSource: Send + Sync {
     async fn page(&self, query: &ReplayQuery) -> Result<EventPage, SourceError>;
 }

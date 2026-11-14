@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use alloy_consensus::Transaction as _;
 use alloy_network_primitives::TransactionResponse;
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, TransactionInput, TransactionRequest};
 use alloy_transport::{TransportError, TransportErrorKind};
@@ -212,12 +212,34 @@ impl ArchiveRpc for AlloyArchiveRpc {
                 detail: "the node returned transaction hashes, not full transactions".into(),
             })?
             .iter()
-            .map(|tx| RawTx {
-                hash: tx.tx_hash(),
-                from: TransactionResponse::from(tx),
-                to: tx.to(),
+            .enumerate()
+            .map(|(index, tx)| {
+                let index = u64::try_from(index).expect("a block's transaction count fits u64");
+                let reported_index = tx.transaction_index.ok_or_else(|| RpcError::Permanent {
+                    op: OP,
+                    detail: format!("transaction {} omitted transactionIndex", tx.tx_hash()),
+                })?;
+                if reported_index != index {
+                    return Err(RpcError::Permanent {
+                        op: OP,
+                        detail: format!(
+                            "transaction {} reported index {reported_index}, expected {index}",
+                            tx.tx_hash()
+                        ),
+                    });
+                }
+                Ok(RawTx {
+                    hash: tx.tx_hash(),
+                    index,
+                    from: TransactionResponse::from(tx),
+                    to: tx.to(),
+                    nonce: tx.nonce(),
+                    value: tx.value(),
+                    input: tx.input().clone(),
+                    gas_limit: tx.gas_limit(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(RawBlock {
             number: block.header.number,
             hash: block.header.hash,
@@ -277,5 +299,54 @@ impl ArchiveRpc for AlloyArchiveRpc {
             Some(bytes) => CallOutcome::Returned(bytes),
             None => CallOutcome::Reverted,
         })
+    }
+
+    async fn balance(&self, address: Address, state: StateAt) -> Result<U256, RpcError> {
+        self.read("eth_getBalance", || {
+            self.provider
+                .get_balance(address)
+                .block_id(at(state))
+                .into_future()
+        })
+        .await?
+        .ok_or_else(|| not_a_call("eth_getBalance"))
+    }
+
+    async fn nonce(&self, address: Address, state: StateAt) -> Result<u64, RpcError> {
+        self.read("eth_getTransactionCount", || {
+            self.provider
+                .get_transaction_count(address)
+                .block_id(at(state))
+                .into_future()
+        })
+        .await?
+        .ok_or_else(|| not_a_call("eth_getTransactionCount"))
+    }
+
+    async fn code(&self, address: Address, state: StateAt) -> Result<Bytes, RpcError> {
+        self.read("eth_getCode", || {
+            self.provider
+                .get_code_at(address)
+                .block_id(at(state))
+                .into_future()
+        })
+        .await?
+        .ok_or_else(|| not_a_call("eth_getCode"))
+    }
+
+    async fn storage(
+        &self,
+        address: Address,
+        slot: U256,
+        state: StateAt,
+    ) -> Result<U256, RpcError> {
+        self.read("eth_getStorageAt", || {
+            self.provider
+                .get_storage_at(address, slot)
+                .block_id(at(state))
+                .into_future()
+        })
+        .await?
+        .ok_or_else(|| not_a_call("eth_getStorageAt"))
     }
 }

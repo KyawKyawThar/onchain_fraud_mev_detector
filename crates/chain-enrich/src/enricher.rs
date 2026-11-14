@@ -476,7 +476,7 @@ mod tests {
     use crate::decode::tests::{swap_log, transfer_log};
     use crate::decode::{RawReceipt, RawTx};
     use crate::test_util::FakeChain;
-    use alloy_primitives::{address, B256};
+    use alloy_primitives::{address, Bytes, B256, U256};
     use detector_api::DetectorPlugin;
 
     const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -503,8 +503,13 @@ mod tests {
     fn tx(t: u8, from: Address) -> RawTx {
         RawTx {
             hash: hash(t),
+            index: u64::from(t),
             from,
             to: Some(Address::repeat_byte(0xEE)),
+            nonce: u64::from(t),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            gas_limit: 21_000,
         }
     }
 

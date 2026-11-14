@@ -146,6 +146,7 @@ impl event_bus::Transience for LeaderboardError {
 /// The read seam. Object-safe; production is [`ClickhouseLeaderboard`], tests
 /// use the double in [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LeaderboardStore: Send + Sync {
     async fn leaderboard(&self, query: &LeaderboardQuery) -> Result<Leaderboard, LeaderboardError>;
 }

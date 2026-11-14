@@ -104,8 +104,13 @@ mod tests {
             timestamp: T0 as u64,
             txs: vec![RawTx {
                 hash: B256::repeat_byte(1),
+                index: 0,
                 from,
                 to: Some(USDC),
+                nonce: 0,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                gas_limit: 21_000,
             }],
         };
         let receipt = RawReceipt {

@@ -147,6 +147,7 @@ pub fn sample_events() -> Vec<DomainEvent> {
         DomainEvent::BlockFinalized(BlockFinalized { block: block() }),
         // Detection (§6)
         DomainEvent::DetectorTriggered(DetectorTriggered {
+            alert_id: Some(alert_id()),
             detector: detector(),
             block: block(),
             txs: vec![tx()],

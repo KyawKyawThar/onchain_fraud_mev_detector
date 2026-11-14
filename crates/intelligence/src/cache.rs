@@ -103,6 +103,7 @@ pub struct CachedScreeningFacts {
 /// The hot-path cache seam. Object-safe; production is [`RedisHotCache`],
 /// tests use the in-memory double in [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait HotCache: Send + Sync {
     /// The cached active-label set for an address, if present.
     async fn labels(

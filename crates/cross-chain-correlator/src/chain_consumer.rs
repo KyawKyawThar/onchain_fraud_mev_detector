@@ -195,6 +195,7 @@ mod tests {
         EventEnvelope::new(
             chain,
             DomainEvent::DetectorTriggered(DetectorTriggered {
+                alert_id: None,
                 detector: DetectorRef {
                     id: "sandwich".into(),
                     version: "1".into(),

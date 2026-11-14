@@ -66,6 +66,7 @@ pub struct BlockFacts {
 /// Where block bodies come from. Production is [`RpcBlockFacts`]; tests use
 /// the in-memory double in [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BlockFactsSource: Send + Sync {
     /// The facts of the block with this exact hash — `None` when the node
     /// doesn't (yet) know it. Fetching by hash, not height, keeps the read
@@ -156,6 +157,7 @@ pub struct RelayEndpoint {
 /// stalls the pipeline (see the module docs).
 #[async_trait]
 pub trait RelaySource: Send + Sync {
+    #[allow(clippy::double_must_use)]
     /// The first configured relay (in config order) whose data API reports
     /// having delivered this exact block (matched by hash), with the winning
     /// builder's pubkey.

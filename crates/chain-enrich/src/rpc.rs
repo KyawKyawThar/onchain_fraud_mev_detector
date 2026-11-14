@@ -5,7 +5,7 @@
 //! [`crate::test_util::FakeChain`]. The production implementation is
 //! [`crate::alloy::AlloyArchiveRpc`].
 
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use async_trait::async_trait;
 
 use crate::decode::{RawBlock, RawReceipt};
@@ -58,6 +58,7 @@ impl RpcError {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ArchiveRpc: Send + Sync {
     /// The chain the node serves (`eth_chainId`).
     async fn chain_id(&self) -> Result<u64, RpcError>;
@@ -80,9 +81,23 @@ pub trait ArchiveRpc: Send + Sync {
 
     /// `eth_call` with no value and no sender.
     async fn call(&self, to: Address, data: Bytes, at: StateAt) -> Result<CallOutcome, RpcError>;
+
+    /// Native balance at an exact historical state.
+    async fn balance(&self, address: Address, at: StateAt) -> Result<U256, RpcError>;
+
+    /// Account nonce at an exact historical state.
+    async fn nonce(&self, address: Address, at: StateAt) -> Result<u64, RpcError>;
+
+    /// Runtime bytecode at an exact historical state. Empty bytes are an EOA or
+    /// an account without deployed code.
+    async fn code(&self, address: Address, at: StateAt) -> Result<Bytes, RpcError>;
+
+    /// One storage word at an exact historical state.
+    async fn storage(&self, address: Address, slot: U256, at: StateAt) -> Result<U256, RpcError>;
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl<T: ArchiveRpc + ?Sized> ArchiveRpc for std::sync::Arc<T> {
     async fn chain_id(&self) -> Result<u64, RpcError> {
         (**self).chain_id().await
@@ -101,5 +116,17 @@ impl<T: ArchiveRpc + ?Sized> ArchiveRpc for std::sync::Arc<T> {
     }
     async fn call(&self, to: Address, data: Bytes, at: StateAt) -> Result<CallOutcome, RpcError> {
         (**self).call(to, data, at).await
+    }
+    async fn balance(&self, address: Address, at: StateAt) -> Result<U256, RpcError> {
+        (**self).balance(address, at).await
+    }
+    async fn nonce(&self, address: Address, at: StateAt) -> Result<u64, RpcError> {
+        (**self).nonce(address, at).await
+    }
+    async fn code(&self, address: Address, at: StateAt) -> Result<Bytes, RpcError> {
+        (**self).code(address, at).await
+    }
+    async fn storage(&self, address: Address, slot: U256, at: StateAt) -> Result<U256, RpcError> {
+        (**self).storage(address, slot, at).await
     }
 }

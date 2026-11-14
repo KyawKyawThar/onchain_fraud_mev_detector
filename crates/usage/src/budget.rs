@@ -373,6 +373,7 @@ pub fn evaluate(window: &SpendWindow, policy: &BudgetPolicy) -> BudgetReport {
 /// be exercisable without ClickHouse, and "what has been spent" is the only
 /// thing it reads.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SpendSource: Send + Sync + std::fmt::Debug {
     /// Token spend per customer since `since`, largest first, at most `limit`
     /// rows — and [`SpendWindow::truncated`] when that limit bound the answer.

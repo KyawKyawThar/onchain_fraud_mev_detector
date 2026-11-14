@@ -90,6 +90,7 @@ impl event_bus::Transience for JobError {
 /// the dispatcher can hold a `dyn JobSink` and swap the broker for a test double
 /// without generics rippling through it.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait JobSink: Send + Sync {
     /// Publish one command, returning only once the broker has accepted it
     /// (at-least-once). An `Err` means the job is *not* queued; the caller uses

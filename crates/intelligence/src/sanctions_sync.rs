@@ -129,6 +129,7 @@ pub enum Fetched {
 /// and so the manual `seed` path (a file) and the scheduled one (a URL) run
 /// the same sync.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait FeedSource: Send + Sync {
     /// What the ledger records as the list's `source`. Must not carry a
     /// credential (see [`HttpFeedSource`]).

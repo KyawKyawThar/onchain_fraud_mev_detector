@@ -152,6 +152,7 @@ pub struct ReplayPage {
 /// The seam a rebuild reads through. Object-safe so the driver takes
 /// `&dyn ReplaySource` and tests hand it a canned stream with no event store.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ReplaySource: Send + Sync {
     /// Pin the current ingest-time cut, read from the **store's** clock.
     ///

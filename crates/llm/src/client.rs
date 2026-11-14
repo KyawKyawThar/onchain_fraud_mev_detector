@@ -601,6 +601,7 @@ impl Transience for LlmError {
 /// compiling a drafted rule) is unit-testable against
 /// [`crate::test_util::StubClient`] with no network, no key, and no cost.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// The model id this client will ask for, for stamping into a draft event
     /// *before* the call (§20.4). The model that actually answered is

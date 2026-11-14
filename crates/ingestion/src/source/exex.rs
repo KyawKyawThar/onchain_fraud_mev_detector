@@ -125,6 +125,7 @@ pub struct ExecutedBlock {
 /// far side is Kafka, a KV store, or a test double. Object-safe (via `async_trait`)
 /// so [`ExExSource`] can hold a `dyn` sink chosen by configuration.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ExecutedBlockSink: Send + Sync {
     /// Ship one committed block's post-execution facts. At-least-once semantics
     /// and durability are the sink's concern (mirroring [`crate::publisher`]).

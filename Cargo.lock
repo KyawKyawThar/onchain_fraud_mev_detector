@@ -7605,6 +7605,7 @@ dependencies = [
  "axum",
  "bounded-map",
  "ch-migrate",
+ "chain-enrich",
  "chrono",
  "clickhouse",
  "db",

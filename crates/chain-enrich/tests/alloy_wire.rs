@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy_primitives::{address, b256, Address, Bytes, B256};
+use alloy_primitives::{address, b256, Address, Bytes, B256, U256};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 const BLOCK: B256 = b256!("1111111111111111111111111111111111111111111111111111111111111111");
 const PARENT: B256 = b256!("2222222222222222222222222222222222222222222222222222222222222222");
 const TX: B256 = b256!("3333333333333333333333333333333333333333333333333333333333333333");
+const TX_2: B256 = b256!("4444444444444444444444444444444444444444444444444444444444444444");
 const FROM: Address = address!("00000000000000000000000000000000000000a1");
 const TO: Address = address!("00000000000000000000000000000000000000b2");
 const TOKEN: Address = address!("00000000000000000000000000000000000000c3");
@@ -64,6 +65,14 @@ fn block_json() -> Value {
             "s": "0x4ba69724e8f69de52f0125ad8b3c5c2cef33019bac3249e2c0a2192766d1721c",
             "hash": TX, "blockHash": BLOCK, "blockNumber": "0x121eac0",
             "transactionIndex": "0x0", "from": FROM
+        }, {
+            "type": "0x0", "chainId": "0x1", "nonce": "0x8", "gasPrice": "0x4a817c800",
+            "gas": "0x5208", "to": TO, "value": "0x2a", "input": "0x1234",
+            "v": "0x25",
+            "r": "0x1b5e176d927f8e9ab405058b2d2457392da3e20f328b16ddabcebc33eaac5fea",
+            "s": "0x4ba69724e8f69de52f0125ad8b3c5c2cef33019bac3249e2c0a2192766d1721c",
+            "hash": TX_2, "blockHash": BLOCK, "blockNumber": "0x121eac0",
+            "transactionIndex": "0x1", "from": FROM
         }]
     })
 }
@@ -169,11 +178,19 @@ async fn blocks_and_receipts_decode_from_the_node_wire_format() {
         (0x121eac0, BLOCK, PARENT)
     );
     assert_eq!(block.timestamp, 0x6553f100);
-    assert_eq!(block.txs.len(), 1);
-    assert_eq!(
-        (block.txs[0].hash, block.txs[0].from, block.txs[0].to),
-        (TX, FROM, Some(TO))
-    );
+    assert_eq!(block.txs.len(), 2);
+    let tx = &block.txs[0];
+    assert_eq!((tx.hash, tx.index, tx.from, tx.to), (TX, 0, FROM, Some(TO)));
+    assert_eq!(tx.nonce, 7);
+    assert_eq!(tx.value, U256::ZERO);
+    assert!(tx.input.is_empty());
+    assert_eq!(tx.gas_limit, 0x30d40);
+    let second = &block.txs[1];
+    assert_eq!((second.hash, second.index), (TX_2, 1));
+    assert_eq!(second.nonce, 8);
+    assert_eq!(second.value, U256::from(42));
+    assert_eq!(second.input, Bytes::from_static(&[0x12, 0x34]));
+    assert_eq!(second.gas_limit, 21_000);
 
     let receipts = rpc.receipts(BLOCK).await.unwrap().expect("receipts");
     assert_eq!(receipts.len(), 1);

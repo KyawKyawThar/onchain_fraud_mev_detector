@@ -27,6 +27,15 @@ pub struct FakeChain {
     at_state: HashMap<(CallKey, StateAt), CallOutcome>,
     calls: AtomicUsize,
     failure: Mutex<Option<RpcError>>,
+    state: Mutex<HashMap<(Address, StateAt), AccountState>>,
+    storage: Mutex<HashMap<(Address, U256, StateAt), U256>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AccountState {
+    balance: U256,
+    nonce: u64,
+    code: Bytes,
 }
 
 fn words(values: &[U256]) -> Bytes {
@@ -146,6 +155,33 @@ impl FakeChain {
         *self.failure.lock().unwrap() = Some(error);
     }
 
+    /// Set the account fields a forked simulation reads at `state`.
+    pub fn set_account(
+        &self,
+        address: Address,
+        state: StateAt,
+        balance: U256,
+        nonce: u64,
+        code: Bytes,
+    ) {
+        self.state.lock().unwrap().insert(
+            (address, state),
+            AccountState {
+                balance,
+                nonce,
+                code,
+            },
+        );
+    }
+
+    /// Set one storage word a forked simulation reads at `state`.
+    pub fn set_storage(&self, address: Address, slot: U256, state: StateAt, value: U256) {
+        self.storage
+            .lock()
+            .unwrap()
+            .insert((address, slot, state), value);
+    }
+
     /// Contract calls made so far.
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -209,5 +245,50 @@ impl ArchiveRpc for FakeChain {
             .or_else(|| self.any_state.get(&key))
             .cloned()
             .unwrap_or(CallOutcome::Returned(Bytes::new())))
+    }
+
+    async fn balance(&self, address: Address, state: StateAt) -> Result<U256, RpcError> {
+        self.check()?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .get(&(address, state))
+            .map_or(U256::ZERO, |account| account.balance))
+    }
+
+    async fn nonce(&self, address: Address, state: StateAt) -> Result<u64, RpcError> {
+        self.check()?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .get(&(address, state))
+            .map_or(0, |account| account.nonce))
+    }
+
+    async fn code(&self, address: Address, state: StateAt) -> Result<Bytes, RpcError> {
+        self.check()?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .get(&(address, state))
+            .map_or_else(Bytes::new, |account| account.code.clone()))
+    }
+
+    async fn storage(
+        &self,
+        address: Address,
+        slot: U256,
+        state: StateAt,
+    ) -> Result<U256, RpcError> {
+        self.check()?;
+        Ok(*self
+            .storage
+            .lock()
+            .unwrap()
+            .get(&(address, slot, state))
+            .unwrap_or(&U256::ZERO))
     }
 }

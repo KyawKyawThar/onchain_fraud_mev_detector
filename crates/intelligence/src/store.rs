@@ -179,7 +179,9 @@ pub enum ReversalOutcome {
 /// [`update_label_value`](Self::update_label_value) (an operator correcting
 /// the same claim's display value in place, e.g. a typo'd tag name — distinct
 /// from a *new* claim, which always mints a new coexisting row).
+
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LabelStore: Send + Sync {
     /// Insert a label, keyed by its `label_id`. Returns `false` when the id is
     /// already stored — a redelivered `LabelAdded` is a no-op.
@@ -272,6 +274,7 @@ pub trait LabelStore: Send + Sync {
 
 /// Versioned entities + membership (§8.2).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait EntityStore: Send + Sync {
     /// Create an entity seeded with one address, atomically.
     async fn create_entity(
@@ -400,6 +403,7 @@ pub trait EntityStore: Send + Sync {
 
 /// Attribution records (§8): the mutable incident→entity overlay.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait AttributionStore: Send + Sync {
     /// Upsert one attribution link, keyed `(incident_id, entity_id)` — a
     /// re-run on a redelivered `IncidentCreated` overwrites with fresher
@@ -453,6 +457,7 @@ pub trait AttributionStore: Send + Sync {
 /// Sanctions lists (§8.5). The exact-address match behind the immediate
 /// `SanctionHit` hard alert.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SanctionsStore: Send + Sync {
     /// Import (or refresh) list entries, keyed `(address, list_name)` — a
     /// re-import upserts in place. Returns how many rows were written.
@@ -561,6 +566,7 @@ pub enum PromotionOutcome {
 /// promotion only lands on the version it was decided against. So a slow run
 /// finishing after a newer one, or two runs racing, cannot corrupt a list.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait SanctionsListStore: Send + Sync {
     /// The database clock — the one clock every freshness stamp is taken
     /// from, so a skewed job pod cannot make a list look fresher than it is.

@@ -127,6 +127,7 @@ impl Transience for PublishError {
 /// can hold a `dyn EventSink` and swap the Kafka producer for a test double
 /// without generics rippling through it.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait EventSink: Send + Sync {
     /// Publish one envelope, returning only once it is accepted by the transport
     /// (at-least-once). An `Err` means the event is *not* on the wire; the caller
@@ -543,6 +544,7 @@ pub enum Handled {
 /// handler sees a fully-decoded [`EventEnvelope`] (poison is skipped by the loop
 /// before it gets here) and returns a [`Handled`] verdict.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait EventHandler: Send + Sync {
     /// Handle one decoded event. `&self` (not `&mut`) because handlers hold their
     /// collaborators behind `Arc`; concurrency, if any, is the handler's own.

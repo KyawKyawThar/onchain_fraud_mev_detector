@@ -292,7 +292,7 @@ mod tests {
     use crate::decode::{RawBlock, RawReceipt, RawTx};
     use crate::rpc::RpcError;
     use crate::test_util::FakeChain;
-    use alloy_primitives::{address, Address, B256};
+    use alloy_primitives::{address, Address, Bytes, B256, U256};
     use events::primitives::Chain;
 
     const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -325,8 +325,13 @@ mod tests {
             timestamp: NOW,
             txs: vec![RawTx {
                 hash: hash(1),
+                index: 0,
                 from: trader,
                 to: Some(Address::repeat_byte(0xEE)),
+                nonce: 0,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                gas_limit: 21_000,
             }],
         };
         let receipts = vec![RawReceipt {

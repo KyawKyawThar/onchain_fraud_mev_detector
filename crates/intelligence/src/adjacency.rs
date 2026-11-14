@@ -145,6 +145,7 @@ impl std::fmt::Display for Shard {
 /// [`ClickhouseAdjacency`], tests use the in-memory double in
 /// [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait AdjacencyStore: Send + Sync {
     /// Append edge observations (immutable; duplicates are harmless extra
     /// rows the `DISTINCT` reads collapse).

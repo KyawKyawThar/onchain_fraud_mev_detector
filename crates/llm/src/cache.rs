@@ -111,6 +111,7 @@ impl std::fmt::Display for CacheKey {
 /// exactly backwards when the expensive one is the one that runs in
 /// production.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait CompletionCache: Send + Sync + std::fmt::Debug {
     /// A previously stored completion for this exact request, if any.
     async fn get(&self, key: &CacheKey) -> Option<Completion>;

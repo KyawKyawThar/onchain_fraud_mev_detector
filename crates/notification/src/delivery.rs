@@ -48,6 +48,7 @@ impl event_bus::Transience for DeliveryError {
 /// `None` when there is nothing to adjudicate (anything but a confirmed
 /// incident) or when this deployment mints no grants.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ChannelSink: Send + Sync {
     async fn deliver(
         &self,

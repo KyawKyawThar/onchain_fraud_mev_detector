@@ -134,6 +134,7 @@ pub enum CtxError {
 /// so the export holds a `&dyn CtxSource` and the archive-backed
 /// implementation is a swap, not a rewrite.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait CtxSource: Send + Sync {
     /// The context for `block` on `chain`, or `None` if this source knows
     /// nothing about that block (its findings are then skipped and counted —
@@ -158,6 +159,7 @@ pub trait CtxSource: Send + Sync {
 /// Putting the choice behind a factory keeps [`crate::export`] from having to
 /// know which kind it holds.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait CtxSourceFactory: Send + Sync {
     /// A source for `window`, the events of one shard (or of the whole export
     /// when unsharded).
@@ -370,6 +372,7 @@ mod tests {
 
     fn triggered(block_ref: BlockRef, txs: Vec<B256>) -> EventEnvelope {
         envelope(DomainEvent::DetectorTriggered(DetectorTriggered {
+            alert_id: None,
             detector: DetectorRef {
                 id: "sandwich".into(),
                 version: "1.0.0".into(),

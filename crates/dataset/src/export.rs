@@ -548,6 +548,7 @@ mod tests {
             envelope(
                 1,
                 DomainEvent::DetectorTriggered(DetectorTriggered {
+                    alert_id: None,
                     detector: detector(),
                     block: block(),
                     txs: vec![tx(1), tx(2)],
@@ -572,6 +573,7 @@ mod tests {
             envelope(
                 3,
                 DomainEvent::DetectorTriggered(DetectorTriggered {
+                    alert_id: None,
                     detector: detector(),
                     block: block(),
                     txs: vec![tx(3)],

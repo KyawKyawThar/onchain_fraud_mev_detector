@@ -56,6 +56,7 @@ pub enum SinkError {
 /// position — a Parquet file handle, a batch buffer — and pretending otherwise
 /// would push interior mutability into every implementation for no gain.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait DatasetSink: Send {
     /// Write a batch of rows, in order. Called repeatedly; order across calls
     /// is preserved.

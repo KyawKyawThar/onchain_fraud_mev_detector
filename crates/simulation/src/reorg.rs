@@ -281,6 +281,7 @@ pub enum IndexError {
 /// [`crate::resolver`] is blocked on. Until it lands, [`EmptyIncidentIndex`] retracts
 /// nothing (the honest no-op).
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait IncidentIndex: Send + Sync {
     /// The incidents produced by transactions in `block`. `Ok(vec![])` means there is
     /// nothing to retract for this block.

@@ -747,6 +747,7 @@ pub fn plan(owed: &[Proposal], subject_flagged: bool) -> Vec<Effect> {
 /// `PgIntelligenceStore` (see [`crate::store`]), tests use the in-memory
 /// double in [`crate::test_util`].
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LinkCandidateStore: Send + Sync {
     /// Record a proposal, keyed by its deterministic
     /// [`Proposal::candidate_id`]. See [`ProposalOutcome`] for the four ways

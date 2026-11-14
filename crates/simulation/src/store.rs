@@ -198,6 +198,7 @@ pub struct IncidentPage {
 /// Object-safe so the consumer holds a `dyn IncidentStore` and swaps [`PgIncidentStore`]
 /// for a test double.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait IncidentStore: Send + Sync {
     /// Upsert the folded incident read-model row, keyed by `alert_id`. Idempotent: the
     /// [`IncidentRecord`] is always the current merged truth, so re-applying a
@@ -221,6 +222,7 @@ pub trait IncidentStore: Send + Sync {
 /// incident fold, it is a statement *about* one, and it arrives on its own
 /// event with no [`IncidentRecord`] behind it.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait FeedbackLedger: Send + Sync {
     /// Record one customer's verdict. Idempotent by construction rather than
     /// by convention: the table is a `ReplacingMergeTree` keyed
@@ -242,6 +244,7 @@ pub trait FeedbackLedger: Send + Sync {
 /// lives inside a SQL string cannot be unit-tested, cannot be named in a type,
 /// and cannot be changed without a database to try it against.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait FeedbackSliStore: Send + Sync {
     /// Read the window's evidence.
     ///
@@ -336,6 +339,7 @@ struct LagRow {
 
 /// The append-only ClickHouse analytics firehose (§14). Object-safe for the same reason.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait IncidentAnalytics: Send + Sync {
     /// Append one immutable analytics row.
     async fn append(&self, row: &AnalyticsRow) -> Result<(), PersistError>;
@@ -355,6 +359,7 @@ pub const MAX_EXPOSURE_INCIDENTS: u64 = 10_000;
 /// firehose's contract (mirrors `intelligence::adjacency::AdjacencyStore` sitting
 /// beside `intelligence::store`'s write seams).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait WalletExposureStore: Send + Sync {
     /// The confirmed incidents that named `victim_address` as their victim,
     /// newest first, optionally narrowed to a created-time lower bound `since`.
@@ -391,6 +396,7 @@ pub struct TimingBucketRow {
 /// the `incident_timing_rollup` rollup, not the append-only
 /// `incident_analytics` firehose.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait TimingStore: Send + Sync {
     /// Every bucket recorded for `chain`/`severity`, in no particular order —
     /// [`crate::timing::rank_windows`] does the ranking.
@@ -654,6 +660,7 @@ impl CrossChainFindingFilters {
 /// a method on it, since a finding is a structurally different row (see
 /// [`crate::cross_chain_projection`]'s module docs).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait CrossChainFindingStore: Send + Sync {
     /// Upsert the folded finding read-model row, keyed by `finding_id`.
     /// Idempotent: the [`CrossChainFindingRecord`] is always the current

@@ -196,6 +196,7 @@ impl std::fmt::Display for Staging {
 /// reference implementation drives the real `ProjectionConsumer::handle` with
 /// the broker taken out of the loop.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Projector: Send + Sync {
     /// The event types this projection is derived from, as
     /// [`events::DomainEvent::event_type`] strings. Empty means "the whole
@@ -223,6 +224,7 @@ pub trait Projector: Send + Sync {
 /// Fingerprints the **live** read model. The narrow trait a read-only
 /// `fingerprint` holds — it can observe, and can do nothing else.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Snapshotter: Send + Sync {
     /// Stable name, for logs, metrics and staging ids (`"simulation-incidents"`).
     fn name(&self) -> &'static str;
@@ -241,6 +243,7 @@ pub trait Snapshotter: Send + Sync {
 /// `discard` on an absent staging area succeeds, so cleanup after a crash is
 /// safe to repeat.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Stageable: Send + Sync {
     /// Create an empty staging area and return the [`Projector`] that writes
     /// into it.

@@ -538,6 +538,11 @@
       "partition_key": "chain",
       "fields": [
         {
+          "path": "alert_id",
+          "type": "validated_string",
+          "required": false
+        },
+        {
           "path": "block",
           "type": "object",
           "required": true

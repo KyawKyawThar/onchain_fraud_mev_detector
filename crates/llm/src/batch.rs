@@ -218,6 +218,7 @@ pub struct BatchOutcome {
 /// exercisable against [`crate::test_util::StubBatchClient`] with no network,
 /// no key, and no 24-hour wait.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BatchClient: Send + Sync + std::fmt::Debug {
     /// The model this client submits for.
     fn model(&self) -> &str;

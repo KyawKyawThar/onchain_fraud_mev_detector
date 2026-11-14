@@ -227,6 +227,11 @@ pub struct EventRow {
     /// `Nullable(UUID)` column.
     #[serde(with = "clickhouse::serde::uuid::option")]
     pub incident_id: Option<Uuid>,
+    /// Denormalized alert linkage. A `DetectorTriggered` records this only
+    /// when it raised an active provisional alert; it makes evidence lookup a
+    /// durable key query rather than an assumption about adjacent Kafka events.
+    #[serde(with = "clickhouse::serde::uuid::option")]
+    pub alert_id: Option<Uuid>,
     /// Denormalized business key for the §4 by-address query: every on-chain
     /// address this event references, lowercase `0x…` hex. Derived from `payload`
     /// via [`DomainEvent::addresses`]; maps to the `Array(String)` column.
@@ -247,6 +252,7 @@ impl TryFrom<&EventEnvelope> for EventRow {
             occurred_at: env.occurred_at,
             payload: serde_json::to_string(&env.payload)?,
             incident_id: env.payload.incident_id().map(|id| id.0),
+            alert_id: env.payload.alert_id().map(|id| id.0),
             addresses: {
                 // One event can name the same address twice (e.g. a
                 // PreliminaryAlertCreated listing it as both a victim and a
@@ -267,7 +273,7 @@ impl TryFrom<&EventEnvelope> for EventRow {
 
 /// The canonical columns a read needs to rebuild an [`EventEnvelope`]: identity,
 /// chain, occurrence time, and the payload that is the source of truth. The
-/// denormalized `incident_id`/`addresses` index columns are deliberately *not*
+/// denormalized `incident_id`/`alert_id`/`addresses` index columns are deliberately *not*
 /// selected — they only accelerate lookups, never feed reconstruction, so a
 /// query that returns rows doesn't pay to ship them.
 #[derive(Debug, clickhouse::Row, Deserialize)]
@@ -364,6 +370,32 @@ mod tests {
         // Stored lowercase so it matches the by-address query's normalized input.
         assert_eq!(row.addresses, vec![format!("{address:#x}")]);
         assert_eq!(row.addresses[0], row.addresses[0].to_lowercase());
+    }
+
+    #[test]
+    fn row_denormalizes_the_trigger_alert_link() {
+        use events::detection::DetectorTriggered;
+        use events::primitives::{AlertId, BlockRef, Confidence, DetectorRef};
+
+        let alert_id = AlertId::new();
+        let env = EventEnvelope::new(
+            Chain::ETHEREUM,
+            DomainEvent::DetectorTriggered(DetectorTriggered {
+                alert_id: Some(alert_id),
+                detector: DetectorRef {
+                    id: "sandwich".into(),
+                    version: "1.2.0".into(),
+                    config_hash: "deadbeef".into(),
+                },
+                block: BlockRef::new(19_800_000, B256::repeat_byte(0x55)),
+                txs: vec![B256::repeat_byte(0x99)],
+                raw_confidence: Confidence::new(0.9),
+                evidence: serde_json::json!({}),
+            }),
+        );
+
+        let row = EventRow::try_from(&env).expect("map");
+        assert_eq!(row.alert_id, Some(alert_id.0));
     }
 
     #[test]

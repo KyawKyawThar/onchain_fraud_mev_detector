@@ -143,6 +143,7 @@ fn stored_stream(plan: &[Planned]) -> (Vec<EventEnvelope>, Truth) {
             occurred_at,
             CHAIN,
             DomainEvent::DetectorTriggered(DetectorTriggered {
+                alert_id: None,
                 detector: detector_ref(p.detector),
                 block: block(),
                 txs: vec![tx],

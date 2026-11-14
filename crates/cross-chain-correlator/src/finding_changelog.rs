@@ -71,6 +71,7 @@ pub use events::cross_chain::CrossChainFindingKind as FindingKind;
 /// exactly (a trait, not a bare writer type, so tests substitute an
 /// in-memory double instead of a live broker).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait FindingChangelogSink: Send + Sync {
     async fn append(
         &self,

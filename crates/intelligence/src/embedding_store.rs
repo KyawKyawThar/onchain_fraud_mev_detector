@@ -113,6 +113,7 @@ impl StoredEmbedding {
 /// [`ClickhouseEmbeddingStore`], tests use the recording double in
 /// [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait EmbeddingStore: Send + Sync {
     /// Append computed vectors (immutable; a recomputation that lands on the
     /// same values is a harmless extra row the latest-per-key read collapses).

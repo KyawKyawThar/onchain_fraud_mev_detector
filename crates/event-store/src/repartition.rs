@@ -43,7 +43,7 @@ pub const SWAP: TableSwap = TableSwap::new(TABLE);
 
 /// Every column, in table order, for `INSERT … SELECT` in both directions.
 const COLUMNS: &str = "event_id, schema_version, chain, event_type, event_family, occurred_at, \
-                       payload, appended_at, incident_id, addresses";
+                       payload, appended_at, incident_id, alert_id, addresses";
 
 /// Catch-up passes per month before giving up. More than one because an insert
 /// in flight at the exchange can commit into the retired table afterwards.
@@ -376,6 +376,6 @@ mod tests {
                 "{column} missing from DDL"
             );
         }
-        assert_eq!(COLUMNS.split(',').count(), 10);
+        assert_eq!(COLUMNS.split(',').count(), 11);
     }
 }

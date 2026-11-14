@@ -20,7 +20,7 @@
 //! Writes still go through [`EventStore::append_batch`]; nothing here mutates.
 
 use chrono::{DateTime, Utc};
-use events::primitives::{AccountAddress, IncidentId};
+use events::primitives::{AccountAddress, AlertId, IncidentId};
 use events::EventEnvelope;
 use uuid::Uuid;
 
@@ -50,6 +50,11 @@ pub enum QueryError {
     /// least a chain, an event type, or a time bound.
     #[error("replay requires at least one of: chain, event_type, from, to")]
     UnboundedReplay,
+
+    /// More than one trigger claims one alert. This is a violated producer
+    /// invariant; returning an arbitrary one would make simulation unsafe.
+    #[error("multiple DetectorTriggered events claim alert {0}")]
+    ConflictingAlertEvidence(AlertId),
 }
 
 /// A keyset cursor into the `(occurred_at, event_id)` sort order: the position to
@@ -218,6 +223,34 @@ impl Conditions {
 }
 
 impl EventStore {
+    /// The exact detector evidence that raised `alert_id`, if the alert is
+    /// backed by a post-linkage trigger. Historical alerts return `None` rather
+    /// than guessing from event order.
+    pub async fn trigger_for_alert(
+        &self,
+        alert_id: AlertId,
+    ) -> Result<Option<EventEnvelope>, QueryError> {
+        let rows = self
+            .client()
+            .query(&format!(
+                "SELECT {STORED_EVENT_COLUMNS} FROM events WHERE event_type = 'DetectorTriggered' \
+                 AND alert_id = ? ORDER BY occurred_at, event_id LIMIT 1 BY event_id LIMIT 2"
+            ))
+            .bind(alert_id.0)
+            .fetch_all::<StoredEvent>()
+            .await
+            .map_err(StoreError::from)?;
+        if rows.len() > 1 {
+            return Err(QueryError::ConflictingAlertEvidence(alert_id));
+        }
+        rows.into_iter()
+            .next()
+            .map(EventEnvelope::try_from)
+            .transpose()
+            .map_err(StoreError::from)
+            .map_err(QueryError::from)
+    }
+
     /// The event sequence for one incident, oldest first (§4 audit use case):
     /// every event whose payload directly carries `incident_id` — the simulation
     /// lifecycle and the `AttributionUpdated` overlay — optionally narrowed and

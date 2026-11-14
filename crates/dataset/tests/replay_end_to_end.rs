@@ -85,6 +85,7 @@ fn window() -> Vec<EventEnvelope> {
 
     fn trigger(id: &str, b: BlockRef, txs: Vec<B256>, confidence: f64) -> DomainEvent {
         DomainEvent::DetectorTriggered(DetectorTriggered {
+            alert_id: None,
             detector: detector(id),
             block: b,
             txs,

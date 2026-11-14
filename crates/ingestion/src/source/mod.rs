@@ -103,6 +103,7 @@ pub enum SourceError {
 ///
 /// Reads are header-only; assembling full blocks (txs/traces) is task 2.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ChainSource: Send + Sync {
     /// The latest block height the source has seen (`eth_blockNumber`). The head
     /// poller diffs this against the last emitted height to find new blocks.

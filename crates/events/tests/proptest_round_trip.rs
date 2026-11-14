@@ -303,6 +303,7 @@ fn detection_event() -> impl Strategy<Value = DomainEvent> {
         )
             .prop_map(|(detector, block, txs, raw_confidence, evidence)| {
                 DomainEvent::DetectorTriggered(DetectorTriggered {
+                    alert_id: None,
                     detector,
                     block,
                     txs,

@@ -76,6 +76,7 @@ pub enum DeliveryOutcome {
 /// Subscribers, delivery receipts, and the incident↔alert correlation index
 /// (§11, §14) — this service's tables alone (no cross-service joins).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait NotificationStore: Send + Sync {
     /// Insert a subscriber, keyed by its `id` — a redelivered/retried create
     /// (same id) is an idempotent no-op. Returns `false` when the id already

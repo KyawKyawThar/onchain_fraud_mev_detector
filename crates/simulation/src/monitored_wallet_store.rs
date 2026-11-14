@@ -73,6 +73,7 @@ pub struct MonitoredWalletPage {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait MonitoredWalletStore: Send + Sync {
     /// Opt `address` in for `owner`. Idempotent: opting the same
     /// `(owner, chain, address)` in twice returns

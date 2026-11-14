@@ -36,6 +36,7 @@ impl event_bus::Transience for ProductionStoreError {
 /// [`ClickhouseProductionStore`], tests use the recording double in
 /// [`crate::test_util`].
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BlockProductionStore: Send + Sync {
     /// Append snapshots in fold order (immutable; a redelivered fold's
     /// identical snapshot is a harmless extra row the latest-per-block read

@@ -109,6 +109,7 @@ fn build_router(state: AppState) -> (Router<AppState>, utoipa::openapi::OpenApi)
     let read = OpenApiRouter::new()
         .routes(routes!(healthz))
         .routes(routes!(audit_incident))
+        .routes(routes!(trigger_for_alert))
         .routes(routes!(events_by_address))
         .routes(routes!(replay))
         .routes(routes!(watermark));
@@ -303,6 +304,41 @@ async fn audit_incident(
     Ok(Json(page.into()))
 }
 
+/// `GET /v1/alerts/{alert_id}/trigger` — the exact `DetectorTriggered` evidence
+/// that created a provisional alert. This is the simulation resolver's
+/// alert-to-bundle join; it never infers a relationship from stream adjacency.
+#[utoipa::path(
+    get,
+    path = "/v1/alerts/{alert_id}/trigger",
+    tag = "event-store",
+    params(("alert_id" = String, Path, format = Uuid, description = "Provisional alert id")),
+    responses(
+        (status = 200, description = "Detector trigger evidence", body = EventEnvelope),
+        (status = 404, description = "No linked trigger (historical or shadow alert)"),
+        (status = 409, description = "More than one trigger claims the alert"),
+        (status = 500, description = "Storage failure"),
+    ),
+)]
+async fn trigger_for_alert(
+    State(state): State<AppState>,
+    Path(alert_id): Path<uuid::Uuid>,
+) -> Result<Json<EventEnvelope>, ApiError> {
+    match state
+        .store
+        .trigger_for_alert(events::primitives::AlertId(alert_id))
+        .await
+    {
+        Ok(Some(event)) => Ok(Json(event)),
+        Ok(None) => Err(ApiError::not_found(
+            "linked DetectorTriggered evidence was not found",
+        )),
+        Err(QueryError::ConflictingAlertEvidence(_)) => Err(ApiError::conflict(
+            "multiple DetectorTriggered events claim this alert",
+        )),
+        Err(error) => Err(map_query_error(error)),
+    }
+}
+
 /// `GET /v1/address/{address}/events` — every event referencing an on-chain
 /// address, oldest first, within the optional filters (§4 by-address query).
 #[utoipa::path(
@@ -428,6 +464,7 @@ fn map_query_error(err: QueryError) -> ApiError {
         QueryError::UnboundedReplay => ApiError::bad_request(QueryError::UnboundedReplay),
         // A clock the store itself cannot read is ours, not the caller's.
         QueryError::UnreadableWatermark => ApiError::internal(QueryError::UnreadableWatermark),
+        QueryError::ConflictingAlertEvidence(_) => ApiError::conflict(err),
         QueryError::Store(inner) => ApiError::internal(inner),
     }
 }
@@ -480,6 +517,7 @@ mod tests {
             ("/v1/events", "post"),
             ("/healthz", "get"),
             ("/v1/audit/incident/{incident_id}", "get"),
+            ("/v1/alerts/{alert_id}/trigger", "get"),
             ("/v1/address/{address}/events", "get"),
             ("/v1/replay", "get"),
         ] {

@@ -47,6 +47,7 @@ use crate::leg::{BridgeOrPair, CandidateLeg};
 /// in-memory double ([`RecordingChangelogWriter`], test-only) instead of
 /// exercising a real Kafka producer, mirroring `event_bus::test_util::RecordingSink`.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ChangelogSink: Send + Sync {
     async fn append(&self, entry: &ChangelogEntry, backoff: Duration, shutdown: &CancellationToken);
 }

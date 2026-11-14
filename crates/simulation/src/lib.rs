@@ -97,6 +97,7 @@ pub mod dispatcher;
 pub mod exposure;
 pub mod exposure_report;
 pub mod feedback_sli;
+pub mod fork;
 pub mod http;
 pub mod metrics;
 pub mod monitored_wallet_store;

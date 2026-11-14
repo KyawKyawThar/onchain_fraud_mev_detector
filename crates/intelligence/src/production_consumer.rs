@@ -724,6 +724,7 @@ mod tests {
     fn triggered(b: BlockRef, txs: Vec<B256>, secs: i64) -> EventEnvelope {
         envelope(
             DomainEvent::DetectorTriggered(DetectorTriggered {
+                alert_id: None,
                 detector: DetectorRef {
                     id: "sandwich".into(),
                     version: "2.1.0".into(),

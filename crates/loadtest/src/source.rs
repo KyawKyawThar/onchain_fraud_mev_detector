@@ -85,6 +85,7 @@ impl Window {
 
 /// One driver of load against the subject.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LoadSource: Send + Sync {
     /// Stable name ([`CHAIN`], [`API`]) — how a gate finds this source's result.
     fn name(&self) -> &'static str;

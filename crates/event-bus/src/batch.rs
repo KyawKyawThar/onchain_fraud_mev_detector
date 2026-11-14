@@ -81,6 +81,7 @@ pub enum Accepted<T> {
 /// write. Everything else — pacing, offsets, retries, the DLQ, shutdown
 /// draining — is the loop's ([`run_batch_consumer`]).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BatchHandler: Send + Sync {
     /// What a record becomes inside a batch.
     type Item: Send;
